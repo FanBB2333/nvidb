@@ -1,5 +1,6 @@
 import pytest
 
+from src.connection import *
 
 def test_connection():
     pass
@@ -12,3 +13,7 @@ def test_get_gpu_stats():
 
 def test_get_info():
     pass
+
+
+if __name__ == '__main__':
+    pytest.main()
