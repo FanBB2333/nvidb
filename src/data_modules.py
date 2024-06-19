@@ -1,3 +1,4 @@
+from typing import Literal
 from dataclasses import dataclass, asdict, field
 
 
@@ -6,9 +7,43 @@ class ServerInfo:
     host: str
     port: int
     username: str
-    auth: str = 'password'
+    description: str
+    auth: Literal['password', 'key'] = 'password'
     password: str = field(init=False, repr=False)
-    description: str = field(init=False)
     
     def __post_init__(self):
-        self.description = f'{self.username}@{self.host}:{self.port}'
+        if self.description is None:
+            self.description = f'{self.username}@{self.host}:{self.port}'
+
+
+class ServerList:
+    def __init__(self):
+        self.servers = []
+        
+    def add_server(self, server_info):
+        self.servers.append(server_info)
+        
+    def __iter__(self):
+        return iter(self.servers)
+    
+    def __len__(self):
+        return len(self.servers)
+    
+    def __getitem__(self, index):
+        return self.servers[index]
+    
+    def __repr__(self):
+        return f'ServerList({self.servers})'
+    
+    def __str__(self):
+        return '\n'.join([server.description for server in self.servers])
+    
+    def to_dict(self):
+        return [asdict(server) for server in self.servers]
+    
+    @classmethod
+    def from_dict(cls, server_list):
+        instance = cls()
+        for server in server_list:
+            instance.add_server(ServerInfo(**server))
+        return instance
