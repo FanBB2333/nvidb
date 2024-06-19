@@ -8,7 +8,7 @@ class ServerInfo:
     port: int
     username: str
     description: str
-    auth: Literal['password', 'key'] = 'password'
+    auth: Literal['password', 'key', 'auto'] = 'auto'
     password: str = field(init=False, repr=False)
     
     def __post_init__(self):
@@ -36,7 +36,7 @@ class ServerList:
         return f'ServerList({self.servers})'
     
     def __str__(self):
-        return '\n'.join([server.description for server in self.servers])
+        return '\n'.join([f"{idx}: {server.description}" for idx, server in enumerate(self.servers)])
     
     def to_dict(self):
         return [asdict(server) for server in self.servers]
@@ -47,3 +47,10 @@ class ServerList:
         for server in server_list:
             instance.add_server(ServerInfo(**server))
         return instance
+    
+    @classmethod
+    def from_yaml(cls, file):
+        import yaml
+        with open(file, 'r') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        return cls.from_dict(config['servers'])

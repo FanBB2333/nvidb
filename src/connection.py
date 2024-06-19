@@ -33,6 +33,7 @@ class NviClient:
         self.auth = server.auth
         self.description = server.description
         self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.client.load_system_host_keys()
         self.connect()
     
@@ -41,20 +42,24 @@ class NviClient:
         logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
 
     def connect(self) -> None:
-        if "password" == self.auth:
+        if "auto" == self.auth:
             try:
-                # prompt to input password
-                password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
-                self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                self.client.connect(hostname=self.host, port=self.port, username=self.username)
                 logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
             except AuthenticationException as e:
-                logging.error(msg=f"Authentication failed: {e}")
-                sys.exit(1)
+                logging.error(msg=f"Authentication failed on {self.description}")
+                try:
+                    # prompt to input password
+                    password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
+                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                except AuthenticationException as e:
+                    logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
+                    sys.exit(1)
             except NoValidConnectionsError as e:
                 logging.error(msg=f"Connection failed: {e}")
                 sys.exit(1)
-        elif "key" == self.auth:
-            pass
+        else:
+            logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto' strategy.")
     
     def test(self):
         # test with ls command

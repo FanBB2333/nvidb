@@ -2,12 +2,8 @@ servers:
   - host: "example1.com"
     port: 8080
     username: "user1"
-    auth: "password"
-    password: "password1"
     description: "First server description"
   - host: "example2.com"
     port: 9090
     username: "user2"
-    auth: "key"
-    password: "password2"
     description: "Second server description"
