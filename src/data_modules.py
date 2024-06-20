@@ -1,6 +1,16 @@
+import logging
+import sys
+import os
 from typing import Literal
+import getpass
 from dataclasses import dataclass, asdict, field
 
+
+import paramiko
+from paramiko import AuthenticationException
+from paramiko.client import SSHClient, AutoAddPolicy
+from paramiko.ssh_exception import NoValidConnectionsError
+import pandas as pd
 
 @dataclass
 class ServerInfo:
@@ -16,13 +26,16 @@ class ServerInfo:
             self.description = f'{self.username}@{self.host}:{self.port}'
 
 
-class ServerList:
+class ServerListInfo:
     def __init__(self):
         self.servers = []
         
     def add_server(self, server_info):
         self.servers.append(server_info)
-        
+    
+    def remove_server(self, idx):
+        del self.servers[idx]
+    
     def __iter__(self):
         return iter(self.servers)
     

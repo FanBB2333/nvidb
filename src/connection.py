@@ -75,11 +75,15 @@ class NviClient:
         return result
     
     
-    def get_gpu_stats(self, command = 'nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv') -> str:
+    def get_gpu_stats(self, command = 'nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv') -> str:
         stdin, stdout, stderr = self.client.exec_command(command=command)
         stats = pd.read_csv(filepath_or_buffer=stdout, header=0)
         return stats
     
+    def execute_command(self, command: str) -> str:
+        stdin, stdout, stderr = self.client.exec_command(command=command)
+        result = stdout.read().decode()
+        return result
     
     def get_client(self) -> SSHClient:
         return self.client
@@ -101,3 +105,7 @@ class NviClientPool:
 
     def test(self):
         pass
+    
+    def execute_command(self, command):
+        pass
+
