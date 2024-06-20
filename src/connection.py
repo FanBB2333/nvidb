@@ -3,6 +3,7 @@ import logging
 import sys
 import os
 import getpass
+import time
 
 import pynvml
 import paramiko
@@ -10,8 +11,9 @@ from paramiko import AuthenticationException
 from paramiko.client import SSHClient, AutoAddPolicy
 from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
+from termcolor import colored, cprint
 
-from .data_modules import ServerInfo
+from .data_modules import ServerInfo, ServerListInfo
 
 
 def nvidbInit():
@@ -88,24 +90,20 @@ class NviClient:
     def get_client(self) -> SSHClient:
         return self.client
 
-    
-    # def close(self) -> None:
-    #     self.client.close()
-    #     logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
-        
 
 class NviClientPool:
-    def __init__(self, host: str, port: int, username: str, password: str, pool_size: int):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.password = password
-        self.pool_size = pool_size
-        self.client_pool = [NviClient(host=host, port=port, username=username, password=password) for _ in range(pool_size)]
+    def __init__(self, server_list: ServerListInfo):
+        self.pool = [NviClient(server) for server in server_list]
+        logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
 
     def test(self):
         pass
     
     def execute_command(self, command):
-        pass
+        for idx, client in enumerate(self.pool):
+            # cprint(f"Output on {client.description}", 'yellow')
+            # logging.info(msg=f"Executing command on {client.description}")
+            result = client.execute_command(command)
+            logging.info(msg=colored(f"{client.description}", 'yellow'))
+            print(result)
 

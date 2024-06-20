@@ -31,11 +31,16 @@ def test_get_gpu_stats():
     logging.info(msg=s)
 
 def test_get_all_stats():
-    server_list
+    pool = NviClientPool(server_list)
+    # pool.execute_command(command='nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv')
+    # pool.execute_command(command='nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.memory,utilization.gpu --format=csv,nounits')
+    pool.execute_command(command='nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.memory,utilization.gpu,memory.used,memory.total,power.draw --format=csv')
+    # pool.execute_command(command='gpustat')
+    
     
 
 
 if __name__ == '__main__':
     # pytest.main()
     init()
-    test_get_gpu_stats()
+    test_get_all_stats()
