@@ -38,9 +38,11 @@ def test_get_all_stats():
     # pool.execute_command(command='gpustat')
     
     
-
-
-if __name__ == '__main__':
-    # pytest.main()
+def main():
     init()
     test_get_all_stats()
+
+if __name__ == '__main__':
+    init()
+    test_get_all_stats()
+    
