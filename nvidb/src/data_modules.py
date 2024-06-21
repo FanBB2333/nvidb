@@ -67,3 +67,8 @@ class ServerListInfo:
         with open(file, 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         return cls.from_dict(config['servers'])
+    
+    def to_yaml(self, file):
+        import yaml
+        with open(file, 'w') as f:
+            yaml.dump(self.to_dict(), f)
