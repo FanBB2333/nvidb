@@ -1,4 +1,3 @@
-nvidia_ml_py
 pandas
 paramiko
 pytest

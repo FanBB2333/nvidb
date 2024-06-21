@@ -5,7 +5,13 @@ setup(
     version='0.1',
     packages=find_packages(),
     install_requires=[
-        # 'numpy',
+        'pandas',
+        'paramiko',
+        'pytest',
+        'PyYAML',
+        'setuptools',
+        'termcolor',
+        'nvidia_ml_py',
     ],
     entry_points={
         'console_scripts': [
