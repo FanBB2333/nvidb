@@ -1,1 +1,1 @@
-python -m test.run
+python -m nvidb.test.run

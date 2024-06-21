@@ -9,7 +9,7 @@ setup(
     ],
     entry_points={
         'console_scripts': [
-            'nvidbtest=test.run:main',
+            'nvidb=nvidb.test.run:main',
         ],
     },
 )

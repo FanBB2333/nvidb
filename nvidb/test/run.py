@@ -2,8 +2,8 @@ import pytest
 import yaml
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-from src.connection import NviClient, NviClientPool
-from src.data_modules import ServerInfo, ServerListInfo
+from ..src.connection import NviClient, NviClientPool
+from ..src.data_modules import ServerInfo, ServerListInfo
 
 
 cli: NviClient = None
@@ -11,11 +11,12 @@ server_list: ServerListInfo = None
 
 def init():
     global test_server, cli, server_list
-    with open('test/config.yml', 'r') as f:
+    config_path = 'nvidb/test/config.yml'
+    with open(config_path, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     # test_server = ServerInfo(**config['servers'][0])
     # server_list = ServerList.from_dict(config['servers'])
-    server_list = ServerListInfo.from_yaml('test/config.yml')
+    server_list = ServerListInfo.from_yaml(config_path)
     cli = NviClient(server_list[0])
 
 
@@ -42,7 +43,5 @@ def main():
     init()
     test_get_all_stats()
 
-if __name__ == '__main__':
-    init()
-    test_get_all_stats()
-    
+if __name__ == "__main__":
+    main()
