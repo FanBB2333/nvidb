@@ -34,6 +34,7 @@ class NviClient:
         self.username = server.username
         self.auth = server.auth
         self.description = server.description
+        self.password = server.password
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.client.load_system_host_keys()
@@ -46,7 +47,10 @@ class NviClient:
     def connect(self) -> None:
         if "auto" == self.auth:
             try:
-                self.client.connect(hostname=self.host, port=self.port, username=self.username)
+                if self.password is not None:
+                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
+                else:
+                    self.client.connect(hostname=self.host, port=self.port, username=self.username)
                 logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
             except AuthenticationException as e:
                 logging.error(msg=f"Authentication failed on {self.description}")

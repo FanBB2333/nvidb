@@ -18,8 +18,8 @@ class ServerInfo:
     port: int
     username: str
     description: str
+    password: str = field(repr=False, default=None)
     auth: Literal['password', 'key', 'auto'] = 'auto'
-    password: str = field(init=False, repr=False)
     
     def __post_init__(self):
         if self.description is None:
