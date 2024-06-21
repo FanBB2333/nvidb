@@ -1,3 +1,4 @@
 *.pyc
 **/config.yml
 *.egg-info/
+build/
