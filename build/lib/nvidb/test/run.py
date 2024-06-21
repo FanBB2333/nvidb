@@ -1,7 +1,7 @@
 import pytest
-import os
 import yaml
 import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 from ..src.connection import NviClient, NviClientPool
 from ..src.data_modules import ServerInfo, ServerListInfo
 
@@ -10,13 +10,8 @@ cli: NviClient = None
 server_list: ServerListInfo = None
 
 def init():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     global test_server, cli, server_list
-    # config_path = 'nvidb/test/config.yml'
-    config_path = '~/.nvidb/config.yml'
-    config_path = os.path.expanduser(config_path)
-    # mkdir if not exists
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    config_path = 'nvidb/test/config.yml'
     with open(config_path, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     # test_server = ServerInfo(**config['servers'][0])
@@ -45,10 +40,8 @@ def test_get_all_stats():
     
     
 def main():
-    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     init()
     test_get_all_stats()
 
 if __name__ == "__main__":
-    init()
-    test_get_all_stats()
+    main()

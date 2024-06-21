@@ -105,6 +105,5 @@ class NviClientPool:
             # logging.info(msg=f"Executing command on {client.description}")
             result = client.execute_command(command)
             logging.info(msg=colored(f"{client.description}", 'yellow'))
-            print(colored(f"{client.description}", 'yellow'))
             print(result)
 
