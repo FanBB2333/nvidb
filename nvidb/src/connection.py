@@ -39,7 +39,6 @@ class NviClient:
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.client.load_system_host_keys()
-        self.connect()
     
     def __del__(self):
         self.client.close()
@@ -132,6 +131,11 @@ class NviClientPool:
     def __init__(self, server_list: ServerListInfo):
         self.pool = [NviClient(server) for server in server_list]
         logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
+        self.connect_all()
+    
+    def connect_all(self):
+        for client in self.pool:
+            client.connect()
 
     def test(self):
         pass
