@@ -2,8 +2,10 @@ from typing import Literal
 import logging
 import sys
 import os
+import subprocess
 import getpass
 import time
+import xml.etree.ElementTree as ET
 
 import pynvml
 import paramiko
@@ -12,7 +14,6 @@ from paramiko.client import SSHClient, AutoAddPolicy
 from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
 from termcolor import colored, cprint
-
 from .data_modules import ServerInfo, ServerListInfo
 
 
@@ -80,11 +81,43 @@ class NviClient:
         result = stdout.read().decode()
         return result
     
-    
     def get_gpu_stats(self, command = 'nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv') -> str:
         stdin, stdout, stderr = self.client.exec_command(command=command)
         stats = pd.read_csv(filepath_or_buffer=stdout, header=0)
         return stats
+    
+    def get_full_gpu_info(self):
+        result = subprocess.run(['nvidia-smi', '-q', '-x'], capture_output=True, text=True)
+        response = result.stdout
+        root = ET.fromstring(response)
+        gpus = root.findall('gpu')
+        for gpu in gpus:
+            product_name = gpu.find('product_name').text
+            product_architecture = gpu.find('product_architecture').text
+            
+            pci = gpu.find('pci')
+            tx_util = pci.find('tx_util').text
+            rx_util = pci.find('rx_util').text
+            fan_speed = gpu.find('fan_speed').text
+            
+            fb_memory_usage = gpu.find('fb_memory_usage')
+            total = fb_memory_usage.find('total').text
+            used = fb_memory_usage.find('used').text
+            free = fb_memory_usage.find('free').text
+            
+            utilization = gpu.find('utilization')
+            gpu_util = utilization.find('gpu_util').text
+            memory_util = utilization.find('memory_util').text
+            
+            temperature = gpu.find('temperature')
+            gpu_temp = temperature.find('gpu_temp').text
+
+            gpu_power_readings = gpu.find('gpu_power_readings')
+            power_state = gpu_power_readings.find('power_state').text
+            power_draw = gpu_power_readings.find('power_draw').text
+            current_power_limit = gpu_power_readings.find('current_power_limit').text
+            
+            processes = gpu.find('processes')
     
     def execute_command(self, command: str) -> str:
         stdin, stdout, stderr = self.client.exec_command(command=command)
