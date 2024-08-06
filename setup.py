@@ -6,6 +6,7 @@ setup(
     name='nvidb',
     version='0.1',
     packages=find_packages(),
+    url="https://github.com/FanBB2333/nvidb/",
     long_description=long_description,
     long_description_content_type='text/markdown',
     install_requires=[
