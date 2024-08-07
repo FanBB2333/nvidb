@@ -4,3 +4,4 @@ pytest
 PyYAML
 setuptools
 termcolor
+nvidia-ml-py
