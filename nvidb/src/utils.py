@@ -1,7 +1,8 @@
-from typing import Dict
+from typing import Dict, Any
 import subprocess
 import logging
 import os
+import re
 import pandas as pd
 import xml.etree.ElementTree as ET
 
@@ -61,6 +62,29 @@ def get_gpu_stats_query():
         logging.info(msg=f"GPU Temp: {gpu_temp}")
         logging.info(msg=f"Power Draw: {power_draw}, Power Limit: {current_power_limit}, Power State: {power_state}")
         
-        
+
+def num_from_str(s: str, type: Any = float) -> int:
+    return type(''.join(filter(str.isdigit, s)))
+
+def units_from_str(s: str) -> str:
+    return ''.join(filter(str.isalpha, s))
+
+def extract_numbers(s):
+    return re.findall(r'\d+', s)
+
+def xml_to_dict(root):
+    # root = ET.fromstring(xml_string)
+    child_to_dict = {} 
+    for child in root:
+        child_tag = child.tag
+        child_text = child.text
+
+        if len(child) > 0: # child nodes available
+            child_to_dict[child_tag] = xml_to_dict(child) 
+        else:
+            child_to_dict[child_tag] = child_text
+    return child_to_dict
+
+
 if __name__ == '__main__':
     pass

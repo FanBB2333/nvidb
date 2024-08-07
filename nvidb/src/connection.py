@@ -4,6 +4,7 @@ import sys
 import os
 import subprocess
 import getpass
+import json
 import time
 import xml.etree.ElementTree as ET
 
@@ -15,6 +16,7 @@ from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
 from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
+from .utils import xml_to_dict, num_from_str, units_from_str
 
 
 def nvidbInit():
@@ -93,10 +95,10 @@ class NviClient:
         return stats
     
     def get_full_gpu_info(self):
-        result = subprocess.run(['nvidia-smi', '-q', '-x'], capture_output=True, text=True)
-        response = result.stdout
-        root = ET.fromstring(response)
+        stdin, stdout, stderr = self.client.exec_command(command='nvidia-smi -q -x')
+        root = ET.fromstring(stdout.read().decode())
         gpus = root.findall('gpu')
+        stats = []
         for gpu in gpus:
             product_name = gpu.find('product_name').text
             product_architecture = gpu.find('product_architecture').text
@@ -124,6 +126,25 @@ class NviClient:
             current_power_limit = gpu_power_readings.find('current_power_limit').text
             
             processes = gpu.find('processes')
+            # add new line to the dataframe
+            stats.append({
+                          'product_name': product_name, 
+                          'product_architecture': product_architecture, 
+                          'tx_util': tx_util, 
+                          'rx_util': rx_util, 
+                          'fan_speed': fan_speed, 
+                          'total': total, 
+                          'used': used, 
+                          'free': free, 
+                          'gpu_util': gpu_util, 
+                          'memory_util': memory_util, 
+                          'gpu_temp': gpu_temp, 
+                          'power_state': power_state, 
+                          'power_draw': power_draw, 
+                          'current_power_limit': current_power_limit
+                          })
+        stats = pd.DataFrame(stats)
+        return stats
     
     def execute_command(self, command: str) -> str:
         stdin, stdout, stderr = self.client.exec_command(command=command)
@@ -154,4 +175,53 @@ class NviClientPool:
             logging.info(msg=colored(f"{client.description}", 'yellow'))
             print(colored(f"{client.description}", 'yellow'))
             print(result)
+    
+    def execute_command_parse(self, command, type: Literal['csv', 'xml', 'json']='xml'):
+        for idx, client in enumerate(self.pool):
+            result = client.execute_command(command)
+            logging.info(msg=colored(f"{client.description}", 'yellow'))
+            # if result is the instance of dict
+            if isinstance(result, dict):
+                pass
+            elif isinstance(result, str):
+                if 'xml' == type:
+                    result = xml_to_dict(result)
+                elif 'csv' == type:
+                    result = pd.read_csv(filepath_or_buffer=result, header=0)
+                elif 'json' == type:
+                    result = json.loads(result)
+                else:
+                    logging.error(msg=f"Unsupported type: {type}")
+            else:
+                logging.error(msg=f"Unsupported result type: {type(result)}")
+        return result
+    
+    def get_client_gpus_info(self):
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', 0)
+        for idx, client in enumerate(self.pool):
+            logging.info(msg=colored(f"{client.description}", 'yellow'))
+            print(colored(f"{client.description}", 'yellow'))
+            stats = client.get_full_gpu_info()
+            # apply from_str to rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
+            stats['rx_util'] = stats['rx_util'].apply(num_from_str)
+            stats['tx_util'] = stats['tx_util'].apply(num_from_str)
+            stats['power_draw'] = stats['power_draw'].apply(num_from_str)
+            stats['current_power_limit'] = stats['current_power_limit'].apply(num_from_str)
+            stats['used'] = stats['used'].apply(num_from_str)
+            stats['total'] = stats['total'].apply(num_from_str)
+            for idx, row in stats.iterrows():
+                # combine rx_util and tx_util to one row
+                # stats['rx/tx'] = f"{stats['rx_util']}/{stats['tx_util']}"
+                stats.loc[idx, 'rx/tx'] = f"{row['rx_util']}/{row['tx_util']}"
+                # combine the power state and power draw to one row
+                # stats['power'] = f"{stats['power_state']} {stats['power_draw']}/{stats['current_power_limit']}"
+                stats.loc[idx, 'power'] = f"{row['power_state']} {row['power_draw']}/{row['current_power_limit']}"
+                # combine the memory utilization
+                # stats['memory[used]/total'] = f"{stats['used']}/{stats['total']}"
+                stats.loc[idx, 'memory[used/total]'] = f"{row['used']}/{row['total']}"
+            # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
+            stats = stats.drop(columns=['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free'])
+
+            print(stats)
 
