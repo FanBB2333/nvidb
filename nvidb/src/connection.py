@@ -16,7 +16,7 @@ from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
 from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
-from .utils import xml_to_dict, num_from_str, units_from_str
+from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers
 
 
 def nvidbInit():
@@ -204,22 +204,10 @@ class NviClientPool:
             print(colored(f"{client.description}", 'yellow'))
             stats = client.get_full_gpu_info()
             # apply from_str to rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
-            stats['rx_util'] = stats['rx_util'].apply(num_from_str)
-            stats['tx_util'] = stats['tx_util'].apply(num_from_str)
-            stats['power_draw'] = stats['power_draw'].apply(num_from_str)
-            stats['current_power_limit'] = stats['current_power_limit'].apply(num_from_str)
-            stats['used'] = stats['used'].apply(num_from_str)
-            stats['total'] = stats['total'].apply(num_from_str)
-            for idx, row in stats.iterrows():
-                # combine rx_util and tx_util to one row
-                # stats['rx/tx'] = f"{stats['rx_util']}/{stats['tx_util']}"
-                stats.loc[idx, 'rx/tx'] = f"{row['rx_util']}/{row['tx_util']}"
-                # combine the power state and power draw to one row
-                # stats['power'] = f"{stats['power_state']} {stats['power_draw']}/{stats['current_power_limit']}"
-                stats.loc[idx, 'power'] = f"{row['power_state']} {row['power_draw']}/{row['current_power_limit']}"
-                # combine the memory utilization
-                # stats['memory[used]/total'] = f"{stats['used']}/{stats['total']}"
-                stats.loc[idx, 'memory[used/total]'] = f"{row['used']}/{row['total']}"
+            stats['rx/tx'] = [f"{'/'.join(extract_numbers(row['rx_util']))}/{'/'.join(extract_numbers(row['tx_util']))}" for _, row in stats.iterrows()]
+            stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
+            stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
+
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             stats = stats.drop(columns=['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free'])
 
