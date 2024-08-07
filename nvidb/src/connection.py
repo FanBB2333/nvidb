@@ -44,29 +44,36 @@ class NviClient:
         self.client.close()
         logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
 
-    def connect(self) -> None:
-        if "auto" == self.auth:
-            try:
-                if self.password is not None:
-                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
-                else:
-                    self.client.connect(hostname=self.host, port=self.port, username=self.username)
-                logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
-            except AuthenticationException as e:
-                logging.error(msg=f"Authentication failed on {self.description}")
+    def connect(self) -> bool:
+        print(f"Connecting to {self.host}:{self.port} as {self.username}")
+        # catch the OSError exception when the host is not reachable
+        try:
+            if "auto" == self.auth:
                 try:
-                    # prompt to input password
-                    password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
-                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                    if self.password is not None:
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
+                    else:
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username)
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
+                    return True
                 except AuthenticationException as e:
-                    logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
+                    logging.error(msg=f"Authentication failed on {self.description}")
+                    try:
+                        # prompt to input password
+                        password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                    except AuthenticationException as e:
+                        logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
+                        sys.exit(1)
+                except NoValidConnectionsError as e:
+                    logging.error(msg=f"Connection failed: {e}")
                     sys.exit(1)
-            except NoValidConnectionsError as e:
-                logging.error(msg=f"Connection failed: {e}")
-                sys.exit(1)
-        else:
-            logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto' strategy.")
-    
+            else:
+                logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto' strategy.")
+        except OSError as e:
+            logging.error(msg=f"Connection failed: {e}")
+            return False
+        
     def test(self):
         # test with ls command
         stdin, stdout, stderr = self.client.exec_command(command='ls')
@@ -134,8 +141,7 @@ class NviClientPool:
         self.connect_all()
     
     def connect_all(self):
-        for client in self.pool:
-            client.connect()
+        self.pool = [client for client in self.pool if client.connect()]
 
     def test(self):
         pass
