@@ -1,4 +1,5 @@
 from typing import Literal
+from blessed import Terminal
 import logging
 import sys
 import os
@@ -160,6 +161,7 @@ class NviClientPool:
         self.pool = [NviClient(server) for server in server_list]
         logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
         self.connect_all()
+        self.term = Terminal()
     
     def connect_all(self):
         self.pool = [client for client in self.pool if client.connect()]
@@ -199,17 +201,39 @@ class NviClientPool:
     def get_client_gpus_info(self):
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', 0)
+        stats_str = []
         for idx, client in enumerate(self.pool):
-            logging.info(msg=colored(f"{client.description}", 'yellow'))
-            print(colored(f"{client.description}", 'yellow'))
+            # logging.info(msg=colored(f"{client.description}", 'yellow'))
+            # print(colored(f"{client.description}", 'yellow'))
             stats = client.get_full_gpu_info()
             # apply from_str to rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             stats['rx/tx'] = [f"{'/'.join(extract_numbers(row['rx_util']))}/{'/'.join(extract_numbers(row['tx_util']))}" for _, row in stats.iterrows()]
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
+            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> gpu_util
+            stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem', 'gpu_util': 'util'})
+            
+            # replace the NVIDIA/GeForce with "" in name column
+            stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
+            
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             stats = stats.drop(columns=['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free'])
 
+            stats_str.append(stats)
+        # reformat the str into a single string
+        stats_str = [f"\n{colored(client.description)}\n{str(stats)}" for client, stats in zip(self.pool, stats_str)]
+        return stats_str
+    
+    def print_stats(self):
+        stats_str = self.get_client_gpus_info()
+        print(self.term.clear)
+        for stats in stats_str:
             print(stats)
+
+    def print_refresh(self):
+        while True:
+            # print(self.term.clear)
+            self.print_stats()
+            # time.sleep(1)
 

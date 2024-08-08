@@ -42,7 +42,7 @@ def test_get_all_stats(server_list):
     # pool.execute_command(command='nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.memory,utilization.gpu,memory.used,memory.total,power.draw --format=csv')
     # pool.execute_command(command='gpustat')
     # pool.execute_command_parse('nvidia-smi -q -x', type='xml')
-    pool.get_client_gpus_info()
+    pool.print_refresh()
     
     
 def main():

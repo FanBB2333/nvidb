@@ -5,3 +5,4 @@ PyYAML
 setuptools
 termcolor
 nvidia-ml-py
+blessed
