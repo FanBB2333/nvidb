@@ -2,6 +2,7 @@ import pytest
 import os
 import yaml
 import logging
+import argparse
 from ..src.connection import NviClient, NviClientPool
 from ..src.data_modules import ServerInfo, ServerListInfo
 
@@ -49,6 +50,33 @@ def main():
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     server_list = init()
     test_get_all_stats(server_list)
+    # 创建主解析器
+    parser = argparse.ArgumentParser(prog="nvidb", description="A simple tool to manage Nvidia GPU servers.")
+    
+    # 添加子解析器
+    subparsers = parser.add_subparsers(dest='command')  # 子命令存储在 args.command 中
+
+    # 添加 `ls` 子命令
+    ls_parser = subparsers.add_parser('ls', help='List items')
+    ls_parser.add_argument('--detail', action='store_true', help='Show detailed list')
+
+    # 添加 `add` 子命令
+    add_parser = subparsers.add_parser('add', help='Add an item')
+    add_parser.add_argument('name', type=str, help='Name of the item to add')
+
+    # 解析命令行参数
+    args = parser.parse_args()
+
+    # 根据不同的子命令执行不同的功能
+    if args.command == 'ls':
+        if args.detail:
+            print("Showing detailed list of items.")
+        else:
+            print("Showing list of items.")
+    elif args.command == 'add':
+        print(f"Adding item: {args.name}")
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     # python -m nvidb.test.run
