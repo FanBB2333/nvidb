@@ -73,6 +73,55 @@ def extract_numbers(s):
     # 捕获整数和小数部分，包括前导零和小数点
     return re.findall(r'\d+\.?\d*', s)
 
+def extract_value_and_unit(s: str) -> tuple[str, str]:
+    """从字符串中提取数值和单位，例如 '1024 KB/s' -> ('1024', 'KB/s')"""
+    if not s or s.strip() == 'N/A':
+        return ('0', '')
+    
+    # 匹配数字(包括小数)和单位
+    match = re.match(r'(\d+\.?\d*)\s*(.*)$', s.strip())
+    if match:
+        value, unit = match.groups()
+        return (value, unit.strip())
+    return ('0', '')
+
+def format_bandwidth(value: str, unit: str) -> str:
+    """格式化带宽显示，优化单位"""
+    if not value or value == '0':
+        return '0'
+    
+    try:
+        val = float(value)
+        
+        # 如果值为0，返回简洁的0
+        if val == 0:
+            return '0'
+        
+        # 如果单位包含 /s，说明是带宽，进行单位转换
+        if '/s' in unit.lower():
+            if 'kb/s' in unit.lower():
+                if val >= 1024:
+                    return f"{val/1024:.1f}MB/s"
+                else:
+                    return f"{val:.0f}KB/s"
+            elif 'mb/s' in unit.lower():
+                if val >= 1024:
+                    return f"{val/1024:.2f}GB/s"
+                else:
+                    return f"{val:.1f}MB/s"
+            elif 'gb/s' in unit.lower():
+                return f"{val:.2f}GB/s"
+        
+        # 如果没有单位，直接返回数值
+        if not unit:
+            return f"{val:.0f}" if val == int(val) else f"{val:.1f}"
+            
+        # 其他情况保持原样
+        return f"{value}{unit}"
+        
+    except ValueError:
+        return f"{value}{unit}" if unit else value
+
 def xml_to_dict(root):
     # root = ET.fromstring(xml_string)
     child_to_dict = {} 

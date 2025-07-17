@@ -19,7 +19,7 @@ from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
 from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
-from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers
+from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth
 
 
 def nvidbInit():
@@ -283,8 +283,23 @@ class NviClientPool:
             # logging.info(msg=colored(f"{client.description}", 'yellow'))
             # print(colored(f"{client.description}", 'yellow'))
             stats = client.get_full_gpu_info()
-            # apply from_str to rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
-            stats['rx/tx'] = [f"{'/'.join(extract_numbers(row['rx_util']))}/{'/'.join(extract_numbers(row['tx_util']))}" for _, row in stats.iterrows()]
+            
+            # 优化 rx/tx 显示 - 提取数值和单位，并格式化
+            rx_tx_list = []
+            for _, row in stats.iterrows():
+                rx_val, rx_unit = extract_value_and_unit(row['rx_util'])
+                tx_val, tx_unit = extract_value_and_unit(row['tx_util'])
+                
+                rx_formatted = format_bandwidth(rx_val, rx_unit)
+                tx_formatted = format_bandwidth(tx_val, tx_unit)
+                
+                # 如果rx和tx都是0，显示更简洁的格式
+                if rx_formatted == '0' and tx_formatted == '0':
+                    rx_tx_list.append('0/0')
+                else:
+                    rx_tx_list.append(f"{rx_formatted}/{tx_formatted}")
+            
+            stats['rx/tx'] = rx_tx_list
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
