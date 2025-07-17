@@ -289,8 +289,10 @@ class LocalClient:
 
 
 class NviClientPool:
-    def __init__(self, server_list: ServerListInfo, add_local: bool = True):
-        self.pool = [LocalClient()] + [RemoteClient(server) for server in server_list]
+    def __init__(self, server_list: ServerListInfo):
+        self.pool = [LocalClient()]
+        if server_list is not None:
+            self.pool += [RemoteClient(server) for server in server_list]
         logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
         self.connect_all()
         self.term = Terminal()
