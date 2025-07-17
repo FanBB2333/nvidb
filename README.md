@@ -86,6 +86,9 @@ GPU  |         name         |   fan    |   util   | mem_util |   temp   |     rx
  6   |       RTX 3090       |   78 %   |  100 %   |   56 %   |   75 C   |  28.8MB/s  |  8.3MB/s   |  P2 349.30/350.00  |      21135/24576       | user1(21112M) gdm(4M) 
  7   |       RTX 3090       |   84 %   |  100 %   |   82 %   |   80 C   |  13.9MB/s  |  4.0MB/s   |  P2 362.74/350.00  |      21235/24576       | user1(21212M) gdm(4M) 
 
+One sample output for a remote server might look like:
+```bash
+⏰ Time: 09:41:00
 
 Server 2
 Driver: 575.57.08 | CUDA: 12.9 | GPUs: 7
