@@ -3,11 +3,11 @@ import os
 import yaml
 import logging
 import argparse
-from ..src.connection import NviClient, NviClientPool
+from ..src.connection import RemoteClient, NviClientPool
 from ..src.data_modules import ServerInfo, ServerListInfo
 
 
-cli: NviClient = None
+cli: RemoteClient = None
 
 def init(config_path = '~/.nvidb/config.yml'):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -21,7 +21,7 @@ def init(config_path = '~/.nvidb/config.yml'):
     # test_server = ServerInfo(**config['servers'][0])
     # server_list = ServerList.from_dict(config['servers'])
     server_list: ServerListInfo = ServerListInfo.from_yaml(config_path)
-    cli = NviClient(server_list[0])
+    cli = RemoteClient(server_list[0])
     return server_list
 
 
@@ -38,12 +38,12 @@ def test_get_gpu_stats():
 
 def test_get_all_stats(server_list):
     pool = NviClientPool(server_list)
+    pool.print_refresh()
     # pool.execute_command(command='nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv')
     # pool.execute_command(command='nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.memory,utilization.gpu --format=csv,nounits')
     # pool.execute_command(command='nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.memory,utilization.gpu,memory.used,memory.total,power.draw --format=csv')
     # pool.execute_command(command='gpustat')
     # pool.execute_command_parse('nvidia-smi -q -x', type='xml')
-    pool.print_refresh()
     
     
 def main():

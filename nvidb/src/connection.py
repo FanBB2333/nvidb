@@ -31,7 +31,7 @@ def nvidbInit():
         print("GPU", i, "Temperature:", temperature, "C")
 
 
-class NviClient:
+class RemoteClient:
     def __init__(self, server: ServerInfo):
         self.host = server.host
         self.port = server.port
@@ -156,9 +156,141 @@ class NviClient:
         return self.client
 
 
+class LocalClient:
+    def __init__(self):
+        self.host = "localhost"
+        self.port = "local"
+        self.username = getpass.getuser()
+        self.description = f"Local Machine ({self.username}@{self.host})"
+        
+    def connect(self) -> bool:
+        """Local connection is always successful"""
+        logging.info(msg=f"Connected to local machine as {self.username}")
+        print(f"Connected to local machine as {self.username}")
+        return True
+    
+    def test(self):
+        """Test local connection with ls command"""
+        try:
+            result = subprocess.run(['ls'], capture_output=True, text=True, check=True)
+            output = result.stdout
+            logging.info(msg=f"Test result: {output}")
+            return output
+        except subprocess.CalledProcessError as e:
+            logging.error(msg=f"Test command failed: {e}")
+            return ""
+    
+    def get_os_info(self) -> str:
+        """Get local operating system information"""
+        try:
+            result = subprocess.run(['uname', '-a'], capture_output=True, text=True, check=True)
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            logging.error(msg=f"Failed to get OS info: {e}")
+            return ""
+    
+    def get_gpu_stats(self, command='nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv') -> pd.DataFrame:
+        """Get local GPU statistics"""
+        try:
+            result = subprocess.run(command.split(), capture_output=True, text=True, check=True)
+            # Use StringIO to simulate file object for pandas
+            from io import StringIO
+            stats = pd.read_csv(StringIO(result.stdout), header=0)
+            return stats
+        except subprocess.CalledProcessError as e:
+            logging.error(msg=f"Failed to get GPU stats: {e}")
+            return pd.DataFrame()
+        except FileNotFoundError:
+            logging.error(msg="nvidia-smi command not found")
+            return pd.DataFrame()
+    
+    def get_full_gpu_info(self):
+        """Get complete GPU information"""
+        try:
+            result = subprocess.run(['nvidia-smi', '-q', '-x'], capture_output=True, text=True, check=True)
+            root = ET.fromstring(result.stdout)
+            gpus = root.findall('gpu')
+            stats = []
+            
+            for gpu in gpus:
+                product_name = gpu.find('product_name').text
+                product_architecture = gpu.find('product_architecture').text
+                
+                pci = gpu.find('pci')
+                tx_util = pci.find('tx_util').text
+                rx_util = pci.find('rx_util').text
+                fan_speed = gpu.find('fan_speed').text
+                
+                fb_memory_usage = gpu.find('fb_memory_usage')
+                total = fb_memory_usage.find('total').text
+                used = fb_memory_usage.find('used').text
+                free = fb_memory_usage.find('free').text
+                
+                utilization = gpu.find('utilization')
+                gpu_util = utilization.find('gpu_util').text
+                memory_util = utilization.find('memory_util').text
+                
+                temperature = gpu.find('temperature')
+                gpu_temp = temperature.find('gpu_temp').text
+
+                gpu_power_readings = gpu.find('gpu_power_readings')
+                power_state = gpu_power_readings.find('power_state').text
+                power_draw = gpu_power_readings.find('power_draw').text
+                current_power_limit = gpu_power_readings.find('current_power_limit').text
+                
+                processes = gpu.find('processes')
+                
+                stats.append({
+                    'product_name': product_name, 
+                    'product_architecture': product_architecture, 
+                    'tx_util': tx_util, 
+                    'rx_util': rx_util, 
+                    'fan_speed': fan_speed, 
+                    'total': total, 
+                    'used': used, 
+                    'free': free, 
+                    'gpu_util': gpu_util, 
+                    'memory_util': memory_util, 
+                    'gpu_temp': gpu_temp, 
+                    'power_state': power_state, 
+                    'power_draw': power_draw, 
+                    'current_power_limit': current_power_limit
+                })
+            
+            stats = pd.DataFrame(stats)
+            return stats
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(msg=f"Failed to get full GPU info: {e}")
+            return pd.DataFrame()
+        except FileNotFoundError:
+            logging.error(msg="nvidia-smi command not found")
+            return pd.DataFrame()
+        except ET.ParseError as e:
+            logging.error(msg=f"Failed to parse XML output: {e}")
+            return pd.DataFrame()
+    
+    def execute_command(self, command: str) -> str:
+        """Execute local command"""
+        try:
+            # Use shell=True to support pipes and complex commands
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            logging.error(msg=f"Command execution failed: {e}")
+            return f"Error: {e.stderr}" if e.stderr else f"Command failed with return code {e.returncode}"
+        except Exception as e:
+            logging.error(msg=f"Unexpected error executing command: {e}")
+            return f"Unexpected error: {str(e)}"
+    
+    def get_client(self):
+        """Return self to maintain interface consistency with RemoteClient"""
+        return self
+
+
 class NviClientPool:
-    def __init__(self, server_list: ServerListInfo):
-        self.pool = [NviClient(server) for server in server_list]
+    def __init__(self, server_list: ServerListInfo, add_local: bool = True):
+        self.pool = [LocalClient()] + [RemoteClient(server) for server in server_list]
         logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
         self.connect_all()
         self.term = Terminal()
