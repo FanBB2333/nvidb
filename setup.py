@@ -17,6 +17,7 @@ setup(
         'setuptools',
         'termcolor',
         'nvidia_ml_py',
+        'blessed'
     ],
     entry_points={
         'console_scripts': [
