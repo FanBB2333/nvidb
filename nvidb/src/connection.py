@@ -84,6 +84,13 @@ class BaseClient(ABC):
     
     def get_full_gpu_info(self):
         """Get complete GPU information from nvidia-smi XML output"""
+        def safe_get_text(element, path, default="N/A"):
+            """Safely get text from XML element, return default if not found"""
+            if element is None:
+                return default
+            found = element.find(path)
+            return found.text if found is not None else default
+        
         try:
             result = self.execute_command('nvidia-smi -q -x')
             root = ET.fromstring(result)
@@ -91,30 +98,31 @@ class BaseClient(ABC):
             stats = []
             
             for gpu in gpus:
-                product_name = gpu.find('product_name').text
-                product_architecture = gpu.find('product_architecture').text
+                # Safely extract all values with default fallbacks
+                product_name = safe_get_text(gpu, 'product_name', 'Unknown GPU')
+                product_architecture = safe_get_text(gpu, 'product_architecture', 'N/A')
                 
                 pci = gpu.find('pci')
-                tx_util = pci.find('tx_util').text
-                rx_util = pci.find('rx_util').text
-                fan_speed = gpu.find('fan_speed').text
+                tx_util = safe_get_text(pci, 'tx_util', 'N/A')
+                rx_util = safe_get_text(pci, 'rx_util', 'N/A')
+                fan_speed = safe_get_text(gpu, 'fan_speed', 'N/A')
                 
                 fb_memory_usage = gpu.find('fb_memory_usage')
-                total = fb_memory_usage.find('total').text
-                used = fb_memory_usage.find('used').text
-                free = fb_memory_usage.find('free').text
+                total = safe_get_text(fb_memory_usage, 'total', 'N/A')
+                used = safe_get_text(fb_memory_usage, 'used', 'N/A')
+                free = safe_get_text(fb_memory_usage, 'free', 'N/A')
                 
                 utilization = gpu.find('utilization')
-                gpu_util = utilization.find('gpu_util').text
-                memory_util = utilization.find('memory_util').text
+                gpu_util = safe_get_text(utilization, 'gpu_util', 'N/A')
+                memory_util = safe_get_text(utilization, 'memory_util', 'N/A')
                 
                 temperature = gpu.find('temperature')
-                gpu_temp = temperature.find('gpu_temp').text
+                gpu_temp = safe_get_text(temperature, 'gpu_temp', 'N/A')
 
                 gpu_power_readings = gpu.find('gpu_power_readings')
-                power_state = gpu_power_readings.find('power_state').text
-                power_draw = gpu_power_readings.find('power_draw').text
-                current_power_limit = gpu_power_readings.find('current_power_limit').text
+                power_state = safe_get_text(gpu_power_readings, 'power_state', 'N/A')
+                power_draw = safe_get_text(gpu_power_readings, 'power_draw', 'N/A')
+                current_power_limit = safe_get_text(gpu_power_readings, 'current_power_limit', 'N/A')
                 
                 processes = gpu.find('processes')
                 
