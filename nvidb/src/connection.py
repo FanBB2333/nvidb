@@ -10,6 +10,7 @@ import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from io import StringIO
+import threading
 
 import pynvml
 import paramiko
@@ -239,6 +240,7 @@ class NviClientPool:
         logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
         self.connect_all()
         self.term = Terminal()
+        self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
     
     def connect_all(self):
         self.pool = [client for client in self.pool if client.connect()]
@@ -276,11 +278,11 @@ class NviClientPool:
         return result
     
     def get_client_gpus_info(self):
-        # 设置pandas显示选项 - 固定列宽并横向占满
+        # Set pandas display options - fixed column width and fill horizontally
         pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)  # 自动占满终端宽度
-        pd.set_option('display.max_colwidth', 12)  # 固定每列最大宽度为12字符
-        pd.set_option('display.colheader_justify', 'center')  # 列标题居中
+        pd.set_option('display.width', None)  # Auto-fill terminal width
+        pd.set_option('display.max_colwidth', 12)  # Fixed max column width to 12 characters
+        pd.set_option('display.colheader_justify', 'center')  # Center column headers
         
         stats_str = []
         for idx, client in enumerate(self.pool):
@@ -288,7 +290,7 @@ class NviClientPool:
             # print(colored(f"{client.description}", 'yellow'))
             stats = client.get_full_gpu_info()
             
-            # 优化 rx/tx 显示 - 分为两列展示
+            # Optimize rx/tx display - split into two columns
             rx_list = []
             tx_list = []
             for _, row in stats.iterrows():
@@ -298,7 +300,7 @@ class NviClientPool:
                 rx_formatted = format_bandwidth(rx_val, rx_unit)
                 tx_formatted = format_bandwidth(tx_val, tx_unit)
                 
-                # 确保格式化后的字符串长度不超过列宽限制
+                # Ensure formatted strings don't exceed column width limit
                 rx_list.append(rx_formatted[:11] if len(rx_formatted) > 11 else rx_formatted)
                 tx_list.append(tx_formatted[:11] if len(tx_formatted) > 11 else tx_formatted)
             
@@ -313,7 +315,7 @@ class NviClientPool:
             # replace the NVIDIA/GeForce with "" in name column
             stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
             
-            # 确保name列不超过列宽限制
+            # Ensure name column doesn't exceed column width limit
             stats['name'] = stats['name'].apply(lambda x: x[:11] if len(str(x)) > 11 else x)
             
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
@@ -323,23 +325,23 @@ class NviClientPool:
         # reformat the str into a single string with fixed width formatting
         formatted_stats = []
         for client, stats in zip(self.pool, stats_str):
-            # 创建格式化的表格显示
+            # Create formatted table display
             formatted_table = self._format_fixed_width_table(stats)
             formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{formatted_table}")
         return formatted_stats
     
     def _format_fixed_width_table(self, df):
-        """格式化固定宽度的表格显示"""
+        """Format fixed-width table display"""
         if df.empty:
             return "No GPU data available"
         
-        # 获取终端宽度
+        # Get terminal width
         try:
             terminal_width = os.get_terminal_size().columns
         except OSError:
-            terminal_width = 120  # 默认宽度
+            terminal_width = 120  # Default width
         
-        # 定义每列的固定宽度 - 根据终端宽度自适应
+        # Define fixed width for each column - adaptive to terminal width
         base_widths = {
             'name': 12,
             'temp': 8,
@@ -352,65 +354,112 @@ class NviClientPool:
             'memory[used/total]': 18
         }
         
-        # 计算当前所需的最小宽度
-        min_width_needed = sum(base_widths.get(col, 12) for col in df.columns) + 3 * (len(df.columns) - 1)  # 加上分隔符
+        # Calculate minimum width required
+        min_width_needed = sum(base_widths.get(col, 12) for col in df.columns) + 3 * (len(df.columns) - 1)  # Add separators
         
-        # 如果终端宽度足够，适当增加某些列的宽度
+        # If terminal width is sufficient, appropriately increase width of certain columns
         if terminal_width > min_width_needed + 20:
-            extra_space = terminal_width - min_width_needed - 10  # 留一些边距
-            # 优先给name列增加宽度
+            extra_space = terminal_width - min_width_needed - 10  # Leave some margin
+            # Priority to increase name column width
             if 'name' in base_widths:
                 base_widths['name'] += min(extra_space // 2, 8)
-            # 给memory列增加宽度
+            # Increase memory column width
             if 'memory[used/total]' in base_widths:
                 base_widths['memory[used/total]'] += min(extra_space // 4, 6)
         
         column_widths = base_widths
         
-        # 格式化表头
+        # Format table header
         header_parts = []
         for col in df.columns:
             width = column_widths.get(col, 12)
             header_parts.append(f"{col:^{width}}")
         header = " | ".join(header_parts)
         
-        # 格式化分隔线
+        # Format separator line
         separator_parts = []
         for col in df.columns:
             width = column_widths.get(col, 12)
             separator_parts.append("-" * width)
         separator = "-+-".join(separator_parts)
         
-        # 格式化数据行
+        # Format data rows
         data_lines = []
         for _, row in df.iterrows():
             row_parts = []
             for col in df.columns:
                 width = column_widths.get(col, 12)
                 value = str(row[col])
-                # 截断过长的值并添加省略号
+                # Truncate long values and add ellipsis
                 if len(value) > width:
                     value = value[:width-2] + ".."
-                # 数字列右对齐，文本列左对齐
+                # Right-align numeric columns, left-align text columns
                 if col in ['temp', 'fan', 'util', 'mem', 'rx', 'tx']:
                     row_parts.append(f"{value:>{width}}")
                 else:
                     row_parts.append(f"{value:<{width}}")
             data_lines.append(" | ".join(row_parts))
         
-        # 组合所有部分
+        # Combine all parts
         result = [header, separator] + data_lines
         return "\n".join(result)
     
     def print_stats(self):
         stats_str = self.get_client_gpus_info()
-        print(self.term.clear)
+        current_time = time.strftime("%H:%M:%S")
+        print(self.term.home + self.term.clear)
+        print(f"⏰ Time: {current_time}")
         for stats in stats_str:
             print(stats)
 
+    def _keyboard_listener(self):
+        """Real-time keyboard listener thread, monitors 'q' key to exit"""
+        try:
+            with self.term.cbreak():  # Enable character-by-character input
+                while not self.quit_flag.is_set():
+                    try:
+                        key = self.term.inkey(timeout=0.1)  # Non-blocking input with timeout
+                        if key:
+                            if key.lower() == 'q':
+                                self.quit_flag.set()
+                                break
+                            elif key.lower() == 'h':
+                                # Temporarily show help overlay
+                                print(self.term.move_yx(0, 0) + self.term.clear_eol + 
+                                      self.term.bold + "💡 Help: Press 'q' to exit | Press any key to continue" + self.term.normal)
+                    except KeyboardInterrupt:
+                        break
+        except:
+            pass
+    
     def print_refresh(self):
-        while True:
-            # print(self.term.clear)
-            self.print_stats()
-            # time.sleep(1)
+        """Real-time GPU status display with global keyboard monitoring"""
+        print("🖥️  GPU monitoring starting...")
+        print("💡 Tips:")
+        print("   - Press 'q' key to exit program (no Enter required)")
+        print("   - Press 'h' key to show help") 
+        print("   - Press Ctrl+C to force exit")
+        print("=" * 60)
+        
+        # Start keyboard listener thread
+        keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+        keyboard_thread.start()
+        
+        try:
+            while not self.quit_flag.is_set():
+                # Display GPU status with time at top
+                self.print_stats()
+                
+                # Wait 2 seconds or until exit flag is set
+                for _ in range(20):  # 2 seconds divided into 20 x 0.1 seconds
+                    if self.quit_flag.is_set():
+                        break
+                    time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print("\n\n👋 Detected Ctrl+C, exiting program...")
+        except Exception as e:
+            print(f"\n\n❌ Error occurred: {e}")
+        finally:
+            self.quit_flag.set()  # Ensure thread exits
 

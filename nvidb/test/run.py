@@ -65,9 +65,6 @@ def main():
     else:
         server_list = None
     
-    pool = NviClientPool(server_list)
-    pool.print_refresh()
-    
     if args.command == 'ls':
         if args.detail:
             print("Showing detailed list of items.")
@@ -76,7 +73,9 @@ def main():
     elif args.command == 'add':
         print(f"Adding item: {args.name}")
     else:
-        parser.print_help()
+        # Default action: run interactive monitoring
+        pool = NviClientPool(server_list)
+        pool.print_refresh()
 
 if __name__ == "__main__":
     # python -m nvidb.test.run
