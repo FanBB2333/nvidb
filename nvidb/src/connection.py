@@ -121,7 +121,12 @@ class BaseClient(ABC):
 
                 gpu_power_readings = gpu.find('gpu_power_readings')
                 power_state = safe_get_text(gpu_power_readings, 'power_state', 'N/A')
-                power_draw = safe_get_text(gpu_power_readings, 'power_draw', 'N/A')
+                
+                # Try to get power_draw, if not available, try instant_power_draw as fallback
+                power_draw = safe_get_text(gpu_power_readings, 'power_draw', None)
+                if power_draw is None or power_draw == 'N/A':
+                    power_draw = safe_get_text(gpu_power_readings, 'instant_power_draw', 'N/A')
+                
                 current_power_limit = safe_get_text(gpu_power_readings, 'current_power_limit', 'N/A')
                 
                 processes = gpu.find('processes')
