@@ -8,6 +8,8 @@ import getpass
 import json
 import time
 import xml.etree.ElementTree as ET
+from abc import ABC, abstractmethod
+from io import StringIO
 
 import pynvml
 import paramiko
@@ -31,184 +33,59 @@ def nvidbInit():
         print("GPU", i, "Temperature:", temperature, "C")
 
 
-class RemoteClient:
-    def __init__(self, server: ServerInfo):
-        self.host = server.host
-        self.port = server.port
-        self.username = server.username
-        self.auth = server.auth
-        self.description = server.description
-        self.password = server.password
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.client.load_system_host_keys()
+class BaseClient(ABC):
+    """Base class for both RemoteClient and LocalClient with common functionality"""
     
-    def __del__(self):
-        self.client.close()
-        logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
-
-    def connect(self) -> bool:
-        print(f"Connecting to {self.host}:{self.port} as {self.username}")
-        # catch the OSError exception when the host is not reachable
-        try:
-            if "auto" == self.auth:
-                try:
-                    if self.password is not None:
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
-                    else:
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username)
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
-                    return True
-                except AuthenticationException as e:
-                    logging.error(msg=f"Authentication failed on {self.description}")
-                    try:
-                        # prompt to input password
-                        password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
-                    except AuthenticationException as e:
-                        logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
-                        sys.exit(1)
-                except NoValidConnectionsError as e:
-                    logging.error(msg=f"Connection failed: {e}")
-                    sys.exit(1)
-            else:
-                logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto' strategy.")
-        except OSError as e:
-            logging.error(msg=f"Connection failed: {e}")
-            return False
-        
-    def test(self):
-        # test with ls command
-        stdin, stdout, stderr = self.client.exec_command(command='ls')
-        result = stdout.read().decode()
-        logging.info(msg=f"Test result: {result}")
-        return result
-    
-    
-    def get_os_info(self) -> str:
-        stdin, stdout, stderr = self.client.exec_command(command='uname -a')
-        result = stdout.read().decode()
-        return result
-    
-    def get_gpu_stats(self, command = 'nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv') -> str:
-        stdin, stdout, stderr = self.client.exec_command(command=command)
-        stats = pd.read_csv(filepath_or_buffer=stdout, header=0)
-        return stats
-    
-    def get_full_gpu_info(self):
-        stdin, stdout, stderr = self.client.exec_command(command='nvidia-smi -q -x')
-        root = ET.fromstring(stdout.read().decode())
-        gpus = root.findall('gpu')
-        stats = []
-        for gpu in gpus:
-            product_name = gpu.find('product_name').text
-            product_architecture = gpu.find('product_architecture').text
-            
-            pci = gpu.find('pci')
-            tx_util = pci.find('tx_util').text
-            rx_util = pci.find('rx_util').text
-            fan_speed = gpu.find('fan_speed').text
-            
-            fb_memory_usage = gpu.find('fb_memory_usage')
-            total = fb_memory_usage.find('total').text
-            used = fb_memory_usage.find('used').text
-            free = fb_memory_usage.find('free').text
-            
-            utilization = gpu.find('utilization')
-            gpu_util = utilization.find('gpu_util').text
-            memory_util = utilization.find('memory_util').text
-            
-            temperature = gpu.find('temperature')
-            gpu_temp = temperature.find('gpu_temp').text
-
-            gpu_power_readings = gpu.find('gpu_power_readings')
-            power_state = gpu_power_readings.find('power_state').text
-            power_draw = gpu_power_readings.find('power_draw').text
-            current_power_limit = gpu_power_readings.find('current_power_limit').text
-            
-            processes = gpu.find('processes')
-            # add new line to the dataframe
-            stats.append({
-                          'product_name': product_name, 
-                          'product_architecture': product_architecture, 
-                          'tx_util': tx_util, 
-                          'rx_util': rx_util, 
-                          'fan_speed': fan_speed, 
-                          'total': total, 
-                          'used': used, 
-                          'free': free, 
-                          'gpu_util': gpu_util, 
-                          'memory_util': memory_util, 
-                          'gpu_temp': gpu_temp, 
-                          'power_state': power_state, 
-                          'power_draw': power_draw, 
-                          'current_power_limit': current_power_limit
-                          })
-        stats = pd.DataFrame(stats)
-        return stats
-    
-    def execute_command(self, command: str) -> str:
-        stdin, stdout, stderr = self.client.exec_command(command=command)
-        result = stdout.read().decode()
-        return result
-    
-    def get_client(self) -> SSHClient:
-        return self.client
-
-
-class LocalClient:
     def __init__(self):
-        self.host = "localhost"
-        self.port = "local"
-        self.username = getpass.getuser()
-        self.description = f"Local Machine ({self.username}@{self.host})"
-        
+        self.host = None
+        self.port = None
+        self.username = None
+        self.description = None
+    
+    @abstractmethod
     def connect(self) -> bool:
-        """Local connection is always successful"""
-        logging.info(msg=f"Connected to local machine as {self.username}")
-        print(f"Connected to local machine as {self.username}")
-        return True
+        """Connect to the client (remote or local)"""
+        pass
+    
+    @abstractmethod
+    def execute_command(self, command: str) -> str:
+        """Execute a command and return the output"""
+        pass
     
     def test(self):
-        """Test local connection with ls command"""
+        """Test connection with ls command"""
         try:
-            result = subprocess.run(['ls'], capture_output=True, text=True, check=True)
-            output = result.stdout
-            logging.info(msg=f"Test result: {output}")
-            return output
-        except subprocess.CalledProcessError as e:
+            result = self.execute_command('ls')
+            logging.info(msg=f"Test result: {result}")
+            return result
+        except Exception as e:
             logging.error(msg=f"Test command failed: {e}")
             return ""
     
     def get_os_info(self) -> str:
-        """Get local operating system information"""
+        """Get operating system information"""
         try:
-            result = subprocess.run(['uname', '-a'], capture_output=True, text=True, check=True)
-            return result.stdout
-        except subprocess.CalledProcessError as e:
+            result = self.execute_command('uname -a')
+            return result
+        except Exception as e:
             logging.error(msg=f"Failed to get OS info: {e}")
             return ""
     
     def get_gpu_stats(self, command='nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv') -> pd.DataFrame:
-        """Get local GPU statistics"""
+        """Get GPU statistics in CSV format"""
         try:
-            result = subprocess.run(command.split(), capture_output=True, text=True, check=True)
-            # Use StringIO to simulate file object for pandas
-            from io import StringIO
-            stats = pd.read_csv(StringIO(result.stdout), header=0)
+            result = self.execute_command(command)
+            stats = pd.read_csv(StringIO(result), header=0)
             return stats
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             logging.error(msg=f"Failed to get GPU stats: {e}")
-            return pd.DataFrame()
-        except FileNotFoundError:
-            logging.error(msg="nvidia-smi command not found")
             return pd.DataFrame()
     
     def get_full_gpu_info(self):
-        """Get complete GPU information"""
+        """Get complete GPU information from nvidia-smi XML output"""
         try:
-            result = subprocess.run(['nvidia-smi', '-q', '-x'], capture_output=True, text=True, check=True)
-            root = ET.fromstring(result.stdout)
+            result = self.execute_command('nvidia-smi -q -x')
+            root = ET.fromstring(result)
             gpus = root.findall('gpu')
             stats = []
             
@@ -260,15 +137,85 @@ class LocalClient:
             stats = pd.DataFrame(stats)
             return stats
             
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             logging.error(msg=f"Failed to get full GPU info: {e}")
             return pd.DataFrame()
-        except FileNotFoundError:
-            logging.error(msg="nvidia-smi command not found")
-            return pd.DataFrame()
-        except ET.ParseError as e:
-            logging.error(msg=f"Failed to parse XML output: {e}")
-            return pd.DataFrame()
+    
+    def get_client(self):
+        """Return the client object"""
+        return self
+
+
+class RemoteClient(BaseClient):
+    def __init__(self, server: ServerInfo):
+        super().__init__()
+        self.host = server.host
+        self.port = server.port
+        self.username = server.username
+        self.auth = server.auth
+        self.description = server.description
+        self.password = server.password
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.load_system_host_keys()
+    
+    def __del__(self):
+        self.client.close()
+        logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
+
+    def connect(self) -> bool:
+        print(f"Connecting to {self.host}:{self.port} as {self.username}")
+        # catch the OSError exception when the host is not reachable
+        try:
+            if "auto" == self.auth:
+                try:
+                    if self.password is not None:
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
+                    else:
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username)
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
+                    return True
+                except AuthenticationException as e:
+                    logging.error(msg=f"Authentication failed on {self.description}")
+                    try:
+                        # prompt to input password
+                        password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                    except AuthenticationException as e:
+                        logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
+                        sys.exit(1)
+                except NoValidConnectionsError as e:
+                    logging.error(msg=f"Connection failed: {e}")
+                    sys.exit(1)
+            else:
+                logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto' strategy.")
+        except OSError as e:
+            logging.error(msg=f"Connection failed: {e}")
+            return False
+    
+    def execute_command(self, command: str) -> str:
+        """Execute command on remote server"""
+        stdin, stdout, stderr = self.client.exec_command(command=command)
+        result = stdout.read().decode()
+        return result
+    
+    def get_client(self) -> SSHClient:
+        return self.client
+
+
+class LocalClient(BaseClient):
+    def __init__(self):
+        super().__init__()
+        self.host = "localhost"
+        self.port = "local"
+        self.username = getpass.getuser()
+        self.description = f"Local Machine ({self.username}@{self.host})"
+        
+    def connect(self) -> bool:
+        """Local connection is always successful"""
+        logging.info(msg=f"Connected to local machine as {self.username}")
+        print(f"Connected to local machine as {self.username}")
+        return True
     
     def execute_command(self, command: str) -> str:
         """Execute local command"""
@@ -282,10 +229,6 @@ class LocalClient:
         except Exception as e:
             logging.error(msg=f"Unexpected error executing command: {e}")
             return f"Unexpected error: {str(e)}"
-    
-    def get_client(self):
-        """Return self to maintain interface consistency with RemoteClient"""
-        return self
 
 
 class NviClientPool:
