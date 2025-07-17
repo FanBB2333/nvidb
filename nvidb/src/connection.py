@@ -276,16 +276,21 @@ class NviClientPool:
         return result
     
     def get_client_gpus_info(self):
+        # 设置pandas显示选项 - 固定列宽并横向占满
         pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', 0)
+        pd.set_option('display.width', None)  # 自动占满终端宽度
+        pd.set_option('display.max_colwidth', 12)  # 固定每列最大宽度为12字符
+        pd.set_option('display.colheader_justify', 'center')  # 列标题居中
+        
         stats_str = []
         for idx, client in enumerate(self.pool):
             # logging.info(msg=colored(f"{client.description}", 'yellow'))
             # print(colored(f"{client.description}", 'yellow'))
             stats = client.get_full_gpu_info()
             
-            # 优化 rx/tx 显示 - 提取数值和单位，并格式化
-            rx_tx_list = []
+            # 优化 rx/tx 显示 - 分为两列展示
+            rx_list = []
+            tx_list = []
             for _, row in stats.iterrows():
                 rx_val, rx_unit = extract_value_and_unit(row['rx_util'])
                 tx_val, tx_unit = extract_value_and_unit(row['tx_util'])
@@ -293,13 +298,12 @@ class NviClientPool:
                 rx_formatted = format_bandwidth(rx_val, rx_unit)
                 tx_formatted = format_bandwidth(tx_val, tx_unit)
                 
-                # 如果rx和tx都是0，显示更简洁的格式
-                if rx_formatted == '0' and tx_formatted == '0':
-                    rx_tx_list.append('0/0')
-                else:
-                    rx_tx_list.append(f"{rx_formatted}/{tx_formatted}")
+                # 确保格式化后的字符串长度不超过列宽限制
+                rx_list.append(rx_formatted[:11] if len(rx_formatted) > 11 else rx_formatted)
+                tx_list.append(tx_formatted[:11] if len(tx_formatted) > 11 else tx_formatted)
             
-            stats['rx/tx'] = rx_tx_list
+            stats['rx'] = rx_list
+            stats['tx'] = tx_list
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
@@ -309,13 +313,94 @@ class NviClientPool:
             # replace the NVIDIA/GeForce with "" in name column
             stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
             
+            # 确保name列不超过列宽限制
+            stats['name'] = stats['name'].apply(lambda x: x[:11] if len(str(x)) > 11 else x)
+            
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             stats = stats.drop(columns=['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free'])
 
             stats_str.append(stats)
-        # reformat the str into a single string
-        stats_str = [f"\n{colored(client.description)}\n{str(stats)}" for client, stats in zip(self.pool, stats_str)]
-        return stats_str
+        # reformat the str into a single string with fixed width formatting
+        formatted_stats = []
+        for client, stats in zip(self.pool, stats_str):
+            # 创建格式化的表格显示
+            formatted_table = self._format_fixed_width_table(stats)
+            formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{formatted_table}")
+        return formatted_stats
+    
+    def _format_fixed_width_table(self, df):
+        """格式化固定宽度的表格显示"""
+        if df.empty:
+            return "No GPU data available"
+        
+        # 获取终端宽度
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 120  # 默认宽度
+        
+        # 定义每列的固定宽度 - 根据终端宽度自适应
+        base_widths = {
+            'name': 12,
+            'temp': 8,
+            'fan': 8,
+            'util': 6,
+            'mem': 6,
+            'rx': 10,
+            'tx': 10,
+            'power': 15,
+            'memory[used/total]': 18
+        }
+        
+        # 计算当前所需的最小宽度
+        min_width_needed = sum(base_widths.get(col, 12) for col in df.columns) + 3 * (len(df.columns) - 1)  # 加上分隔符
+        
+        # 如果终端宽度足够，适当增加某些列的宽度
+        if terminal_width > min_width_needed + 20:
+            extra_space = terminal_width - min_width_needed - 10  # 留一些边距
+            # 优先给name列增加宽度
+            if 'name' in base_widths:
+                base_widths['name'] += min(extra_space // 2, 8)
+            # 给memory列增加宽度
+            if 'memory[used/total]' in base_widths:
+                base_widths['memory[used/total]'] += min(extra_space // 4, 6)
+        
+        column_widths = base_widths
+        
+        # 格式化表头
+        header_parts = []
+        for col in df.columns:
+            width = column_widths.get(col, 12)
+            header_parts.append(f"{col:^{width}}")
+        header = " | ".join(header_parts)
+        
+        # 格式化分隔线
+        separator_parts = []
+        for col in df.columns:
+            width = column_widths.get(col, 12)
+            separator_parts.append("-" * width)
+        separator = "-+-".join(separator_parts)
+        
+        # 格式化数据行
+        data_lines = []
+        for _, row in df.iterrows():
+            row_parts = []
+            for col in df.columns:
+                width = column_widths.get(col, 12)
+                value = str(row[col])
+                # 截断过长的值并添加省略号
+                if len(value) > width:
+                    value = value[:width-2] + ".."
+                # 数字列右对齐，文本列左对齐
+                if col in ['temp', 'fan', 'util', 'mem', 'rx', 'tx']:
+                    row_parts.append(f"{value:>{width}}")
+                else:
+                    row_parts.append(f"{value:<{width}}")
+            data_lines.append(" | ".join(row_parts))
+        
+        # 组合所有部分
+        result = [header, separator] + data_lines
+        return "\n".join(result)
     
     def print_stats(self):
         stats_str = self.get_client_gpus_info()
