@@ -154,11 +154,18 @@ class BaseClient(ABC):
                 })
             
             stats = pd.DataFrame(stats)
-            return stats
+            
+            # Return both stats and system info
+            system_info = {
+                'driver_version': driver_version,
+                'cuda_version': cuda_version,
+                'attached_gpus': attached_gpus
+            }
+            return stats, system_info
             
         except Exception as e:
             logging.error(msg=f"Failed to get full GPU info: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), {}
     
     def get_client(self):
         """Return the client object"""
@@ -306,7 +313,20 @@ class NviClientPool:
         for idx, client in enumerate(self.pool):
             # logging.info(msg=colored(f"{client.description}", 'yellow'))
             # print(colored(f"{client.description}", 'yellow'))
-            stats = client.get_full_gpu_info()
+            result = client.get_full_gpu_info()
+            
+            # Handle the tuple return from get_full_gpu_info
+            if isinstance(result, tuple) and len(result) == 2:
+                stats, system_info = result
+            else:
+                # Fallback for backward compatibility
+                stats = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+                system_info = {}
+            
+            # Skip processing if stats is empty
+            if stats.empty:
+                stats_str.append((stats, system_info))
+                continue
             
             # Optimize rx/tx display - split into two columns
             rx_list = []
@@ -339,13 +359,19 @@ class NviClientPool:
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             stats = stats.drop(columns=['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free'])
 
-            stats_str.append(stats)
+            stats_str.append((stats, system_info))
         # reformat the str into a single string with fixed width formatting
         formatted_stats = []
-        for client, stats in zip(self.pool, stats_str):
+        for client, (stats, system_info) in zip(self.pool, stats_str):
             # Create formatted table display
             formatted_table = self._format_fixed_width_table(stats)
-            formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{formatted_table}")
+            
+            # Create system info header
+            system_info_header = ""
+            if system_info:
+                system_info_header = f"Driver: {system_info.get('driver_version', 'N/A')} | CUDA: {system_info.get('cuda_version', 'N/A')} | GPUs: {system_info.get('attached_gpus', '0')}\n"
+            
+            formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{system_info_header}{formatted_table}")
         return formatted_stats
     
     def _format_fixed_width_table(self, df):
