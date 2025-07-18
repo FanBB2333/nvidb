@@ -20,7 +20,7 @@ from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
 from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
-from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth
+from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color, get_memory_ratio_color
 
 
 def nvidbInit():
@@ -439,58 +439,34 @@ class NviClientPool:
                 if len(value) > width:
                     value = value[:width-2] + ".."
                 
-                # Add color formatting for memory utilization
-                if col == 'mem' and value != 'N/A':
-                    try:
-                        # Extract numeric value from memory utilization (remove % sign)
-                        mem_value = float(value.replace('%', '').strip())
-                        if mem_value >= 60:
-                            # Red for high memory usage (>=60%)
-                            value = colored(f"{value:^{width}}", 'red')
-                        elif mem_value >= 10:
-                            # Yellow for medium memory usage (10%-60%)
-                            value = colored(f"{value:^{width}}", 'yellow')
-                        else:
-                            # No color for low memory usage (<10%)
-                            value = f"{value:^{width}}"
-                    except (ValueError, AttributeError):
-                        # If parsing fails, use default formatting
+                # Add color formatting for different columns
+                if col == 'util' and value != 'N/A':
+                    # GPU utilization coloring
+                    color = get_utilization_color(value)
+                    if color:
+                        value = colored(f"{value:^{width}}", color)
+                    else:
                         value = f"{value:^{width}}"
-                # Add color formatting for memory[used/total] column
+                elif col == 'mem' and value != 'N/A':
+                    # Memory utilization coloring
+                    color = get_memory_color(value)
+                    if color:
+                        value = colored(f"{value:^{width}}", color)
+                    else:
+                        value = f"{value:^{width}}"
                 elif col == 'memory[used/total]' and value != 'N/A':
+                    # Memory ratio coloring
                     try:
-                        # Parse the used/total format, e.g., "2048/8192" or "2.5G/8G"
                         if '/' in value:
                             used_str, total_str = value.split('/')
-                            
-                            # Extract numbers from strings (handle units like G, M, etc.)
-                            used_numbers = extract_numbers(used_str)
-                            total_numbers = extract_numbers(total_str)
-                            
-                            if used_numbers and total_numbers:
-                                used_val = float(used_numbers[0])
-                                total_val = float(total_numbers[0])
-                                
-                                if total_val > 0:
-                                    usage_ratio = (used_val / total_val) * 100
-                                    
-                                    if usage_ratio >= 60:
-                                        # Red for high memory usage (>=60%)
-                                        value = colored(f"{value:^{width}}", 'red')
-                                    elif usage_ratio >= 10:
-                                        # Yellow for medium memory usage (10%-60%)
-                                        value = colored(f"{value:^{width}}", 'yellow')
-                                    else:
-                                        # No color for low memory usage (<10%)
-                                        value = f"{value:^{width}}"
-                                else:
-                                    value = f"{value:^{width}}"
+                            color = get_memory_ratio_color(used_str, total_str)
+                            if color:
+                                value = colored(f"{value:^{width}}", color)
                             else:
                                 value = f"{value:^{width}}"
                         else:
                             value = f"{value:^{width}}"
                     except (ValueError, AttributeError, IndexError):
-                        # If parsing fails, use default formatting
                         value = f"{value:^{width}}"
                 else:
                     # Center-align all other columns
