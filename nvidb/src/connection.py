@@ -388,15 +388,15 @@ class NviClientPool:
         # Define fixed width for each column - adaptive to terminal width
         base_widths = {
             'GPU': 4,
-            'name': 10,
+            'name': 12,
             'temp': 8,
             'fan': 8,
-            'util': 6,
-            'mem': 6,
+            'util': 8,
+            'mem': 8,
             'rx': 10,
             'tx': 10,
             'power': 18,
-            'memory[used/total]': 18
+            'memory[used/total]': 16
         }
         
         # Calculate minimum width required
