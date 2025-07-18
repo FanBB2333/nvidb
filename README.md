@@ -11,9 +11,9 @@ pip install .
 
 Or using pip directly:
 ```bash
-pip install nvidb==1.0.0
+pip install nvidb
 # If the specified version is unavailable in your custom repository, use pypi.org as the source:
-pip install nvidb==1.0.0 -i https://pypi.org/simple
+pip install nvidb -i https://pypi.org/simple
 ```
 
 Here's an optimized version of the instructions for the project documentation:
