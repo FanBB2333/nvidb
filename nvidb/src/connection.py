@@ -412,11 +412,8 @@ class NviClientPool:
                 # Truncate long values and add ellipsis
                 if len(value) > width:
                     value = value[:width-2] + ".."
-                # Right-align numeric columns, left-align text columns
-                if col in ['GPU', 'temp', 'fan', 'util', 'mem', 'rx', 'tx']:
-                    row_parts.append(f"{value:>{width}}")
-                else:
-                    row_parts.append(f"{value:<{width}}")
+                # Center-align all columns
+                row_parts.append(f"{value:^{width}}")
             data_lines.append(" | ".join(row_parts))
         
         # Combine all parts
