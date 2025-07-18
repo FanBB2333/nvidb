@@ -94,11 +94,15 @@ class BaseClient(ABC):
         try:
             result = self.execute_command('nvidia-smi -q -x')
             root = ET.fromstring(result)
+            driver_version = safe_get_text(root, 'driver_version', 'N/A')
+            cuda_version = safe_get_text(root, 'cuda_version', 'N/A')
+            attached_gpus = safe_get_text(root, 'attached_gpus', '0')
             gpus = root.findall('gpu')
             stats = []
             
             for gpu in gpus:
                 # Safely extract all values with default fallbacks
+                minor_number = safe_get_text(gpu, 'minor_number', 'N/A')
                 product_name = safe_get_text(gpu, 'product_name', 'Unknown GPU')
                 product_architecture = safe_get_text(gpu, 'product_architecture', 'N/A')
                 
@@ -132,6 +136,7 @@ class BaseClient(ABC):
                 processes = gpu.find('processes')
                 
                 stats.append({
+                    'minor_number': minor_number,
                     'product_name': product_name, 
                     'product_architecture': product_architecture, 
                     'tx_util': tx_util, 
@@ -322,8 +327,8 @@ class NviClientPool:
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
-            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> gpu_util
-            stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem', 'gpu_util': 'util'})
+            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> gpu_util, minor_number -> GPU
+            stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem_util', 'gpu_util': 'util', 'minor_number': 'GPU'})
             
             # replace the NVIDIA/GeForce with "" in name column
             stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
@@ -356,14 +361,15 @@ class NviClientPool:
         
         # Define fixed width for each column - adaptive to terminal width
         base_widths = {
-            'name': 12,
+            'GPU': 4,
+            'name': 10,
             'temp': 8,
             'fan': 8,
             'util': 6,
             'mem': 6,
             'rx': 10,
             'tx': 10,
-            'power': 15,
+            'power': 18,
             'memory[used/total]': 18
         }
         
@@ -407,7 +413,7 @@ class NviClientPool:
                 if len(value) > width:
                     value = value[:width-2] + ".."
                 # Right-align numeric columns, left-align text columns
-                if col in ['temp', 'fan', 'util', 'mem', 'rx', 'tx']:
+                if col in ['GPU', 'temp', 'fan', 'util', 'mem', 'rx', 'tx']:
                     row_parts.append(f"{value:>{width}}")
                 else:
                     row_parts.append(f"{value:<{width}}")
