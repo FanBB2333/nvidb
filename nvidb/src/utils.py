@@ -100,7 +100,9 @@ def format_bandwidth(value: str, unit: str) -> str:
         # 如果单位包含 /s，说明是带宽，进行单位转换
         if '/s' in unit.lower():
             if 'kb/s' in unit.lower():
-                if val >= 1024:
+                if val >= 1024 * 1024:  # >= 1GB/s
+                    return f"{val/(1024*1024):.2f}GB/s"
+                elif val >= 1024:  # >= 1MB/s
                     return f"{val/1024:.1f}MB/s"
                 else:
                     return f"{val:.0f}KB/s"
