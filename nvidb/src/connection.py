@@ -150,7 +150,8 @@ class BaseClient(ABC):
                     'gpu_temp': gpu_temp, 
                     'power_state': power_state, 
                     'power_draw': power_draw, 
-                    'current_power_limit': current_power_limit
+                    'current_power_limit': current_power_limit,
+                    'processes': processes
                 })
             
             stats = pd.DataFrame(stats)
@@ -170,6 +171,125 @@ class BaseClient(ABC):
     def get_client(self):
         """Return the client object"""
         return self
+    
+    def get_process_summary(self, gpu_stats=None):
+        """Get detailed GPU processes information with user summary"""
+        def safe_get_text(element, path, default="N/A"):
+            """Safely get text from XML element, return default if not found"""
+            if element is None:
+                return default
+            found = element.find(path)
+            return found.text if found is not None else default
+        
+        try:
+            # Use provided gpu_stats if available, otherwise get fresh data
+            if gpu_stats is None:
+                stats, _ = self.get_full_gpu_info()
+            else:
+                stats = gpu_stats
+            
+            all_processes = []
+            user_memory_summary = {}
+            
+            # Process each GPU's process information from the DataFrame
+            for idx, row in stats.iterrows():
+                processes_element = row.get('processes')
+                if processes_element is not None and hasattr(processes_element, 'findall'):
+                    for process_info in processes_element.findall('process_info'):
+                        pid = safe_get_text(process_info, 'pid', 'N/A')
+                        process_name = safe_get_text(process_info, 'process_name', 'N/A')
+                        used_memory = safe_get_text(process_info, 'used_memory', '0 MiB')
+                        gpu_instance_id = safe_get_text(process_info, 'gpu_instance_id', 'N/A')
+                        compute_instance_id = safe_get_text(process_info, 'compute_instance_id', 'N/A')
+                        process_type = safe_get_text(process_info, 'type', 'N/A')
+                        
+                        # Get username from pid using ps command
+                        username = 'N/A'
+                        if pid != 'N/A':
+                            try:
+                                user_result = self.execute_command(f'ps -o user= -p {pid}')
+                                username = user_result.strip() if user_result.strip() else 'N/A'
+                            except:
+                                username = 'N/A'
+                        
+                        # Extract memory value in MiB
+                        memory_value = 0
+                        if used_memory != 'N/A':
+                            try:
+                                memory_value = int(used_memory.replace('MiB', '').strip())
+                            except:
+                                memory_value = 0
+                        
+                        process_data = {
+                            'gpu_instance_id': gpu_instance_id,
+                            'compute_instance_id': compute_instance_id,
+                            'pid': pid,
+                            'type': process_type,
+                            'process_name': process_name,
+                            'used_memory': used_memory,
+                            'username': username,
+                            'gpu_index': idx
+                        }
+                        
+                        all_processes.append(process_data)
+                        
+                        # Accumulate memory usage by user
+                        if username != 'N/A' and memory_value > 0:
+                            if username not in user_memory_summary:
+                                user_memory_summary[username] = 0
+                            user_memory_summary[username] += memory_value
+            
+            return all_processes, user_memory_summary
+            
+        except Exception as e:
+            logging.error(msg=f"Failed to get process summary: {e}")
+            return [], {}
+    
+    def format_process_summary_xml(self):
+        """Format process summary as XML similar to nvidia-smi output"""
+        processes, user_summary = self.get_process_summary()
+        
+        if not processes:
+            return ""
+        
+        xml_output = []
+        xml_output.append("        <processes>")
+        
+        for process in processes:
+            xml_output.append("            <process_info>")
+            xml_output.append(f"                <gpu_instance_id>{process['gpu_instance_id']}</gpu_instance_id>")
+            xml_output.append(f"                <compute_instance_id>{process['compute_instance_id']}</compute_instance_id>")
+            xml_output.append(f"                <pid>{process['pid']}</pid>")
+            xml_output.append(f"                <type>{process['type']}</type>")
+            xml_output.append(f"                <process_name>{process['process_name']}</process_name>")
+            xml_output.append(f"                <used_memory>{process['used_memory']}</used_memory>")
+            xml_output.append(f"                <username>{process['username']}</username>")
+            xml_output.append("            </process_info>")
+        
+        xml_output.append("        </processes>")
+        
+        # Add user memory summary
+        if user_summary:
+            xml_output.append("        <user_memory_summary>")
+            for username, total_memory in user_summary.items():
+                xml_output.append("            <user_info>")
+                xml_output.append(f"                <username>{username}</username>")
+                xml_output.append(f"                <total_memory>{total_memory} MiB</total_memory>")
+                xml_output.append("            </user_info>")
+            xml_output.append("        </user_memory_summary>")
+        
+        return "\n".join(xml_output)
+    
+    def format_user_memory_compact(self, user_summary):
+        """Format user memory summary in compact format like 'qbs(23082M) gdm(4M)'"""
+        if not user_summary:
+            return ""
+        
+        formatted_users = []
+        for username, total_memory in sorted(user_summary.items()):
+            formatted_users.append(f"{username}({total_memory}M)")
+        
+        return " ".join(formatted_users)
 
 
 class RemoteClient(BaseClient):
@@ -347,7 +467,24 @@ class NviClientPool:
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
-            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> gpu_util, minor_number -> GPU
+            # Add process information as a column
+            process_list = []
+            for idx, row in stats.iterrows():
+                try:
+                    # Get process summary for this GPU
+                    processes, user_summary = client.get_process_summary(stats.iloc[[idx]])
+                    if user_summary:
+                        process_info = client.format_user_memory_compact(user_summary)
+                    else:
+                        process_info = "-"
+                    process_list.append(process_info)
+                except Exception as e:
+                    logging.warning(f"Failed to get process info for GPU {idx}: {e}")
+                    process_list.append("-")
+            
+            stats['processes'] = process_list
+
+            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> util, minor_number -> GPU
             stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem_util', 'gpu_util': 'util', 'minor_number': 'GPU'})
             
             # replace the NVIDIA/GeForce with "" in name column
@@ -357,7 +494,11 @@ class NviClientPool:
             stats['name'] = stats['name'].apply(lambda x: x[:11] if len(str(x)) > 11 else x)
             
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
-            stats = stats.drop(columns=['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free'])
+            # but keep the new processes column
+            columns_to_drop = ['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free']
+            # Only drop columns that exist in the DataFrame
+            columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
+            stats = stats.drop(columns=columns_to_drop)
 
             stats_str.append((stats, system_info))
         # reformat the str into a single string with fixed width formatting
@@ -392,11 +533,12 @@ class NviClientPool:
             'temp': 8,
             'fan': 8,
             'util': 8,
-            'mem': 8,
+            'mem_util': 8,
             'rx': 10,
             'tx': 10,
             'power': 18,
-            'memory[used/total]': 16
+            'memory[used/total]': 16,
+            'processes': 20  # Add width for processes column
         }
         
         # Calculate minimum width required
