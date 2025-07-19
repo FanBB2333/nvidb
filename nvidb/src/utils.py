@@ -85,6 +85,90 @@ def extract_value_and_unit(s: str) -> tuple[str, str]:
         return (value, unit.strip())
     return ('0', '')
 
+def get_utilization_color(value_str: str) -> str:
+    """根据利用率获取对应的颜色
+    
+    Args:
+        value_str: 利用率字符串，如 "50%", "75", "N/A"
+    
+    Returns:
+        颜色名称字符串: 'red', 'yellow', 或 None (无颜色)
+    """
+    if not value_str or value_str.strip() in ['N/A', '0', '0%']:
+        return None
+    
+    try:
+        # 提取数值，移除百分号
+        numeric_value = float(value_str.replace('%', '').strip())
+        
+        if numeric_value >= 80:
+            return 'red'      # 高利用率 (>=80%)
+        elif numeric_value >= 50:
+            return 'yellow'   # 中等利用率 (50%-80%)
+        else:
+            return None       # 低利用率 (<50%)
+            
+    except (ValueError, AttributeError):
+        return None
+
+def get_memory_color(value_str: str) -> str:
+    """根据内存利用率获取对应的颜色
+    
+    Args:
+        value_str: 内存利用率字符串，如 "50%", "75", "N/A"
+    
+    Returns:
+        颜色名称字符串: 'red', 'yellow', 或 None (无颜色)
+    """
+    if not value_str or value_str.strip() in ['N/A', '0', '0%']:
+        return None
+    
+    try:
+        # 提取数值，移除百分号
+        numeric_value = float(value_str.replace('%', '').strip())
+        
+        if numeric_value >= 60:
+            return 'red'      # 高内存使用率 (>=60%)
+        elif numeric_value >= 10:
+            return 'yellow'   # 中等内存使用率 (10%-60%)
+        else:
+            return None       # 低内存使用率 (<10%)
+            
+    except (ValueError, AttributeError):
+        return None
+
+def get_memory_ratio_color(used_str: str, total_str: str) -> str:
+    """根据内存使用比例获取对应的颜色
+    
+    Args:
+        used_str: 已使用内存字符串
+        total_str: 总内存字符串
+    
+    Returns:
+        颜色名称字符串: 'red', 'yellow', 或 None (无颜色)
+    """
+    try:
+        used_numbers = extract_numbers(used_str)
+        total_numbers = extract_numbers(total_str)
+        
+        if used_numbers and total_numbers:
+            used_val = float(used_numbers[0])
+            total_val = float(total_numbers[0])
+            
+            if total_val > 0:
+                usage_ratio = (used_val / total_val) * 100
+                
+                if usage_ratio >= 60:
+                    return 'red'      # 高内存使用率 (>=60%)
+                elif usage_ratio >= 10:
+                    return 'yellow'   # 中等内存使用率 (10%-60%)
+                else:
+                    return None       # 低内存使用率 (<10%)
+    except (ValueError, AttributeError, IndexError):
+        pass
+    
+    return None
+
 def format_bandwidth(value: str, unit: str) -> str:
     """格式化带宽显示，优化单位"""
     if not value or value == '0':
@@ -100,7 +184,9 @@ def format_bandwidth(value: str, unit: str) -> str:
         # 如果单位包含 /s，说明是带宽，进行单位转换
         if '/s' in unit.lower():
             if 'kb/s' in unit.lower():
-                if val >= 1024:
+                if val >= 1024 * 1024:  # >= 1GB/s
+                    return f"{val/(1024*1024):.2f}GB/s"
+                elif val >= 1024:  # >= 1MB/s
                     return f"{val/1024:.1f}MB/s"
                 else:
                     return f"{val:.0f}KB/s"
