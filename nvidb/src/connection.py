@@ -281,12 +281,13 @@ class BaseClient(ABC):
         return "\n".join(xml_output)
     
     def format_user_memory_compact(self, user_summary):
-        """Format user memory summary in compact format like 'qbs(23082M) gdm(4M)'"""
+        """Format user memory summary in compact format like 'qbs(23082M) gdm(4M)' sorted by memory usage desc"""
         if not user_summary:
             return ""
         
         formatted_users = []
-        for username, total_memory in sorted(user_summary.items()):
+        # Sort by memory usage in descending order
+        for username, total_memory in sorted(user_summary.items(), key=lambda x: x[1], reverse=True):
             formatted_users.append(f"{username}({total_memory}M)")
         
         return " ".join(formatted_users)
@@ -499,6 +500,11 @@ class NviClientPool:
             # Only drop columns that exist in the DataFrame
             columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
             stats = stats.drop(columns=columns_to_drop)
+            
+            # Reorder columns to put processes at the end
+            if 'processes' in stats.columns:
+                other_columns = [col for col in stats.columns if col != 'processes']
+                stats = stats[other_columns + ['processes']]
 
             stats_str.append((stats, system_info))
         # reformat the str into a single string with fixed width formatting
