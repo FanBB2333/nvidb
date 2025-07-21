@@ -5,7 +5,7 @@ NVIDB Interactive GPU Monitoring Example
 This example demonstrates how to use the new interactive keyboard listening functionality
 """
 
-from nvidb.src.connection import NviClientPool, LocalClient
+from nvidb.connection import NviClientPool, LocalClient
 
 def main():
     """Main function - Demonstrates interactive GPU monitoring"""

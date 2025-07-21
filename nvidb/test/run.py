@@ -3,8 +3,8 @@ import os
 import yaml
 import logging
 import argparse
-from ..src.connection import RemoteClient, NviClientPool
-from ..src.data_modules import ServerInfo, ServerListInfo
+from ..connection import RemoteClient, NviClientPool
+from ..data_modules import ServerInfo, ServerListInfo
 
 
 cli: RemoteClient = None
