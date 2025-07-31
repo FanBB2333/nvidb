@@ -100,7 +100,7 @@ class BaseClient(ABC):
             gpus = root.findall('gpu')
             stats = []
             
-            for gpu in gpus:
+            for gpu_index, gpu in enumerate(gpus):
                 # Safely extract all values with default fallbacks
                 minor_number = safe_get_text(gpu, 'minor_number', 'N/A')
                 product_name = safe_get_text(gpu, 'product_name', 'Unknown GPU')
@@ -136,6 +136,7 @@ class BaseClient(ABC):
                 processes = gpu.find('processes')
                 
                 stats.append({
+                    'gpu_index': gpu_index,
                     'minor_number': minor_number,
                     'product_name': product_name, 
                     'product_architecture': product_architecture, 
@@ -485,8 +486,8 @@ class NviClientPool:
             
             stats['processes'] = process_list
 
-            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> util, minor_number -> GPU
-            stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem_util', 'gpu_util': 'util', 'minor_number': 'GPU'})
+            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> util, gpu_index -> GPU
+            stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem_util', 'gpu_util': 'util', 'gpu_index': 'GPU'})
             
             # replace the NVIDIA/GeForce with "" in name column
             stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()

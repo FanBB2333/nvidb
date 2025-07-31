@@ -126,7 +126,7 @@ class NVLogger:
                 new_entry = {
                     'timestamp': timestamp,
                     'node': node_name,
-                    'gpu_id': row.get('minor_number', idx),
+                    'gpu_id': row.get('gpu_index', idx),
                     'name': row.get('product_name', 'N/A'),
                     'fan_speed': row.get('fan_speed', 'N/A'),
                     'util_gpu': row.get('gpu_util', 'N/A'),
