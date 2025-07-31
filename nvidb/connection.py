@@ -137,7 +137,6 @@ class BaseClient(ABC):
                 
                 stats.append({
                     'gpu_index': gpu_index,
-                    'minor_number': minor_number,
                     'product_name': product_name, 
                     'product_architecture': product_architecture, 
                     'tx_util': tx_util, 
