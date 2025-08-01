@@ -368,10 +368,13 @@ class LocalClient(BaseClient):
         """Execute local command"""
         try:
             # Use shell=True to support pipes and complex commands
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                logging.error(msg=f"Command '{command}' execution failed with return code {result.returncode}")
+                return "N/A"
             return result.stdout
         except subprocess.CalledProcessError as e:
-            logging.error(msg=f"Command execution failed: {e}")
+            logging.error(msg=f"Command '{command}' execution failed: {e}")
             return f"Error: {e.stderr}" if e.stderr else f"Command failed with return code {e.returncode}"
         except Exception as e:
             logging.error(msg=f"Unexpected error executing command: {e}")
