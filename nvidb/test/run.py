@@ -5,6 +5,7 @@ import logging
 import argparse
 from ..connection import RemoteClient, NviClientPool
 from ..data_modules import ServerInfo, ServerListInfo
+from ..logger import run_sqlite_logger
 
 
 cli: RemoteClient = None
@@ -242,6 +243,9 @@ def main():
     ls_parser.add_argument('--detail', action='store_true', help='Show detailed list')
     add_parser = subparsers.add_parser('add', help='Add a server interactively')
     info_parser = subparsers.add_parser('info', help='Show configuration info')
+    log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
+    log_parser.add_argument('--interval', type=int, default=5, help='Logging interval in seconds (default: 5)')
+    log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: ~/.nvidb/gpu_log.db)')
     args = parser.parse_args()
     
     if args.remote:
@@ -258,6 +262,12 @@ def main():
         interactive_add_server()
     elif args.command == 'info':
         show_info()
+    elif args.command == 'log':
+        run_sqlite_logger(
+            server_list=server_list,
+            interval=args.interval,
+            db_path=getattr(args, 'db_path', None)
+        )
     else:
         # Default action: run interactive monitoring
         pool = NviClientPool(server_list)
