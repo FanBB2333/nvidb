@@ -1,9 +1,15 @@
 from setuptools import setup, find_packages
 from pathlib import Path
-from nvidb.config import VERSION
+import re
 
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
+
+# Read VERSION from config.py without importing (to avoid dependency issues during install)
+config_file = this_directory / "nvidb" / "config.py"
+version_match = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', config_file.read_text(), re.MULTILINE)
+VERSION = version_match.group(1) if version_match else "0.0.0"
+
 setup(
     name='nvidb',
     version=VERSION,
