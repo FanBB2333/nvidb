@@ -152,6 +152,63 @@ def interactive_add_server(config_path='~/.nvidb/config.yml'):
         print("\n✗ Operation cancelled.")
 
 
+def show_info(config_path='~/.nvidb/config.yml'):
+    """Show configuration information."""
+    config_path = os.path.expanduser(config_path)
+    
+    print("\n" + "=" * 50)
+    print("         nvidb Configuration Info")
+    print("=" * 50 + "\n")
+    
+    # Config file info
+    print(f"📁 Config File: {config_path}")
+    
+    if not os.path.exists(config_path):
+        print(f"   Status: ✗ Not found")
+        print("\n   Run 'nvidb add' to add your first server.")
+        return
+    
+    print(f"   Status: ✓ Exists")
+    
+    # Load and display server info
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.load(f, Loader=yaml.FullLoader) or {}
+    except Exception as e:
+        print(f"   Error reading config: {e}")
+        return
+    
+    servers = config.get('servers', [])
+    server_count = len(servers)
+    
+    print(f"\n🖥  Total Servers: {server_count}")
+    
+    if server_count == 0:
+        print("\n   No servers configured yet.")
+        print("   Run 'nvidb add' to add a server.")
+        return
+    
+    print("\n" + "-" * 50)
+    print("Server List:")
+    print("-" * 50)
+    
+    for idx, server in enumerate(servers):
+        host = server.get('host', 'N/A')
+        port = server.get('port', 22)
+        username = server.get('username', 'N/A')
+        description = server.get('description', f'{username}@{host}:{port}')
+        auth = server.get('auth', 'auto')
+        has_password = '✓' if server.get('password') else '✗'
+        
+        print(f"\n  [{idx + 1}] {description}")
+        print(f"      Host:     {host}:{port}")
+        print(f"      User:     {username}")
+        print(f"      Auth:     {auth}")
+        print(f"      Password: {has_password}")
+    
+    print("\n" + "=" * 50)
+
+
 def test_connection():
     cli.connect()
 
@@ -184,6 +241,7 @@ def main():
     ls_parser = subparsers.add_parser('ls', help='List items')
     ls_parser.add_argument('--detail', action='store_true', help='Show detailed list')
     add_parser = subparsers.add_parser('add', help='Add a server interactively')
+    info_parser = subparsers.add_parser('info', help='Show configuration info')
     args = parser.parse_args()
     
     if args.remote:
@@ -198,6 +256,8 @@ def main():
             print("Showing list of items.")
     elif args.command == 'add':
         interactive_add_server()
+    elif args.command == 'info':
+        show_info()
     else:
         # Default action: run interactive monitoring
         pool = NviClientPool(server_list)
