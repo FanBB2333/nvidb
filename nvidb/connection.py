@@ -390,6 +390,10 @@ class NviClientPool:
         self.connect_all()
         self.term = Terminal()
         self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
+        # Collapsible display state
+        self.expanded_servers = set()  # Set of expanded server indices (all collapsed by default)
+        self.selected_server = 0  # Currently selected server for navigation
+        self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
     
     def connect_all(self):
         self.pool = [client for client in self.pool if client.connect()]
@@ -630,29 +634,156 @@ class NviClientPool:
         result = [header, separator] + data_lines
         return "\n".join(result)
     
+    def _get_server_summary(self, stats, system_info):
+        """Generate compact summary for collapsed server view."""
+        if stats.empty:
+            return "No GPU data available"
+        
+        gpu_count = len(stats)
+        
+        # Calculate idle GPUs (util < 5%)
+        idle_count = 0
+        total_util = 0
+        total_mem_used = 0
+        total_mem_total = 0
+        
+        for _, row in stats.iterrows():
+            # Parse utilization
+            util_str = str(row.get('util', row.get('gpu_util', '0')))
+            try:
+                util_val = int(util_str.replace('%', '').strip())
+                total_util += util_val
+                if util_val < 5:
+                    idle_count += 1
+            except (ValueError, AttributeError):
+                pass
+            
+            # Parse memory
+            mem_col = row.get('memory[used/total]', '')
+            if mem_col and '/' in str(mem_col):
+                try:
+                    used_str, total_str = str(mem_col).split('/')
+                    used_val = int(''.join(filter(str.isdigit, used_str)) or 0)
+                    total_val = int(''.join(filter(str.isdigit, total_str)) or 0)
+                    total_mem_used += used_val
+                    total_mem_total += total_val
+                except (ValueError, AttributeError):
+                    pass
+        
+        avg_util = total_util // gpu_count if gpu_count > 0 else 0
+        
+        # Format memory display
+        if total_mem_total > 0:
+            # Convert to GB if large enough
+            if total_mem_total >= 1024:
+                mem_display = f"{total_mem_used//1024}GB/{total_mem_total//1024}GB"
+            else:
+                mem_display = f"{total_mem_used}MB/{total_mem_total}MB"
+        else:
+            mem_display = "N/A"
+        
+        # Color coding for utilization
+        if avg_util >= 80:
+            util_color = 'red'
+        elif avg_util >= 50:
+            util_color = 'yellow'
+        else:
+            util_color = 'green'
+        
+        util_display = colored(f"{avg_util}%", util_color)
+        
+        return f"{gpu_count} GPUs | {idle_count} idle | {util_display} avg | {mem_display}"
+    
     def print_stats(self):
-        stats_str = self.get_client_gpus_info()
+        """Print GPU stats with collapsible server view."""
+        stats_list = self.get_client_gpus_info()
         current_time = time.strftime("%H:%M:%S")
+        
+        # Ensure selected_server is within bounds
+        if self.selected_server >= len(self.pool):
+            self.selected_server = len(self.pool) - 1
+        if self.selected_server < 0:
+            self.selected_server = 0
+        
         print(self.term.home + self.term.clear)
-        print(f"⏰ Time: {current_time}")
-        for stats in stats_str:
-            print(stats)
+        print(f"Time: {current_time} | Servers: {len(self.pool)} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit")
+        print("-" * 80)
+        
+        for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
+            is_selected = (idx == self.selected_server)
+            is_expanded = (idx in self.expanded_servers)
+            
+            # Parse the stats_info (which is a formatted string from get_client_gpus_info)
+            # We need to get raw stats for summary, so let's get them again
+            result = client.get_full_gpu_info()
+            if isinstance(result, tuple) and len(result) == 2:
+                stats, system_info = result
+            else:
+                stats = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+                system_info = {}
+            
+            # Build summary
+            summary = self._get_server_summary(stats, system_info)
+            
+            # Format the header line
+            expand_icon = "v" if is_expanded else ">"
+            selector = "*" if is_selected else " "
+            
+            header = f"{selector} {expand_icon} [{idx + 1}] {client.description}"
+            
+            if is_selected:
+                header = self.term.reverse + header + self.term.normal
+            
+            # Print header with summary on same line
+            print(f"{header}  {summary}")
+            
+            # If expanded, print the full stats table (already formatted from get_client_gpus_info)
+            if is_expanded:
+                print(stats_info)
+                print()  # Add spacing after expanded server
 
     def _keyboard_listener(self):
-        """Real-time keyboard listener thread, monitors 'q' key to exit"""
+        """Real-time keyboard listener thread, monitors keys for navigation and control"""
         try:
             with self.term.cbreak():  # Enable character-by-character input
                 while not self.quit_flag.is_set():
                     try:
                         key = self.term.inkey(timeout=0.1)  # Non-blocking input with timeout
                         if key:
-                            if key.lower() == 'q':
+                            key_name = key.name if hasattr(key, 'name') and key.name else str(key)
+                            key_lower = str(key).lower()
+                            
+                            if key_lower == 'q':
                                 self.quit_flag.set()
                                 break
-                            elif key.lower() == 'h':
-                                # Temporarily show help overlay
-                                print(self.term.move_yx(0, 0) + self.term.clear_eol + 
-                                      self.term.bold + "💡 Help: Press 'q' to exit | Press any key to continue" + self.term.normal)
+                            elif key_lower == 'h':
+                                # Show help - will be overwritten on next refresh
+                                pass
+                            elif key_lower == 'j' or key_name == 'KEY_DOWN':
+                                # Move selection down
+                                if self.selected_server < len(self.pool) - 1:
+                                    self.selected_server += 1
+                                    self.refresh_needed.set()  # Trigger immediate refresh
+                            elif key_lower == 'k' or key_name == 'KEY_UP':
+                                # Move selection up
+                                if self.selected_server > 0:
+                                    self.selected_server -= 1
+                                    self.refresh_needed.set()  # Trigger immediate refresh
+                            elif key_name == 'KEY_ENTER' or key_lower == ' ' or key == '\n' or key == '\r':
+                                # Toggle expand/collapse for selected server
+                                if self.selected_server in self.expanded_servers:
+                                    self.expanded_servers.discard(self.selected_server)
+                                else:
+                                    self.expanded_servers.add(self.selected_server)
+                                self.refresh_needed.set()  # Trigger immediate refresh
+                            elif key_lower == 'a':
+                                # Expand all servers
+                                self.expanded_servers = set(range(len(self.pool)))
+                                self.refresh_needed.set()  # Trigger immediate refresh
+                            elif key_lower == 'c':
+                                # Collapse all servers
+                                self.expanded_servers.clear()
+                                self.refresh_needed.set()  # Trigger immediate refresh
                     except KeyboardInterrupt:
                         break
         except:
@@ -660,11 +791,13 @@ class NviClientPool:
     
     def print_refresh(self):
         """Real-time GPU status display with global keyboard monitoring"""
-        print("🖥️  GPU monitoring starting...")
-        print("💡 Tips:")
-        print("   - Press 'q' key to exit program (no Enter required)")
-        print("   - Press 'h' key to show help") 
-        print("   - Press Ctrl+C to force exit")
+        print("GPU monitoring starting...")
+        print("Controls:")
+        print("   j/k or Up/Down : Navigate between servers")
+        print("   Enter/Space    : Toggle expand/collapse")
+        print("   a              : Expand all")
+        print("   c              : Collapse all")
+        print("   q              : Quit")
         print("=" * 60)
         
         # Start keyboard listener thread
@@ -676,10 +809,13 @@ class NviClientPool:
                 # Display GPU status with time at top
                 self.print_stats()
                 
-                # Wait 2 seconds or until exit flag is set
+                # Wait 2 seconds or until exit flag is set or refresh is needed
                 for _ in range(20):  # 2 seconds divided into 20 x 0.1 seconds
                     if self.quit_flag.is_set():
                         break
+                    if self.refresh_needed.is_set():
+                        self.refresh_needed.clear()  # Reset the flag
+                        break  # Break early to refresh immediately
                     time.sleep(0.1)
                 
         except KeyboardInterrupt:
