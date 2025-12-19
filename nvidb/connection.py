@@ -442,8 +442,6 @@ class NviClientPool:
         
         stats_str = []
         for idx, client in enumerate(self.pool):
-            # logging.info(msg=colored(f"{client.description}", 'yellow'))
-            # print(colored(f"{client.description}", 'yellow'))
             result = client.get_full_gpu_info()
             
             # Handle the tuple return from get_full_gpu_info
@@ -453,6 +451,9 @@ class NviClientPool:
                 # Fallback for backward compatibility
                 stats = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
                 system_info = {}
+            
+            # Cache raw stats for summary display (avoids redundant SSH calls)
+            self.cached_raw_stats[idx] = (stats.copy() if not stats.empty else stats, system_info)
             
             # Skip processing if stats is empty
             if stats.empty:
@@ -700,18 +701,12 @@ class NviClientPool:
     def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
         # Fetch new data or use cache
+        # Raw stats are cached inside get_client_gpus_info() during data fetch
         if use_cache and self.cached_stats is not None:
             stats_list = self.cached_stats
         else:
             stats_list = self.get_client_gpus_info()
             self.cached_stats = stats_list
-            # Also cache raw stats for summary
-            for idx, client in enumerate(self.pool):
-                result = client.get_full_gpu_info()
-                if isinstance(result, tuple) and len(result) == 2:
-                    self.cached_raw_stats[idx] = result
-                else:
-                    self.cached_raw_stats[idx] = (result if isinstance(result, pd.DataFrame) else pd.DataFrame(), {})
         
         current_time = time.strftime("%H:%M:%S")
         
