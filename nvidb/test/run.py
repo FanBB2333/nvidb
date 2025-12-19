@@ -6,19 +6,19 @@ import argparse
 from ..connection import RemoteClient, NviClientPool
 from ..data_modules import ServerInfo, ServerListInfo
 from ..logger import run_sqlite_logger
+from .. import config
 
 
 cli: RemoteClient = None
 
-def init(config_path = '~/.nvidb/config.yml'):
+def init(config_path=None):
+    config_path = config_path or config.get_config_path()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     global test_server, cli
     # config_path = 'nvidb/test/config.yml'
-    config_path = os.path.expanduser(config_path)
-    # mkdir if not exists
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+        cfg = yaml.load(f, Loader=yaml.FullLoader)
     # test_server = ServerInfo(**config['servers'][0])
     # server_list = ServerList.from_dict(config['servers'])
     server_list: ServerListInfo = ServerListInfo.from_yaml(config_path)
@@ -26,8 +26,9 @@ def init(config_path = '~/.nvidb/config.yml'):
     return server_list
 
 
-def interactive_add_server(config_path='~/.nvidb/config.yml'):
+def interactive_add_server(config_path=None):
     """Interactively add a new server to the configuration."""
+    config_path = config_path or config.get_config_path()
     print("\n" + "=" * 50)
     print("       Add New Server Configuration")
     print("=" * 50 + "\n")
@@ -153,33 +154,45 @@ def interactive_add_server(config_path='~/.nvidb/config.yml'):
         print("\n✗ Operation cancelled.")
 
 
-def show_info(config_path='~/.nvidb/config.yml'):
+def show_info(config_path=None):
     """Show configuration information."""
-    config_path = os.path.expanduser(config_path)
+    config_path = config_path or config.get_config_path()
     
     print("\n" + "=" * 50)
     print("         nvidb Configuration Info")
     print("=" * 50 + "\n")
     
+    # Working directory info
+    print(f"Working Directory: {config.WORKING_DIR}")
+    print(f"   (Override with NVIDB_HOME environment variable)\n")
+    
     # Config file info
-    print(f"📁 Config File: {config_path}")
+    print(f"Config File: {config_path}")
     
     if not os.path.exists(config_path):
-        print(f"   Status: ✗ Not found")
+        print(f"   Status: Not found")
         print("\n   Run 'nvidb add' to add your first server.")
         return
     
-    print(f"   Status: ✓ Exists")
+    print(f"   Status: Exists")
+    
+    # Database file info
+    db_path = config.get_db_path()
+    print(f"\nDatabase File: {db_path}")
+    if os.path.exists(db_path):
+        print(f"   Status: Exists")
+    else:
+        print(f"   Status: Not created yet")
     
     # Load and display server info
     try:
         with open(config_path, 'r') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader) or {}
+            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
     except Exception as e:
         print(f"   Error reading config: {e}")
         return
     
-    servers = config.get('servers', [])
+    servers = cfg.get('servers', [])
     server_count = len(servers)
     
     print(f"\n🖥  Total Servers: {server_count}")
@@ -245,7 +258,7 @@ def main():
     info_parser = subparsers.add_parser('info', help='Show configuration info')
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
     log_parser.add_argument('--interval', type=int, default=5, help='Logging interval in seconds (default: 5)')
-    log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: ~/.nvidb/gpu_log.db)')
+    log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
     args = parser.parse_args()
     
     if args.remote:

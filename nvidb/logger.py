@@ -8,16 +8,16 @@ from datetime import datetime
 from pathlib import Path
 from .connection import NviClientPool
 from .data_modules import ServerListInfo
+from . import config
 
 
 class NVLoggerSQLite:
     """GPU Logger with SQLite3 storage for persistent data collection."""
     
-    DEFAULT_DB_PATH = "~/.nvidb/gpu_log.db"
     DEFAULT_INTERVAL = 5  # seconds
     
     def __init__(self, db_path=None, server_list=None, interval=None):
-        self.db_path = os.path.expanduser(db_path or self.DEFAULT_DB_PATH)
+        self.db_path = db_path or config.get_db_path()
         self.interval = interval or self.DEFAULT_INTERVAL
         self.server_list = server_list
         self.client_pool = None
