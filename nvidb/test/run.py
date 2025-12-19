@@ -2,6 +2,7 @@ import pytest
 import yaml
 import logging
 import argparse
+import shutil
 from pathlib import Path
 from ..connection import RemoteClient, NviClientPool
 from ..data_modules import ServerInfo, ServerListInfo
@@ -223,6 +224,170 @@ def show_info(config_path=None):
     print("\n" + "=" * 50)
 
 
+def interactive_clean(clean_all=False):
+    """Interactively clean server configurations or log data."""
+    config_path = config.get_config_path()
+    db_path = config.get_db_path()
+    working_dir = config.WORKING_DIR
+    
+    if clean_all:
+        # Clean all: delete entire working directory
+        print("\n" + "=" * 50)
+        print("         Clean All Data")
+        print("=" * 50 + "\n")
+        
+        print(f"This will delete the entire working directory:")
+        print(f"  {working_dir}")
+        print("\nThis includes:")
+        print(f"  - Configuration file: {config_path}")
+        print(f"  - Database file: {db_path}")
+        print("  - All other files in the directory")
+        
+        confirm = input("\nAre you sure you want to delete ALL data? [y/N]: ").strip().lower()
+        if confirm in ['y', 'yes']:
+            confirm2 = input("Type 'DELETE' to confirm: ").strip()
+            if confirm2 == 'DELETE':
+                if Path(working_dir).exists():
+                    shutil.rmtree(working_dir)
+                    print(f"\nDeleted: {working_dir}")
+                else:
+                    print(f"\nDirectory does not exist: {working_dir}")
+            else:
+                print("\nOperation cancelled.")
+        else:
+            print("\nOperation cancelled.")
+        return
+    
+    # Interactive clean menu
+    print("\n" + "=" * 50)
+    print("         Clean Data")
+    print("=" * 50 + "\n")
+    
+    print("What would you like to clean?")
+    print("  1. Remove a server from configuration")
+    print("  2. Delete log database")
+    print("  3. Cancel")
+    
+    choice = input("\nEnter your choice [1-3]: ").strip()
+    
+    if choice == '1':
+        # Remove a server
+        _clean_server(config_path)
+    elif choice == '2':
+        # Delete database
+        _clean_database(db_path)
+    else:
+        print("\nOperation cancelled.")
+
+
+def _clean_server(config_path):
+    """Remove a server from configuration."""
+    if not Path(config_path).exists():
+        print(f"\nConfiguration file not found: {config_path}")
+        return
+    
+    try:
+        with open(config_path, 'r') as f:
+            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
+    except Exception as e:
+        print(f"\nError reading config: {e}")
+        return
+    
+    servers = cfg.get('servers', [])
+    if not servers:
+        print("\nNo servers configured.")
+        return
+    
+    print("\nConfigured servers:")
+    print("-" * 50)
+    for idx, server in enumerate(servers):
+        host = server.get('host', 'N/A')
+        port = server.get('port', 22)
+        description = server.get('description', f"{server.get('username', 'N/A')}@{host}:{port}")
+        print(f"  [{idx + 1}] {description} ({host}:{port})")
+    
+    print(f"  [0] Cancel")
+    
+    try:
+        choice = input("\nEnter the number of the server to remove: ").strip()
+        if choice == '0' or not choice:
+            print("\nOperation cancelled.")
+            return
+        
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(servers):
+            print("\nInvalid selection.")
+            return
+        
+        server = servers[idx]
+        description = server.get('description', f"{server.get('username', 'N/A')}@{server.get('host', 'N/A')}")
+        
+        confirm = input(f"\nRemove server '{description}'? [y/N]: ").strip().lower()
+        if confirm in ['y', 'yes']:
+            servers.pop(idx)
+            cfg['servers'] = servers
+            
+            with open(config_path, 'w') as f:
+                yaml.dump(cfg, f, default_flow_style=False)
+            
+            print(f"\nServer removed successfully.")
+        else:
+            print("\nOperation cancelled.")
+            
+    except ValueError:
+        print("\nInvalid input.")
+
+
+def _clean_database(db_path):
+    """Delete the log database."""
+    db_path = Path(db_path)
+    
+    if not db_path.exists():
+        print(f"\nDatabase file not found: {db_path}")
+        return
+    
+    # Show database info
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Get session count
+        cursor.execute("SELECT COUNT(*) FROM log_sessions")
+        session_count = cursor.fetchone()[0]
+        
+        # Get log count
+        cursor.execute("SELECT COUNT(*) FROM gpu_logs")
+        log_count = cursor.fetchone()[0]
+        
+        # Get file size
+        file_size = db_path.stat().st_size
+        if file_size >= 1024 * 1024:
+            size_str = f"{file_size / (1024 * 1024):.2f} MB"
+        elif file_size >= 1024:
+            size_str = f"{file_size / 1024:.2f} KB"
+        else:
+            size_str = f"{file_size} bytes"
+        
+        conn.close()
+        
+        print(f"\nDatabase: {db_path}")
+        print(f"  Size: {size_str}")
+        print(f"  Sessions: {session_count}")
+        print(f"  Log entries: {log_count}")
+        
+    except Exception as e:
+        print(f"\nDatabase: {db_path}")
+        print(f"  Error reading database: {e}")
+    
+    confirm = input("\nDelete this database? [y/N]: ").strip().lower()
+    if confirm in ['y', 'yes']:
+        db_path.unlink()
+        print(f"\nDatabase deleted successfully.")
+    else:
+        print("\nOperation cancelled.")
+
+
 def test_connection():
     cli.connect()
 
@@ -260,6 +425,8 @@ def main():
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
     log_parser.add_argument('--interval', type=int, default=5, help='Logging interval in seconds (default: 5)')
     log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
+    clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
+    clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
     args = parser.parse_args()
     
     if args.remote:
@@ -282,6 +449,8 @@ def main():
             interval=args.interval,
             db_path=getattr(args, 'db_path', None)
         )
+    elif args.command == 'clean':
+        interactive_clean(clean_all=(args.target == 'all'))
     else:
         # Default action: run interactive monitoring
         pool = NviClientPool(server_list)

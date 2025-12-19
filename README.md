@@ -114,7 +114,16 @@ nvidb log --db-path /path/to/db    # Specify custom database path
 
 Press `Ctrl+C` to stop logging and save data.
 
-### 2.4 Interactive TUI Navigation
+### 2.4 Cleanup
+
+Remove server configurations or delete log data:
+
+```bash
+nvidb clean              # Interactive cleanup menu
+nvidb clean all          # Delete all data (requires double confirmation)
+```
+
+### 2.5 Interactive TUI Navigation
 
 When viewing GPU stats, use these keyboard shortcuts:
 
