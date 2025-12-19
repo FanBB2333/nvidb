@@ -390,10 +390,13 @@ class NviClientPool:
         self.connect_all()
         self.term = Terminal()
         self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
-        # Collapsible display state
-        self.expanded_servers = set()  # Set of expanded server indices (all collapsed by default)
+        # Collapsible display state - all servers expanded by default
+        self.expanded_servers = set(range(len(self.pool)))  # All servers expanded by default
         self.selected_server = 0  # Currently selected server for navigation
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
+        self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
+        self.cached_stats = None  # Cached GPU stats data
+        self.cached_raw_stats = {}  # Cached raw stats per client index
     
     def connect_all(self):
         self.pool = [client for client in self.pool if client.connect()]
@@ -694,9 +697,22 @@ class NviClientPool:
         
         return f"{gpu_count} GPUs | {idle_count} idle | {util_display} avg | {mem_display}"
     
-    def print_stats(self):
+    def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
-        stats_list = self.get_client_gpus_info()
+        # Fetch new data or use cache
+        if use_cache and self.cached_stats is not None:
+            stats_list = self.cached_stats
+        else:
+            stats_list = self.get_client_gpus_info()
+            self.cached_stats = stats_list
+            # Also cache raw stats for summary
+            for idx, client in enumerate(self.pool):
+                result = client.get_full_gpu_info()
+                if isinstance(result, tuple) and len(result) == 2:
+                    self.cached_raw_stats[idx] = result
+                else:
+                    self.cached_raw_stats[idx] = (result if isinstance(result, pd.DataFrame) else pd.DataFrame(), {})
+        
         current_time = time.strftime("%H:%M:%S")
         
         # Ensure selected_server is within bounds
@@ -713,13 +729,11 @@ class NviClientPool:
             is_selected = (idx == self.selected_server)
             is_expanded = (idx in self.expanded_servers)
             
-            # Parse the stats_info (which is a formatted string from get_client_gpus_info)
-            # We need to get raw stats for summary, so let's get them again
-            result = client.get_full_gpu_info()
-            if isinstance(result, tuple) and len(result) == 2:
-                stats, system_info = result
+            # Use cached raw stats for summary
+            if idx in self.cached_raw_stats:
+                stats, system_info = self.cached_raw_stats[idx]
             else:
-                stats = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+                stats = pd.DataFrame()
                 system_info = {}
             
             # Build summary
@@ -763,11 +777,13 @@ class NviClientPool:
                                 # Move selection down
                                 if self.selected_server < len(self.pool) - 1:
                                     self.selected_server += 1
+                                    self.ui_only_refresh = True  # Use cached data for fast UI update
                                     self.refresh_needed.set()  # Trigger immediate refresh
                             elif key_lower == 'k' or key_name == 'KEY_UP':
                                 # Move selection up
                                 if self.selected_server > 0:
                                     self.selected_server -= 1
+                                    self.ui_only_refresh = True  # Use cached data for fast UI update
                                     self.refresh_needed.set()  # Trigger immediate refresh
                             elif key_name == 'KEY_ENTER' or key_lower == ' ' or key == '\n' or key == '\r':
                                 # Toggle expand/collapse for selected server
@@ -775,14 +791,17 @@ class NviClientPool:
                                     self.expanded_servers.discard(self.selected_server)
                                 else:
                                     self.expanded_servers.add(self.selected_server)
+                                self.ui_only_refresh = True  # Use cached data for fast UI update
                                 self.refresh_needed.set()  # Trigger immediate refresh
                             elif key_lower == 'a':
                                 # Expand all servers
                                 self.expanded_servers = set(range(len(self.pool)))
+                                self.ui_only_refresh = True  # Use cached data for fast UI update
                                 self.refresh_needed.set()  # Trigger immediate refresh
                             elif key_lower == 'c':
                                 # Collapse all servers
                                 self.expanded_servers.clear()
+                                self.ui_only_refresh = True  # Use cached data for fast UI update
                                 self.refresh_needed.set()  # Trigger immediate refresh
                     except KeyboardInterrupt:
                         break
@@ -807,7 +826,9 @@ class NviClientPool:
         try:
             while not self.quit_flag.is_set():
                 # Display GPU status with time at top
-                self.print_stats()
+                # Use cache for UI-only refreshes (navigation), fetch new data otherwise
+                self.print_stats(use_cache=self.ui_only_refresh)
+                self.ui_only_refresh = False  # Reset the flag
                 
                 # Wait 2 seconds or until exit flag is set or refresh is needed
                 for _ in range(20):  # 2 seconds divided into 20 x 0.1 seconds
