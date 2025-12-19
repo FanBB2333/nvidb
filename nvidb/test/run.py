@@ -149,9 +149,9 @@ def interactive_add_server(config_path=None):
         with open(config_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False)
         
-        print(f"\n✓ Server added successfully to {config_path}")
+        print(f"\nServer added successfully to {config_path}")
     else:
-        print("\n✗ Operation cancelled.")
+        print("\nOperation cancelled.")
 
 
 def show_info(config_path=None):
@@ -195,7 +195,7 @@ def show_info(config_path=None):
     servers = cfg.get('servers', [])
     server_count = len(servers)
     
-    print(f"\n🖥  Total Servers: {server_count}")
+    print(f"\nTotal Servers: {server_count}")
     
     if server_count == 0:
         print("\n   No servers configured yet.")
@@ -212,7 +212,7 @@ def show_info(config_path=None):
         username = server.get('username', 'N/A')
         description = server.get('description', f'{username}@{host}:{port}')
         auth = server.get('auth', 'auto')
-        has_password = '✓' if server.get('password') else '✗'
+        has_password = 'Yes' if server.get('password') else 'No'
         
         print(f"\n  [{idx + 1}] {description}")
         print(f"      Host:     {host}:{port}")
