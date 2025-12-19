@@ -1,15 +1,21 @@
 # nvidb
+
 A package that provides an aggregated view of the NVIDIA GPU information on several hosts.
-## 1.Installation
+
+## 1. Installation
+
 ### 1.1 Install using `pip`
+
 You can install `nvidb` using pip. First, clone the repository:
+
 ```bash
 git clone https://github.com/FanBB2333/nvidb.git
 cd nvidb
 pip install .
 ```
 
-Or using pip directly:
+Or install directly from PyPI:
+
 ```bash
 pip install nvidb
 # If the specified version is unavailable in your custom repository, use pypi.org as the source:
@@ -18,97 +24,141 @@ pip install nvidb -i https://pypi.org/simple
 
 ---
 
-### 1.2 \[Optional] Manually Add a Configuration File
+### 1.2 Configuration
 
-To monitor the status of remote servers, a configuration file is required. `nvidb` will look for the `config.yml` file in the `~/.nvidb/` directory.
+#### Option A: Interactive Setup (Recommended)
 
-To create the configuration file, follow these steps:
+Use the interactive command to add servers:
+
+```bash
+nvidb add
+```
+
+This will guide you through adding a new server with prompts for host, port, username, authentication method, etc.
+
+#### Option B: Manual Configuration
+
+To manually configure remote servers, create or edit the configuration file at `~/.nvidb/config.yml`:
 
 ```bash
 mkdir -p ~/.nvidb/
-cd ~/.nvidb/
-touch config.yml
+cp config.example.yml ~/.nvidb/config.yml
+# Edit the file with your server details
 ```
 
-Then, edit the `config.yml` file with the following structure:
+Configuration file structure:
 
 ```yaml
 servers:
   - host: "example1.com"
-    port: 8080
+    port: 22
     username: "user1"
     description: "Description of the first server"
+    auth: "auto"  # auto | key | password
+    
   - host: "example2.com"
-    port: 9090
+    port: 22
     username: "user2"
-    password: "password2" # Optional, if password-based authentication is required
+    password: "password2"  # Optional, prompted if not set
     description: "Description of the second server"
-```
-- The `password` field is optional, omit the field if the server can be accessed with the public key (By default, the program will read the key located in `~/.ssh`). If your key is not accessed or the filled password is incorrect, the program will prompt you to enter the password.
-
-
-## 2.Usage
-After installation, the command `nvidb` will be available in the terminal. Run the command to get the aggregated view of the NVIDIA GPU information on several hosts.
-```bash
-nvidb # for local machine only
-nvidb --remote # for local and remote servers
+    auth: "auto"
 ```
 
-The output format will be like:
-```bash
-[Local Machine Info]
-[Remote Server0 GPU Info]
-[Remote Server1 GPU Info]
-...
+**Configuration Options:**
+- `host`: Server hostname or IP address (required)
+- `port`: SSH port, default is 22 (required)
+- `username`: SSH username (required)
+- `description`: Human-readable server description (optional)
+- `auth`: Authentication method - `auto`, `key`, or `password` (optional, default: `auto`)
+- `password`: SSH password (optional, will prompt if needed)
 
+#### Environment Variables
+
+You can customize the working directory by setting `NVIDB_HOME`:
+
+```bash
+export NVIDB_HOME=/path/to/custom/nvidb
 ```
 
-One sample output for a remote server might look like:
+Default working directory is `~/.nvidb/`.
+
+---
+
+## 2. Usage
+
+### 2.1 Basic Commands
+
 ```bash
-⏰ Time: 09:41:00
+nvidb                  # Monitor local GPU only
+nvidb --remote         # Monitor local and remote servers
+nvidb --version        # Show version
+```
+
+### 2.2 Server Management
+
+```bash
+nvidb add              # Interactively add a new server
+nvidb info             # Show configuration info and server list
+```
+
+### 2.3 GPU Logging
+
+Continuously log GPU statistics to an SQLite database:
+
+```bash
+nvidb log                          # Log local GPU with default settings
+nvidb log --remote                 # Log local and remote GPUs
+nvidb log --interval 10            # Set logging interval to 10 seconds
+nvidb log --db-path /path/to/db    # Specify custom database path
+```
+
+Press `Ctrl+C` to stop logging and save data.
+
+### 2.4 Interactive TUI Navigation
+
+When viewing GPU stats, use these keyboard shortcuts:
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move selection down |
+| `k` / `↑` | Move selection up |
+| `Enter` / `Space` | Toggle expand/collapse server |
+| `a` | Expand all servers |
+| `c` | Collapse all servers |
+| `q` | Quit |
+
+---
+
+## 3. Sample Output
+
+```bash
+Time: 09:41:00 | Servers: 2 | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit
+--------------------------------------------------------------------------------
+* v [1] Local Machine (l1ght@localhost)  1 GPUs | 1 idle | 0% avg | 0GB/24GB
 
 Local Machine (l1ght@localhost)
 Driver: 570.169 | CUDA: 12.8 | GPUs: 1
-GPU  |         name         |   fan    |   util   | mem_util |   temp   |     rx     |     tx     |       power        |   memory[used/total]   |      processes      
------+----------------------+----------+----------+----------+----------+------------+------------+--------------------+------------------------+---------------------
- 0   |     RTX 3090 Ti      |   0 %    |   0 %    |   0 %    |   39 C   |  350KB/s   |  500KB/s   |  P8 32.72/450.00   |        41/24564        |       gdm(17M)      
+GPU  |    name     |   fan   |  util   | mem_util |  temp   |    rx    |    tx    |      power       | memory[used/total] |   processes   
+-----+-------------+---------+---------+----------+---------+----------+----------+------------------+--------------------+---------------
+ 0   | RTX 3090 Ti |   0 %   |   0 %   |   0 %    |  39 C   | 350KB/s  | 500KB/s  | P8 32.72/450.00  |      41/24564      |    gdm(17M)   
 
-Server 1
-Driver: 575.57.08 | CUDA: 12.9 | GPUs: 8
-GPU  |         name         |   fan    |   util   | mem_util |   temp   |     rx     |     tx     |       power        |   memory[used/total]   |      processes      
------+----------------------+----------+----------+----------+----------+------------+------------+--------------------+------------------------+---------------------
- 0   |       RTX 3090       |   39 %   |   6 %    |   4 %    |   50 C   |  350KB/s   |  350KB/s   |  P2 150.35/350.00  |      16147/24576       | user1(16124M) gdm(4M) 
- 1   |       RTX 3090       |   57 %   |   13 %   |   11 %   |   62 C   |  350KB/s   |  400KB/s   |  P2 174.41/350.00  |      17581/24576       | user1(17558M) gdm(4M) 
- 2   |       RTX 3090       |   89 %   |  100 %   |   37 %   |   80 C   |  13.9MB/s  |  4.8MB/s   |  P2 314.48/350.00  |      21415/24576       | user1(21392M) gdm(4M) 
- 3   |       RTX 3090       |  100 %   |  100 %   |   32 %   |   71 C   |  27.6MB/s  |  7.7MB/s   |  P2 260.81/350.00  |      21035/24576       | user1(21012M) gdm(4M) 
- 4   |       RTX 3090       |   79 %   |  100 %   |   31 %   |   75 C   |  13.1MB/s  |  7.4MB/s   |  P2 321.92/350.00  |      20975/24576       | user1(20952M) gdm(4M) 
- 5   |       RTX 3090       |   90 %   |  100 %   |   28 %   |   84 C   |  35.0MB/s  |  9.8MB/s   |  P2 283.55/350.00  |      21035/24576       | user1(21012M) gdm(4M) 
- 6   |       RTX 3090       |   78 %   |  100 %   |   56 %   |   75 C   |  28.8MB/s  |  8.3MB/s   |  P2 349.30/350.00  |      21135/24576       | user1(21112M) gdm(4M) 
- 7   |       RTX 3090       |   84 %   |  100 %   |   82 %   |   80 C   |  13.9MB/s  |  4.0MB/s   |  P2 362.74/350.00  |      21235/24576       | user1(21212M) gdm(4M) 
-
-One sample output for a remote server might look like:
-```bash
-⏰ Time: 09:41:00
-
-Server 2
-Driver: 575.57.08 | CUDA: 12.9 | GPUs: 7
-GPU  |         name         |   fan    |   util   | mem_util |   temp   |     rx     |     tx     |       power        |   memory[used/total]   |      processes      
------+----------------------+----------+----------+----------+----------+------------+------------+--------------------+------------------------+---------------------
- 0   |       RTX 3090       |   41 %   |   0 %    |   0 %    |   30 C   |  400KB/s   |  500KB/s   |  P8 22.33/350.00   |        18/24576        |       gdm(4M)       
- 1   |       RTX 3090       |   30 %   |   0 %    |   0 %    |   33 C   |  400KB/s   |  450KB/s   |  P8 15.31/350.00   |        18/24576        |       gdm(4M)       
- 2   |       RTX 3090       |   30 %   |   0 %    |   0 %    |   29 C   |  450KB/s   |  500KB/s   |   P8 7.20/350.00   |        18/24576        |       gdm(4M)       
- 3   |       RTX 3090       |   30 %   |   0 %    |   0 %    |   29 C   |  500KB/s   |  500KB/s   |   P8 4.42/350.00   |        18/24576        |       gdm(4M)       
- 4   |       RTX 3090       |   30 %   |   0 %    |   0 %    |   26 C   |  800KB/s   |  950KB/s   |   P8 5.04/350.00   |        18/24576        |       gdm(4M)       
- 5   |       RTX 3090       |   30 %   |   0 %    |   0 %    |   24 C   |  500KB/s   |  550KB/s   |   P8 5.13/350.00   |        18/24576        |       gdm(4M)       
- 6   |       RTX 3090       |   30 %   |   0 %    |   0 %    |   25 C   |  450KB/s   |  550KB/s   |   P8 8.03/350.00   |        18/24576        |       gdm(4M)       
+  > [2] Server 1  8 GPUs | 0 idle | 78% avg | 156GB/192GB
 ```
 
-## 3.System Requirements
-The hosts should install the NVIDIA driver and be able to use `nvidia-smi` in terminal.
+---
 
-## 4.Tips
-`nvidia-smi` query options: use `nvidia-smi --help-query-gpu` to get the query options.
+## 4. System Requirements
 
+- NVIDIA driver installed with `nvidia-smi` available in terminal
+- Python 3.8+
+- SSH access to remote servers (for remote monitoring)
 
-## 5.Acknowledgements
+## 5. Tips
+
+- Use `nvidia-smi --help-query-gpu` to see available query options
+- Database files are stored in `~/.nvidb/gpu_log.db` by default
+- Configuration and logs are stored in `~/.nvidb/` directory
+
+## 6. Acknowledgements
+
 Thanks to NVIDIA for providing the `nvidia-smi` tool, which is used to query GPU information.

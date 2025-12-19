@@ -1,0 +1,26 @@
+# nvidb Configuration Example
+# Copy this file to ~/.nvidb/config.yml and modify it to your needs.
+# Or use `nvidb add` command to interactively add servers.
+
+servers:
+  # Example server with SSH key authentication (recommended)
+  - host: "server1.example.com"
+    port: 22
+    username: "user1"
+    description: "GPU Server 1"
+    auth: "auto"  # auto | key | password
+
+  # Example server with password authentication
+  - host: "192.168.1.100"
+    port: 22
+    username: "admin"
+    password: "your_password_here"  # Optional, will prompt if not set
+    description: "Local GPU Workstation"
+    auth: "auto"
+
+  # Example server with custom SSH port
+  - host: "server2.example.com"
+    port: 2222
+    username: "user2"
+    description: "GPU Server 2 (Custom Port)"
+    auth: "key"  # Use key-only authentication
