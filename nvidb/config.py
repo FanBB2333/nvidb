@@ -4,6 +4,9 @@ Centralized configuration for working directory and other settings.
 """
 import os
 
+# Package version
+VERSION = "1.2.0"
+
 # Default working directory for nvidb data (config, logs, database)
 # Can be overridden by NVIDB_HOME environment variable
 WORKING_DIR = os.path.expanduser(os.environ.get('NVIDB_HOME', '~/.nvidb'))

@@ -1,10 +1,12 @@
 from setuptools import setup, find_packages
 from pathlib import Path
+from nvidb.config import VERSION
+
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 setup(
     name='nvidb',
-    version='1.2.0',
+    version=VERSION,
     packages=find_packages(),
     url="https://github.com/FanBB2333/nvidb/",
     long_description=long_description,

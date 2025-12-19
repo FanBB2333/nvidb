@@ -249,6 +249,7 @@ def main():
     
     # 创建主解析器
     parser = argparse.ArgumentParser(prog="nvidb", description="A simple tool to manage Nvidia GPU servers.")
+    parser.add_argument('--version', action='version', version=f'nvidb {config.VERSION}')
     parser.add_argument('--remote', action='store_true', help='Use remote servers')
     
     subparsers = parser.add_subparsers(dest='command')
