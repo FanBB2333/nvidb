@@ -5,7 +5,7 @@ Centralized configuration for working directory and other settings.
 import os
 
 # Package version
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Default working directory for nvidb data (config, logs, database)
 # Can be overridden by NVIDB_HOME environment variable
