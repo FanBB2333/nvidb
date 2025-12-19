@@ -390,8 +390,8 @@ class NviClientPool:
         self.connect_all()
         self.term = Terminal()
         self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
-        # Collapsible display state - all servers expanded by default
-        self.expanded_servers = set(range(len(self.pool)))  # All servers expanded by default
+        # Collapsible display state - only first server expanded by default
+        self.expanded_servers = {0}  # Only first server expanded by default
         self.selected_server = 0  # Currently selected server for navigation
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
         self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
