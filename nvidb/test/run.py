@@ -1,8 +1,8 @@
 import pytest
-import os
 import yaml
 import logging
 import argparse
+from pathlib import Path
 from ..connection import RemoteClient, NviClientPool
 from ..data_modules import ServerInfo, ServerListInfo
 from ..logger import run_sqlite_logger
@@ -16,7 +16,7 @@ def init(config_path=None):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     global test_server, cli
     # config_path = 'nvidb/test/config.yml'
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    Path(config_path).parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, 'r') as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
     # test_server = ServerInfo(**config['servers'][0])
@@ -118,12 +118,12 @@ def interactive_add_server(config_path=None):
     # Confirm and save
     confirm = input("\nSave this server configuration? [Y/n]: ").strip().lower()
     if confirm in ['', 'y', 'yes']:
-        config_path = os.path.expanduser(config_path)
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        config_path = Path(config_path).expanduser()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Load existing config or create new one
         import yaml
-        if os.path.exists(config_path):
+        if config_path.exists():
             with open(config_path, 'r') as f:
                 config = yaml.load(f, Loader=yaml.FullLoader) or {}
         else:
@@ -169,7 +169,7 @@ def show_info(config_path=None):
     # Config file info
     print(f"Config File: {config_path}")
     
-    if not os.path.exists(config_path):
+    if not Path(config_path).exists():
         print(f"   Status: Not found")
         print("\n   Run 'nvidb add' to add your first server.")
         return
@@ -179,7 +179,7 @@ def show_info(config_path=None):
     # Database file info
     db_path = config.get_db_path()
     print(f"\nDatabase File: {db_path}")
-    if os.path.exists(db_path):
+    if Path(db_path).exists():
         print(f"   Status: Exists")
     else:
         print(f"   Status: Not created yet")

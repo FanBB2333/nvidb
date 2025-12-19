@@ -2,7 +2,6 @@ import pandas as pd
 import logging
 import time
 import threading
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +28,7 @@ class NVLoggerSQLite:
         self.data_buffer = []
         
         # Ensure directory exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         
         # Initialize database
         self._init_database()
