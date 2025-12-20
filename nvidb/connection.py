@@ -867,6 +867,10 @@ class NVClientPool:
         """Format summary string; if widths provided, columns are aligned."""
         if not summary_data:
             return "No GPU data available"
+        if isinstance(summary_data, dict) and summary_data.get("status") == "loading":
+            return "Loading..."
+        if isinstance(summary_data, dict) and summary_data.get("status") == "empty":
+            return "No GPU data available"
 
         gpu_count = summary_data["gpu_count"]
         idle_count = summary_data["idle_count"]
@@ -968,7 +972,10 @@ class NVClientPool:
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
 
             # Build summary
-            summary_data = self._get_server_summary_data(stats)
+            if last_update_time is None and stats.empty:
+                summary_data = {"status": "loading"}
+            else:
+                summary_data = self._get_server_summary_data(stats) or {"status": "empty"}
 
             # Format the header line (index padded for consistent width)
             expand_icon = "v" if is_expanded else ">"
@@ -981,7 +988,7 @@ class NVClientPool:
             summary_rows.append(summary_data)
             server_rows.append((is_selected, is_expanded, header_plain, summary_data, stats_info))
 
-        non_empty_summaries = [s for s in summary_rows if s]
+        non_empty_summaries = [s for s in summary_rows if isinstance(s, dict) and "gpu_count" in s]
         if non_empty_summaries:
             widths = {
                 "gpu_digits": max(len(str(s["gpu_count"])) for s in non_empty_summaries),
