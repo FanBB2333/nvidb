@@ -953,8 +953,10 @@ class NVClientPool:
         warn_display = " | WARN: refresh failed" if last_fetch_error else ""
 
         output_lines = []
+        server_count = len(self.pool)
+        server_label = "Server" if server_count == 1 else "Servers"
         output_lines.append(
-            f"Time: {current_time} | Updated: {update_display}{fetch_display} | Servers: {len(self.pool)} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
+            f"Time: {current_time} | Updated: {update_display}{fetch_display} | {server_label}: {server_count} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
         )
         output_lines.append("-" * 80)
 
@@ -1147,8 +1149,10 @@ class NVClientPool:
     def print_once(self):
         """Print GPU stats once and exit (no TUI loop)"""
         current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"Time: {current_time} | Servers: {len(self.pool)}")
-        print("=" * 80)
+        server_count = len(self.pool)
+        server_label = "Server" if server_count == 1 else "Servers"
+        print(f"Time: {current_time} | {server_label}: {server_count}")
+        print("-" * 80)
         
         # Get stats
         stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
