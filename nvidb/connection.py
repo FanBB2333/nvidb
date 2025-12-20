@@ -775,63 +775,123 @@ class NVClientPool:
     
     def _get_server_summary(self, stats, system_info):
         """Generate compact summary for collapsed server view."""
+        summary_data = self._get_server_summary_data(stats)
+        return self._format_server_summary(summary_data)
+
+    def _get_server_summary_data(self, stats):
+        """Compute summary data for formatting/alignment."""
         if stats.empty:
-            return "No GPU data available"
-        
+            return None
+
+        def mem_to_mib(value_str) -> int:
+            if not value_str or str(value_str).strip() in {"N/A", ""}:
+                return 0
+            try:
+                numbers = extract_numbers(str(value_str))
+                if not numbers:
+                    return 0
+                value = float(numbers[0])
+                unit = units_from_str(str(value_str)).lower()
+                if unit in {"mib", "mb"}:
+                    return int(value)
+                if unit in {"gib", "gb"}:
+                    return int(value * 1024)
+                if unit in {"kib", "kb"}:
+                    return int(value / 1024)
+                if unit in {"b"}:
+                    return int(value / (1024 * 1024))
+                return int(value)
+            except Exception:
+                return 0
+
         gpu_count = len(stats)
-        
-        # Calculate idle GPUs (util < 5%)
         idle_count = 0
         total_util = 0
-        total_mem_used = 0
-        total_mem_total = 0
-        
+        total_mem_used_mib = 0
+        total_mem_total_mib = 0
+
         for _, row in stats.iterrows():
-            # Parse utilization
-            util_str = str(row.get('util', row.get('gpu_util', '0')))
+            util_str = str(row.get("util", row.get("gpu_util", "0")))
             try:
-                util_val = int(util_str.replace('%', '').strip())
+                util_val = int(util_str.replace("%", "").strip())
                 total_util += util_val
                 if util_val < 5:
                     idle_count += 1
             except (ValueError, AttributeError):
                 pass
-            
-            # Parse memory
-            mem_col = row.get('memory[used/total]', '')
-            if mem_col and '/' in str(mem_col):
-                try:
-                    used_str, total_str = str(mem_col).split('/')
-                    used_val = int(''.join(filter(str.isdigit, used_str)) or 0)
-                    total_val = int(''.join(filter(str.isdigit, total_str)) or 0)
-                    total_mem_used += used_val
-                    total_mem_total += total_val
-                except (ValueError, AttributeError):
-                    pass
-        
+
+            # Prefer explicit used/total fields (from nvidia-smi -q -x); fallback to pre-formatted column
+            used_mib = mem_to_mib(row.get("used", ""))
+            total_mib = mem_to_mib(row.get("total", ""))
+
+            if used_mib == 0 and total_mib == 0:
+                mem_col = row.get("memory[used/total]", "")
+                if mem_col and "/" in str(mem_col):
+                    try:
+                        used_str, total_str = str(mem_col).split("/", 1)
+                        used_mib = int("".join(filter(str.isdigit, used_str)) or 0)
+                        total_mib = int("".join(filter(str.isdigit, total_str)) or 0)
+                    except Exception:
+                        used_mib = 0
+                        total_mib = 0
+
+            total_mem_used_mib += used_mib
+            total_mem_total_mib += total_mib
+
         avg_util = total_util // gpu_count if gpu_count > 0 else 0
-        
-        # Format memory display
-        if total_mem_total > 0:
-            # Convert to GB if large enough
-            if total_mem_total >= 1024:
-                mem_display = f"{total_mem_used//1024}GB/{total_mem_total//1024}GB"
+
+        if total_mem_total_mib > 0:
+            if total_mem_total_mib >= 1024:
+                mem_display = f"{total_mem_used_mib//1024}GB/{total_mem_total_mib//1024}GB"
             else:
-                mem_display = f"{total_mem_used}MB/{total_mem_total}MB"
+                mem_display = f"{total_mem_used_mib}MB/{total_mem_total_mib}MB"
         else:
             mem_display = "N/A"
-        
-        # Color coding for utilization
+
         if avg_util >= 80:
-            util_color = 'red'
+            util_color = "red"
         elif avg_util >= 50:
-            util_color = 'yellow'
+            util_color = "yellow"
         else:
-            util_color = 'green'
-        
-        util_display = colored(f"{avg_util}%", util_color)
-        
-        return f"{gpu_count} GPUs | {idle_count} idle | {util_display} avg | {mem_display}"
+            util_color = "green"
+
+        return {
+            "gpu_count": gpu_count,
+            "idle_count": idle_count,
+            "avg_util": avg_util,
+            "util_color": util_color,
+            "mem_display": mem_display,
+        }
+
+    def _format_server_summary(self, summary_data, widths=None) -> str:
+        """Format summary string; if widths provided, columns are aligned."""
+        if not summary_data:
+            return "No GPU data available"
+
+        gpu_count = summary_data["gpu_count"]
+        idle_count = summary_data["idle_count"]
+        avg_util = summary_data["avg_util"]
+        util_color = summary_data["util_color"]
+        mem_display = summary_data["mem_display"]
+
+        if widths:
+            gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
+            idle_digits = widths.get("idle_digits", len(str(idle_count)))
+            util_digits = widths.get("util_digits", len(str(avg_util)))
+            mem_width = widths.get("mem_width", len(str(mem_display)))
+        else:
+            gpu_digits = len(str(gpu_count))
+            idle_digits = len(str(idle_count))
+            util_digits = len(str(avg_util))
+            mem_width = len(str(mem_display))
+
+        gpu_part = f"{gpu_count:>{gpu_digits}} GPUs"
+        idle_part = f"{idle_count:>{idle_digits}} idle"
+        util_plain = f"{avg_util:>{util_digits}}%"
+        util_part = colored(util_plain, util_color) if util_color else util_plain
+        mem_part = f"{str(mem_display):>{mem_width}}"
+
+        return f"{gpu_part} | {idle_part} | {util_part} avg | {mem_part}"
     
     def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
@@ -893,29 +953,58 @@ class NVClientPool:
             f"Time: {current_time} | Updated: {update_display}{fetch_display} | Servers: {len(self.pool)} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
         )
         output_lines.append("-" * 80)
-        
+
+        # Align the collapsed server list by padding headers to the same display width
+        index_width = len(str(len(self.pool)))
+        server_rows = []
+        max_header_width = 0
+
+        summary_rows = []
         for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
-            is_selected = (idx == self.selected_server)
-            is_expanded = (idx in self.expanded_servers)
-            
+            is_selected = idx == self.selected_server
+            is_expanded = idx in self.expanded_servers
+
             # Use cached raw stats for summary
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-            
+
             # Build summary
-            summary = self._get_server_summary(stats, system_info)
-            
-            # Format the header line
+            summary_data = self._get_server_summary_data(stats)
+
+            # Format the header line (index padded for consistent width)
             expand_icon = "v" if is_expanded else ">"
             selector = "*" if is_selected else " "
-            
-            header = f"{selector} {expand_icon} [{idx + 1}] {client.description}"
-            
+            header_plain = f"{selector} {expand_icon} [{idx + 1:{index_width}d}] {client.description}"
+
+            header_width = self.term.length(header_plain)
+            max_header_width = max(max_header_width, header_width)
+
+            summary_rows.append(summary_data)
+            server_rows.append((is_selected, is_expanded, header_plain, summary_data, stats_info))
+
+        non_empty_summaries = [s for s in summary_rows if s]
+        if non_empty_summaries:
+            widths = {
+                "gpu_digits": max(len(str(s["gpu_count"])) for s in non_empty_summaries),
+                "idle_digits": max(len(str(s["idle_count"])) for s in non_empty_summaries),
+                "util_digits": max(len(str(s["avg_util"])) for s in non_empty_summaries),
+                "mem_width": max(len(str(s["mem_display"])) for s in non_empty_summaries),
+            }
+        else:
+            widths = None
+
+        for is_selected, is_expanded, header_plain, summary_data, stats_info in server_rows:
+            pad = max_header_width - self.term.length(header_plain)
+            header_padded = header_plain + (" " * pad if pad > 0 else "")
+
             if is_selected:
-                header = self.term.reverse + header + self.term.normal
-            
-            # Header with summary on same line
-            output_lines.append(f"{header}  {summary}")
-            
+                header_display = self.term.reverse + header_padded + self.term.normal
+            else:
+                header_display = header_padded
+
+            # Header with summary on same line (summary aligned)
+            summary = self._format_server_summary(summary_data, widths=widths)
+            output_lines.append(f"{header_display}  {summary}")
+
             # If expanded, print the full stats table (already formatted from get_client_gpus_info)
             if is_expanded:
                 output_lines.extend(str(stats_info).splitlines())
