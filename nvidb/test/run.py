@@ -1,4 +1,3 @@
-import pytest
 import yaml
 import logging
 import argparse

@@ -1,6 +1,5 @@
 pandas
 paramiko
-pytest
 PyYAML
 setuptools
 termcolor
