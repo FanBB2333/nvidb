@@ -155,6 +155,33 @@ def interactive_add_server(config_path=None):
         print("\nOperation cancelled.")
 
 
+def _get_directory_size(path):
+    """Calculate the total size of a directory in bytes."""
+    total_size = 0
+    path = Path(path)
+    if not path.exists():
+        return 0
+    for file_path in path.rglob('*'):
+        if file_path.is_file():
+            try:
+                total_size += file_path.stat().st_size
+            except (OSError, PermissionError):
+                pass
+    return total_size
+
+
+def _format_size(size_bytes):
+    """Format size in bytes to human-readable string."""
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    elif size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    else:
+        return f"{size_bytes} bytes"
+
+
 def show_info(config_path=None):
     """Show configuration information."""
     config_path = config_path or config.get_config_path()
@@ -165,7 +192,15 @@ def show_info(config_path=None):
     
     # Working directory info
     print(f"Working Directory: {config.WORKING_DIR}")
-    print(f"   (Override with NVIDB_HOME environment variable)\n")
+    print(f"   (Override with NVIDB_HOME environment variable)")
+    
+    # Disk usage statistics
+    if Path(config.WORKING_DIR).exists():
+        total_size = _get_directory_size(config.WORKING_DIR)
+        print(f"   Disk Usage: {_format_size(total_size)}")
+    else:
+        print(f"   Disk Usage: 0 bytes (directory not created)")
+    print()
     
     # Config file info
     print(f"Config File: {config_path}")
