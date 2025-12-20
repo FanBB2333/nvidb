@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvidb"
+dynamic = ["version"]
+description = "A package that provides an aggregated view of the NVIDIA GPU information on several hosts."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    {name = "FanBB2333"}
+]
+keywords = ["nvidia", "gpu", "monitoring", "ssh", "remote"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "pandas",
+    "paramiko",
+    "PyYAML",
+    "termcolor",
+    "nvidia-ml-py",
+    "blessed",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "setuptools",
+]
+
+[project.urls]
+Homepage = "https://github.com/FanBB2333/nvidb"
+Repository = "https://github.com/FanBB2333/nvidb"
+
+[project.scripts]
+nvidb = "nvidb.test.run:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "nvidb.config.VERSION"}
+
+[tool.setuptools.packages.find]
+include = ["nvidb*"]
