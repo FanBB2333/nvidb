@@ -434,10 +434,9 @@ class NviClientPool:
         return result
     
     def get_client_gpus_info(self):
-        # Set pandas display options - fixed column width and fill horizontally
+        # Set pandas display options for terminal output
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', None)  # Auto-fill terminal width
-        pd.set_option('display.max_colwidth', 12)  # Fixed max column width to 12 characters
         pd.set_option('display.colheader_justify', 'center')  # Center column headers
         
         stats_str = []
@@ -502,9 +501,6 @@ class NviClientPool:
             # replace the NVIDIA/GeForce with "" in name column
             stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
             
-            # Ensure name column doesn't exceed column width limit
-            stats['name'] = stats['name'].apply(lambda x: x[:11] if len(str(x)) > 11 else x)
-            
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             # but keep the new processes column
             columns_to_drop = ['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free']
@@ -543,8 +539,8 @@ class NviClientPool:
         except OSError:
             terminal_width = 120  # Default width
         
-        # Define fixed width for each column - adaptive to terminal width
-        base_widths = {
+        # Define minimum width for each column
+        min_widths = {
             'GPU': 4,
             'name': 12,
             'temp': 8,
@@ -557,21 +553,72 @@ class NviClientPool:
             'memory[used/total]': 16,
             'processes': 20  # Add width for processes column
         }
-        
-        # Calculate minimum width required
-        min_width_needed = sum(base_widths.get(col, 12) for col in df.columns) + 3 * (len(df.columns) - 1)  # Add separators
-        
-        # If terminal width is sufficient, appropriately increase width of certain columns
-        if terminal_width > min_width_needed + 20:
-            extra_space = terminal_width - min_width_needed - 10  # Leave some margin
-            # Priority to increase name column width
-            if 'name' in base_widths:
-                base_widths['name'] += min(extra_space // 2, 8)
-            # Increase memory column width
-            if 'memory[used/total]' in base_widths:
-                base_widths['memory[used/total]'] += min(extra_space // 4, 6)
-        
-        column_widths = base_widths
+
+        # Compute content width for each column
+        content_widths = {}
+        for col in df.columns:
+            max_len = len(str(col))
+            for value in df[col]:
+                value_len = len(str(value))
+                if value_len > max_len:
+                    max_len = value_len
+            content_widths[col] = max_len
+
+        # Calculate widths based on terminal space
+        separator_width = 3
+        total_separator_width = separator_width * (len(df.columns) - 1)
+        available_width = terminal_width - total_separator_width
+
+        min_widths_for_cols = {}
+        desired_widths = {}
+        for col in df.columns:
+            min_width = min_widths.get(col, 12)
+            min_width = max(min_width, len(str(col)))
+            min_widths_for_cols[col] = min_width
+            desired_widths[col] = max(min_width, content_widths.get(col, min_width))
+
+        min_total = sum(min_widths_for_cols.values())
+        desired_total = sum(desired_widths.values())
+
+        if available_width <= min_total:
+            column_widths = min_widths_for_cols
+        elif available_width >= desired_total:
+            column_widths = desired_widths
+        else:
+            column_widths = dict(min_widths_for_cols)
+            extra = available_width - min_total
+            priority = [
+                'name',
+                'processes',
+                'power',
+                'memory[used/total]',
+                'rx',
+                'tx',
+                'temp',
+                'fan',
+                'util',
+                'mem_util',
+                'GPU',
+            ]
+            for col in [c for c in priority if c in df.columns]:
+                if extra <= 0:
+                    break
+                need = desired_widths[col] - column_widths[col]
+                if need > 0:
+                    add = min(extra, need)
+                    column_widths[col] += add
+                    extra -= add
+            if extra > 0:
+                for col in df.columns:
+                    if extra <= 0:
+                        break
+                    if col in priority:
+                        continue
+                    need = desired_widths[col] - column_widths[col]
+                    if need > 0:
+                        add = min(extra, need)
+                        column_widths[col] += add
+                        extra -= add
         
         # Format table header
         header_parts = []
@@ -596,7 +643,12 @@ class NviClientPool:
                 value = str(row[col])
                 # Truncate long values and add ellipsis
                 if len(value) > width:
-                    value = value[:width-2] + ".."
+                    if col == 'name' and width > 2:
+                        value = ".." + value[-(width - 2):]
+                    elif width > 2:
+                        value = value[:width - 2] + ".."
+                    else:
+                        value = value[:width]
                 
                 # Add color formatting for different columns
                 if col == 'util' and value != 'N/A':
