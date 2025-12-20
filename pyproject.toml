@@ -9,9 +9,7 @@ description = "A package that provides an aggregated view of the NVIDIA GPU info
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
-authors = [
-    {name = "FanBB2333"}
-]
+authors = [{ name = "L1ght" }]
 keywords = ["nvidia", "gpu", "monitoring", "ssh", "remote"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -38,10 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest",
-    "setuptools",
-]
+dev = ["pytest", "setuptools"]
 
 [project.urls]
 Homepage = "https://github.com/FanBB2333/nvidb"
@@ -51,7 +46,7 @@ Repository = "https://github.com/FanBB2333/nvidb"
 nvidb = "nvidb.test.run:main"
 
 [tool.setuptools.dynamic]
-version = {attr = "nvidb.config.VERSION"}
+version = { attr = "nvidb.config.VERSION" }
 
 [tool.setuptools.packages.find]
 include = ["nvidb*"]
