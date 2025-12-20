@@ -88,11 +88,6 @@ def interactive_add_server(config_path=None):
     
     # Password (optional)
     password = None
-    if auth in ['auto', 'password']:
-        password_prompt = "Password (leave empty for key-based auth): " if auth == 'auto' else "Password: "
-        password = getpass.getpass(password_prompt)
-        if not password:
-            password = None
     
     # Create the server info
     server_info = ServerInfo(
