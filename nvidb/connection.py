@@ -372,7 +372,8 @@ class RemoteClient(BaseClient):
         print(f"Connecting to {self.host}:{self.port} as {self.username}")
         # catch the OSError exception when the host is not reachable
         try:
-            if "auto" == self.auth:
+            if self.auth == "auto":
+                # Auto mode: try key-based auth first, then password
                 try:
                     if self.password is not None:
                         self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
@@ -386,14 +387,45 @@ class RemoteClient(BaseClient):
                         # prompt to input password
                         password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
                         self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                        return True
                     except AuthenticationException as e:
                         logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
                         sys.exit(1)
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
                     sys.exit(1)
+            elif self.auth == "key":
+                # Key-based authentication only (no password fallback)
+                try:
+                    self.client.connect(hostname=self.host, port=self.port, username=self.username)
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (key auth)")
+                    return True
+                except AuthenticationException as e:
+                    logging.error(msg=f"Key-based authentication failed on {self.description}: {e}")
+                    return False
+                except NoValidConnectionsError as e:
+                    logging.error(msg=f"Connection failed: {e}")
+                    return False
+            elif self.auth == "password":
+                # Password authentication
+                try:
+                    if self.password is not None:
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
+                    else:
+                        # Prompt for password if not provided in config
+                        password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
+                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (password auth)")
+                    return True
+                except AuthenticationException as e:
+                    logging.error(msg=f"Password authentication failed on {self.description}: {e}")
+                    return False
+                except NoValidConnectionsError as e:
+                    logging.error(msg=f"Connection failed: {e}")
+                    return False
             else:
-                logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto' strategy.")
+                logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto', 'key', or 'password'.")
+                return False
         except OSError as e:
             logging.error(msg=f"Connection failed: {e}")
             return False
