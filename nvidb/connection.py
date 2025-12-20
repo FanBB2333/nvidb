@@ -879,8 +879,7 @@ class NVClientPool:
             self.selected_server = len(self.pool) - 1
         if self.selected_server < 0:
             self.selected_server = 0
-        
-        print(self.term.home + self.term.clear)
+
         update_display = "--:--:--"
         if last_update_time:
             update_display = time.strftime("%H:%M:%S", time.localtime(last_update_time))
@@ -889,10 +888,11 @@ class NVClientPool:
             fetch_display = f" ({last_fetch_duration:.1f}s)"
         warn_display = " | WARN: refresh failed" if last_fetch_error else ""
 
-        print(
+        output_lines = []
+        output_lines.append(
             f"Time: {current_time} | Updated: {update_display}{fetch_display} | Servers: {len(self.pool)} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
         )
-        print("-" * 80)
+        output_lines.append("-" * 80)
         
         for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
             is_selected = (idx == self.selected_server)
@@ -913,13 +913,18 @@ class NVClientPool:
             if is_selected:
                 header = self.term.reverse + header + self.term.normal
             
-            # Print header with summary on same line
-            print(f"{header}  {summary}")
+            # Header with summary on same line
+            output_lines.append(f"{header}  {summary}")
             
             # If expanded, print the full stats table (already formatted from get_client_gpus_info)
             if is_expanded:
-                print(stats_info)
-                print()  # Add spacing after expanded server
+                output_lines.extend(str(stats_info).splitlines())
+                output_lines.append("")  # Add spacing after expanded server
+
+        # Single write reduces visible flicker vs. clearing + many print() calls
+        screen = self.term.home + "\n".join(self.term.clear_eol + line for line in output_lines) + "\n" + self.term.clear_eos
+        sys.stdout.write(screen)
+        sys.stdout.flush()
 
     def _keyboard_listener(self):
         """Real-time keyboard listener thread, monitors keys for navigation and control"""
@@ -1024,19 +1029,17 @@ class NVClientPool:
         refresh_thread.start()
         
         try:
-            while not self.quit_flag.is_set():
-                # Display GPU status with time at top
-                # Always render from cache; data fetching happens in the background thread
+            with self.term.hidden_cursor():
+                # Initial draw (may show "Loading..." until first background refresh completes)
                 self.print_stats(use_cache=True)
-                
-                # Wait 1 second or until exit flag is set or refresh is needed
-                for _ in range(10):  # 1 second divided into 10 x 0.1 seconds
+
+                while not self.quit_flag.is_set():
+                    # Event-driven redraw: avoids back-to-back full redraws (less flicker)
+                    self.refresh_needed.wait(timeout=1.0)
+                    self.refresh_needed.clear()
                     if self.quit_flag.is_set():
                         break
-                    if self.refresh_needed.is_set():
-                        self.refresh_needed.clear()  # Reset the flag
-                        break  # Break early to refresh immediately
-                    time.sleep(0.1)
+                    self.print_stats(use_cache=True)
                 
         except KeyboardInterrupt:
             print("\n\n👋 Detected Ctrl+C, exiting program...")
