@@ -52,6 +52,49 @@ class BaseClient(ABC):
     def execute_command(self, command: str) -> str:
         """Execute a command and return the output"""
         pass
+
+    def _chunked(self, items, chunk_size: int):
+        for i in range(0, len(items), chunk_size):
+            yield items[i : i + chunk_size]
+
+    def get_pid_user_map(self, pids, chunk_size: int = 128):
+        """Batch query pid -> username mapping via a single ps call (or a few chunked calls)."""
+        if not pids:
+            return {}
+
+        # Clean and de-duplicate PIDs (preserve order)
+        seen = set()
+        unique_pids = []
+        for pid in pids:
+            pid_str = str(pid).strip()
+            if not pid_str or pid_str == "N/A":
+                continue
+            if pid_str in seen:
+                continue
+            seen.add(pid_str)
+            unique_pids.append(pid_str)
+
+        if not unique_pids:
+            return {}
+
+        pid_to_user = {}
+        for pid_chunk in self._chunked(unique_pids, chunk_size):
+            pid_list = ",".join(pid_chunk)
+            output = self.execute_command(f"ps -o pid=,user= -p {pid_list}")
+            if not isinstance(output, str) or not output.strip():
+                continue
+            for line in output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                pid_str, username = parts[0].strip(), parts[1].strip()
+                if pid_str and username:
+                    pid_to_user[pid_str] = username
+
+        return pid_to_user
     
     def test(self):
         """Test connection with ls command"""
@@ -188,56 +231,71 @@ class BaseClient(ABC):
             else:
                 stats = gpu_stats
             
+            process_entries = []
+            pids = []
+
+            # First pass: extract processes and collect all pids
+            for idx, row in stats.iterrows():
+                processes_element = row.get("processes")
+                if processes_element is None or not hasattr(processes_element, "findall"):
+                    continue
+                for process_info in processes_element.findall("process_info"):
+                    pid = safe_get_text(process_info, "pid", "N/A")
+                    process_name = safe_get_text(process_info, "process_name", "N/A")
+                    used_memory = safe_get_text(process_info, "used_memory", "0 MiB")
+                    gpu_instance_id = safe_get_text(process_info, "gpu_instance_id", "N/A")
+                    compute_instance_id = safe_get_text(process_info, "compute_instance_id", "N/A")
+                    process_type = safe_get_text(process_info, "type", "N/A")
+
+                    # Extract memory value in MiB
+                    memory_value = 0
+                    if used_memory != "N/A":
+                        try:
+                            memory_value = int(str(used_memory).replace("MiB", "").strip())
+                        except Exception:
+                            memory_value = 0
+
+                    pid_str = str(pid).strip()
+                    if pid_str and pid_str != "N/A":
+                        pids.append(pid_str)
+
+                    process_entries.append(
+                        {
+                            "gpu_instance_id": gpu_instance_id,
+                            "compute_instance_id": compute_instance_id,
+                            "pid": pid,
+                            "type": process_type,
+                            "process_name": process_name,
+                            "used_memory": used_memory,
+                            "gpu_index": idx,
+                            "_memory_value": memory_value,
+                        }
+                    )
+
+            pid_to_user = self.get_pid_user_map(pids)
+
             all_processes = []
             user_memory_summary = {}
-            
-            # Process each GPU's process information from the DataFrame
-            for idx, row in stats.iterrows():
-                processes_element = row.get('processes')
-                if processes_element is not None and hasattr(processes_element, 'findall'):
-                    for process_info in processes_element.findall('process_info'):
-                        pid = safe_get_text(process_info, 'pid', 'N/A')
-                        process_name = safe_get_text(process_info, 'process_name', 'N/A')
-                        used_memory = safe_get_text(process_info, 'used_memory', '0 MiB')
-                        gpu_instance_id = safe_get_text(process_info, 'gpu_instance_id', 'N/A')
-                        compute_instance_id = safe_get_text(process_info, 'compute_instance_id', 'N/A')
-                        process_type = safe_get_text(process_info, 'type', 'N/A')
-                        
-                        # Get username from pid using ps command
-                        username = 'N/A'
-                        if pid != 'N/A':
-                            try:
-                                user_result = self.execute_command(f'ps -o user= -p {pid}')
-                                username = user_result.strip() if user_result.strip() else 'N/A'
-                            except:
-                                username = 'N/A'
-                        
-                        # Extract memory value in MiB
-                        memory_value = 0
-                        if used_memory != 'N/A':
-                            try:
-                                memory_value = int(used_memory.replace('MiB', '').strip())
-                            except:
-                                memory_value = 0
-                        
-                        process_data = {
-                            'gpu_instance_id': gpu_instance_id,
-                            'compute_instance_id': compute_instance_id,
-                            'pid': pid,
-                            'type': process_type,
-                            'process_name': process_name,
-                            'used_memory': used_memory,
-                            'username': username,
-                            'gpu_index': idx
-                        }
-                        
-                        all_processes.append(process_data)
-                        
-                        # Accumulate memory usage by user
-                        if username != 'N/A' and memory_value > 0:
-                            if username not in user_memory_summary:
-                                user_memory_summary[username] = 0
-                            user_memory_summary[username] += memory_value
+            for entry in process_entries:
+                pid_str = str(entry.get("pid", "")).strip()
+                username = pid_to_user.get(pid_str, "N/A") if pid_str and pid_str != "N/A" else "N/A"
+
+                all_processes.append(
+                    {
+                        "gpu_instance_id": entry.get("gpu_instance_id", "N/A"),
+                        "compute_instance_id": entry.get("compute_instance_id", "N/A"),
+                        "pid": entry.get("pid", "N/A"),
+                        "type": entry.get("type", "N/A"),
+                        "process_name": entry.get("process_name", "N/A"),
+                        "used_memory": entry.get("used_memory", "0 MiB"),
+                        "username": username,
+                        "gpu_index": entry.get("gpu_index"),
+                    }
+                )
+
+                memory_value = entry.get("_memory_value", 0) or 0
+                if username != "N/A" and memory_value > 0:
+                    user_memory_summary[username] = user_memory_summary.get(username, 0) + memory_value
             
             return all_processes, user_memory_summary
             
@@ -397,6 +455,10 @@ class NVClientPool:
         self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
         self.cached_stats = None  # Cached GPU stats data
         self.cached_raw_stats = {}  # Cached raw stats per client index
+        self._cache_lock = threading.Lock()
+        self._last_update_time = None
+        self._last_fetch_duration = None
+        self._last_fetch_error = None
     
     def connect_all(self):
         self.pool = [client for client in self.pool if client.connect()]
@@ -433,13 +495,14 @@ class NVClientPool:
                 logging.error(msg=f"Unsupported result type: {type(result)}")
         return result
     
-    def get_client_gpus_info(self):
+    def get_client_gpus_info(self, return_raw: bool = False):
         # Set pandas display options for terminal output
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', None)  # Auto-fill terminal width
         pd.set_option('display.colheader_justify', 'center')  # Center column headers
         
         stats_str = []
+        raw_stats_by_client = {}
         for idx, client in enumerate(self.pool):
             result = client.get_full_gpu_info()
             
@@ -452,7 +515,7 @@ class NVClientPool:
                 system_info = {}
             
             # Cache raw stats for summary display (avoids redundant SSH calls)
-            self.cached_raw_stats[idx] = (stats.copy() if not stats.empty else stats, system_info)
+            raw_stats_by_client[idx] = (stats.copy() if not stats.empty else stats, system_info)
             
             # Skip processing if stats is empty
             if stats.empty:
@@ -478,20 +541,38 @@ class NVClientPool:
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
-            # Add process information as a column
+            # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)
             process_list = []
-            for idx, row in stats.iterrows():
-                try:
-                    # Get process summary for this GPU
-                    processes, user_summary = client.get_process_summary(stats.iloc[[idx]])
+            try:
+                all_processes, _ = client.get_process_summary(stats)
+
+                per_gpu_user_summary = {}
+                for proc in all_processes:
+                    gpu_idx = proc.get("gpu_index")
+                    username = proc.get("username")
+                    used_memory = proc.get("used_memory", "0 MiB")
+
+                    if not username or username == "N/A":
+                        continue
+                    try:
+                        memory_value = int(str(used_memory).replace("MiB", "").strip())
+                    except Exception:
+                        memory_value = 0
+                    if memory_value <= 0:
+                        continue
+
+                    gpu_summary = per_gpu_user_summary.setdefault(gpu_idx, {})
+                    gpu_summary[username] = gpu_summary.get(username, 0) + memory_value
+
+                for gpu_idx, _row in stats.iterrows():
+                    user_summary = per_gpu_user_summary.get(gpu_idx, {})
                     if user_summary:
-                        process_info = client.format_user_memory_compact(user_summary)
+                        process_list.append(client.format_user_memory_compact(user_summary))
                     else:
-                        process_info = "-"
-                    process_list.append(process_info)
-                except Exception as e:
-                    logging.warning(f"Failed to get process info for GPU {idx}: {e}")
-                    process_list.append("-")
+                        process_list.append("-")
+            except Exception as e:
+                logging.warning(f"Failed to get process info: {e}")
+                process_list = ["-" for _ in range(len(stats))]
             
             stats['processes'] = process_list
 
@@ -526,6 +607,8 @@ class NVClientPool:
                 system_info_header = f"Driver: {system_info.get('driver_version', 'N/A')} | CUDA: {system_info.get('cuda_version', 'N/A')} | GPUs: {system_info.get('attached_gpus', '0')}\n"
             
             formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{system_info_header}{formatted_table}")
+        if return_raw:
+            return formatted_stats, raw_stats_by_client
         return formatted_stats
     
     def _format_fixed_width_table(self, df):
@@ -753,12 +836,41 @@ class NVClientPool:
     def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
         # Fetch new data or use cache
-        # Raw stats are cached inside get_client_gpus_info() during data fetch
-        if use_cache and self.cached_stats is not None:
-            stats_list = self.cached_stats
+        if use_cache:
+            with self._cache_lock:
+                stats_list = self.cached_stats
+                raw_stats_by_client = self.cached_raw_stats
+                last_update_time = self._last_update_time
+                last_fetch_duration = self._last_fetch_duration
+                last_fetch_error = self._last_fetch_error
         else:
-            stats_list = self.get_client_gpus_info()
-            self.cached_stats = stats_list
+            fetch_started_at = time.time()
+            try:
+                stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
+                fetch_error = None
+            except Exception as e:
+                stats_list, raw_stats_by_client = None, {}
+                fetch_error = e
+            fetch_duration = time.time() - fetch_started_at
+
+            with self._cache_lock:
+                if stats_list is not None:
+                    self.cached_stats = stats_list
+                    self.cached_raw_stats = raw_stats_by_client
+                    self._last_update_time = time.time()
+                    self._last_fetch_error = None
+                else:
+                    self._last_fetch_error = fetch_error
+                self._last_fetch_duration = fetch_duration
+
+            last_update_time = self._last_update_time
+            last_fetch_duration = self._last_fetch_duration
+            last_fetch_error = self._last_fetch_error
+
+        if stats_list is None:
+            stats_list = ["Loading..."] * len(self.pool)
+        if not isinstance(raw_stats_by_client, dict):
+            raw_stats_by_client = {}
         
         current_time = time.strftime("%H:%M:%S")
         
@@ -769,7 +881,17 @@ class NVClientPool:
             self.selected_server = 0
         
         print(self.term.home + self.term.clear)
-        print(f"Time: {current_time} | Servers: {len(self.pool)} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit")
+        update_display = "--:--:--"
+        if last_update_time:
+            update_display = time.strftime("%H:%M:%S", time.localtime(last_update_time))
+        fetch_display = ""
+        if isinstance(last_fetch_duration, (int, float)):
+            fetch_display = f" ({last_fetch_duration:.1f}s)"
+        warn_display = " | WARN: refresh failed" if last_fetch_error else ""
+
+        print(
+            f"Time: {current_time} | Updated: {update_display}{fetch_display} | Servers: {len(self.pool)} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
+        )
         print("-" * 80)
         
         for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
@@ -777,11 +899,7 @@ class NVClientPool:
             is_expanded = (idx in self.expanded_servers)
             
             # Use cached raw stats for summary
-            if idx in self.cached_raw_stats:
-                stats, system_info = self.cached_raw_stats[idx]
-            else:
-                stats = pd.DataFrame()
-                system_info = {}
+            stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
             
             # Build summary
             summary = self._get_server_summary(stats, system_info)
@@ -854,6 +972,37 @@ class NVClientPool:
                         break
         except:
             pass
+
+    def _background_refresh(self, interval_seconds: float = 1.0):
+        """Background thread: fetch stats periodically so UI thread stays responsive."""
+        while not self.quit_flag.is_set():
+            fetch_started_at = time.time()
+            try:
+                stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
+                fetch_error = None
+            except Exception as e:
+                stats_list, raw_stats_by_client = None, {}
+                fetch_error = e
+            fetch_duration = time.time() - fetch_started_at
+
+            with self._cache_lock:
+                if stats_list is not None:
+                    self.cached_stats = stats_list
+                    self.cached_raw_stats = raw_stats_by_client
+                    self._last_update_time = time.time()
+                    self._last_fetch_error = None
+                else:
+                    self._last_fetch_error = fetch_error
+                self._last_fetch_duration = fetch_duration
+
+            # Trigger UI refresh (both for new data and errors)
+            self.refresh_needed.set()
+
+            # Keep a minimum idle interval between refreshes to avoid hammering remote hosts
+            sleep_seconds = max(0.0, interval_seconds)
+            end_time = time.time() + sleep_seconds
+            while time.time() < end_time and not self.quit_flag.is_set():
+                time.sleep(0.1)
     
     def print_refresh(self):
         """Real-time GPU status display with global keyboard monitoring"""
@@ -869,13 +1018,16 @@ class NVClientPool:
         # Start keyboard listener thread
         keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
         keyboard_thread.start()
+
+        # Start background data refresh thread (prevents remote SSH calls from blocking UI)
+        refresh_thread = threading.Thread(target=self._background_refresh, daemon=True)
+        refresh_thread.start()
         
         try:
             while not self.quit_flag.is_set():
                 # Display GPU status with time at top
-                # Use cache for UI-only refreshes (navigation), fetch new data otherwise
-                self.print_stats(use_cache=self.ui_only_refresh)
-                self.ui_only_refresh = False  # Reset the flag
+                # Always render from cache; data fetching happens in the background thread
+                self.print_stats(use_cache=True)
                 
                 # Wait 1 second or until exit flag is set or refresh is needed
                 for _ in range(10):  # 1 second divided into 10 x 0.1 seconds
@@ -900,15 +1052,10 @@ class NVClientPool:
         print("=" * 80)
         
         # Get stats
-        stats_list = self.get_client_gpus_info()
+        stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
         
         for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
-            # Use cached raw stats for summary
-            if idx in self.cached_raw_stats:
-                stats, system_info = self.cached_raw_stats[idx]
-            else:
-                stats = pd.DataFrame()
-                system_info = {}
+            stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
             
             # Build summary
             summary = self._get_server_summary(stats, system_info)
