@@ -362,7 +362,8 @@ class RemoteClient(BaseClient):
         self.password = server.password
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.client.load_system_host_keys()
+        if self.auth in ['auto', 'key']:
+            self.client.load_system_host_keys()
     
     def __del__(self):
         self.client.close()
