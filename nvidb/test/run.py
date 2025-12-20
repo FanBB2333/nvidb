@@ -186,9 +186,9 @@ def show_info(config_path=None):
     """Show configuration information."""
     config_path = config_path or config.get_config_path()
     
-    print("\n" + "=" * 50)
+    print("\n" + "-" * 50)
     print("         nvidb Configuration Info")
-    print("=" * 50 + "\n")
+    print("-" * 50 + "\n")
     
     # Working directory info
     print(f"Working Directory: {config.WORKING_DIR}")
@@ -207,10 +207,8 @@ def show_info(config_path=None):
     
     if not Path(config_path).exists():
         print(f"   Status: Not found")
-        print("\n   Run 'nvidb add' to add your first server.")
-        return
-    
-    print(f"   Status: Exists")
+    else:
+        print(f"   Status: Exists")
     
     # Database file info
     db_path = config.get_db_path()
@@ -220,26 +218,36 @@ def show_info(config_path=None):
     else:
         print(f"   Status: Not created yet")
     
-    # Load and display server info
+    print("\n" + "-" * 50)
+
+
+def show_servers(config_path=None, detail=False):
+    """Show configured server list."""
+    config_path = config_path or config.get_config_path()
+    
+    if not Path(config_path).exists():
+        print("\nNo servers configured yet.")
+        print("Run 'nvidb add' to add your first server.")
+        return
+    
+    # Load server info
     try:
         with open(config_path, 'r') as f:
             cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
     except Exception as e:
-        print(f"   Error reading config: {e}")
+        print(f"Error reading config: {e}")
         return
     
     servers = cfg.get('servers', [])
     server_count = len(servers)
     
-    print(f"\nTotal Servers: {server_count}")
-    
     if server_count == 0:
-        print("\n   No servers configured yet.")
-        print("   Run 'nvidb add' to add a server.")
+        print("\nNo servers configured yet.")
+        print("Run 'nvidb add' to add a server.")
         return
     
     print("\n" + "-" * 50)
-    print("Server List:")
+    print(f"         Server List ({server_count} servers)")
     print("-" * 50)
     
     for idx, server in enumerate(servers):
@@ -247,16 +255,20 @@ def show_info(config_path=None):
         port = server.get('port', 22)
         username = server.get('username', 'N/A')
         description = server.get('description', f'{username}@{host}:{port}')
-        auth = server.get('auth', 'auto')
-        has_password = 'Yes' if server.get('password') else 'No'
         
-        print(f"\n  [{idx + 1}] {description}")
-        print(f"      Host:     {host}:{port}")
-        print(f"      User:     {username}")
-        print(f"      Auth:     {auth}")
-        print(f"      Password: {has_password}")
+        if detail:
+            auth = server.get('auth', 'auto')
+            has_password = 'Yes' if server.get('password') else 'No'
+            
+            print(f"\n  [{idx + 1}] {description}")
+            print(f"      Host:     {host}:{port}")
+            print(f"      User:     {username}")
+            print(f"      Auth:     {auth}")
+            print(f"      Password: {has_password}")
+        else:
+            print(f"  [{idx + 1}] {description} ({host}:{port})")
     
-    print("\n" + "=" * 50)
+    print("\n" + "-" * 50)
 
 
 def interactive_clean(clean_all=False):
@@ -454,8 +466,8 @@ def main():
     parser.add_argument('--once', action='store_true', help='Print GPU stats once and exit (no TUI loop)')
     
     subparsers = parser.add_subparsers(dest='command')
-    ls_parser = subparsers.add_parser('ls', help='List items')
-    ls_parser.add_argument('--detail', action='store_true', help='Show detailed list')
+    ls_parser = subparsers.add_parser('ls', help='List configured servers')
+    ls_parser.add_argument('--detail', action='store_true', help='Show detailed server information')
     add_parser = subparsers.add_parser('add', help='Add a server interactively')
     info_parser = subparsers.add_parser('info', help='Show configuration info')
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
@@ -471,10 +483,7 @@ def main():
         server_list = None
     
     if args.command == 'ls':
-        if args.detail:
-            print("Showing detailed list of items.")
-        else:
-            print("Showing list of items.")
+        show_servers(detail=args.detail)
     elif args.command == 'add':
         interactive_add_server()
     elif args.command == 'info':
