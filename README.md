@@ -136,6 +136,56 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `c` | Collapse all servers |
 | `q` | Quit |
 
+### 2.6 GPU Monitor Decorator
+
+Use the `@nvidb.monitor` decorator to track GPU usage during function execution:
+
+```python
+import nvidb
+
+@nvidb.monitor
+def train_model():
+    # Your training code here
+    pass
+
+# With custom options
+@nvidb.monitor(sample_interval=0.05, gpu_indices=[0, 1])
+def multi_gpu_training(epochs: int = 100):
+    pass
+
+# Async function support
+@nvidb.monitor
+async def async_training():
+    pass
+```
+
+After function execution, it outputs:
+```
+======================================================================
+[nvidb.monitor] Function completed: train_model
+  Signature: train_model()
+  Location: /path/to/file.py:14
+----------------------------------------------------------------------
+  Duration: 125.3s
+----------------------------------------------------------------------
+  GPU 0: NVIDIA GeForce RTX 3090 Ti
+    Memory:
+      Peak:    8192.00 MiB / 24.00 GiB
+      Delta:   +6144.00 MiB
+    Utilization:
+      Avg:     85.0%
+    Temperature:
+      Peak:    72C
+    Power:
+      Peak:    320.5W
+======================================================================
+```
+
+**Decorator Options:**
+- `sample_interval`: Sampling interval in seconds (default: 0.1)
+- `gpu_indices`: List of GPU indices to monitor (default: all GPUs)
+- `enabled`: Enable/disable monitoring (default: True)
+
 ---
 
 ## 3. Sample Output
