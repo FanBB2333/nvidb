@@ -192,7 +192,6 @@ def show_info(config_path=None):
     
     # Working directory info
     print(f"Working Directory: {config.WORKING_DIR}")
-    print(f"   (Override with NVIDB_HOME environment variable)")
     
     # Disk usage statistics
     if Path(config.WORKING_DIR).exists():
