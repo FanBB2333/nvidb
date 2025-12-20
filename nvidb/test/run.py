@@ -122,15 +122,14 @@ def interactive_add_server(config_path=None):
         config_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Load existing config or create new one
-        import yaml
         if config_path.exists():
             with open(config_path, 'r') as f:
-                config = yaml.load(f, Loader=yaml.FullLoader) or {}
+                cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
         else:
-            config = {}
+            cfg = {}
         
-        if 'servers' not in config:
-            config['servers'] = []
+        if 'servers' not in cfg:
+            cfg['servers'] = []
         
         # Add the new server
         server_dict = {
@@ -143,11 +142,11 @@ def interactive_add_server(config_path=None):
         if password:
             server_dict['password'] = password
         
-        config['servers'].append(server_dict)
+        cfg['servers'].append(server_dict)
         
         # Save to file
         with open(config_path, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False)
+            yaml.dump(cfg, f, default_flow_style=False)
         
         print(f"\nServer added successfully to {config_path}")
     else:
