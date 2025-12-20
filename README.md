@@ -46,22 +46,15 @@ cp config.example.yml ~/.nvidb/config.yml
 # Edit the file with your server details
 ```
 
-Configuration file structure:
+Configuration file [template](config.example.yml):
 
 ```yaml
 servers:
-  - host: "example1.com"
-    port: 22
-    username: "user1"
-    description: "Description of the first server"
-    auth: "auto"  # auto | key | password
-    
-  - host: "example2.com"
-    port: 22
-    username: "user2"
-    password: "password2"  # Optional, prompted if not set
-    description: "Description of the second server"
-    auth: "auto"
+  - host: "example1.com"           # Server hostname or IP address
+    port: 22                       # SSH port number
+    username: "user1"              # SSH username for authentication
+    description: "Production GPU"  # Human-readable description for display
+    auth: "auto"                   # Authentication method: auto | key | password
 ```
 
 **Configuration Options:**
@@ -129,14 +122,14 @@ nvidb clean all          # Delete all data (requires double confirmation)
 
 When viewing GPU stats, use these keyboard shortcuts:
 
-| Key | Action |
-|-----|--------|
-| `j` / `↓` | Move selection down |
-| `k` / `↑` | Move selection up |
+| Key               | Action                        |
+| ----------------- | ----------------------------- |
+| `j` / `↓`         | Move selection down           |
+| `k` / `↑`         | Move selection up             |
 | `Enter` / `Space` | Toggle expand/collapse server |
-| `a` | Expand all servers |
-| `c` | Collapse all servers |
-| `q` | Quit |
+| `a`               | Expand all servers            |
+| `c`               | Collapse all servers          |
+| `q`               | Quit                          |
 
 ### 2.6 GPU Monitor Decorator
 
