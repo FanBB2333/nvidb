@@ -841,3 +841,29 @@ class NviClientPool:
         finally:
             self.quit_flag.set()  # Ensure thread exits
 
+    def print_once(self):
+        """Print GPU stats once and exit (no TUI loop)"""
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"Time: {current_time} | Servers: {len(self.pool)}")
+        print("=" * 80)
+        
+        # Get stats
+        stats_list = self.get_client_gpus_info()
+        
+        for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
+            # Use cached raw stats for summary
+            if idx in self.cached_raw_stats:
+                stats, system_info = self.cached_raw_stats[idx]
+            else:
+                stats = pd.DataFrame()
+                system_info = {}
+            
+            # Build summary
+            summary = self._get_server_summary(stats, system_info)
+            
+            # Print header with summary
+            print(f"[{idx + 1}] {client.description}  {summary}")
+            
+            # Print the full stats table
+            print(stats_info)
+            print()  # Add spacing after each server

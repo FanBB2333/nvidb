@@ -89,8 +89,10 @@ Default working directory is `~/.nvidb/`.
 ### 2.1 Basic Commands
 
 ```bash
-nvidb                  # Monitor local GPU only
+nvidb                  # Monitor local GPU only (interactive TUI)
 nvidb --remote         # Monitor local and remote servers
+nvidb --once           # Print GPU stats once and exit
+nvidb --once --remote  # Print all servers once and exit
 nvidb --version        # Show version
 ```
 

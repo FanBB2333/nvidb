@@ -416,6 +416,7 @@ def main():
     parser = argparse.ArgumentParser(prog="nvidb", description="A simple tool to manage Nvidia GPU servers.")
     parser.add_argument('--version', action='version', version=f'nvidb {config.VERSION}')
     parser.add_argument('--remote', action='store_true', help='Use remote servers')
+    parser.add_argument('--once', action='store_true', help='Print GPU stats once and exit (no TUI loop)')
     
     subparsers = parser.add_subparsers(dest='command')
     ls_parser = subparsers.add_parser('ls', help='List items')
@@ -454,7 +455,10 @@ def main():
     else:
         # Default action: run interactive monitoring
         pool = NviClientPool(server_list)
-        pool.print_refresh()
+        if args.once:
+            pool.print_once()
+        else:
+            pool.print_refresh()
 
 if __name__ == "__main__":
     # python -m nvidb.test.run
