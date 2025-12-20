@@ -877,8 +877,8 @@ class NviClientPool:
                 self.print_stats(use_cache=self.ui_only_refresh)
                 self.ui_only_refresh = False  # Reset the flag
                 
-                # Wait 2 seconds or until exit flag is set or refresh is needed
-                for _ in range(20):  # 2 seconds divided into 20 x 0.1 seconds
+                # Wait 1 second or until exit flag is set or refresh is needed
+                for _ in range(10):  # 1 second divided into 10 x 0.1 seconds
                     if self.quit_flag.is_set():
                         break
                     if self.refresh_needed.is_set():
