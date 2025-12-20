@@ -368,6 +368,48 @@ class RemoteClient(BaseClient):
     def __del__(self):
         self.client.close()
         logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
+    
+    def _authenticate_with_password(self, max_attempts=3) -> bool:
+        """Attempt password authentication with retry limit.
+        
+        Args:
+            max_attempts: Maximum number of password attempts (default: 3)
+            
+        Returns:
+            bool: True if authentication succeeds
+            
+        Raises:
+            SystemExit: If authentication fails after max_attempts
+        """
+        for attempt in range(max_attempts):
+            try:
+                if self.password is not None and attempt == 0:
+                    # First attempt: try with pre-configured password if available
+                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
+                    return True
+                else:
+                    # Prompt user for password
+                    remaining = max_attempts - attempt
+                    if attempt > 0:
+                        logging.warning(msg=f"Authentication failed. {remaining} attempt(s) remaining.")
+                        print(f"  ⚠ Authentication failed. {remaining} attempt(s) remaining.")
+                    
+                    password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
+                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
+                    return True
+                    
+            except AuthenticationException as e:
+                if attempt == max_attempts - 1:
+                    # Last attempt failed
+                    logging.error(msg=f"Password authentication failed after {max_attempts} attempts on {self.description}, exiting...")
+                    print(f"  ✗ Password authentication failed after {max_attempts} attempts.")
+                    sys.exit(1)
+                # Continue to next attempt
+                continue
+        
+        return False
 
     def connect(self) -> bool:
         print(f"Connecting to {self.host}:{self.port} as {self.username}")
@@ -383,15 +425,9 @@ class RemoteClient(BaseClient):
                     logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
                     return True
                 except AuthenticationException as e:
-                    logging.error(msg=f"Authentication failed on {self.description}")
-                    try:
-                        # prompt to input password
-                        password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
-                        return True
-                    except AuthenticationException as e:
-                        logging.error(msg=f"Password authentication failed on {self.description}, exiting...")
-                        sys.exit(1)
+                    logging.error(msg=f"Key-based authentication failed on {self.description}, trying password...")
+                    # Use the new password authentication method with retry limit
+                    return self._authenticate_with_password()
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
                     sys.exit(1)
@@ -408,19 +444,9 @@ class RemoteClient(BaseClient):
                     logging.error(msg=f"Connection failed: {e}")
                     return False
             elif self.auth == "password":
-                # Password authentication
+                # Password authentication with retry limit
                 try:
-                    if self.password is not None:
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
-                    else:
-                        # Prompt for password if not provided in config
-                        password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (password auth)")
-                    return True
-                except AuthenticationException as e:
-                    logging.error(msg=f"Password authentication failed on {self.description}: {e}")
-                    return False
+                    return self._authenticate_with_password()
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
                     return False
