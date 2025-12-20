@@ -4,7 +4,7 @@ import logging
 import argparse
 import shutil
 from pathlib import Path
-from ..connection import RemoteClient, NviClientPool
+from ..connection import RemoteClient, NVClientPool
 from ..data_modules import ServerInfo, ServerListInfo
 from ..logger import run_sqlite_logger
 from .. import config
@@ -400,7 +400,7 @@ def test_get_gpu_stats():
     logging.info(msg=s)
 
 def test_get_all_stats(server_list):
-    pool = NviClientPool(server_list)
+    pool = NVClientPool(server_list)
     pool.print_refresh()
     # pool.execute_command(command='nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv')
     # pool.execute_command(command='nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.memory,utilization.gpu --format=csv,nounits')
@@ -454,7 +454,7 @@ def main():
         interactive_clean(clean_all=(args.target == 'all'))
     else:
         # Default action: run interactive monitoring
-        pool = NviClientPool(server_list)
+        pool = NVClientPool(server_list)
         if args.once:
             pool.print_once()
         else:

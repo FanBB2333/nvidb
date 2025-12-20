@@ -381,7 +381,7 @@ class LocalClient(BaseClient):
             return f"Unexpected error: {str(e)}"
 
 
-class NviClientPool:
+class NVClientPool:
     def __init__(self, server_list: ServerListInfo):
         self.pool = [LocalClient()]
         if server_list is not None:

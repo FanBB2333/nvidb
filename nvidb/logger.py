@@ -5,7 +5,7 @@ import threading
 import sys
 from datetime import datetime
 from pathlib import Path
-from .connection import NviClientPool
+from .connection import NVClientPool
 from .data_modules import ServerListInfo
 from . import config
 
@@ -142,13 +142,13 @@ class NVLoggerSQLite:
         logging.info(f"Flushed {buffer_count} records to database")
     
     def initialize_client_pool(self):
-        """Initialize NviClientPool for data collection."""
+        """Initialize NVClientPool for data collection."""
         try:
-            self.client_pool = NviClientPool(self.server_list)
-            logging.info("NviClientPool initialized successfully")
+            self.client_pool = NVClientPool(self.server_list)
+            logging.info("NVClientPool initialized successfully")
             return True
         except Exception as e:
-            logging.error(f"Failed to initialize NviClientPool: {e}")
+            logging.error(f"Failed to initialize NVClientPool: {e}")
             return False
     
     def start_logging(self):
@@ -192,7 +192,7 @@ class NVLoggerSQLite:
                 time.sleep(self.interval)
     
     def _collect_data(self):
-        """Collect data from NviClientPool and buffer it."""
+        """Collect data from NVClientPool and buffer it."""
         if not self.client_pool:
             return
         
