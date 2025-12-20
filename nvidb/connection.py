@@ -1024,55 +1024,54 @@ class NVClientPool:
         sys.stdout.write(screen)
         sys.stdout.flush()
 
-    def _keyboard_listener(self):
+    def _keyboard_listener(self, cbreak_context):
         """Real-time keyboard listener thread, monitors keys for navigation and control"""
         try:
-            with self.term.cbreak():  # Enable character-by-character input
-                while not self.quit_flag.is_set():
-                    try:
-                        key = self.term.inkey(timeout=0.1)  # Non-blocking input with timeout
-                        if key:
-                            key_name = key.name if hasattr(key, 'name') and key.name else str(key)
-                            key_lower = str(key).lower()
-                            
-                            if key_lower == 'q':
-                                self.quit_flag.set()
-                                break
-                            elif key_lower == 'h':
-                                # Show help - will be overwritten on next refresh
-                                pass
-                            elif key_lower == 'j' or key_name == 'KEY_DOWN':
-                                # Move selection down
-                                if self.selected_server < len(self.pool) - 1:
-                                    self.selected_server += 1
-                                    self.ui_only_refresh = True  # Use cached data for fast UI update
-                                    self.refresh_needed.set()  # Trigger immediate refresh
-                            elif key_lower == 'k' or key_name == 'KEY_UP':
-                                # Move selection up
-                                if self.selected_server > 0:
-                                    self.selected_server -= 1
-                                    self.ui_only_refresh = True  # Use cached data for fast UI update
-                                    self.refresh_needed.set()  # Trigger immediate refresh
-                            elif key_name == 'KEY_ENTER' or key_lower == ' ' or key == '\n' or key == '\r':
-                                # Toggle expand/collapse for selected server
-                                if self.selected_server in self.expanded_servers:
-                                    self.expanded_servers.discard(self.selected_server)
-                                else:
-                                    self.expanded_servers.add(self.selected_server)
+            while not self.quit_flag.is_set():
+                try:
+                    key = self.term.inkey(timeout=0.1)  # Non-blocking input with timeout
+                    if key:
+                        key_name = key.name if hasattr(key, 'name') and key.name else str(key)
+                        key_lower = str(key).lower()
+                        
+                        if key_lower == 'q':
+                            self.quit_flag.set()
+                            break
+                        elif key_lower == 'h':
+                            # Show help - will be overwritten on next refresh
+                            pass
+                        elif key_lower == 'j' or key_name == 'KEY_DOWN':
+                            # Move selection down
+                            if self.selected_server < len(self.pool) - 1:
+                                self.selected_server += 1
                                 self.ui_only_refresh = True  # Use cached data for fast UI update
                                 self.refresh_needed.set()  # Trigger immediate refresh
-                            elif key_lower == 'a':
-                                # Expand all servers
-                                self.expanded_servers = set(range(len(self.pool)))
+                        elif key_lower == 'k' or key_name == 'KEY_UP':
+                            # Move selection up
+                            if self.selected_server > 0:
+                                self.selected_server -= 1
                                 self.ui_only_refresh = True  # Use cached data for fast UI update
                                 self.refresh_needed.set()  # Trigger immediate refresh
-                            elif key_lower == 'c':
-                                # Collapse all servers
-                                self.expanded_servers.clear()
-                                self.ui_only_refresh = True  # Use cached data for fast UI update
-                                self.refresh_needed.set()  # Trigger immediate refresh
-                    except KeyboardInterrupt:
-                        break
+                        elif key_name == 'KEY_ENTER' or key_lower == ' ' or key == '\n' or key == '\r':
+                            # Toggle expand/collapse for selected server
+                            if self.selected_server in self.expanded_servers:
+                                self.expanded_servers.discard(self.selected_server)
+                            else:
+                                self.expanded_servers.add(self.selected_server)
+                            self.ui_only_refresh = True  # Use cached data for fast UI update
+                            self.refresh_needed.set()  # Trigger immediate refresh
+                        elif key_lower == 'a':
+                            # Expand all servers
+                            self.expanded_servers = set(range(len(self.pool)))
+                            self.ui_only_refresh = True  # Use cached data for fast UI update
+                            self.refresh_needed.set()  # Trigger immediate refresh
+                        elif key_lower == 'c':
+                            # Collapse all servers
+                            self.expanded_servers.clear()
+                            self.ui_only_refresh = True  # Use cached data for fast UI update
+                            self.refresh_needed.set()  # Trigger immediate refresh
+                except KeyboardInterrupt:
+                    break
         except:
             pass
 
@@ -1118,15 +1117,19 @@ class NVClientPool:
         print("   q              : Quit")
         print("=" * 60)
         
-        # Start keyboard listener thread
-        keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
-        keyboard_thread.start()
-
-        # Start background data refresh thread (prevents remote SSH calls from blocking UI)
-        refresh_thread = threading.Thread(target=self._background_refresh, daemon=True)
-        refresh_thread.start()
+        # Use cbreak context in main thread for proper cleanup on Ctrl+C
+        cbreak_ctx = self.term.cbreak()
+        cbreak_ctx.__enter__()
         
         try:
+            # Start keyboard listener thread (uses cbreak mode from main thread)
+            keyboard_thread = threading.Thread(target=self._keyboard_listener, args=(cbreak_ctx,), daemon=True)
+            keyboard_thread.start()
+
+            # Start background data refresh thread (prevents remote SSH calls from blocking UI)
+            refresh_thread = threading.Thread(target=self._background_refresh, daemon=True)
+            refresh_thread.start()
+            
             with self.term.hidden_cursor():
                 # Initial draw (may show "Loading..." until first background refresh completes)
                 self.print_stats(use_cache=True)
@@ -1140,11 +1143,18 @@ class NVClientPool:
                     self.print_stats(use_cache=True)
                 
         except KeyboardInterrupt:
-            print("\n\n👋 Detected Ctrl+C, exiting program...")
+            pass  # Silently exit on Ctrl+C
         except Exception as e:
-            print(f"\n\n❌ Error occurred: {e}")
+            print(f"\n\n Error occurred: {e}")
         finally:
             self.quit_flag.set()  # Ensure thread exits
+            # Explicitly exit cbreak mode to restore terminal state
+            try:
+                cbreak_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            # Print newline to ensure clean prompt
+            print()
 
     def print_once(self):
         """Print GPU stats once and exit (no TUI loop)"""
