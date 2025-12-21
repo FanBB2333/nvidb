@@ -3,6 +3,7 @@ import getpass
 import logging
 import argparse
 import shutil
+import json
 from pathlib import Path
 from ..connection import RemoteClient, NVClientPool
 from ..data_modules import ServerInfo, ServerListInfo
@@ -25,6 +26,51 @@ def init(config_path=None):
     server_list: ServerListInfo = ServerListInfo.from_yaml(config_path)
     cli = RemoteClient(server_list[0])
     return server_list
+
+
+def _dq(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _format_servers_yaml(servers) -> str:
+    lines = ["servers:"]
+
+    for i, server in enumerate(servers):
+        if i > 0:
+            lines.append("")
+        lines.append(f"  - host: {_dq(server.get('host', ''))}")
+
+        port = server.get("port", 22)
+        try:
+            port_int = int(port)
+        except Exception:
+            port_int = 22
+        lines.append(f"    port: {port_int}")
+
+        username = server.get("username")
+        if username is not None:
+            lines.append(f"    username: {_dq(username)}")
+
+        password = server.get("password")
+        if password:
+            lines.append(f"    password: {_dq(password)}")
+
+        description = server.get("description")
+        if description is not None:
+            lines.append(f"    description: {_dq(description)}")
+
+        auth = server.get("auth", "auto")
+        if auth is not None:
+            lines.append(f"    auth: {_dq(auth)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _write_config_yaml(config_path: Path, cfg: dict):
+    config_path = Path(config_path).expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    servers = cfg.get("servers", []) or []
+    config_path.write_text(_format_servers_yaml(servers), encoding="utf-8")
 
 
 def interactive_add_server(config_path=None):
@@ -140,9 +186,7 @@ def interactive_add_server(config_path=None):
         
         cfg['servers'].append(server_dict)
         
-        # Save to file
-        with open(config_path, 'w') as f:
-            yaml.dump(cfg, f, default_flow_style=False)
+        _write_config_yaml(config_path, cfg)
         
         print(f"\nServer added successfully to {config_path}")
     else:
@@ -367,8 +411,7 @@ def _clean_server(config_path):
             servers.pop(idx)
             cfg['servers'] = servers
             
-            with open(config_path, 'w') as f:
-                yaml.dump(cfg, f, default_flow_style=False)
+            _write_config_yaml(config_path, cfg)
             
             print(f"\nServer removed successfully.")
         else:

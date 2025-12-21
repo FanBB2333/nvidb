@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 from blessed import Terminal
 import logging
 import sys
@@ -42,6 +42,14 @@ class BaseClient(ABC):
         self.port = None
         self.username = None
         self.description = None
+        self.connected = False
+        self.last_connect_error = None
+        self.last_error_type = None
+
+    def _set_connect_error(self, message: str, error_type: str = "error"):
+        self.connected = False
+        self.last_connect_error = message
+        self.last_error_type = error_type
     
     @abstractmethod
     def connect(self) -> bool:
@@ -127,6 +135,11 @@ class BaseClient(ABC):
     
     def get_full_gpu_info(self):
         """Get complete GPU information from nvidia-smi XML output"""
+        if getattr(self, "connected", True) is False:
+            error_message = getattr(self, "last_connect_error", None) or "Not connected"
+            error_type = getattr(self, "last_error_type", None) or "error"
+            return pd.DataFrame(), {"error": error_message, "error_type": error_type}
+
         def safe_get_text(element, path, default="N/A"):
             """Safely get text from XML element, return default if not found"""
             if element is None:
@@ -369,46 +382,57 @@ class RemoteClient(BaseClient):
         self.client.close()
         logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
     
-    def _authenticate_with_password(self, max_attempts=3) -> bool:
+    def _authenticate_with_password(self, max_attempts=3, *, prompt_only: bool = False) -> bool:
         """Attempt password authentication with retry limit.
         
         Args:
             max_attempts: Maximum number of password attempts (default: 3)
+            prompt_only: Do not try any configured password; always prompt (default: False)
             
         Returns:
             bool: True if authentication succeeds
             
-        Raises:
-            SystemExit: If authentication fails after max_attempts
         """
         for attempt in range(max_attempts):
             try:
-                if self.password is not None and attempt == 0:
-                    # First attempt: try with pre-configured password if available
-                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
-                    return True
+                password = None
+                if not prompt_only and self.password is not None and attempt == 0:
+                    password = self.password
                 else:
-                    # Prompt user for password
                     remaining = max_attempts - attempt
                     if attempt > 0:
                         logging.warning(msg=f"Authentication failed. {remaining} attempt(s) remaining.")
                         print(f"  ⚠ Authentication failed. {remaining} attempt(s) remaining.")
-                    
-                    password = getpass.getpass(prompt=f'Enter password for {self.username}@{self.host}:{self.port} -> ')
-                    self.client.connect(hostname=self.host, port=self.port, username=self.username, password=password)
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
-                    return True
+                    password = getpass.getpass(prompt=f"Enter password for {self.username}@{self.host}:{self.port} -> ")
+
+                self.client.connect(
+                    hostname=self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=password,
+                    allow_agent=False,
+                    look_for_keys=False,
+                )
+                self.connected = True
+                self.last_connect_error = None
+                self.last_error_type = None
+                logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
+                return True
                     
             except AuthenticationException as e:
                 if attempt == max_attempts - 1:
-                    # Last attempt failed
-                    logging.error(msg=f"Password authentication failed after {max_attempts} attempts on {self.description}, exiting...")
-                    print(f"  ✗ Password authentication failed after {max_attempts} attempts.")
-                    sys.exit(1)
-                # Continue to next attempt
+                    logging.error(
+                        msg=f"Password authentication failed after {max_attempts} attempts on {self.description}"
+                    )
+                    self._set_connect_error("Password incorrect", error_type="auth")
+                    return False
                 continue
-        
+            except Exception as e:
+                logging.error(msg=f"Password authentication error on {self.description}: {e}")
+                self._set_connect_error(str(e), error_type="connect")
+                return False
+
+        self._set_connect_error("Password incorrect", error_type="auth")
         return False
 
     def connect(self) -> bool:
@@ -418,10 +442,16 @@ class RemoteClient(BaseClient):
             if self.auth == "auto":
                 # Auto mode: try key-based auth first, then password
                 try:
-                    if self.password is not None:
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username, password=self.password)
-                    else:
-                        self.client.connect(hostname=self.host, port=self.port, username=self.username)
+                    self.client.connect(
+                        hostname=self.host,
+                        port=self.port,
+                        username=self.username,
+                        allow_agent=True,
+                        look_for_keys=True,
+                    )
+                    self.connected = True
+                    self.last_connect_error = None
+                    self.last_error_type = None
                     logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
                     return True
                 except AuthenticationException as e:
@@ -430,31 +460,47 @@ class RemoteClient(BaseClient):
                     return self._authenticate_with_password()
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
-                    sys.exit(1)
+                    self._set_connect_error(str(e), error_type="connect")
+                    return False
             elif self.auth == "key":
                 # Key-based authentication only (no password fallback)
                 try:
-                    self.client.connect(hostname=self.host, port=self.port, username=self.username)
+                    self.client.connect(
+                        hostname=self.host,
+                        port=self.port,
+                        username=self.username,
+                        allow_agent=True,
+                        look_for_keys=True,
+                    )
+                    self.connected = True
+                    self.last_connect_error = None
+                    self.last_error_type = None
                     logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (key auth)")
                     return True
                 except AuthenticationException as e:
                     logging.error(msg=f"Key-based authentication failed on {self.description}: {e}")
+                    self._set_connect_error("Key authentication failed", error_type="auth")
                     return False
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
+                    self._set_connect_error(str(e), error_type="connect")
                     return False
             elif self.auth == "password":
                 # Password authentication with retry limit
                 try:
-                    return self._authenticate_with_password()
+                    # Password mode must not use keys/agent; always prompt for password.
+                    return self._authenticate_with_password(prompt_only=True)
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
+                    self._set_connect_error(str(e), error_type="connect")
                     return False
             else:
                 logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto', 'key', or 'password'.")
+                self._set_connect_error(f"Unsupported auth method: {self.auth}", error_type="error")
                 return False
         except OSError as e:
             logging.error(msg=f"Connection failed: {e}")
+            self._set_connect_error(str(e), error_type="connect")
             return False
     
     def execute_command(self, command: str) -> str:
@@ -479,6 +525,9 @@ class LocalClient(BaseClient):
         """Local connection is always successful"""
         logging.info(msg=f"Connected to local machine as {self.username}")
         print(f"Connected to local machine as {self.username}")
+        self.connected = True
+        self.last_connect_error = None
+        self.last_error_type = None
         return True
     
     def execute_command(self, command: str) -> str:
@@ -518,9 +567,16 @@ class NVClientPool:
         self._last_update_time = None
         self._last_fetch_duration = None
         self._last_fetch_error = None
+        self._toggle_disabled_servers = set()
     
     def connect_all(self):
-        self.pool = [client for client in self.pool if client.connect()]
+        for client in self.pool:
+            try:
+                client.connect()
+            except Exception as e:
+                logging.error(msg=f"Failed to connect to {getattr(client, 'description', 'unknown')}: {e}")
+                if hasattr(client, "_set_connect_error"):
+                    client._set_connect_error(str(e), error_type="connect")
 
     def test(self):
         pass
@@ -657,18 +713,52 @@ class NVClientPool:
         # reformat the str into a single string with fixed width formatting
         formatted_stats = []
         for client, (stats, system_info) in zip(self.pool, stats_str):
-            # Create formatted table display
+            # Create formatted table display (or error panel)
+            if isinstance(system_info, dict) and system_info.get("error"):
+                error_panel = self._format_error_panel(
+                    system_info.get("error", "Error"),
+                    error_type=system_info.get("error_type"),
+                )
+                formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{error_panel}")
+                continue
+
             formatted_table = self._format_fixed_width_table(stats)
-            
-            # Create system info header
+
             system_info_header = ""
             if system_info:
-                system_info_header = f"Driver: {system_info.get('driver_version', 'N/A')} | CUDA: {system_info.get('cuda_version', 'N/A')} | GPUs: {system_info.get('attached_gpus', '0')}\n"
-            
+                system_info_header = (
+                    f"Driver: {system_info.get('driver_version', 'N/A')} | "
+                    f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
+                    f"GPUs: {system_info.get('attached_gpus', '0')}\n"
+                )
+
             formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{system_info_header}{formatted_table}")
         if return_raw:
             return formatted_stats, raw_stats_by_client
         return formatted_stats
+
+    def _format_error_panel(self, message: str, error_type: Optional[str] = None) -> str:
+        try:
+            width = os.get_terminal_size().columns
+        except OSError:
+            width = 80
+
+        if error_type == "auth" and str(message).strip() == "Password incorrect":
+            title = "Password incorrect"
+        elif error_type == "auth":
+            title = "Authentication failed"
+        else:
+            title = "Error"
+        line1 = f" {title} ".center(width, " ")
+        line2 = f" {message} ".center(width, " ")
+        line3 = " ".center(width, " ")
+        return "\n".join(
+            [
+                colored(line1[:width], "white", "on_red", attrs=["bold"]),
+                colored(line2[:width], "white", "on_red", attrs=["bold"]),
+                colored(line3[:width], "white", "on_red", attrs=["bold"]),
+            ]
+        )
     
     def _format_fixed_width_table(self, df):
         """Format fixed-width table display"""
@@ -928,6 +1018,12 @@ class NVClientPool:
             return "No GPU data available"
         if isinstance(summary_data, dict) and summary_data.get("status") == "loading":
             return "Loading..."
+        if isinstance(summary_data, dict) and summary_data.get("status") == "error":
+            message = summary_data.get("message", "Error")
+            error_type = summary_data.get("error_type")
+            if error_type == "auth" and str(message).strip() == "Password incorrect":
+                return colored("Password incorrect", "red", attrs=["bold"])
+            return colored(message, "red", attrs=["bold"])
         if isinstance(summary_data, dict) and summary_data.get("status") == "empty":
             return "No GPU data available"
 
@@ -994,6 +1090,17 @@ class NVClientPool:
             stats_list = ["Loading..."] * len(self.pool)
         if not isinstance(raw_stats_by_client, dict):
             raw_stats_by_client = {}
+
+        # Disable expand/collapse for servers with auth errors (e.g., password incorrect)
+        try:
+            disabled = set()
+            for idx in range(len(self.pool)):
+                _stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+                if isinstance(system_info, dict) and system_info.get("error_type") == "auth":
+                    disabled.add(idx)
+            self._toggle_disabled_servers = disabled
+        except Exception:
+            self._toggle_disabled_servers = set()
         
         current_time = time.strftime("%H:%M:%S")
         
@@ -1028,18 +1135,28 @@ class NVClientPool:
         for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
             is_selected = idx == self.selected_server
             is_expanded = idx in self.expanded_servers
+            toggle_disabled = idx in self._toggle_disabled_servers
 
             # Use cached raw stats for summary
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
 
             # Build summary
-            if last_update_time is None and stats.empty:
+            if isinstance(system_info, dict) and system_info.get("error"):
+                summary_data = {
+                    "status": "error",
+                    "message": system_info.get("error", "Error"),
+                    "error_type": system_info.get("error_type"),
+                }
+            elif last_update_time is None and stats.empty:
                 summary_data = {"status": "loading"}
             else:
                 summary_data = self._get_server_summary_data(stats) or {"status": "empty"}
 
             # Format the header line (index padded for consistent width)
-            expand_icon = "v" if is_expanded else ">"
+            if toggle_disabled:
+                expand_icon = "!"
+            else:
+                expand_icon = "v" if is_expanded else ">"
             selector = "*" if is_selected else " "
             header_plain = f"{selector} {expand_icon} [{idx + 1:{index_width}d}] {client.description}"
 
@@ -1113,6 +1230,8 @@ class NVClientPool:
                                 self.refresh_needed.set()  # Trigger immediate refresh
                         elif key_name == 'KEY_ENTER' or key_lower == ' ' or key == '\n' or key == '\r':
                             # Toggle expand/collapse for selected server
+                            if self.selected_server in getattr(self, "_toggle_disabled_servers", set()):
+                                continue
                             if self.selected_server in self.expanded_servers:
                                 self.expanded_servers.discard(self.selected_server)
                             else:
@@ -1121,7 +1240,8 @@ class NVClientPool:
                             self.refresh_needed.set()  # Trigger immediate refresh
                         elif key_lower == 'a':
                             # Expand all servers
-                            self.expanded_servers = set(range(len(self.pool)))
+                            disabled = getattr(self, "_toggle_disabled_servers", set())
+                            self.expanded_servers = set(i for i in range(len(self.pool)) if i not in disabled)
                             self.ui_only_refresh = True  # Use cached data for fast UI update
                             self.refresh_needed.set()  # Trigger immediate refresh
                         elif key_lower == 'c':
