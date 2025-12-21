@@ -95,6 +95,7 @@ nvidb --version        # Show version
 
 ```bash
 nvidb add              # Interactively add a new server
+nvidb import [path]    # Import servers from SSH config (default: ~/.ssh/config)
 nvidb info             # Show configuration info and server list
 ```
 

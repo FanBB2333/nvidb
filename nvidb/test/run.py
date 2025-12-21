@@ -4,7 +4,9 @@ import logging
 import argparse
 import shutil
 import json
+import re
 from pathlib import Path
+from paramiko import SSHConfig
 from ..connection import RemoteClient, NVClientPool
 from ..data_modules import ServerInfo, ServerListInfo
 from ..logger import run_sqlite_logger
@@ -19,6 +21,204 @@ def _warn_if_deprecated_config_keys(servers):
             ServerListInfo._normalize_server_dict(dict(server))
         except Exception:
             pass
+
+
+def _is_specific_ssh_host(name: str) -> bool:
+    if not name:
+        return False
+    if name.startswith("!"):
+        return False
+    if any(ch in name for ch in ["*", "?"]):
+        return False
+    return True
+
+
+def _format_import_candidate(candidate: dict) -> str:
+    nickname = candidate.get("nickname") or candidate.get("hostname")
+    hostname = candidate.get("hostname")
+    port = candidate.get("port")
+    username = candidate.get("username")
+    identityfile = candidate.get("identityfile")
+    label = f"{nickname} ({username}@{hostname}:{port})"
+    if identityfile:
+        label += f" [key: {identityfile}]"
+    return label
+
+
+def _prompt_import_selection(candidates):
+    if not candidates:
+        return []
+    
+    from blessed import Terminal
+    
+    term = Terminal()
+    selected = [True] * len(candidates)
+    cursor_pos = 0
+    
+    def draw_menu():
+        # Clear screen area and draw menu
+        lines = []
+        lines.append("Select servers to import (use arrow keys to navigate, space to toggle):")
+        lines.append("")
+        
+        for idx, candidate in enumerate(candidates):
+            mark = "[x]" if selected[idx] else "[ ]"
+            label = _format_import_candidate(candidate)
+            line = f"  {mark} {idx + 1}. {label}"
+            
+            if idx == cursor_pos:
+                lines.append(term.reverse(line))
+            else:
+                lines.append(line)
+        
+        lines.append("")
+        lines.append("Space: toggle | a: all | n: none | i: invert | s/Enter: save | q: cancel")
+        
+        # Move cursor up to redraw
+        total_lines = len(lines)
+        print(term.move_up(total_lines) + term.clear_eos, end='')
+        for line in lines:
+            print(line)
+        
+    # Print initial empty lines to reserve space
+    total_lines = len(candidates) + 4
+    for _ in range(total_lines):
+        print()
+    
+    cbreak_ctx = term.cbreak()
+    cbreak_ctx.__enter__()
+    
+    try:
+        with term.hidden_cursor():
+            draw_menu()
+            
+            while True:
+                key = term.inkey(timeout=None)
+                
+                if key.code == term.KEY_UP or key == 'k':
+                    cursor_pos = max(0, cursor_pos - 1)
+                elif key.code == term.KEY_DOWN or key == 'j':
+                    cursor_pos = min(len(candidates) - 1, cursor_pos + 1)
+                elif key == ' ':  # Space to toggle
+                    selected[cursor_pos] = not selected[cursor_pos]
+                elif key.lower() == 'a':  # Select all
+                    selected[:] = [True] * len(candidates)
+                elif key.lower() == 'n':  # Select none
+                    selected[:] = [False] * len(candidates)
+                elif key.lower() == 'i':  # Invert selection
+                    selected[:] = [not s for s in selected]
+                elif key.lower() == 's' or key.code in (term.KEY_ENTER, 10, 13) or key == '\n' or key == '\r':  # Save
+                    return selected
+                elif key.lower() == 'q' or key.code == term.KEY_ESCAPE:  # Cancel
+                    return None
+                
+                draw_menu()
+    except KeyboardInterrupt:
+        return None
+    finally:
+        try:
+            cbreak_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        print()  # Clean newline
+
+
+def import_ssh_config(ssh_config_path=None, config_path=None):
+    config_path = config_path or config.get_config_path()
+    ssh_config_path = Path(ssh_config_path or "~/.ssh/config").expanduser()
+    if not ssh_config_path.exists():
+        print(f"\nSSH config not found: {ssh_config_path}")
+        return
+
+    ssh_config = SSHConfig()
+    with open(ssh_config_path, "r") as f:
+        ssh_config.parse(f)
+
+    hostnames = sorted(name for name in ssh_config.get_hostnames() if _is_specific_ssh_host(name))
+    if not hostnames:
+        print("\nNo importable hosts found in SSH config.")
+        return
+
+    candidates = []
+    for alias in hostnames:
+        data = ssh_config.lookup(alias) or {}
+        hostname = data.get("hostname") or alias
+        port = data.get("port", 22)
+        try:
+            port = int(port)
+        except Exception:
+            port = 22
+        username = data.get("user") or getpass.getuser()
+        identityfile = None
+        identityfiles = data.get("identityfile")
+        if isinstance(identityfiles, (list, tuple)):
+            if identityfiles:
+                identityfile = identityfiles[0]
+        elif isinstance(identityfiles, str):
+            identityfile = identityfiles
+
+        candidate = {
+            "hostname": hostname,
+            "port": port,
+            "username": username,
+            "nickname": alias,
+            "auth": "auto",
+        }
+        if identityfile:
+            candidate["identityfile"] = identityfile
+        candidates.append(candidate)
+
+    selection = _prompt_import_selection(candidates)
+    if selection is None:
+        print("\nImport cancelled.")
+        return
+
+    selected_candidates = [c for c, chosen in zip(candidates, selection) if chosen]
+    if not selected_candidates:
+        print("\nNo servers selected for import.")
+        return
+
+    confirm = input(f"\nImport {len(selected_candidates)} server(s) into {config_path}? [Y/n]: ").strip().lower()
+    if confirm not in ("", "y", "yes"):
+        print("\nImport cancelled.")
+        return
+
+    config_path = Path(config_path).expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
+    else:
+        cfg = {}
+
+    servers = cfg.get("servers", []) or []
+    existing_keys = set()
+    for server in servers:
+        normalized = ServerListInfo._normalize_server_dict(dict(server))
+        host = normalized.get("host") or normalized.get("hostname")
+        port = normalized.get("port", 22)
+        try:
+            port = int(port)
+        except Exception:
+            port = 22
+        username = normalized.get("username")
+        existing_keys.add((host, port, username))
+
+    added = 0
+    skipped = 0
+    for candidate in selected_candidates:
+        key = (candidate.get("hostname"), candidate.get("port"), candidate.get("username"))
+        if key in existing_keys:
+            skipped += 1
+            continue
+        servers.append(candidate)
+        existing_keys.add(key)
+        added += 1
+
+    cfg["servers"] = servers
+    _write_config_yaml(config_path, cfg)
+
+    print(f"\nImport complete: {added} added, {skipped} skipped (already exists).")
 
 def init(config_path=None):
     config_path = config_path or config.get_config_path()
@@ -533,6 +733,8 @@ def main():
     ls_parser = subparsers.add_parser('ls', help='List configured servers')
     ls_parser.add_argument('--detail', action='store_true', help='Show detailed server information')
     add_parser = subparsers.add_parser('add', help='Add a server interactively')
+    import_parser = subparsers.add_parser('import', help='Import servers from SSH config')
+    import_parser.add_argument('path', nargs='?', default=None, help='Path to SSH config (default: ~/.ssh/config)')
     info_parser = subparsers.add_parser('info', help='Show configuration info')
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
     log_parser.add_argument('--interval', type=int, default=5, help='Logging interval in seconds (default: 5)')
@@ -550,6 +752,8 @@ def main():
         show_servers(detail=args.detail)
     elif args.command == 'add':
         interactive_add_server()
+    elif args.command == 'import':
+        import_ssh_config(args.path)
     elif args.command == 'info':
         show_info()
     elif args.command == 'log':
