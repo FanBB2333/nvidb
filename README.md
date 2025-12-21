@@ -50,18 +50,18 @@ Configuration file [template](config.example.yml):
 
 ```yaml
 servers:
-  - host: "example1.com"           # Server hostname or IP address
+  - hostname: "example1.com"       # Server hostname or IP address
     port: 22                       # SSH port number
     username: "user1"              # SSH username for authentication
-    description: "Production GPU"  # Human-readable description for display
+    nickname: "Production GPU"     # Human-readable nickname for display
     auth: "auto"                   # Authentication method: auto | key | password
 ```
 
 **Configuration Options:**
-- `host`: Server hostname or IP address (required)
+- `hostname`: Server hostname or IP address (required)
 - `port`: SSH port, default is 22 (required)
 - `username`: SSH username (required)
-- `description`: Human-readable server description (optional)
+- `nickname`: Human-readable server nickname (optional)
 - `auth`: Authentication method - `auto`, `key`, or `password` (optional, default: `auto`)
 - `password`: SSH password (optional, will prompt if needed)
 

@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+from typing import Optional
 from typing import Literal
 import getpass
 from dataclasses import dataclass, asdict, field
@@ -95,7 +96,7 @@ class ServerInfo:
     host: str
     port: int
     username: str
-    description: str
+    description: Optional[str] = None
     password: str = field(repr=False, default=None)
     auth: Literal['password', 'key', 'auto'] = 'auto'
     
@@ -105,6 +106,8 @@ class ServerInfo:
 
 # List of ServerInfo
 class ServerListInfo:
+    _deprecated_warnings_emitted = set()
+
     def __init__(self):
         self.servers = []
         
@@ -130,13 +133,47 @@ class ServerListInfo:
         return '\n'.join([f"{idx}: {server.description}" for idx, server in enumerate(self.servers)])
     
     def to_dict(self):
-        return [asdict(server) for server in self.servers]
+        servers = []
+        for server in self.servers:
+            data = asdict(server)
+            data["hostname"] = data.pop("host", None)
+            data["nickname"] = data.pop("description", None)
+            for key in [k for k, v in data.items() if v is None]:
+                data.pop(key, None)
+            servers.append(data)
+        return servers
+
+    @classmethod
+    def _warn_deprecated_key(cls, old_key: str, new_key: str):
+        token = (old_key, new_key)
+        if token in cls._deprecated_warnings_emitted:
+            return
+        cls._deprecated_warnings_emitted.add(token)
+        logging.warning("Config key `%s` is deprecated; please use `%s` instead.", old_key, new_key)
+
+    @staticmethod
+    def _normalize_server_dict(server: dict) -> dict:
+        server = dict(server or {})
+        hostname = server.get("hostname")
+        if "host" in server:
+            ServerListInfo._warn_deprecated_key("host", "hostname")
+        if hostname is not None:
+            server["host"] = hostname
+        server.pop("hostname", None)
+
+        nickname = server.get("nickname")
+        if "description" in server:
+            ServerListInfo._warn_deprecated_key("description", "nickname")
+        if nickname is not None:
+            server["description"] = nickname
+        server.pop("nickname", None)
+        return server
     
     @classmethod
     def from_dict(cls, server_list):
         instance = cls()
         for server in server_list:
-            instance.add_server(ServerInfo(**server))
+            instance.add_server(ServerInfo(**cls._normalize_server_dict(server)))
         return instance
     
     @classmethod
@@ -144,9 +181,9 @@ class ServerListInfo:
         import yaml
         with open(file, 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
-        return cls.from_dict(config['servers'])
+        return cls.from_dict((config or {}).get('servers', []))
     
     def to_yaml(self, file):
         import yaml
         with open(file, 'w') as f:
-            yaml.dump(self.to_dict(), f)
+            yaml.dump({"servers": self.to_dict()}, f, sort_keys=False)

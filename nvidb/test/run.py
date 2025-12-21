@@ -13,6 +13,13 @@ from .. import config
 
 cli: RemoteClient = None
 
+def _warn_if_deprecated_config_keys(servers):
+    for server in servers or []:
+        try:
+            ServerListInfo._normalize_server_dict(dict(server))
+        except Exception:
+            pass
+
 def init(config_path=None):
     config_path = config_path or config.get_config_path()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -38,7 +45,8 @@ def _format_servers_yaml(servers) -> str:
     for i, server in enumerate(servers):
         if i > 0:
             lines.append("")
-        lines.append(f"  - host: {_dq(server.get('host', ''))}")
+        hostname = server.get("hostname") or server.get("host") or ""
+        lines.append(f"  - hostname: {_dq(hostname)}")
 
         port = server.get("port", 22)
         try:
@@ -55,9 +63,11 @@ def _format_servers_yaml(servers) -> str:
         if password:
             lines.append(f"    password: {_dq(password)}")
 
-        description = server.get("description")
-        if description is not None:
-            lines.append(f"    description: {_dq(description)}")
+        nickname = server.get("nickname")
+        if nickname is None:
+            nickname = server.get("description")
+        if nickname is not None:
+            lines.append(f"    nickname: {_dq(nickname)}")
 
         auth = server.get("auth", "auto")
         if auth is not None:
@@ -108,11 +118,11 @@ def interactive_add_server(config_path=None):
             break
         print("  ⚠ Username is required.")
     
-    # Description (optional, has default)
+    # Nickname (optional, has default)
     default_desc = f"{username}@{host}:{port}"
-    description = input(f"Description [{default_desc}]: ").strip()
-    if not description:
-        description = default_desc
+    nickname = input(f"Nickname [{default_desc}]: ").strip()
+    if not nickname:
+        nickname = default_desc
     
     # Auth method
     print("\nAuthentication method:")
@@ -140,7 +150,7 @@ def interactive_add_server(config_path=None):
         host=host,
         port=port,
         username=username,
-        description=description,
+        description=nickname,
         password=password,
         auth=auth
     )
@@ -152,7 +162,7 @@ def interactive_add_server(config_path=None):
     print(f"  Host:        {host}")
     print(f"  Port:        {port}")
     print(f"  Username:    {username}")
-    print(f"  Description: {description}")
+    print(f"  Nickname:    {nickname}")
     print(f"  Auth:        {auth}")
     print(f"  Password:    {'***' if password else '(not set)'}")
     print("-" * 50)
@@ -175,10 +185,10 @@ def interactive_add_server(config_path=None):
         
         # Add the new server
         server_dict = {
-            'host': host,
+            'hostname': host,
             'port': port,
             'username': username,
-            'description': description,
+            'nickname': nickname,
             'auth': auth
         }
         if password:
@@ -276,6 +286,7 @@ def show_servers(config_path=None, detail=False):
         return
     
     servers = cfg.get('servers', [])
+    _warn_if_deprecated_config_keys(servers)
     server_count = len(servers)
     
     if server_count == 0:
@@ -288,22 +299,22 @@ def show_servers(config_path=None, detail=False):
     print("-" * 50)
     
     for idx, server in enumerate(servers):
-        host = server.get('host', 'N/A')
+        host = server.get('hostname') or server.get('host', 'N/A')
         port = server.get('port', 22)
         username = server.get('username', 'N/A')
-        description = server.get('description', f'{username}@{host}:{port}')
+        nickname = server.get('nickname') or server.get('description', f'{username}@{host}:{port}')
         
         if detail:
             auth = server.get('auth', 'auto')
             has_password = 'Yes' if server.get('password') else 'No'
             
-            print(f"\n  [{idx + 1}] {description}")
+            print(f"\n  [{idx + 1}] {nickname}")
             print(f"      Host:     {host}:{port}")
             print(f"      User:     {username}")
             print(f"      Auth:     {auth}")
             print(f"      Password: {has_password}")
         else:
-            print(f"  [{idx + 1}] {description} ({host}:{port})")
+            print(f"  [{idx + 1}] {nickname} ({host}:{port})")
     
     print("\n" + "-" * 50)
 
@@ -378,6 +389,7 @@ def _clean_server(config_path):
         return
     
     servers = cfg.get('servers', [])
+    _warn_if_deprecated_config_keys(servers)
     if not servers:
         print("\nNo servers configured.")
         return
@@ -385,10 +397,10 @@ def _clean_server(config_path):
     print("\nConfigured servers:")
     print("-" * 50)
     for idx, server in enumerate(servers):
-        host = server.get('host', 'N/A')
+        host = server.get('hostname') or server.get('host', 'N/A')
         port = server.get('port', 22)
-        description = server.get('description', f"{server.get('username', 'N/A')}@{host}:{port}")
-        print(f"  [{idx + 1}] {description} ({host}:{port})")
+        nickname = server.get('nickname') or server.get('description', f"{server.get('username', 'N/A')}@{host}:{port}")
+        print(f"  [{idx + 1}] {nickname} ({host}:{port})")
     
     print(f"  [0] Cancel")
     
@@ -404,9 +416,10 @@ def _clean_server(config_path):
             return
         
         server = servers[idx]
-        description = server.get('description', f"{server.get('username', 'N/A')}@{server.get('host', 'N/A')}")
+        server_host = server.get('hostname') or server.get('host', 'N/A')
+        nickname = server.get('nickname') or server.get('description', f"{server.get('username', 'N/A')}@{server_host}")
         
-        confirm = input(f"\nRemove server '{description}'? [y/N]: ").strip().lower()
+        confirm = input(f"\nRemove server '{nickname}'? [y/N]: ").strip().lower()
         if confirm in ['y', 'yes']:
             servers.pop(idx)
             cfg['servers'] = servers
