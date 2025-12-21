@@ -97,6 +97,7 @@ class ServerInfo:
     port: int
     username: str
     description: Optional[str] = None
+    identityfile: Optional[str] = None
     password: str = field(repr=False, default=None)
     auth: Literal['password', 'key', 'auto'] = 'auto'
     

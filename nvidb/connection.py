@@ -16,7 +16,7 @@ import pynvml
 import paramiko
 from paramiko import AuthenticationException
 from paramiko.client import SSHClient, AutoAddPolicy
-from paramiko.ssh_exception import NoValidConnectionsError
+from paramiko.ssh_exception import NoValidConnectionsError, PasswordRequiredException
 import pandas as pd
 from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
@@ -373,6 +373,7 @@ class RemoteClient(BaseClient):
         self.auth = server.auth
         self.description = server.description
         self.password = server.password
+        self.identityfile = getattr(server, "identityfile", None)
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         if self.auth in ['auto', 'key']:
@@ -439,6 +440,9 @@ class RemoteClient(BaseClient):
         print(f"Connecting to {self.host}:{self.port} as {self.username}")
         # catch the OSError exception when the host is not reachable
         try:
+            identityfile = None
+            if self.auth in ("auto", "key") and self.identityfile:
+                identityfile = os.path.expanduser(str(self.identityfile))
             if self.auth == "auto":
                 # Auto mode: try key-based auth first, then password
                 try:
@@ -446,8 +450,28 @@ class RemoteClient(BaseClient):
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
-                        allow_agent=True,
-                        look_for_keys=True,
+                        allow_agent=False if identityfile else True,
+                        look_for_keys=False if identityfile else True,
+                        key_filename=identityfile,
+                    )
+                    self.connected = True
+                    self.last_connect_error = None
+                    self.last_error_type = None
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
+                    return True
+                except PasswordRequiredException:
+                    if not identityfile:
+                        logging.error(msg=f"Key requires passphrase on {self.description}, trying password...")
+                        return self._authenticate_with_password()
+                    passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
+                    self.client.connect(
+                        hostname=self.host,
+                        port=self.port,
+                        username=self.username,
+                        allow_agent=False,
+                        look_for_keys=False,
+                        key_filename=identityfile,
+                        passphrase=passphrase,
                     )
                     self.connected = True
                     self.last_connect_error = None
@@ -469,8 +493,28 @@ class RemoteClient(BaseClient):
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
-                        allow_agent=True,
-                        look_for_keys=True,
+                        allow_agent=False if identityfile else True,
+                        look_for_keys=False if identityfile else True,
+                        key_filename=identityfile,
+                    )
+                    self.connected = True
+                    self.last_connect_error = None
+                    self.last_error_type = None
+                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (key auth)")
+                    return True
+                except PasswordRequiredException:
+                    if not identityfile:
+                        self._set_connect_error("Key requires passphrase; set `identityfile` or use `auth: password`", error_type="auth")
+                        return False
+                    passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
+                    self.client.connect(
+                        hostname=self.host,
+                        port=self.port,
+                        username=self.username,
+                        allow_agent=False,
+                        look_for_keys=False,
+                        key_filename=identityfile,
+                        passphrase=passphrase,
                     )
                     self.connected = True
                     self.last_connect_error = None

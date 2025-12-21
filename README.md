@@ -55,6 +55,7 @@ servers:
     username: "user1"              # SSH username for authentication
     nickname: "Production GPU"     # Human-readable nickname for display
     auth: "auto"                   # Authentication method: auto | key | password
+    identityfile: "~/.ssh/id_ed25519"  # Optional, used only when auth is auto/key
 ```
 
 **Configuration Options:**
@@ -63,6 +64,7 @@ servers:
 - `username`: SSH username (required)
 - `nickname`: Human-readable server nickname (optional)
 - `auth`: Authentication method - `auto`, `key`, or `password` (optional, default: `auto`)
+- `identityfile`: SSH private key path (optional, only effective when `auth` is `auto` or `key`)
 - `password`: SSH password (optional, will prompt if needed)
 
 #### Environment Variables

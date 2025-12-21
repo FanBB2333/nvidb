@@ -73,6 +73,10 @@ def _format_servers_yaml(servers) -> str:
         if auth is not None:
             lines.append(f"    auth: {_dq(auth)}")
 
+        identityfile = server.get("identityfile")
+        if auth in ("auto", "key") and identityfile:
+            lines.append(f"    identityfile: {_dq(identityfile)}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -141,6 +145,12 @@ def interactive_add_server(config_path=None):
             auth = 'password'
             break
         print("  ⚠ Please enter 1, 2, or 3.")
+
+    identityfile = None
+    if auth in ("auto", "key"):
+        identityfile_input = input("IdentityFile (SSH private key path, optional): ").strip()
+        if identityfile_input:
+            identityfile = identityfile_input
     
     # Password (optional)
     password = None
@@ -151,6 +161,7 @@ def interactive_add_server(config_path=None):
         port=port,
         username=username,
         description=nickname,
+        identityfile=identityfile,
         password=password,
         auth=auth
     )
@@ -164,6 +175,8 @@ def interactive_add_server(config_path=None):
     print(f"  Username:    {username}")
     print(f"  Nickname:    {nickname}")
     print(f"  Auth:        {auth}")
+    if auth in ("auto", "key"):
+        print(f"  IdentityFile:{' (default)' if not identityfile else ' ' + identityfile}")
     print(f"  Password:    {'***' if password else '(not set)'}")
     print("-" * 50)
     
@@ -191,6 +204,8 @@ def interactive_add_server(config_path=None):
             'nickname': nickname,
             'auth': auth
         }
+        if identityfile and auth in ("auto", "key"):
+            server_dict['identityfile'] = identityfile
         if password:
             server_dict['password'] = password
         

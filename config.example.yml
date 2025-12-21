@@ -9,6 +9,7 @@ servers:
     username: "user1"
     nickname: "GPU Server 1"
     auth: "auto"  # auto | key | password
+    identityfile: "~/.ssh/id_ed25519"  # Optional, used only when auth is auto/key
 
   # Example server with password authentication
   - hostname: "192.168.1.100"
@@ -24,3 +25,4 @@ servers:
     username: "user2"
     nickname: "GPU Server 2 (Custom Port)"
     auth: "key"  # Use key-only authentication
+    # identityfile: "~/.ssh/id_rsa"    # Optional, used only when auth is auto/key
