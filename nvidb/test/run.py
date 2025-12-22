@@ -984,6 +984,10 @@ def main():
     log_info_parser = log_subparsers.add_parser('info', help='Show statistics for a log session')
     log_info_parser.add_argument('session_id', nargs='?', type=int, default=None, help='Session ID (default: latest)')
     log_info_parser.add_argument('--db-path', type=str, default=None, help='Database path')
+    log_web_parser = log_subparsers.add_parser('web', help='Open web dashboard for GPU monitoring')
+    log_web_parser.add_argument('session_id', nargs='?', type=int, default=None, help='Session ID (default: live mode)')
+    log_web_parser.add_argument('--db-path', type=str, default=None, help='Database path')
+    log_web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
     clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
     args = parser.parse_args()
@@ -1007,6 +1011,13 @@ def main():
             list_log_sessions(db_path=db_path)
         elif args.log_command == 'info':
             show_log_info(session_id=args.session_id, db_path=db_path)
+        elif args.log_command == 'web':
+            from ..web import run_streamlit_app
+            run_streamlit_app(
+                session_id=args.session_id,
+                db_path=db_path,
+                port=args.port
+            )
         else:
             # Default: start logging
             run_sqlite_logger(
