@@ -67,6 +67,8 @@ servers:
 - `identityfile`: SSH private key path (optional, only effective when `auth` is `auto` or `key`)
 - `password`: SSH password (optional, will prompt if needed)
 
+> **Warning**: Storing passwords in plaintext in the configuration file is **NOT RECOMMENDED** for security reasons. Consider using SSH key-based authentication (`auth: key`) instead.
+
 #### Environment Variables
 
 You can customize the working directory by setting `NVIDB_HOME`:

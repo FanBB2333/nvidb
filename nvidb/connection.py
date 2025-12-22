@@ -532,8 +532,8 @@ class RemoteClient(BaseClient):
             elif self.auth == "password":
                 # Password authentication with retry limit
                 try:
-                    # Password mode must not use keys/agent; always prompt for password.
-                    return self._authenticate_with_password(prompt_only=True)
+                    # Password mode: try configured password first, then prompt if needed.
+                    return self._authenticate_with_password()
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
                     self._set_connect_error(str(e), error_type="connect")
