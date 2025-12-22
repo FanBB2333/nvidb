@@ -699,6 +699,245 @@ def _clean_database(db_path):
         print("\nOperation cancelled.")
 
 
+def list_log_sessions(db_path=None):
+    """List all log sessions from the database."""
+    import sqlite3
+    from datetime import datetime
+    
+    db_path = Path(db_path or config.get_db_path())
+    
+    if not db_path.exists():
+        print(f"\nDatabase file not found: {db_path}")
+        print("Run 'nvidb log' to start logging first.")
+        return
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT 
+                s.id,
+                s.start_time,
+                s.end_time,
+                s.status,
+                s.interval_seconds,
+                s.include_remote,
+                COUNT(g.id) as log_count
+            FROM log_sessions s
+            LEFT JOIN gpu_logs g ON s.id = g.session_id
+            GROUP BY s.id
+            ORDER BY s.id DESC
+        ''')
+        
+        sessions = cursor.fetchall()
+        conn.close()
+        
+        if not sessions:
+            print("\nNo log sessions found.")
+            return
+        
+        print("\n" + "-" * 70)
+        print("                         Log Sessions")
+        print("-" * 70)
+        print(f"{'ID':>4}  {'Start Time':<20}  {'End Time':<20}  {'Status':<10}  {'Records':>8}")
+        print("-" * 70)
+        
+        for session in sessions:
+            session_id, start_time, end_time, status, interval, include_remote, log_count = session
+            
+            # Format times
+            try:
+                start_dt = datetime.fromisoformat(start_time)
+                start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                start_str = start_time[:19] if start_time else "N/A"
+            
+            if end_time:
+                try:
+                    end_dt = datetime.fromisoformat(end_time)
+                    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    end_str = end_time[:19] if end_time else "N/A"
+            else:
+                end_str = "(running)"
+            
+            print(f"{session_id:>4}  {start_str:<20}  {end_str:<20}  {status:<10}  {log_count:>8}")
+        
+        print("-" * 70)
+        print(f"\nTotal: {len(sessions)} session(s)")
+        
+    except Exception as e:
+        print(f"\nError reading database: {e}")
+
+
+def show_log_info(session_id=None, db_path=None):
+    """Show statistics for a log session."""
+    import sqlite3
+    from datetime import datetime
+    
+    db_path = Path(db_path or config.get_db_path())
+    
+    if not db_path.exists():
+        print(f"\nDatabase file not found: {db_path}")
+        print("Run 'nvidb log' to start logging first.")
+        return
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # If no session_id provided, use the latest session
+        if session_id is None:
+            cursor.execute("SELECT id FROM log_sessions ORDER BY id DESC LIMIT 1")
+            result = cursor.fetchone()
+            if not result:
+                print("\nNo log sessions found.")
+                conn.close()
+                return
+            session_id = result[0]
+        
+        # Get session info
+        cursor.execute('''
+            SELECT id, start_time, end_time, status, interval_seconds, include_remote
+            FROM log_sessions WHERE id = ?
+        ''', (session_id,))
+        
+        session = cursor.fetchone()
+        if not session:
+            print(f"\nSession {session_id} not found.")
+            conn.close()
+            return
+        
+        sid, start_time, end_time, status, interval, include_remote = session
+        
+        # Get log count
+        cursor.execute("SELECT COUNT(*) FROM gpu_logs WHERE session_id = ?", (session_id,))
+        log_count = cursor.fetchone()[0]
+        
+        # Calculate duration
+        try:
+            start_dt = datetime.fromisoformat(start_time)
+            if end_time:
+                end_dt = datetime.fromisoformat(end_time)
+            else:
+                end_dt = datetime.now()
+            duration = end_dt - start_dt
+            duration_str = str(duration).split('.')[0]  # Remove microseconds
+        except:
+            duration_str = "N/A"
+        
+        print("\n" + "-" * 60)
+        print(f"             Session {session_id} Statistics")
+        print("-" * 60)
+        
+        # Session metadata
+        print(f"\nSession Info:")
+        print(f"  Start Time:     {start_time}")
+        print(f"  End Time:       {end_time or '(still running)'}")
+        print(f"  Duration:       {duration_str}")
+        print(f"  Status:         {status}")
+        print(f"  Interval:       {interval} seconds")
+        print(f"  Remote:         {'Yes' if include_remote else 'No'}")
+        print(f"  Total Records:  {log_count}")
+        
+        if log_count == 0:
+            print("\nNo log data available for analysis.")
+            conn.close()
+            return
+        
+        # Get unique nodes
+        cursor.execute('''
+            SELECT DISTINCT node FROM gpu_logs WHERE session_id = ?
+        ''', (session_id,))
+        nodes = [row[0] for row in cursor.fetchall()]
+        
+        print(f"\n  Nodes:          {', '.join(nodes)}")
+        
+        # Parse processes to get user statistics
+        cursor.execute('''
+            SELECT timestamp, node, gpu_id, processes, memory_used
+            FROM gpu_logs 
+            WHERE session_id = ? AND processes != '-' AND processes != 'N/A'
+        ''', (session_id,))
+        
+        process_rows = cursor.fetchall()
+        
+        # Track user GPU time and memory usage
+        user_time = {}  # user -> total_seconds
+        user_max_memory = {}  # user -> max_memory_mb
+        
+        for timestamp, node, gpu_id, processes, memory_used in process_rows:
+            if not processes or processes in ('-', 'N/A'):
+                continue
+            
+            # Parse processes string like "user1:1234MB user2:567MB"
+            for part in processes.split():
+                if ':' in part:
+                    try:
+                        user, mem_str = part.split(':', 1)
+                        # Extract memory value
+                        mem_mb = 0
+                        if 'MB' in mem_str.upper():
+                            mem_mb = float(mem_str.upper().replace('MB', '').replace('MIB', ''))
+                        elif 'GB' in mem_str.upper():
+                            mem_mb = float(mem_str.upper().replace('GB', '').replace('GIB', '')) * 1024
+                        
+                        key = f"{user}@{node}"
+                        
+                        # Add time (interval seconds per record)
+                        user_time[key] = user_time.get(key, 0) + interval
+                        
+                        # Track max memory
+                        if key not in user_max_memory or mem_mb > user_max_memory[key]:
+                            user_max_memory[key] = mem_mb
+                    except:
+                        continue
+        
+        # Display top users by GPU time
+        if user_time:
+            print("\n" + "-" * 60)
+            print("Top Users by GPU Time:")
+            print("-" * 60)
+            
+            sorted_by_time = sorted(user_time.items(), key=lambda x: x[1], reverse=True)[:10]
+            for user, seconds in sorted_by_time:
+                hours = seconds // 3600
+                minutes = (seconds % 3600) // 60
+                secs = seconds % 60
+                if hours > 0:
+                    time_str = f"{hours}h {minutes}m {secs}s"
+                elif minutes > 0:
+                    time_str = f"{minutes}m {secs}s"
+                else:
+                    time_str = f"{secs}s"
+                print(f"  {user:<30}  {time_str}")
+        
+        # Display top users by memory usage
+        if user_max_memory:
+            print("\n" + "-" * 60)
+            print("Top Users by Max Memory Usage:")
+            print("-" * 60)
+            
+            sorted_by_mem = sorted(user_max_memory.items(), key=lambda x: x[1], reverse=True)[:10]
+            for user, mem_mb in sorted_by_mem:
+                if mem_mb >= 1024:
+                    mem_str = f"{mem_mb/1024:.1f} GB"
+                else:
+                    mem_str = f"{mem_mb:.0f} MB"
+                print(f"  {user:<30}  {mem_str}")
+        
+        if not user_time and not user_max_memory:
+            print("\n  No user process data available.")
+        
+        print("\n" + "-" * 60)
+        
+        conn.close()
+        
+    except Exception as e:
+        print(f"\nError analyzing session: {e}")
+
+
 def test_connection():
     cli.connect()
 
@@ -739,6 +978,12 @@ def main():
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
     log_parser.add_argument('--interval', type=int, default=5, help='Logging interval in seconds (default: 5)')
     log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
+    log_subparsers = log_parser.add_subparsers(dest='log_command')
+    log_ls_parser = log_subparsers.add_parser('ls', help='List all log sessions')
+    log_ls_parser.add_argument('--db-path', type=str, default=None, help='Database path')
+    log_info_parser = log_subparsers.add_parser('info', help='Show statistics for a log session')
+    log_info_parser.add_argument('session_id', nargs='?', type=int, default=None, help='Session ID (default: latest)')
+    log_info_parser.add_argument('--db-path', type=str, default=None, help='Database path')
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
     clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
     args = parser.parse_args()
@@ -757,11 +1002,18 @@ def main():
     elif args.command == 'info':
         show_info()
     elif args.command == 'log':
-        run_sqlite_logger(
-            server_list=server_list,
-            interval=args.interval,
-            db_path=getattr(args, 'db_path', None)
-        )
+        db_path = getattr(args, 'db_path', None)
+        if args.log_command == 'ls':
+            list_log_sessions(db_path=db_path)
+        elif args.log_command == 'info':
+            show_log_info(session_id=args.session_id, db_path=db_path)
+        else:
+            # Default: start logging
+            run_sqlite_logger(
+                server_list=server_list,
+                interval=args.interval,
+                db_path=db_path
+            )
     elif args.command == 'clean':
         interactive_clean(clean_all=(args.target == 'all'))
     else:
