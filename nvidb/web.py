@@ -13,6 +13,8 @@ import importlib.util
 import platform
 import re
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -373,6 +375,117 @@ def _get_pool(include_remote):
     return pool
 
 
+class _LiveStatsCache:
+    def __init__(self, pool, *, interval_seconds: int, enabled: bool):
+        self.pool = pool
+        self._lock = threading.Lock()
+        self._interval_seconds = 5
+        self._enabled = bool(enabled)
+
+        self.raw_stats_by_client = None
+        self.last_updated = None
+        self.last_error = None
+        self.last_fetch_duration_s = None
+        self.fetch_in_progress = False
+
+        self._stop_event = threading.Event()
+        self._refresh_event = threading.Event()
+
+        self.set_schedule(interval_seconds=interval_seconds, enabled=enabled, trigger_refresh=True)
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_schedule(self, *, interval_seconds: int, enabled: bool, trigger_refresh: bool = False):
+        try:
+            interval_seconds_int = int(interval_seconds)
+        except Exception:
+            interval_seconds_int = 5
+        interval_seconds_int = max(1, min(3600, interval_seconds_int))
+
+        with self._lock:
+            changed = (
+                interval_seconds_int != self._interval_seconds
+                or bool(enabled) != self._enabled
+            )
+            self._interval_seconds = interval_seconds_int
+            self._enabled = bool(enabled)
+
+        if changed or trigger_refresh:
+            self._refresh_event.set()
+
+    def request_refresh(self):
+        self._refresh_event.set()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "raw_stats_by_client": self.raw_stats_by_client,
+                "last_updated": self.last_updated,
+                "last_error": self.last_error,
+                "last_fetch_duration_s": self.last_fetch_duration_s,
+                "fetch_in_progress": self.fetch_in_progress,
+                "interval_seconds": self._interval_seconds,
+                "enabled": self._enabled,
+            }
+
+    def stop(self):  # pragma: no cover
+        self._stop_event.set()
+        self._refresh_event.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+    def _run(self):  # pragma: no cover
+        while not self._stop_event.is_set():
+            with self._lock:
+                enabled = self._enabled
+                interval = self._interval_seconds
+
+            if enabled:
+                self._refresh_event.wait(timeout=interval)
+            else:
+                self._refresh_event.wait()
+
+            self._refresh_event.clear()
+            if self._stop_event.is_set():
+                break
+
+            start = time.monotonic()
+            with self._lock:
+                self.fetch_in_progress = True
+
+            try:
+                _formatted, raw_stats = self.pool.get_client_gpus_info(return_raw=True)
+                now = datetime.now()
+                with self._lock:
+                    self.raw_stats_by_client = raw_stats
+                    self.last_updated = now
+                    self.last_error = None
+            except Exception as e:
+                with self._lock:
+                    self.last_error = str(e)
+            finally:
+                duration = time.monotonic() - start
+                with self._lock:
+                    self.last_fetch_duration_s = duration
+                    self.fetch_in_progress = False
+
+
+def _get_live_cache(pool, *, interval_seconds: int, enabled: bool):
+    _ensure_streamlit()
+    key = f"_nvidb_live_cache_{id(pool)}"
+    cache = st.session_state.get(key)
+    if cache is None or getattr(cache, "pool", None) is not pool:
+        cache = _LiveStatsCache(pool, interval_seconds=interval_seconds, enabled=enabled)
+        st.session_state[key] = cache
+        return cache
+
+    cache.set_schedule(interval_seconds=interval_seconds, enabled=enabled)
+    return cache
+
+
 def show_live_dashboard(*, include_remote):
     _ensure_streamlit()
 
@@ -381,28 +494,40 @@ def show_live_dashboard(*, include_remote):
     refresh_interval = st.sidebar.slider("Refresh interval (seconds)", 1, 30, 5)
     auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
     use_fragment = hasattr(st, "fragment")
-    st.sidebar.button("Refresh now")
+    refresh_now = st.sidebar.button("Refresh now")
 
     run_every = refresh_interval if auto_refresh else None
 
-    def _render():
-        effective_remote = bool(include_remote)
-        try:
-            pool = _get_pool(include_remote)
-        except Exception as e:
-            effective_remote = False
-            st.error(str(e))
-            pool = _get_pool(False)
+    effective_remote = bool(include_remote)
+    try:
+        pool = _get_pool(include_remote)
+    except Exception as e:
+        effective_remote = False
+        st.error(str(e))
+        pool = _get_pool(False)
 
+    cache = _get_live_cache(pool, interval_seconds=refresh_interval, enabled=auto_refresh)
+    if refresh_now:
+        cache.request_refresh()
+
+    def _render():
         if effective_remote:
             st.caption("Remote: enabled")
         else:
             st.caption("Remote: disabled (run `nvidb web --remote` to include remote servers)")
 
-        try:
-            _formatted, raw_stats_by_client = pool.get_client_gpus_info(return_raw=True)
-        except Exception as e:
-            st.error(f"Failed to fetch GPU data: {e}")
+        snapshot = cache.snapshot()
+        raw_stats_by_client = snapshot.get("raw_stats_by_client")
+        last_updated = snapshot.get("last_updated")
+        last_error = snapshot.get("last_error")
+        fetch_in_progress = snapshot.get("fetch_in_progress")
+        last_fetch_duration_s = snapshot.get("last_fetch_duration_s")
+
+        if last_error:
+            st.warning(f"Last fetch error: {last_error}")
+
+        if raw_stats_by_client is None:
+            st.info("Fetching GPU data...")
             return
 
         meta = {}
@@ -471,7 +596,15 @@ def show_live_dashboard(*, include_remote):
                 st.subheader(description)
                 body()
 
-        st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        status_parts = []
+        if fetch_in_progress:
+            status_parts.append("Updating…")
+        if last_updated is not None:
+            status_parts.append(f"Last updated: {last_updated.strftime('%Y-%m-%d %H:%M:%S')}")
+        if last_fetch_duration_s is not None:
+            status_parts.append(f"Fetch: {last_fetch_duration_s:.2f}s")
+        if status_parts:
+            st.caption(" | ".join(status_parts))
 
     if use_fragment:
         render = st.fragment(_render, run_every=run_every)
