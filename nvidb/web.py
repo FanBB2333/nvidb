@@ -4,12 +4,13 @@ Streamlit web interface for nvidb (Live GPU + Log viewer).
 Usage:
     nvidb web                 # Live view (local)
     nvidb web --remote        # Live view (local + remote)
-    nvidb web 1               # Open session 1 (Logs view)
+    # Select log sessions from the left sidebar after the server starts.
 """
 
 import argparse
 from datetime import datetime
 import importlib.util
+import math
 import platform
 import re
 import sqlite3
@@ -23,6 +24,11 @@ try:
     import streamlit as st
 except Exception:  # pragma: no cover
     st = None
+
+try:
+    import altair as alt
+except Exception:  # pragma: no cover
+    alt = None
 
 try:
     from nvidb import config
@@ -128,6 +134,126 @@ def _parse_mib_pair(value):
         return None, None
 
 
+def _parse_temperature_c(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in ("N/A", "-"):
+        return None
+    match = re.search(r"(\d+\.?\d*)\s*C", text, flags=re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except Exception:
+            return None
+    match = re.search(r"(\d+\.?\d*)", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
+_MEM_UNIT_TO_MIB = {
+    "b": 1 / 1024 / 1024,
+    "kb": 1 / 1024,
+    "kib": 1 / 1024,
+    "mb": 1,
+    "mib": 1,
+    "gb": 1024,
+    "gib": 1024,
+    "tb": 1024 * 1024,
+    "tib": 1024 * 1024,
+}
+
+
+def _parse_memory_gib(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in ("N/A", "-"):
+        return None
+
+    match = re.search(r"(\d+\.?\d*)\s*([a-zA-Z]+)", text)
+    if match:
+        number_str, unit = match.group(1), match.group(2)
+        unit_key = unit.strip().lower()
+    else:
+        number_match = re.search(r"(\d+\.?\d*)", text)
+        if not number_match:
+            return None
+        number_str = number_match.group(1)
+        unit_key = "mib"
+
+    try:
+        number = float(number_str)
+    except Exception:
+        return None
+
+    mib_multiplier = _MEM_UNIT_TO_MIB.get(unit_key)
+    if mib_multiplier is None:
+        mib_multiplier = _MEM_UNIT_TO_MIB.get(unit_key.replace("bytes", "b"), None)
+    if mib_multiplier is None:
+        mib_multiplier = 1
+    mib = number * mib_multiplier
+    return mib / 1024.0
+
+
+_BW_UNIT_TO_MBPS = {
+    "b/s": 1 / 1024 / 1024,
+    "kb/s": 1 / 1024,
+    "kib/s": 1 / 1024,
+    "mb/s": 1,
+    "mib/s": 1,
+    "gb/s": 1024,
+    "gib/s": 1024,
+}
+
+
+def _parse_bandwidth_mbps(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in ("N/A", "-"):
+        return None
+    match = re.search(r"(\d+\.?\d*)\s*([a-zA-Z/]+)", text)
+    if match:
+        number_str, unit = match.group(1), match.group(2)
+        unit_key = unit.strip().lower()
+    else:
+        number_match = re.search(r"(\d+\.?\d*)", text)
+        if not number_match:
+            return None
+        number_str = number_match.group(1)
+        unit_key = "mb/s"
+
+    try:
+        number = float(number_str)
+    except Exception:
+        return None
+
+    multiplier = _BW_UNIT_TO_MBPS.get(unit_key)
+    if multiplier is None:
+        multiplier = 1
+    return number * multiplier
+
+
+def _parse_power_watts(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in ("N/A", "-"):
+        return None
+    match = re.search(r"(\d+\.?\d*)\s*W", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
 def _format_gb(mib):
     if mib is None:
         return "N/A"
@@ -211,6 +337,28 @@ def _trigger_rerun():
         st.rerun()
     if hasattr(st, "experimental_rerun"):  # pragma: no cover
         st.experimental_rerun()
+
+
+def _maybe_cache_data(**cache_kwargs):
+    def decorator(func):
+        if st is None:
+            return func
+        try:
+            import streamlit.runtime as st_runtime
+        except Exception:  # pragma: no cover
+            st_runtime = None
+        if st_runtime is not None:
+            try:
+                if not st_runtime.exists():
+                    return func
+            except Exception:  # pragma: no cover
+                return func
+        cache = getattr(st, "cache_data", None)
+        if cache is None:
+            return func
+        return cache(**cache_kwargs)(func)
+
+    return decorator
 
 
 def _autorefresh(seconds: int, *, enabled: bool, key: str):
@@ -756,7 +904,164 @@ def _build_log_snapshot_table(df):
     return table.sort_values(by="GPU", kind="stable")
 
 
-def show_logs_dashboard(db_path, session_id=None):
+_LOG_METRICS = {
+    "util_gpu": {
+        "label": "GPU Util (%)",
+        "source": "util_gpu",
+        "parser": _parse_percent,
+        "tooltip_format": ".1f",
+        "default": True,
+        "height": 220,
+    },
+    "memory_used": {
+        "label": "VRAM Used (GiB)",
+        "source": "memory_used",
+        "parser": _parse_memory_gib,
+        "tooltip_format": ".2f",
+        "default": True,
+        "height": 220,
+    },
+    "temperature": {
+        "label": "Temperature (°C)",
+        "source": "temperature",
+        "parser": _parse_temperature_c,
+        "tooltip_format": ".1f",
+        "default": True,
+        "height": 220,
+    },
+    "power": {
+        "label": "Power Draw (W)",
+        "source": "power",
+        "parser": _parse_power_watts,
+        "tooltip_format": ".1f",
+        "default": True,
+        "height": 220,
+    },
+    "util_mem": {
+        "label": "Memory Util (%)",
+        "source": "util_mem",
+        "parser": _parse_percent,
+        "tooltip_format": ".1f",
+        "default": False,
+        "height": 220,
+    },
+    "rx": {
+        "label": "PCIe RX (MB/s)",
+        "source": "rx",
+        "parser": _parse_bandwidth_mbps,
+        "tooltip_format": ".2f",
+        "default": False,
+        "height": 220,
+    },
+    "tx": {
+        "label": "PCIe TX (MB/s)",
+        "source": "tx",
+        "parser": _parse_bandwidth_mbps,
+        "tooltip_format": ".2f",
+        "default": False,
+        "height": 220,
+    },
+    "fan_speed": {
+        "label": "Fan Speed (%)",
+        "source": "fan_speed",
+        "parser": _parse_percent,
+        "tooltip_format": ".0f",
+        "default": False,
+        "height": 220,
+    },
+}
+
+
+@_maybe_cache_data(ttl=5)
+def _load_sessions_cached(db_path: str) -> pd.DataFrame:
+    return load_sessions(db_path)
+
+
+@_maybe_cache_data(ttl=5)
+def _load_session_logs_cached(db_path: str, session_id: int) -> pd.DataFrame:
+    return load_session_logs(db_path, session_id)
+
+
+def _downsample_per_gpu(df: pd.DataFrame, *, max_points_per_gpu: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    try:
+        max_points = int(max_points_per_gpu)
+    except Exception:
+        max_points = 600
+    if max_points <= 0:
+        return df
+
+    frames = []
+    for _gpu_id, group in df.groupby("gpu_id", sort=False):
+        group_sorted = group.sort_values(by="timestamp", kind="stable")
+        n = len(group_sorted)
+        if n <= max_points:
+            frames.append(group_sorted)
+            continue
+        step = int(math.ceil(n / max_points))
+        frames.append(group_sorted.iloc[::step])
+    if not frames:
+        return df.iloc[:0]
+    return pd.concat(frames, ignore_index=True)
+
+
+def _render_timeseries_chart(df_long: pd.DataFrame, *, title: str, tooltip_format: str, height: int = 220):
+    _ensure_streamlit()
+    if df_long is None or df_long.empty:
+        st.info("No data to plot.")
+        return
+    if alt is None:  # pragma: no cover
+        st.warning("altair is required for charts.")
+        return
+
+    data = df_long.dropna(subset=["timestamp", "gpu_id", "value"]).copy()
+    if data.empty:
+        st.info("No data to plot.")
+        return
+    data["gpu_id"] = data["gpu_id"].astype(str)
+
+    hover = alt.selection_point(
+        fields=["gpu_id"],
+        nearest=True,
+        on="mouseover",
+        clear="mouseout",
+        empty="none",
+    )
+
+    lines = alt.Chart(data).mark_line().encode(
+        x=alt.X("timestamp:T", title=None),
+        y=alt.Y("value:Q", title=None),
+        color=alt.Color("gpu_id:N", title="GPU"),
+    )
+
+    highlight = alt.Chart(data).mark_line(size=4).encode(
+        x=alt.X("timestamp:T", title=None),
+        y=alt.Y("value:Q", title=None),
+        color=alt.Color("gpu_id:N", legend=None),
+    ).transform_filter(hover)
+
+    points = alt.Chart(data).mark_circle(size=60, opacity=0).encode(
+        x="timestamp:T",
+        y="value:Q",
+        color=alt.Color("gpu_id:N", legend=None),
+        tooltip=[
+            alt.Tooltip("timestamp:T", title="Time"),
+            alt.Tooltip("gpu_id:N", title="GPU"),
+            alt.Tooltip("value:Q", title=title, format=str(tooltip_format or "")),
+        ],
+    )
+
+    chart = (
+        alt.layer(lines, highlight, points)
+        .add_params(hover)
+        .properties(height=height, title=title)
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def show_logs_dashboard(db_path, *, initial_session_id=None):
     _ensure_streamlit()
 
     db_path = _as_path(db_path or get_db_path())
@@ -765,29 +1070,72 @@ def show_logs_dashboard(db_path, session_id=None):
         st.info("Run `nvidb log` first to start logging.")
         return
 
-    sessions_df = load_sessions(db_path)
+    sessions_df = _load_sessions_cached(str(db_path))
     if sessions_df.empty:
         st.warning("No log sessions found.")
         return
 
-    if session_id is None:
-        session_options = {
-            f"Session {row['id']} ({str(row['start_time'])[:19]}) - {row['record_count']} records": row["id"]
-            for _, row in sessions_df.iterrows()
-        }
-        selected = st.sidebar.selectbox("Select Session", list(session_options.keys()))
-        session_id = session_options[selected]
-    else:
-        st.sidebar.info(f"Viewing Session {session_id}")
+    st.sidebar.subheader("Sessions")
+    query = st.sidebar.text_input("Search", value="", placeholder="id / time / status")
 
-    df = load_session_logs(db_path, session_id)
+    session_options = []
+    for _, row in sessions_df.iterrows():
+        start_time = str(row.get("start_time") or "")[:19]
+        end_time = str(row.get("end_time") or "")[:19]
+        status = str(row.get("status") or "unknown")
+        records = int(row.get("record_count") or 0)
+        suffix = f"{status}, {records} records"
+        if end_time and end_time != "None":
+            suffix = f"{suffix}, end {end_time}"
+        session_id = int(row.get("id"))
+        label = f"Session {session_id} • {start_time} • {suffix}"
+        session_options.append((label, session_id))
+
+    if query.strip():
+        q = query.strip().lower()
+        session_options = [(label, sid) for label, sid in session_options if q in label.lower() or q in str(sid)]
+
+    if not session_options:
+        st.sidebar.info("No sessions match the current search.")
+        return
+
+    labels = [label for label, _sid in session_options]
+    label_to_id = {label: sid for label, sid in session_options}
+
+    default_index = 0
+    if initial_session_id is not None:
+        try:
+            initial_session_id_int = int(initial_session_id)
+        except Exception:
+            initial_session_id_int = None
+        if initial_session_id_int is not None:
+            for idx, (_label, sid) in enumerate(session_options):
+                if sid == initial_session_id_int:
+                    default_index = idx
+                    break
+
+    try:
+        session_container = st.sidebar.container(height=320, border=True)
+    except TypeError:  # pragma: no cover
+        session_container = st.sidebar.container()
+
+    selected_label = session_container.radio(
+        "Session",
+        labels,
+        index=default_index,
+        key="_nvidb_session_selector_v1",
+        label_visibility="collapsed",
+    )
+    session_id = label_to_id[selected_label]
+
+    df = _load_session_logs_cached(str(db_path), int(session_id))
     if df.empty:
         st.warning("No logs found for this session.")
         return
 
     session_info = sessions_df[sessions_df["id"] == session_id].iloc[0]
     st.header(f"Session {session_id}")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
         st.metric("Records", int(session_info["record_count"]))
     with col2:
@@ -796,34 +1144,126 @@ def show_logs_dashboard(db_path, session_id=None):
         st.metric("Status", session_info["status"])
     with col4:
         st.metric("Remote", "Yes" if session_info["include_remote"] else "No")
+    with col5:
+        st.metric("Start", str(session_info.get("start_time") or "")[:19] or "N/A")
+    with col6:
+        st.metric("End", str(session_info.get("end_time") or "")[:19] or "running")
 
-    timestamps = df["timestamp"].dropna().drop_duplicates().sort_values()
-    if timestamps.empty:
+    nodes_all = sorted({str(n) for n in df["node"].dropna().unique()})
+    selected_nodes = st.sidebar.multiselect("Nodes", options=nodes_all, default=nodes_all)
+    if not selected_nodes:
+        st.info("Select at least one node to display.")
+        return
+    df = df[df["node"].isin(selected_nodes)]
+
+    min_ts = df["timestamp"].dropna().min()
+    max_ts = df["timestamp"].dropna().max()
+    if pd.isna(min_ts) or pd.isna(max_ts):
         st.warning("No timestamps available in this session.")
         return
 
+    start_ts, end_ts = st.sidebar.slider(
+        "Time range",
+        min_value=min_ts.to_pydatetime(),
+        max_value=max_ts.to_pydatetime(),
+        value=(min_ts.to_pydatetime(), max_ts.to_pydatetime()),
+    )
+    df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
+
+    gpu_ids_all = sorted({int(g) for g in df["gpu_id"].dropna().unique()})
+    visible_gpus = st.sidebar.multiselect("Visible GPUs", options=gpu_ids_all, default=gpu_ids_all)
+    if not visible_gpus:
+        st.info("Select at least one GPU to display.")
+        return
+    df = df[df["gpu_id"].isin(visible_gpus)]
+
+    metric_keys = list(_LOG_METRICS.keys())
+    default_metrics = [k for k, spec in _LOG_METRICS.items() if spec.get("default")]
+    selected_metrics = st.sidebar.multiselect(
+        "Metrics",
+        options=metric_keys,
+        default=default_metrics,
+        format_func=lambda k: (_LOG_METRICS.get(k) or {}).get("label", k),
+    )
+    max_points = st.sidebar.slider("Max points per GPU (charts)", 50, 2000, 600, step=50)
+
+    timestamps = df["timestamp"].dropna().drop_duplicates().sort_values()
+    if timestamps.empty:
+        st.warning("No timestamps available in the selected time range.")
+        return
+
     ts_list = list(timestamps)
-    ts_idx = st.sidebar.slider("Record index", 0, len(ts_list) - 1, len(ts_list) - 1)
+    ts_idx = st.sidebar.slider("Snapshot index", 0, len(ts_list) - 1, len(ts_list) - 1)
     selected_ts = ts_list[ts_idx]
 
-    st.subheader(f"Snapshot @ {selected_ts}")
     snapshot = df[df["timestamp"] == selected_ts]
+    st.subheader(f"Snapshot @ {selected_ts}")
 
-    nodes = list(snapshot["node"].dropna().drop_duplicates())
-    multi = len(nodes) > 1
-    for node in nodes:
-        node_df = snapshot[snapshot["node"] == node]
-        table = _build_log_snapshot_table(node_df)
-        title = f"{node} | {_server_summary(table)}"
+    parsed_cols = {}
+    parsed_sources = []
+    for metric_key in selected_metrics:
+        spec = _LOG_METRICS.get(metric_key)
+        if not spec:
+            continue
+        parsed_sources.append(spec.get("source", metric_key))
+    parsed_sources = sorted({c for c in parsed_sources if c in df.columns})
 
-        if multi:
-            with st.expander(title, expanded=(node == nodes[0])):
-                _render_gpu_table(table)
-        else:
-            st.markdown(f"**{node}**")
-            _render_gpu_table(table)
+    parsed = df[["timestamp", "node", "gpu_id", *parsed_sources]].copy()
+    for metric_key in selected_metrics:
+        spec = _LOG_METRICS.get(metric_key)
+        if not spec:
+            continue
+        source = spec.get("source", metric_key)
+        parser = spec.get("parser")
+        if source not in parsed.columns or parser is None:
+            continue
+        out_col = f"_nvidb_{metric_key}"
+        parsed[out_col] = parsed[source].map(parser)
+        parsed_cols[metric_key] = out_col
 
-    with st.expander("View raw data"):
+    nodes = sorted({str(n) for n in parsed["node"].dropna().unique()})
+    for node_idx, node in enumerate(nodes):
+        node_snapshot = snapshot[snapshot["node"] == node]
+        node_table = _build_log_snapshot_table(node_snapshot)
+        title = f"{node} | {_server_summary(node_table)}"
+
+        with st.expander(title, expanded=(node_idx == 0)):
+            if node_table.empty:
+                st.info("No snapshot data for this node at the selected time.")
+            else:
+                _render_gpu_table(node_table)
+
+            if not selected_metrics:
+                st.info("Select metrics in the sidebar to show trend charts.")
+                continue
+
+            node_df = parsed[parsed["node"] == node]
+            if node_df.empty:
+                st.info("No timeseries data for this node.")
+                continue
+
+            cols = st.columns(2)
+            chart_slot = 0
+            for metric_key in selected_metrics:
+                out_col = parsed_cols.get(metric_key)
+                spec = _LOG_METRICS.get(metric_key) or {}
+                if out_col is None or out_col not in node_df.columns:
+                    continue
+
+                long_df = node_df[["timestamp", "gpu_id", out_col]].rename(columns={out_col: "value"})
+                long_df = long_df.dropna(subset=["value"])
+                long_df = _downsample_per_gpu(long_df, max_points_per_gpu=max_points)
+
+                with cols[chart_slot % 2]:
+                    _render_timeseries_chart(
+                        long_df,
+                        title=str(spec.get("label") or metric_key),
+                        tooltip_format=str(spec.get("tooltip_format") or ""),
+                        height=int(spec.get("height") or 220),
+                    )
+                chart_slot += 1
+
+    with st.expander("View raw data", expanded=False):
         st.dataframe(df, use_container_width=True)
 
 
@@ -833,15 +1273,13 @@ def main(*, session_id=None, db_path=None, include_remote=False):
     st.set_page_config(page_title="nvidb web", page_icon="🖥️", layout="wide")
     st.title("nvidb web")
 
-    if session_id is None:
-        view = st.sidebar.radio("View", ["Live", "Logs"])
-    else:
-        view = "Logs"
+    default_index = 1 if session_id is not None else 0
+    view = st.sidebar.radio("View", ["Live", "Logs"], index=default_index)
 
     if view == "Live":
         show_live_dashboard(include_remote=include_remote)
     else:
-        show_logs_dashboard(db_path=db_path, session_id=session_id)
+        show_logs_dashboard(db_path=db_path, initial_session_id=session_id)
 
 
 def run_streamlit_app(*, session_id=None, db_path=None, port=8501, include_remote=False):
@@ -865,8 +1303,6 @@ def run_streamlit_app(*, session_id=None, db_path=None, port=8501, include_remot
         "--",
     ]
 
-    if session_id is not None:
-        cmd.extend(["--session-id", str(session_id)])
     if db_path is not None:
         cmd.extend(["--db-path", str(db_path)])
     if include_remote:
@@ -879,8 +1315,7 @@ def run_streamlit_app(*, session_id=None, db_path=None, port=8501, include_remot
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--session-id", type=int, default=None)
     parser.add_argument("--db-path", type=str, default=None)
     parser.add_argument("--include-remote", action="store_true", default=False)
     args = parser.parse_args()
-    main(session_id=args.session_id, db_path=args.db_path, include_remote=bool(args.include_remote))
+    main(db_path=args.db_path, include_remote=bool(args.include_remote))

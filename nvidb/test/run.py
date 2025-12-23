@@ -1036,13 +1036,11 @@ def main():
     log_info_parser.add_argument('--db-path', type=str, default=None, help='Database path')
     # Deprecated alias (use `nvidb web` instead)
     log_web_parser = log_subparsers.add_parser('web', help='(deprecated) Use `nvidb web`')
-    log_web_parser.add_argument('session_id', nargs='?', type=int, default=None, help='Session ID (default: live mode)')
     log_web_parser.add_argument('--db-path', type=str, default=None, help='Database path')
     log_web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
     web_parser = subparsers.add_parser('web', help='Open web dashboard (Live + Logs)')
     # Also accept `--remote` after the subcommand (e.g. `nvidb web --remote`)
     web_parser.add_argument('--remote', action='store_true', default=argparse.SUPPRESS, help='Use remote servers')
-    web_parser.add_argument('session_id', nargs='?', type=int, default=None, help='Session ID (default: live mode)')
     web_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
     web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
@@ -1075,7 +1073,6 @@ def main():
             print("Deprecated: use `nvidb web` instead of `nvidb log web`.")
             from ..web import run_streamlit_app
             run_streamlit_app(
-                session_id=args.session_id,
                 db_path=db_path,
                 port=args.port,
                 include_remote=bool(getattr(args, "remote", False)),
@@ -1090,7 +1087,6 @@ def main():
     elif args.command == 'web':
         from ..web import run_streamlit_app
         run_streamlit_app(
-            session_id=args.session_id,
             db_path=getattr(args, "db_path", None),
             port=args.port,
             include_remote=bool(getattr(args, "remote", False)),

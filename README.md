@@ -122,10 +122,11 @@ Open a Streamlit-based web dashboard to view live GPU info and browse log sessio
 pip install streamlit
 nvidb web                 # Live view (local)
 nvidb web --remote        # Live view (local + remote)
-nvidb web 1               # Open session 1 (Logs view)
 nvidb web --db-path /path/to/db
 nvidb web --port 8502
 ```
+
+After the server starts, switch to `Logs` and select a session from the left sidebar.
 
 `nvidb log web` is deprecated; use `nvidb web` instead.
 
