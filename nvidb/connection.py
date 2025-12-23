@@ -766,7 +766,7 @@ class NVClientPool:
                 formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{error_panel}")
                 continue
 
-            formatted_table = self._format_fixed_width_table(stats, border=(len(self.pool) == 1))
+            formatted_table = self._format_fixed_width_table(stats, border=True)
 
             system_info_header = ""
             if system_info:
