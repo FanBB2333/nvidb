@@ -2,6 +2,12 @@
 # Copy this file to ~/.nvidb/config.yml and modify it to your needs.
 # Or use `nvidb add` command to interactively add servers.
 
+basic:
+  # Compact display mode (default: false)
+  # - false: stretch table to fill terminal width (gives more space to processes)
+  # - true:  compact table width (do not force fill)
+  compact: false
+
 servers:
   # Example server with SSH key authentication (recommended)
   - hostname: "server1.example.com"

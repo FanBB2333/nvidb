@@ -592,13 +592,14 @@ class LocalClient(BaseClient):
 
 
 class NVClientPool:
-    def __init__(self, server_list: ServerListInfo):
+    def __init__(self, server_list: ServerListInfo, *, compact: bool = False):
         self.pool = [LocalClient()]
         if server_list is not None:
             self.pool += [RemoteClient(server) for server in server_list]
         logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
         self.connect_all()
         self.term = Terminal()
+        self.compact = bool(compact)
         self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
         # Collapsible display state - only first server expanded by default
         self.expanded_servers = {0}  # Only first server expanded by default
@@ -905,25 +906,37 @@ class NVClientPool:
         min_total = sum(min_widths_selected.values())
         desired_total = sum(desired_widths.values())
 
+        fill_priority = [
+            "processes",
+            "name",
+            "power",
+            "memory[used/total]",
+            "rx",
+            "tx",
+            "temp",
+            "fan",
+            "util",
+            "mem_util",
+            "GPU",
+        ]
+
         if available_width >= desired_total:
             column_widths = dict(desired_widths)
+            extra = available_width - desired_total
+            if extra > 0 and not self.compact:
+                fill_columns = list(selected_columns)
+                share, remainder = divmod(extra, len(fill_columns))
+                if share:
+                    for col in fill_columns:
+                        column_widths[col] += share
+                if remainder:
+                    offset = terminal_width % len(fill_columns)
+                    for i in range(remainder):
+                        column_widths[fill_columns[(offset + i) % len(fill_columns)]] += 1
         elif available_width >= min_total:
             column_widths = dict(min_widths_selected)
             extra = available_width - min_total
-            priority = [
-                "processes",
-                "name",
-                "power",
-                "memory[used/total]",
-                "rx",
-                "tx",
-                "temp",
-                "fan",
-                "util",
-                "mem_util",
-                "GPU",
-            ]
-            for col in [c for c in priority if c in selected_columns]:
+            for col in (c for c in fill_priority if c in selected_columns):
                 if extra <= 0:
                     break
                 need = desired_widths[col] - column_widths[col]
@@ -1316,7 +1329,15 @@ class NVClientPool:
         output_lines.append(
             f"Time: {current_time} | Updated: {update_display}{fetch_display} | {server_label}: {server_count} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
         )
-        output_lines.append("-" * 80)
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 80
+        if self.compact:
+            separator_width = min(80, terminal_width)
+        else:
+            separator_width = max(20, terminal_width)
+        output_lines.append("-" * separator_width)
 
         # Align the collapsed server list by padding headers to the same display width
         index_width = len(str(len(self.pool)))
@@ -1533,7 +1554,15 @@ class NVClientPool:
         server_count = len(self.pool)
         server_label = "Server" if server_count == 1 else "Servers"
         print(f"Time: {current_time} | {server_label}: {server_count}")
-        print("-" * 80)
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 80
+        if self.compact:
+            separator_width = min(80, terminal_width)
+        else:
+            separator_width = max(20, terminal_width)
+        print("-" * separator_width)
         
         # Get stats
         stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)

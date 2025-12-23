@@ -23,6 +23,25 @@ def _warn_if_deprecated_config_keys(servers):
             pass
 
 
+def _load_config_yaml(config_path=None) -> dict:
+    config_path = Path(config_path or config.get_config_path()).expanduser()
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r") as f:
+            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _get_basic_compact(cfg: dict) -> bool:
+    basic = (cfg or {}).get("basic", {})
+    if not isinstance(basic, dict):
+        basic = {}
+    return bool(basic.get("compact", False))
+
+
 def _is_specific_ssh_host(name: str) -> bool:
     if not name:
         return False
@@ -239,8 +258,11 @@ def _dq(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def _format_servers_yaml(servers) -> str:
-    lines = ["servers:"]
+def _format_servers_yaml(servers, *, basic=None) -> str:
+    basic = basic or {}
+    compact = bool(basic.get("compact", False))
+    compact_str = "true" if compact else "false"
+    lines = ["basic:", f"  compact: {compact_str}", "", "servers:"]
 
     for i, server in enumerate(servers):
         if i > 0:
@@ -283,8 +305,13 @@ def _format_servers_yaml(servers) -> str:
 def _write_config_yaml(config_path: Path, cfg: dict):
     config_path = Path(config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    if not isinstance(cfg, dict):
+        cfg = {}
+    basic_cfg = cfg.get("basic", {}) or {}
+    if not isinstance(basic_cfg, dict):
+        basic_cfg = {}
     servers = cfg.get("servers", []) or []
-    config_path.write_text(_format_servers_yaml(servers), encoding="utf-8")
+    config_path.write_text(_format_servers_yaml(servers, basic=basic_cfg), encoding="utf-8")
 
 
 def interactive_add_server(config_path=None):
@@ -967,6 +994,11 @@ def main():
     parser.add_argument('--version', action='version', version=f'nvidb {config.VERSION}')
     parser.add_argument('--remote', action='store_true', help='Use remote servers')
     parser.add_argument('--once', action='store_true', help='Print GPU stats once and exit (no TUI loop)')
+    parser.add_argument(
+        '--compact',
+        action='store_true',
+        help='Use compact display (do not stretch columns to fill terminal width)',
+    )
     
     subparsers = parser.add_subparsers(dest='command')
     ls_parser = subparsers.add_parser('ls', help='List configured servers')
@@ -991,6 +1023,9 @@ def main():
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
     clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
     args = parser.parse_args()
+
+    cfg = _load_config_yaml()
+    compact = bool(args.compact or _get_basic_compact(cfg))
     
     if args.remote:
         server_list = init()
@@ -1029,7 +1064,7 @@ def main():
         interactive_clean(clean_all=(args.target == 'all'))
     else:
         # Default action: run interactive monitoring
-        pool = NVClientPool(server_list)
+        pool = NVClientPool(server_list, compact=compact)
         if args.once:
             pool.print_once()
         else:
