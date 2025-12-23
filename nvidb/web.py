@@ -283,19 +283,19 @@ def _user_summary_df(user_summary: dict) -> pd.DataFrame:
 _GPU_TABLE_COLUMNS = [
     ("GPU", "GPU"),
     ("name", "name"),
+    ("fan", "fan"),
     ("util", "util (GPU%)"),
     ("mem_util", "mem_util (mem%)"),
-    ("memory[used/total]", "memory[used/total]"),
-    ("mem%", "mem%"),
     ("temp", "temp"),
-    ("power", "power"),
     ("rx", "rx"),
     ("tx", "tx"),
-    ("fan", "fan"),
+    ("power", "power"),
+    ("memory[used/total]", "memory[used/total]"),
+    ("mem%", "mem%"),
     ("processes", "processes"),
 ]
 
-_DEFAULT_GPU_TABLE_COLUMNS = ["GPU", "name", "util", "mem_util", "memory[used/total]", "mem%", "temp"]
+_DEFAULT_GPU_TABLE_COLUMNS = [col_name for col_name, _label in _GPU_TABLE_COLUMNS]
 
 
 def _render_gpu_column_checkboxes(available_columns, *, key_prefix: str):
@@ -314,6 +314,8 @@ def _render_gpu_column_checkboxes(available_columns, *, key_prefix: str):
                 disabled = "memory[used/total]" not in available
             else:
                 disabled = col_name not in available
+            if disabled:
+                default_checked = False
         checked = grid[idx % 6].checkbox(
             label,
             value=default_checked,
@@ -401,7 +403,7 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     if "GPU" in column_order:
         column_config.setdefault("GPU", st.column_config.NumberColumn("GPU", width="small"))
     if "name" in column_order:
-        column_config.setdefault("name", st.column_config.TextColumn("name", width="medium", max_chars=28))
+        column_config.setdefault("name", st.column_config.TextColumn("name", width="small", max_chars=20))
     if "fan" in column_order:
         column_config.setdefault("fan", st.column_config.TextColumn("fan", width="small"))
     if "temp" in column_order:
@@ -411,16 +413,16 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     if "tx" in column_order:
         column_config.setdefault("tx", st.column_config.TextColumn("tx", width="small"))
     if "power" in column_order:
-        column_config.setdefault("power", st.column_config.TextColumn("power", width="small", max_chars=18))
+        column_config.setdefault("power", st.column_config.TextColumn("power", width="medium", max_chars=18))
     if "memory[used/total]" in column_order:
         column_config.setdefault(
             "memory[used/total]",
-            st.column_config.TextColumn("memory", width="small", max_chars=16),
+            st.column_config.TextColumn("memory[used/total]", width="small", max_chars=16),
         )
     if "processes" in column_order:
         column_config.setdefault(
             "processes",
-            st.column_config.TextColumn("processes", width="medium", max_chars=32),
+            st.column_config.TextColumn("processes", width="small", max_chars=24),
         )
 
     st.dataframe(
@@ -628,7 +630,7 @@ def show_live_dashboard(*, include_remote):
 
         visible_columns = _render_gpu_column_checkboxes(
             available_columns,
-            key_prefix="_nvidb_live_cols",
+            key_prefix="_nvidb_live_cols_v2",
         )
 
         if raw_stats_by_client is None:
