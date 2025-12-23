@@ -663,6 +663,8 @@ class NVClientPool:
         
         stats_str = []
         raw_stats_by_client = {}
+        user_memory_by_client = {}
+        global_user_memory = {}
         for idx, client in enumerate(self.pool):
             result = client.get_full_gpu_info()
             
@@ -673,13 +675,14 @@ class NVClientPool:
                 # Fallback for backward compatibility
                 stats = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
                 system_info = {}
-            
-            # Cache raw stats for summary display (avoids redundant SSH calls)
-            raw_stats_by_client[idx] = (stats.copy() if not stats.empty else stats, system_info)
+
+            user_summary_for_client = {}
             
             # Skip processing if stats is empty
             if stats.empty:
+                raw_stats_by_client[idx] = (stats.copy() if not stats.empty else stats, system_info)
                 stats_str.append((stats, system_info))
+                user_memory_by_client[idx] = {}
                 continue
             
             # Optimize rx/tx display - split into two columns
@@ -704,7 +707,7 @@ class NVClientPool:
             # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)
             process_list = []
             try:
-                all_processes, _ = client.get_process_summary(stats)
+                all_processes, user_summary_for_client = client.get_process_summary(stats)
 
                 per_gpu_user_summary = {}
                 for proc in all_processes:
@@ -733,6 +736,7 @@ class NVClientPool:
             except Exception as e:
                 logging.warning(f"Failed to get process info: {e}")
                 process_list = ["-" for _ in range(len(stats))]
+                user_summary_for_client = {}
             
             stats['processes'] = process_list
 
@@ -755,6 +759,23 @@ class NVClientPool:
                 stats = stats[other_columns + ['processes']]
 
             stats_str.append((stats, system_info))
+
+            # Cache processed table (not raw XML) and per-user memory stats for this client
+            raw_stats_by_client[idx] = (stats.copy() if not stats.empty else stats, system_info)
+            user_memory_by_client[idx] = dict(user_summary_for_client or {})
+            for username, total_mib in (user_summary_for_client or {}).items():
+                try:
+                    total_mib_int = int(total_mib)
+                except Exception:
+                    continue
+                if total_mib_int <= 0:
+                    continue
+                global_user_memory[username] = global_user_memory.get(username, 0) + total_mib_int
+
+        raw_stats_by_client["_nvidb"] = {
+            "user_memory_by_client": user_memory_by_client,
+            "user_memory_global": global_user_memory,
+        }
         # reformat the str into a single string with fixed width formatting
         formatted_stats = []
         for client, (stats, system_info) in zip(self.pool, stats_str):
@@ -1256,6 +1277,37 @@ class NVClientPool:
         mem_part = f"{str(mem_display):>{mem_width}}"
 
         return f"{gpu_part} | {idle_part} | {util_part} avg | {mem_part}"
+
+    def _format_user_memory_totals(self, user_summary: dict, *, max_users: int = 10) -> str:
+        """Format per-user total VRAM usage (MiB) as a compact single-line string."""
+        if not user_summary:
+            return ""
+
+        items = []
+        for user, mib in user_summary.items():
+            try:
+                mib_int = int(mib)
+            except Exception:
+                continue
+            if mib_int <= 0:
+                continue
+            items.append((str(user), mib_int))
+
+        if not items:
+            return ""
+
+        items.sort(key=lambda x: x[1], reverse=True)
+        parts = []
+        for user, mib_int in items[:max_users]:
+            if mib_int >= 1024:
+                parts.append(f"{user}({mib_int/1024:.1f}G)")
+            else:
+                parts.append(f"{user}({mib_int}M)")
+
+        remaining = len(items) - max_users
+        if remaining > 0:
+            parts.append(f"+{remaining} more")
+        return " ".join(parts)
     
     def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
@@ -1339,6 +1391,18 @@ class NVClientPool:
             separator_width = max(20, terminal_width)
         output_lines.append("-" * separator_width)
 
+        meta = {}
+        if isinstance(raw_stats_by_client, dict):
+            meta = raw_stats_by_client.get("_nvidb", {}) or {}
+        user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
+        global_user_memory = meta.get("user_memory_global", {}) or {}
+
+        if global_user_memory:
+            global_line = f"Users (all nodes): {self._format_user_memory_totals(global_user_memory, max_users=12)}"
+            if self.term.length(global_line) > terminal_width:
+                global_line = global_line[: max(0, terminal_width - 3)] + "..."
+            output_lines.append(global_line)
+
         # Align the collapsed server list by padding headers to the same display width
         index_width = len(str(len(self.pool)))
         server_rows = []
@@ -1377,7 +1441,7 @@ class NVClientPool:
             max_header_width = max(max_header_width, header_width)
 
             summary_rows.append(summary_data)
-            server_rows.append((is_selected, is_expanded, header_plain, summary_data, stats_info))
+            server_rows.append((idx, is_selected, is_expanded, header_plain, summary_data, stats_info))
 
         non_empty_summaries = [s for s in summary_rows if isinstance(s, dict) and "gpu_count" in s]
         if non_empty_summaries:
@@ -1390,7 +1454,7 @@ class NVClientPool:
         else:
             widths = None
 
-        for is_selected, is_expanded, header_plain, summary_data, stats_info in server_rows:
+        for idx, is_selected, is_expanded, header_plain, summary_data, stats_info in server_rows:
             pad = max_header_width - self.term.length(header_plain)
             header_padded = header_plain + (" " * pad if pad > 0 else "")
 
@@ -1406,6 +1470,15 @@ class NVClientPool:
             # If expanded, print the full stats table (already formatted from get_client_gpus_info)
             if is_expanded:
                 output_lines.extend(str(stats_info).splitlines())
+                if isinstance(user_memory_by_client, dict):
+                    user_summary = user_memory_by_client.get(idx, {}) or {}
+                else:
+                    user_summary = {}
+                if user_summary:
+                    user_line = f"Users: {self._format_user_memory_totals(user_summary, max_users=12)}"
+                    if self.term.length(user_line) > terminal_width:
+                        user_line = user_line[: max(0, terminal_width - 3)] + "..."
+                    output_lines.append(user_line)
                 output_lines.append("")  # Add spacing after expanded server
 
         # Single write reduces visible flicker vs. clearing + many print() calls
@@ -1566,6 +1639,12 @@ class NVClientPool:
         
         # Get stats
         stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
+
+        meta = {}
+        if isinstance(raw_stats_by_client, dict):
+            meta = raw_stats_by_client.get("_nvidb", {}) or {}
+        user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
+        global_user_memory = meta.get("user_memory_global", {}) or {}
         
         for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
@@ -1578,4 +1657,13 @@ class NVClientPool:
             
             # Print the full stats table
             print(stats_info)
+            if isinstance(user_memory_by_client, dict):
+                user_summary = user_memory_by_client.get(idx, {}) or {}
+            else:
+                user_summary = {}
+            if user_summary:
+                print(f"Users: {self._format_user_memory_totals(user_summary, max_users=12)}")
             print()  # Add spacing after each server
+
+        if global_user_memory:
+            print(f"Users (all nodes): {self._format_user_memory_totals(global_user_memory, max_users=12)}")
