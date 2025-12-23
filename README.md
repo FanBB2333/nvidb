@@ -114,7 +114,22 @@ nvidb log --db-path /path/to/db    # Specify custom database path
 
 Press `Ctrl+C` to stop logging and save data.
 
-### 2.4 Cleanup
+### 2.4 Web Dashboard
+
+Open a Streamlit-based web dashboard to view live GPU info and browse log sessions:
+
+```bash
+pip install streamlit
+nvidb web                 # Live view (local)
+nvidb web --remote        # Live view (local + remote)
+nvidb web 1               # Open session 1 (Logs view)
+nvidb web --db-path /path/to/db
+nvidb web --port 8502
+```
+
+`nvidb log web` is deprecated; use `nvidb web` instead.
+
+### 2.5 Cleanup
 
 Remove server configurations or delete log data:
 
@@ -123,7 +138,7 @@ nvidb clean              # Interactive cleanup menu
 nvidb clean all          # Delete all data (requires double confirmation)
 ```
 
-### 2.5 Interactive TUI Navigation
+### 2.6 Interactive TUI Navigation
 
 When viewing GPU stats, use these keyboard shortcuts:
 
@@ -136,7 +151,7 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `c`               | Collapse all servers          |
 | `q`               | Quit                          |
 
-### 2.6 GPU Monitor Decorator
+### 2.7 GPU Monitor Decorator
 
 Use the `@nvidb.monitor` decorator to track GPU usage during function execution:
 
