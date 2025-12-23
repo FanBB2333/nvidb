@@ -258,12 +258,8 @@ def _dq(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def _format_servers_yaml(servers, *, basic=None) -> str:
-    basic = basic or {}
-    compact = bool(basic.get("compact", False))
-    compact_str = "true" if compact else "false"
-    lines = ["basic:", f"  compact: {compact_str}", "", "servers:"]
-
+def _format_servers_yaml(servers) -> str:
+    lines = ["servers:"]
     for i, server in enumerate(servers):
         if i > 0:
             lines.append("")
@@ -302,16 +298,36 @@ def _format_servers_yaml(servers, *, basic=None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_config_yaml(cfg: dict) -> str:
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    servers = cfg.get("servers", []) or []
+
+    header_cfg = {}
+    if "basic" in cfg:
+        header_cfg["basic"] = cfg.get("basic")
+    else:
+        header_cfg["basic"] = {"compact": False}
+    for key, value in cfg.items():
+        if key in {"basic", "servers"}:
+            continue
+        header_cfg[key] = value
+
+    header_text = yaml.safe_dump(
+        header_cfg,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    ).rstrip("\n")
+    servers_text = _format_servers_yaml(servers).rstrip("\n")
+    return f"{header_text}\n\n{servers_text}\n"
+
+
 def _write_config_yaml(config_path: Path, cfg: dict):
     config_path = Path(config_path).expanduser()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    if not isinstance(cfg, dict):
-        cfg = {}
-    basic_cfg = cfg.get("basic", {}) or {}
-    if not isinstance(basic_cfg, dict):
-        basic_cfg = {}
-    servers = cfg.get("servers", []) or []
-    config_path.write_text(_format_servers_yaml(servers, basic=basic_cfg), encoding="utf-8")
+    config_path.write_text(_format_config_yaml(cfg), encoding="utf-8")
 
 
 def interactive_add_server(config_path=None):
