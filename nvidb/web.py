@@ -58,11 +58,12 @@ def load_sessions(db_path):
             s.status,
             s.interval_seconds,
             s.include_remote,
-            COUNT(g.id) as record_count
+            COUNT(g.id) as record_count,
+            COUNT(DISTINCT g.timestamp) as snapshot_count
         FROM log_sessions s
         LEFT JOIN gpu_logs g ON s.id = g.session_id
         GROUP BY s.id
-        ORDER BY s.id DESC
+        ORDER BY s.id ASC
         """,
         conn,
     )
@@ -252,6 +253,57 @@ def _parse_power_watts(value):
         return float(match.group(1))
     except Exception:
         return None
+
+
+def _as_datetime(value):
+    if value is None:
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    try:
+        return ts.to_pydatetime()
+    except Exception:
+        return ts
+
+
+def _format_datetime(value, *, include_seconds: bool = True):
+    dt = _as_datetime(value)
+    if dt is None:
+        return "N/A"
+    fmt = "%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M"
+    try:
+        return dt.strftime(fmt)
+    except Exception:
+        text = str(value)
+        text = text.replace("T", " ")
+        return text[:19] if include_seconds else text[:16]
+
+
+def _format_duration(start_value, end_value):
+    start_dt = _as_datetime(start_value)
+    end_dt = _as_datetime(end_value)
+    if start_dt is None:
+        return "N/A"
+    if end_dt is None:
+        end_dt = datetime.now()
+    try:
+        total_seconds = int((end_dt - start_dt).total_seconds())
+    except Exception:
+        return "N/A"
+    total_seconds = max(0, total_seconds)
+
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    if days > 0:
+        return f"{days}d{hours}h"
+    if hours > 0:
+        return f"{hours}h{minutes}m"
+    if minutes > 0:
+        return f"{minutes}m{seconds}s"
+    return f"{seconds}s"
 
 
 def _format_gb(mib):
@@ -1146,17 +1198,16 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
     st.sidebar.subheader("Sessions")
     query = st.sidebar.text_input("Search", value="", placeholder="id / time / status")
 
+    sessions_df = sessions_df.sort_values(by="id", ascending=True, kind="stable")
+
     session_options = []
     for _, row in sessions_df.iterrows():
-        start_time = str(row.get("start_time") or "")[:19]
-        end_time = str(row.get("end_time") or "")[:19]
-        status = str(row.get("status") or "unknown")
-        records = int(row.get("record_count") or 0)
-        suffix = f"{status}, {records} records"
-        if end_time and end_time != "None":
-            suffix = f"{suffix}, end {end_time}"
         session_id = int(row.get("id"))
-        label = f"Session {session_id} • {start_time} • {suffix}"
+        start_time = _format_datetime(row.get("start_time"), include_seconds=False)
+        duration = _format_duration(row.get("start_time"), row.get("end_time"))
+        status = str(row.get("status") or "unknown")
+        snapshot_count = int(row.get("snapshot_count") or 0)
+        label = f"#{session_id} | {start_time} | {duration} | {status} | {snapshot_count} snaps"
         session_options.append((label, session_id))
 
     if query.strip():
@@ -1170,7 +1221,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
     labels = [label for label, _sid in session_options]
     label_to_id = {label: sid for label, sid in session_options}
 
-    default_index = 0
+    default_index = max(0, len(session_options) - 1)
     if initial_session_id is not None:
         try:
             initial_session_id_int = int(initial_session_id)
@@ -1182,8 +1233,9 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                     default_index = idx
                     break
 
+    st.sidebar.markdown("`id | start | dur | status | snaps`")
     try:
-        session_container = st.sidebar.container(height=320, border=True)
+        session_container = st.sidebar.container(height=520, border=True)
     except TypeError:  # pragma: no cover
         session_container = st.sidebar.container()
 
@@ -1203,19 +1255,34 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
 
     session_info = sessions_df[sessions_df["id"] == session_id].iloc[0]
     st.header(f"Session {session_id}")
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    start_time_raw = session_info.get("start_time")
+    end_time_raw = session_info.get("end_time")
+    if end_time_raw in ("None", ""):
+        end_time_raw = None
+
+    status = str(session_info.get("status") or "unknown")
+    interval_seconds = session_info.get("interval_seconds")
+    include_remote = bool(session_info.get("include_remote"))
+    record_count = int(session_info.get("record_count") or 0)
+    snapshot_count = int(session_info.get("snapshot_count") or 0)
+
+    duration_str = _format_duration(start_time_raw, end_time_raw)
+    start_str = _format_datetime(start_time_raw, include_seconds=True)
+    end_str = _format_datetime(end_time_raw, include_seconds=True) if end_time_raw is not None else "running"
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("Records", int(session_info["record_count"]))
+        st.metric("Status", status)
     with col2:
-        st.metric("Interval", f"{session_info['interval_seconds']}s")
+        st.metric("Interval", f"{interval_seconds}s" if interval_seconds else "N/A")
     with col3:
-        st.metric("Status", session_info["status"])
+        st.metric("Snapshots", snapshot_count)
     with col4:
-        st.metric("Remote", "Yes" if session_info["include_remote"] else "No")
+        st.metric("Records", record_count)
     with col5:
-        st.metric("Start", str(session_info.get("start_time") or "")[:19] or "N/A")
-    with col6:
-        st.metric("End", str(session_info.get("end_time") or "")[:19] or "running")
+        st.metric("Remote", "Yes" if include_remote else "No")
+
+    st.markdown(f"**Start:** `{start_str}`  \n**End:** `{end_str}`  \n**Duration:** `{duration_str}`")
 
     try:
         controls = st.container(border=True)
