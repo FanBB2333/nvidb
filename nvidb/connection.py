@@ -1035,15 +1035,15 @@ class NVClientPool:
                 fill_len = 1
             fill_len = max(0, min(width, fill_len))
 
-            empty_bg = "on_grey"
-            fill_bg = mem_bar_bg(p) or empty_bg
+            # Keep the unfilled portion on the terminal default background.
+            # `termcolor`'s "on_grey" maps to ANSI 40 (black), which looks wrong
+            # on light/gray terminal themes.
+            fill_bg = mem_bar_bg(p)
 
             left = "".join(chars[:fill_len])
             right = "".join(chars[fill_len:])
-            if fill_len > 0:
-                left = colored(left, "white", fill_bg)
-            if right:
-                right = colored(right, "white", empty_bg)
+            if fill_len > 0 and fill_bg:
+                left = colored(left, on_color=fill_bg)
             return left + right
 
         # Format table header
