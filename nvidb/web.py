@@ -332,6 +332,51 @@ def _ensure_streamlit():
         raise RuntimeError("streamlit is required for `nvidb web` (install with `pip install streamlit`).")
 
 
+_TEAL_PRIMARY = "#00BFA5"
+_SIDEBAR_WIDTH_PX = 360
+_CHART_COLOR_RANGE = [
+    "#00BFA5",
+    "#00ACC1",
+    "#1E88E5",
+    "#26C6DA",
+    "#5C6BC0",
+    "#00897B",
+    "#039BE5",
+    "#4DD0E1",
+    "#80CBC4",
+    "#26A69A",
+]
+
+
+def _apply_app_styles():
+    _ensure_streamlit()
+    st.markdown(
+        f"""
+        <style>
+        section[data-testid="stSidebar"] {{
+          min-width: {_SIDEBAR_WIDTH_PX}px !important;
+          width: {_SIDEBAR_WIDTH_PX}px !important;
+        }}
+        section[data-testid="stSidebar"] > div {{
+          min-width: {_SIDEBAR_WIDTH_PX}px !important;
+          width: {_SIDEBAR_WIDTH_PX}px !important;
+        }}
+        section[data-testid="stSidebar"] .stRadio label {{
+          font-size: 0.98rem !important;
+        }}
+        section[data-testid="stSidebar"] [data-testid=\"stMarkdownContainer\"] p {{
+          font-size: 0.98rem !important;
+        }}
+        div[data-testid="stSegmentedControl"] button {{
+          font-size: 1.05rem !important;
+          padding: 0.35rem 0.85rem !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _trigger_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -511,7 +556,7 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
             min_value=0,
             max_value=100,
             format="%.0f%%",
-            color="auto-inverse",
+            color="primary",
         )
 
     column_order = []
@@ -534,7 +579,7 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
             min_value=0,
             max_value=100,
             format="%.0f%%",
-            color="auto-inverse",
+            color="primary",
         )
 
     if "mem_util" in column_order and "mem_util" in table.columns:
@@ -545,7 +590,7 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
             min_value=0,
             max_value=100,
             format="%.0f%%",
-            color="auto-inverse",
+            color="primary",
         )
 
     if "GPU" in column_order:
@@ -731,10 +776,31 @@ def show_live_dashboard(*, include_remote):
 
     st.header("Live GPU")
 
-    refresh_interval = st.sidebar.slider("Refresh interval (seconds)", 1, 30, 5)
-    auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
+    try:
+        controls = st.container(border=True)
+    except TypeError:  # pragma: no cover
+        controls = st.container()
+    col1, col2, col3 = controls.columns(3)
+    with col1:
+        refresh_interval = st.slider(
+            "Refresh interval (seconds)",
+            1,
+            30,
+            5,
+            key="_nvidb_live_refresh_interval",
+        )
+    with col2:
+        auto_refresh = st.checkbox(
+            "Auto refresh",
+            value=True,
+            key="_nvidb_live_auto_refresh",
+        )
+    with col3:
+        refresh_now = st.button(
+            "Refresh now",
+            key="_nvidb_live_refresh_now",
+        )
     use_fragment = hasattr(st, "fragment")
-    refresh_now = st.sidebar.button("Refresh now")
 
     run_every = refresh_interval if auto_refresh else None
 
@@ -1029,22 +1095,24 @@ def _render_timeseries_chart(df_long: pd.DataFrame, *, title: str, tooltip_forma
         empty="none",
     )
 
+    color_scale = alt.Scale(range=_CHART_COLOR_RANGE)
+
     lines = alt.Chart(data).mark_line().encode(
         x=alt.X("timestamp:T", title=None),
         y=alt.Y("value:Q", title=None),
-        color=alt.Color("gpu_id:N", title="GPU"),
+        color=alt.Color("gpu_id:N", title="GPU", scale=color_scale),
     )
 
     highlight = alt.Chart(data).mark_line(size=4).encode(
         x=alt.X("timestamp:T", title=None),
         y=alt.Y("value:Q", title=None),
-        color=alt.Color("gpu_id:N", legend=None),
+        color=alt.Color("gpu_id:N", legend=None, scale=color_scale),
     ).transform_filter(hover)
 
     points = alt.Chart(data).mark_circle(size=60, opacity=0).encode(
         x="timestamp:T",
         y="value:Q",
-        color=alt.Color("gpu_id:N", legend=None),
+        color=alt.Color("gpu_id:N", legend=None, scale=color_scale),
         tooltip=[
             alt.Tooltip("timestamp:T", title="Time"),
             alt.Tooltip("gpu_id:N", title="GPU"),
@@ -1149,8 +1217,21 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
     with col6:
         st.metric("End", str(session_info.get("end_time") or "")[:19] or "running")
 
+    try:
+        controls = st.container(border=True)
+    except TypeError:  # pragma: no cover
+        controls = st.container()
+    controls.subheader("Display Options")
+
     nodes_all = sorted({str(n) for n in df["node"].dropna().unique()})
-    selected_nodes = st.sidebar.multiselect("Nodes", options=nodes_all, default=nodes_all)
+    nodes_col, time_col = controls.columns([1, 2])
+    with nodes_col:
+        selected_nodes = st.multiselect(
+            "Nodes",
+            options=nodes_all,
+            default=nodes_all,
+            key=f"_nvidb_nodes_{session_id}",
+        )
     if not selected_nodes:
         st.info("Select at least one node to display.")
         return
@@ -1162,16 +1243,34 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
         st.warning("No timestamps available in this session.")
         return
 
-    start_ts, end_ts = st.sidebar.slider(
-        "Time range",
-        min_value=min_ts.to_pydatetime(),
-        max_value=max_ts.to_pydatetime(),
-        value=(min_ts.to_pydatetime(), max_ts.to_pydatetime()),
-    )
+    with time_col:
+        start_ts, end_ts = st.slider(
+            "Time range",
+            min_value=min_ts.to_pydatetime(),
+            max_value=max_ts.to_pydatetime(),
+            value=(min_ts.to_pydatetime(), max_ts.to_pydatetime()),
+            key=f"_nvidb_time_range_{session_id}",
+        )
     df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
 
     gpu_ids_all = sorted({int(g) for g in df["gpu_id"].dropna().unique()})
-    visible_gpus = st.sidebar.multiselect("Visible GPUs", options=gpu_ids_all, default=gpu_ids_all)
+    gpu_col, points_col = controls.columns(2)
+    with gpu_col:
+        visible_gpus = st.multiselect(
+            "Visible GPUs",
+            options=gpu_ids_all,
+            default=gpu_ids_all,
+            key=f"_nvidb_visible_gpus_{session_id}",
+        )
+    with points_col:
+        max_points = st.slider(
+            "Max points / GPU",
+            50,
+            2000,
+            600,
+            step=50,
+            key=f"_nvidb_max_points_{session_id}",
+        )
     if not visible_gpus:
         st.info("Select at least one GPU to display.")
         return
@@ -1179,13 +1278,13 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
 
     metric_keys = list(_LOG_METRICS.keys())
     default_metrics = [k for k, spec in _LOG_METRICS.items() if spec.get("default")]
-    selected_metrics = st.sidebar.multiselect(
+    selected_metrics = controls.multiselect(
         "Metrics",
         options=metric_keys,
         default=default_metrics,
         format_func=lambda k: (_LOG_METRICS.get(k) or {}).get("label", k),
+        key=f"_nvidb_metrics_{session_id}",
     )
-    max_points = st.sidebar.slider("Max points per GPU (charts)", 50, 2000, 600, step=50)
 
     timestamps = df["timestamp"].dropna().drop_duplicates().sort_values()
     if timestamps.empty:
@@ -1193,7 +1292,13 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
         return
 
     ts_list = list(timestamps)
-    ts_idx = st.sidebar.slider("Snapshot index", 0, len(ts_list) - 1, len(ts_list) - 1)
+    ts_idx = controls.slider(
+        "Snapshot index",
+        0,
+        len(ts_list) - 1,
+        len(ts_list) - 1,
+        key=f"_nvidb_snapshot_idx_{session_id}",
+    )
     selected_ts = ts_list[ts_idx]
 
     snapshot = df[df["timestamp"] == selected_ts]
@@ -1234,7 +1339,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                 _render_gpu_table(node_table)
 
             if not selected_metrics:
-                st.info("Select metrics in the sidebar to show trend charts.")
+                st.info("Select metrics above to show trend charts.")
                 continue
 
             node_df = parsed[parsed["node"] == node]
@@ -1271,10 +1376,28 @@ def main(*, session_id=None, db_path=None, include_remote=False):
     _ensure_streamlit()
 
     st.set_page_config(page_title="nvidb web", page_icon="🖥️", layout="wide")
+    _apply_app_styles()
     st.title("nvidb web")
 
-    default_index = 1 if session_id is not None else 0
-    view = st.sidebar.radio("View", ["Live", "Logs"], index=default_index)
+    default_view = "Logs" if session_id is not None else "Live"
+    if hasattr(st, "segmented_control"):
+        view = st.segmented_control(
+            "View",
+            options=["Live", "Logs"],
+            default=default_view,
+            key="_nvidb_view_v1",
+            format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
+        )
+    else:  # pragma: no cover
+        default_index = 1 if default_view == "Logs" else 0
+        view = st.radio(
+            "View",
+            options=["Live", "Logs"],
+            index=default_index,
+            horizontal=True,
+            key="_nvidb_view_v1",
+            format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
+        )
 
     if view == "Live":
         show_live_dashboard(include_remote=include_remote)
@@ -1310,7 +1433,7 @@ def run_streamlit_app(*, session_id=None, db_path=None, port=8501, include_remot
 
     print(f"Starting Streamlit on port {port}...")
     print(f"Open http://localhost:{port} in your browser")
-    subprocess.run(cmd)
+    subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent))
 
 
 if __name__ == "__main__":
