@@ -1035,15 +1035,13 @@ class NVClientPool:
                 fill_len = 1
             fill_len = max(0, min(width, fill_len))
 
-            empty_bg = "on_grey"
-            fill_bg = mem_bar_bg(p) or empty_bg
+            fill_bg = mem_bar_bg(p)
 
             left = "".join(chars[:fill_len])
             right = "".join(chars[fill_len:])
             if fill_len > 0:
                 left = colored(left, "white", fill_bg)
-            if right:
-                right = colored(right, "white", empty_bg)
+            # right part uses terminal default background (no color)
             return left + right
 
         # Format table header
