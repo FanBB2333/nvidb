@@ -280,14 +280,69 @@ def _user_summary_df(user_summary: dict) -> pd.DataFrame:
     return df
 
 
-def _render_gpu_table(df: pd.DataFrame):
+_GPU_TABLE_COLUMNS = [
+    ("GPU", "GPU"),
+    ("name", "name"),
+    ("util", "util (GPU%)"),
+    ("mem_util", "mem_util (mem%)"),
+    ("memory[used/total]", "memory[used/total]"),
+    ("mem%", "mem%"),
+    ("temp", "temp"),
+    ("power", "power"),
+    ("rx", "rx"),
+    ("tx", "tx"),
+    ("fan", "fan"),
+    ("processes", "processes"),
+]
+
+_DEFAULT_GPU_TABLE_COLUMNS = ["GPU", "name", "util", "mem_util", "memory[used/total]", "mem%", "temp"]
+
+
+def _render_gpu_column_checkboxes(available_columns, *, key_prefix: str):
+    _ensure_streamlit()
+    available = set(available_columns or [])
+    controls = st.container()
+    controls.markdown("**Columns**")
+    grid = controls.columns(6)
+
+    selected = []
+    for idx, (col_name, label) in enumerate(_GPU_TABLE_COLUMNS):
+        default_checked = col_name in _DEFAULT_GPU_TABLE_COLUMNS
+        disabled = False
+        if available:
+            if col_name == "mem%":
+                disabled = "memory[used/total]" not in available
+            else:
+                disabled = col_name not in available
+        checked = grid[idx % 6].checkbox(
+            label,
+            value=default_checked,
+            key=f"{key_prefix}_{col_name}",
+            disabled=disabled,
+        )
+        if checked and not disabled:
+            selected.append(col_name)
+
+    if not selected:
+        selected = list(_DEFAULT_GPU_TABLE_COLUMNS)
+    return selected
+
+
+def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     _ensure_streamlit()
     if df is None or df.empty:
         st.dataframe(df, use_container_width=True, hide_index=True)
         return
 
     table = df.copy()
-    column_order = list(table.columns)
+    available_cols = list(table.columns)
+    desired_cols = list(visible_columns) if visible_columns else list(available_cols)
+    if visible_columns is None and "memory[used/total]" in available_cols and "mem%" not in desired_cols:
+        try:
+            desired_cols.insert(desired_cols.index("memory[used/total]") + 1, "mem%")
+        except ValueError:
+            desired_cols.append("mem%")
+
     column_config = {}
 
     def ratio_percent(value):
@@ -296,45 +351,80 @@ def _render_gpu_table(df: pd.DataFrame):
             return None
         return (float(used) / float(total)) * 100
 
-    if "util" in table.columns:
-        table["util"] = pd.to_numeric(table["util"].map(_parse_percent), errors="coerce")
-        column_config["util"] = st.column_config.ProgressColumn(
-            "util",
-            min_value=0,
-            max_value=100,
-            format="%.0f%%",
-            color="auto-inverse",
-        )
-
-    if "mem_util" in table.columns:
-        table["mem_util"] = pd.to_numeric(table["mem_util"].map(_parse_percent), errors="coerce")
-        column_config["mem_util"] = st.column_config.ProgressColumn(
-            "mem_util",
-            min_value=0,
-            max_value=100,
-            format="%.0f%%",
-            color="auto-inverse",
-        )
-
-    if "memory[used/total]" in table.columns:
+    mem_pct_col = None
+    if "mem%" in desired_cols and "memory[used/total]" in table.columns:
         mem_pct_col = "_nvidb_mem_pct"
         table[mem_pct_col] = pd.to_numeric(table["memory[used/total]"].map(ratio_percent), errors="coerce")
         column_config[mem_pct_col] = st.column_config.ProgressColumn(
             "mem%",
+            width="small",
             min_value=0,
             max_value=100,
             format="%.0f%%",
             color="auto-inverse",
         )
 
-        try:
-            insert_at = column_order.index("memory[used/total]") + 1
-        except ValueError:
-            insert_at = len(column_order)
-        column_order.insert(insert_at, mem_pct_col)
+    column_order = []
+    for col_name in desired_cols:
+        if col_name == "mem%":
+            if mem_pct_col is not None:
+                column_order.append(mem_pct_col)
+            continue
+        if col_name in table.columns:
+            column_order.append(col_name)
+
+    if not column_order:
+        column_order = list(available_cols)
+
+    if "util" in column_order and "util" in table.columns:
+        table["util"] = pd.to_numeric(table["util"].map(_parse_percent), errors="coerce")
+        column_config["util"] = st.column_config.ProgressColumn(
+            "util",
+            width="small",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="auto-inverse",
+        )
+
+    if "mem_util" in column_order and "mem_util" in table.columns:
+        table["mem_util"] = pd.to_numeric(table["mem_util"].map(_parse_percent), errors="coerce")
+        column_config["mem_util"] = st.column_config.ProgressColumn(
+            "mem_util",
+            width="small",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="auto-inverse",
+        )
+
+    if "GPU" in column_order:
+        column_config.setdefault("GPU", st.column_config.NumberColumn("GPU", width="small"))
+    if "name" in column_order:
+        column_config.setdefault("name", st.column_config.TextColumn("name", width="medium", max_chars=28))
+    if "fan" in column_order:
+        column_config.setdefault("fan", st.column_config.TextColumn("fan", width="small"))
+    if "temp" in column_order:
+        column_config.setdefault("temp", st.column_config.TextColumn("temp", width="small"))
+    if "rx" in column_order:
+        column_config.setdefault("rx", st.column_config.TextColumn("rx", width="small"))
+    if "tx" in column_order:
+        column_config.setdefault("tx", st.column_config.TextColumn("tx", width="small"))
+    if "power" in column_order:
+        column_config.setdefault("power", st.column_config.TextColumn("power", width="small", max_chars=18))
+    if "memory[used/total]" in column_order:
+        column_config.setdefault(
+            "memory[used/total]",
+            st.column_config.TextColumn("memory", width="small", max_chars=16),
+        )
+    if "processes" in column_order:
+        column_config.setdefault(
+            "processes",
+            st.column_config.TextColumn("processes", width="medium", max_chars=32),
+        )
 
     st.dataframe(
-        table,
+        table[column_order],
         use_container_width=True,
         hide_index=True,
         column_order=column_order,
@@ -526,6 +616,21 @@ def show_live_dashboard(*, include_remote):
         if last_error:
             st.warning(f"Last fetch error: {last_error}")
 
+        available_columns = set()
+        if isinstance(raw_stats_by_client, dict):
+            for idx in range(len(pool.pool)):
+                try:
+                    table, _system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+                except Exception:
+                    continue
+                if isinstance(table, pd.DataFrame) and not table.empty:
+                    available_columns.update(table.columns)
+
+        visible_columns = _render_gpu_column_checkboxes(
+            available_columns,
+            key_prefix="_nvidb_live_cols",
+        )
+
         if raw_stats_by_client is None:
             st.info("Fetching GPU data...")
             return
@@ -571,7 +676,7 @@ def show_live_dashboard(*, include_remote):
             else:
                 title = f"[{idx + 1}] {description} | {_server_summary(table)}"
 
-                def body(table=table, system_info=system_info, user_summary=user_summary):
+                def body(table=table, system_info=system_info, user_summary=user_summary, visible_columns=visible_columns):
                     if (
                         isinstance(system_info, dict)
                         and any(k in system_info for k in ("driver_version", "cuda_version", "attached_gpus"))
@@ -582,7 +687,7 @@ def show_live_dashboard(*, include_remote):
                             f"GPUs: {system_info.get('attached_gpus', '0')}"
                         )
 
-                    _render_gpu_table(table)
+                    _render_gpu_table(table, visible_columns=visible_columns)
 
                     if user_summary:
                         with st.expander("User VRAM totals (this node)", expanded=False):
