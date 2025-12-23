@@ -766,7 +766,7 @@ class NVClientPool:
                 formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{error_panel}")
                 continue
 
-            formatted_table = self._format_fixed_width_table(stats)
+            formatted_table = self._format_fixed_width_table(stats, border=(len(self.pool) == 1))
 
             system_info_header = ""
             if system_info:
@@ -804,8 +804,8 @@ class NVClientPool:
             ]
         )
     
-    def _format_fixed_width_table(self, df):
-        """Format fixed-width table display"""
+    def _format_fixed_width_table(self, df, border: bool = False):
+        """Format fixed-width table display."""
         if df.empty:
             return "No GPU data available"
         
@@ -830,53 +830,100 @@ class NVClientPool:
             'processes': 20  # Add width for processes column
         }
 
+        all_columns = list(df.columns)
+
+        # Calculate widths based on terminal space
+        separator_width = 3
+        outer_width = 4 if border else 0  # "| " + " |"
+        max_content_width = max(0, terminal_width - outer_width)
+
+        # Column importance: larger => dropped earlier when narrow
+        importance = {
+            "GPU": 0,
+            "util": 1,
+            "mem_util": 2,
+            "memory[used/total]": 3,
+            "name": 4,
+            "processes": 5,
+            "temp": 6,
+            "power": 7,
+            "rx": 8,
+            "tx": 9,
+            "fan": 10,
+        }
+        must_keep = [c for c in ("GPU", "util", "mem_util") if c in all_columns]
+
+        min_widths_for_cols = {}
+        for col in all_columns:
+            min_width = min_widths.get(col, 12)
+            min_widths_for_cols[col] = max(min_width, len(str(col)))
+
+        def min_table_width(cols) -> int:
+            if not cols:
+                return 0
+            return sum(min_widths_for_cols[c] for c in cols) + separator_width * (len(cols) - 1)
+
+        # Drop least important columns until it fits the terminal width
+        selected_columns = list(all_columns)
+        while selected_columns and min_table_width(selected_columns) > max_content_width:
+            droppable = [c for c in selected_columns if c not in must_keep]
+            if not droppable:
+                droppable = list(selected_columns)
+            drop_col = max(
+                droppable,
+                key=lambda c: (importance.get(c, 100), selected_columns.index(c)),
+            )
+            selected_columns.remove(drop_col)
+
+        if not selected_columns:
+            selected_columns = all_columns[:1]
+
+        df_display = df[selected_columns]
+
         # Compute content width for each column
         content_widths = {}
-        for col in df.columns:
+        for col in selected_columns:
             max_len = len(str(col))
-            for value in df[col]:
+            for value in df_display[col]:
                 value_len = len(str(value))
                 if value_len > max_len:
                     max_len = value_len
             content_widths[col] = max_len
 
-        # Calculate widths based on terminal space
-        separator_width = 3
-        total_separator_width = separator_width * (len(df.columns) - 1)
-        available_width = terminal_width - total_separator_width
-
-        min_widths_for_cols = {}
         desired_widths = {}
-        for col in df.columns:
-            min_width = min_widths.get(col, 12)
-            min_width = max(min_width, len(str(col)))
-            min_widths_for_cols[col] = min_width
+        min_widths_selected = {}
+        for col in selected_columns:
+            min_width = min_widths_for_cols.get(col, 12)
+            min_widths_selected[col] = min_width
             desired_widths[col] = max(min_width, content_widths.get(col, min_width))
 
-        min_total = sum(min_widths_for_cols.values())
+        total_separator_width = separator_width * (len(selected_columns) - 1)
+        available_width = max_content_width - total_separator_width  # available for column contents
+        if available_width < 1:
+            available_width = 1
+
+        min_total = sum(min_widths_selected.values())
         desired_total = sum(desired_widths.values())
 
-        if available_width <= min_total:
-            column_widths = min_widths_for_cols
-        elif available_width >= desired_total:
-            column_widths = desired_widths
-        else:
-            column_widths = dict(min_widths_for_cols)
+        if available_width >= desired_total:
+            column_widths = dict(desired_widths)
+        elif available_width >= min_total:
+            column_widths = dict(min_widths_selected)
             extra = available_width - min_total
             priority = [
-                'name',
-                'processes',
-                'power',
-                'memory[used/total]',
-                'rx',
-                'tx',
-                'temp',
-                'fan',
-                'util',
-                'mem_util',
-                'GPU',
+                "processes",
+                "name",
+                "power",
+                "memory[used/total]",
+                "rx",
+                "tx",
+                "temp",
+                "fan",
+                "util",
+                "mem_util",
+                "GPU",
             ]
-            for col in [c for c in priority if c in df.columns]:
+            for col in [c for c in priority if c in selected_columns]:
                 if extra <= 0:
                     break
                 need = desired_widths[col] - column_widths[col]
@@ -884,87 +931,188 @@ class NVClientPool:
                     add = min(extra, need)
                     column_widths[col] += add
                     extra -= add
-            if extra > 0:
-                for col in df.columns:
-                    if extra <= 0:
+        else:
+            # Extremely narrow terminal: shrink columns below minimums, but keep at least 1 char
+            column_widths = dict(min_widths_selected)
+            excess = sum(column_widths.values()) - available_width
+            if excess > 0:
+                shrink_order = sorted(
+                    selected_columns,
+                    key=lambda c: (importance.get(c, 100), selected_columns.index(c)),
+                    reverse=True,
+                )
+                for col in shrink_order:
+                    if excess <= 0:
                         break
-                    if col in priority:
+                    reducible = column_widths[col] - 1
+                    if reducible <= 0:
                         continue
-                    need = desired_widths[col] - column_widths[col]
-                    if need > 0:
-                        add = min(extra, need)
-                        column_widths[col] += add
-                        extra -= add
-        
+                    reduce_by = min(excess, reducible)
+                    column_widths[col] -= reduce_by
+                    excess -= reduce_by
+
+        def truncate_text(text: str, width: int, tail_preserve: bool = False) -> str:
+            if width <= 0:
+                return ""
+            if text is None:
+                text = ""
+            text = str(text)
+            if len(text) <= width:
+                return text
+            if width <= 2:
+                return text[:width]
+            if tail_preserve:
+                return ".." + text[-(width - 2):]
+            return text[:width - 2] + ".."
+
+        def parse_percent(value: str) -> Optional[float]:
+            if value is None:
+                return None
+            value_str = str(value).strip()
+            if not value_str or value_str in {"N/A", "-"}:
+                return None
+            numbers = extract_numbers(value_str)
+            if not numbers:
+                return None
+            try:
+                return float(numbers[0])
+            except Exception:
+                return None
+
+        def parse_ratio_percent(value: str) -> Optional[float]:
+            if value is None:
+                return None
+            value_str = str(value).strip()
+            if not value_str or value_str in {"N/A", "-"} or "/" not in value_str:
+                return None
+            used_str, total_str = value_str.split("/", 1)
+            try:
+                used_numbers = extract_numbers(used_str)
+                total_numbers = extract_numbers(total_str)
+                if not used_numbers or not total_numbers:
+                    return None
+                used_val = float(used_numbers[0])
+                total_val = float(total_numbers[0])
+                if total_val <= 0:
+                    return None
+                return (used_val / total_val) * 100
+            except Exception:
+                return None
+
+        def mem_bar_bg(percent: Optional[float]) -> Optional[str]:
+            if percent is None:
+                return None
+            if percent >= 60:
+                return "on_red"
+            if percent >= 10:
+                return "on_yellow"
+            if percent > 0:
+                return "on_green"
+            return None
+
+        def format_bar_cell(text: str, percent: Optional[float], width: int) -> str:
+            if width <= 0:
+                return ""
+            text = truncate_text(text, width)
+
+            chars = [" "] * width
+            start = max(0, (width - len(text)) // 2)
+            for i, ch in enumerate(text):
+                pos = start + i
+                if 0 <= pos < width:
+                    chars[pos] = ch
+
+            if percent is None:
+                return "".join(chars)
+
+            try:
+                p = max(0.0, min(100.0, float(percent)))
+            except Exception:
+                return "".join(chars)
+
+            fill_len = int(round((p / 100.0) * width))
+            if p > 0 and fill_len == 0:
+                fill_len = 1
+            fill_len = max(0, min(width, fill_len))
+
+            empty_bg = "on_grey"
+            fill_bg = mem_bar_bg(p) or empty_bg
+
+            left = "".join(chars[:fill_len])
+            right = "".join(chars[fill_len:])
+            if fill_len > 0:
+                left = colored(left, "white", fill_bg)
+            if right:
+                right = colored(right, "white", empty_bg)
+            return left + right
+
         # Format table header
         header_parts = []
-        for col in df.columns:
+        for col in selected_columns:
             width = column_widths.get(col, 12)
-            header_parts.append(f"{col:^{width}}")
+            col_name = truncate_text(str(col), width)
+            header_parts.append(f"{col_name:^{width}}")
         header = " | ".join(header_parts)
-        
+
         # Format separator line
         separator_parts = []
-        for col in df.columns:
+        for col in selected_columns:
             width = column_widths.get(col, 12)
             separator_parts.append("-" * width)
         separator = "-+-".join(separator_parts)
-        
+
         # Format data rows
         data_lines = []
-        for _, row in df.iterrows():
+        for _, row in df_display.iterrows():
             row_parts = []
-            for col in df.columns:
+            row_util = str(row.get("util", "0"))
+            row_util_color = get_utilization_color(row_util)
+            for col in selected_columns:
                 width = column_widths.get(col, 12)
-                value = str(row[col])
-                # Truncate long values and add ellipsis
-                if len(value) > width:
-                    if col == 'name' and width > 2:
-                        value = ".." + value[-(width - 2):]
-                    elif width > 2:
-                        value = value[:width - 2] + ".."
-                    else:
-                        value = value[:width]
-                
-                # Add color formatting for different columns
-                if col == 'util' and value != 'N/A':
-                    # GPU utilization coloring
-                    color = get_utilization_color(value)
+                raw_value = row.get(col, "")
+                value = truncate_text(raw_value, width, tail_preserve=(col == "name"))
+
+                if col == "GPU":
+                    cell = f"{value:^{width}}"
+                    if row_util_color:
+                        cell = colored(cell, row_util_color, attrs=["bold"])
+                    row_parts.append(cell)
+                    continue
+
+                if col == "util" and value != "N/A":
+                    cell = f"{value:^{width}}"
+                    color = get_utilization_color(str(raw_value))
                     if color:
-                        value = colored(f"{value:^{width}}", color)
-                    else:
-                        value = f"{value:^{width}}"
-                elif col == 'mem' and value != 'N/A':
-                    # Memory utilization coloring
-                    color = get_memory_color(value)
-                    if color:
-                        value = colored(f"{value:^{width}}", color)
-                    else:
-                        value = f"{value:^{width}}"
-                elif col == 'memory[used/total]' and value != 'N/A':
-                    # Memory ratio coloring
-                    try:
-                        if '/' in value:
-                            used_str, total_str = value.split('/')
-                            color = get_memory_ratio_color(used_str, total_str)
-                            if color:
-                                value = colored(f"{value:^{width}}", color)
-                            else:
-                                value = f"{value:^{width}}"
-                        else:
-                            value = f"{value:^{width}}"
-                    except (ValueError, AttributeError, IndexError):
-                        value = f"{value:^{width}}"
-                else:
-                    # Center-align all other columns
-                    value = f"{value:^{width}}"
-                
-                row_parts.append(value)
+                        cell = colored(cell, color)
+                    row_parts.append(cell)
+                    continue
+
+                if col == "mem_util" and value != "N/A":
+                    percent = parse_percent(raw_value)
+                    display_text = str(raw_value).replace(" ", "")
+                    if percent is not None:
+                        display_text = f"{int(round(percent))}%"
+                    row_parts.append(format_bar_cell(display_text, percent, width))
+                    continue
+
+                if col == "memory[used/total]" and value != "N/A":
+                    percent = parse_ratio_percent(raw_value)
+                    row_parts.append(format_bar_cell(value, percent, width))
+                    continue
+
+                # Center-align all other columns
+                row_parts.append(f"{value:^{width}}")
+
             data_lines.append(" | ".join(row_parts))
-        
-        # Combine all parts
-        result = [header, separator] + data_lines
-        return "\n".join(result)
+
+        result_lines = [header, separator] + data_lines
+        if border:
+            inner_width = len(header)
+            top = "+" + "-" * (inner_width + 2) + "+"
+            bottom = top
+            result_lines = [top] + [f"| {line} |" for line in result_lines] + [bottom]
+
+        return "\n".join(result_lines)
     
     def _get_server_summary(self, stats, system_info):
         """Generate compact summary for collapsed server view."""

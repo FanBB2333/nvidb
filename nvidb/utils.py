@@ -99,14 +99,16 @@ def get_utilization_color(value_str: str) -> str:
     
     try:
         # 提取数值，移除百分号
-        numeric_value = float(value_str.replace('%', '').strip())
+        numeric_value = float(value_str.replace('%', '').replace(' ', '').strip())
         
         if numeric_value >= 80:
             return 'red'      # 高利用率 (>=80%)
         elif numeric_value >= 50:
             return 'yellow'   # 中等利用率 (50%-80%)
+        elif numeric_value >= 5:
+            return 'green'    # 低但非 idle (5%-50%)
         else:
-            return None       # 低利用率 (<50%)
+            return None       # idle (<5%)
             
     except (ValueError, AttributeError):
         return None
