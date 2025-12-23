@@ -1149,20 +1149,30 @@ def _render_timeseries_chart(df_long: pd.DataFrame, *, title: str, tooltip_forma
 
     color_scale = alt.Scale(range=_CHART_COLOR_RANGE)
 
+    x = alt.X(
+        "timestamp:T",
+        title=None,
+        axis=alt.Axis(
+            tickCount=6,
+            labelOverlap="greedy",
+            format="%m-%d %H:%M",
+        ),
+    )
+
     lines = alt.Chart(data).mark_line().encode(
-        x=alt.X("timestamp:T", title=None),
+        x=x,
         y=alt.Y("value:Q", title=None),
         color=alt.Color("gpu_id:N", title="GPU", scale=color_scale),
     )
 
     highlight = alt.Chart(data).mark_line(size=4).encode(
-        x=alt.X("timestamp:T", title=None),
+        x=x,
         y=alt.Y("value:Q", title=None),
         color=alt.Color("gpu_id:N", legend=None, scale=color_scale),
     ).transform_filter(hover)
 
     points = alt.Chart(data).mark_circle(size=60, opacity=0).encode(
-        x="timestamp:T",
+        x=x,
         y="value:Q",
         color=alt.Color("gpu_id:N", legend=None, scale=color_scale),
         tooltip=[
@@ -1320,28 +1330,14 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
         )
     df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
 
-    gpu_ids_all = sorted({int(g) for g in df["gpu_id"].dropna().unique()})
-    gpu_col, points_col = controls.columns(2)
-    with gpu_col:
-        visible_gpus = st.multiselect(
-            "Visible GPUs",
-            options=gpu_ids_all,
-            default=gpu_ids_all,
-            key=f"_nvidb_visible_gpus_{session_id}",
-        )
-    with points_col:
-        max_points = st.slider(
-            "Max points / GPU",
-            50,
-            2000,
-            600,
-            step=50,
-            key=f"_nvidb_max_points_{session_id}",
-        )
-    if not visible_gpus:
-        st.info("Select at least one GPU to display.")
-        return
-    df = df[df["gpu_id"].isin(visible_gpus)]
+    max_points = controls.slider(
+        "Max points / GPU (charts)",
+        50,
+        2000,
+        600,
+        step=50,
+        key=f"_nvidb_max_points_{session_id}",
+    )
 
     metric_keys = list(_LOG_METRICS.keys())
     default_metrics = [k for k, spec in _LOG_METRICS.items() if spec.get("default")]
@@ -1400,40 +1396,63 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
         title = f"{node} | {_server_summary(node_table)}"
 
         with st.expander(title, expanded=(node_idx == 0)):
+            node_df = parsed[parsed["node"] == node]
+            if node_df.empty:
+                st.info("No timeseries data for this node.")
+                if node_table.empty:
+                    st.info("No snapshot data for this node at the selected time.")
+                else:
+                    _render_gpu_table(node_table)
+                continue
+
+            node_gpu_ids = sorted({int(g) for g in node_df["gpu_id"].dropna().unique()})
+            visible_node_gpus = list(node_gpu_ids)
+            if len(node_gpu_ids) > 1:
+                visible_node_gpus = st.multiselect(
+                    "Visible GPUs (this node)",
+                    options=node_gpu_ids,
+                    default=node_gpu_ids,
+                    key=f"_nvidb_node_visible_gpus_{session_id}_{node}",
+                )
+
+            if selected_metrics:
+                node_df_for_charts = node_df
+                if visible_node_gpus:
+                    node_df_for_charts = node_df[node_df["gpu_id"].isin(visible_node_gpus)]
+                else:
+                    st.info("Select at least one GPU to show charts for this node.")
+                    node_df_for_charts = node_df.iloc[:0]
+
+                if not node_df_for_charts.empty:
+                    cols = st.columns(2)
+                    chart_slot = 0
+                    for metric_key in selected_metrics:
+                        out_col = parsed_cols.get(metric_key)
+                        spec = _LOG_METRICS.get(metric_key) or {}
+                        if out_col is None or out_col not in node_df_for_charts.columns:
+                            continue
+
+                        long_df = node_df_for_charts[["timestamp", "gpu_id", out_col]].rename(columns={out_col: "value"})
+                        long_df = long_df.dropna(subset=["value"])
+                        long_df = _downsample_per_gpu(long_df, max_points_per_gpu=max_points)
+
+                        with cols[chart_slot % 2]:
+                            _render_timeseries_chart(
+                                long_df,
+                                title=str(spec.get("label") or metric_key),
+                                tooltip_format=str(spec.get("tooltip_format") or ""),
+                                height=int(spec.get("height") or 220),
+                            )
+                        chart_slot += 1
+                else:
+                    st.info("No chart data available for the current GPU selection.")
+            else:
+                st.info("Select metrics above to show trend charts.")
+
             if node_table.empty:
                 st.info("No snapshot data for this node at the selected time.")
             else:
                 _render_gpu_table(node_table)
-
-            if not selected_metrics:
-                st.info("Select metrics above to show trend charts.")
-                continue
-
-            node_df = parsed[parsed["node"] == node]
-            if node_df.empty:
-                st.info("No timeseries data for this node.")
-                continue
-
-            cols = st.columns(2)
-            chart_slot = 0
-            for metric_key in selected_metrics:
-                out_col = parsed_cols.get(metric_key)
-                spec = _LOG_METRICS.get(metric_key) or {}
-                if out_col is None or out_col not in node_df.columns:
-                    continue
-
-                long_df = node_df[["timestamp", "gpu_id", out_col]].rename(columns={out_col: "value"})
-                long_df = long_df.dropna(subset=["value"])
-                long_df = _downsample_per_gpu(long_df, max_points_per_gpu=max_points)
-
-                with cols[chart_slot % 2]:
-                    _render_timeseries_chart(
-                        long_df,
-                        title=str(spec.get("label") or metric_key),
-                        tooltip_format=str(spec.get("tooltip_format") or ""),
-                        height=int(spec.get("height") or 220),
-                    )
-                chart_slot += 1
 
     with st.expander("View raw data", expanded=False):
         st.dataframe(df, use_container_width=True)
