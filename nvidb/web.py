@@ -14,7 +14,6 @@ import platform
 import re
 import sqlite3
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -279,32 +278,15 @@ def _user_summary_df(user_summary: dict) -> pd.DataFrame:
     return df
 
 
-def _bar_css(percent: Optional[float]) -> str:
-    if percent is None:
-        return ""
-    try:
-        p = float(percent)
-    except Exception:
-        return ""
-    p = max(0.0, min(100.0, p))
-    if p >= 80:
-        fill = "rgba(255, 75, 75, 0.35)"
-        text = "#ff4b4b"
-    elif p >= 50:
-        fill = "rgba(249, 199, 79, 0.35)"
-        text = "#f9c74f"
-    elif p >= 5:
-        fill = "rgba(67, 170, 139, 0.35)"
-        text = "#43aa8b"
-    else:
-        fill = "transparent"
-        text = "inherit"
-    return f"background: linear-gradient(90deg, {fill} {p}%, transparent {p}%); color: {text};"
-
-
-def _style_gpu_table(df: pd.DataFrame):
+def _render_gpu_table(df: pd.DataFrame):
+    _ensure_streamlit()
     if df is None or df.empty:
-        return df
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+
+    table = df.copy()
+    column_order = list(table.columns)
+    column_config = {}
 
     def ratio_percent(value):
         used, total = _parse_mib_pair(value)
@@ -312,19 +294,50 @@ def _style_gpu_table(df: pd.DataFrame):
             return None
         return (float(used) / float(total)) * 100
 
-    styler = df.style
-    styler_map = getattr(styler, "map", None)
-    if styler_map is None:  # pandas<2.0 compatibility
-        styler_map = getattr(styler, "applymap", None)
-    if styler_map is None:
-        return df
-    if "util" in df.columns:
-        styler = styler_map(lambda v: _bar_css(_parse_percent(v)), subset=["util"])
-    if "mem_util" in df.columns:
-        styler = styler_map(lambda v: _bar_css(_parse_percent(v)), subset=["mem_util"])
-    if "memory[used/total]" in df.columns:
-        styler = styler_map(lambda v: _bar_css(ratio_percent(v)), subset=["memory[used/total]"])
-    return styler
+    if "util" in table.columns:
+        table["util"] = pd.to_numeric(table["util"].map(_parse_percent), errors="coerce")
+        column_config["util"] = st.column_config.ProgressColumn(
+            "util",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="auto-inverse",
+        )
+
+    if "mem_util" in table.columns:
+        table["mem_util"] = pd.to_numeric(table["mem_util"].map(_parse_percent), errors="coerce")
+        column_config["mem_util"] = st.column_config.ProgressColumn(
+            "mem_util",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="auto-inverse",
+        )
+
+    if "memory[used/total]" in table.columns:
+        mem_pct_col = "_nvidb_mem_pct"
+        table[mem_pct_col] = pd.to_numeric(table["memory[used/total]"].map(ratio_percent), errors="coerce")
+        column_config[mem_pct_col] = st.column_config.ProgressColumn(
+            "mem%",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="auto-inverse",
+        )
+
+        try:
+            insert_at = column_order.index("memory[used/total]") + 1
+        except ValueError:
+            insert_at = len(column_order)
+        column_order.insert(insert_at, mem_pct_col)
+
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_order=column_order,
+        column_config=column_config or None,
+    )
 
 
 def _load_server_list():
@@ -367,96 +380,105 @@ def show_live_dashboard(*, include_remote):
 
     refresh_interval = st.sidebar.slider("Refresh interval (seconds)", 1, 30, 5)
     auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
-    if st.sidebar.button("Refresh now"):
-        _trigger_rerun()
-    _autorefresh(refresh_interval, enabled=auto_refresh, key="_nvidb_autorefresh_live")
+    use_fragment = hasattr(st, "fragment")
+    st.sidebar.button("Refresh now")
 
-    effective_remote = bool(include_remote)
-    try:
-        pool = _get_pool(include_remote)
-    except Exception as e:
-        effective_remote = False
-        st.error(str(e))
-        pool = _get_pool(False)
+    run_every = refresh_interval if auto_refresh else None
 
-    if effective_remote:
-        st.caption("Remote: enabled")
-    else:
-        st.caption("Remote: disabled (run `nvidb web --remote` to include remote servers)")
+    def _render():
+        effective_remote = bool(include_remote)
+        try:
+            pool = _get_pool(include_remote)
+        except Exception as e:
+            effective_remote = False
+            st.error(str(e))
+            pool = _get_pool(False)
 
-    try:
-        _formatted, raw_stats_by_client = pool.get_client_gpus_info(return_raw=True)
-    except Exception as e:
-        st.error(f"Failed to fetch GPU data: {e}")
-        return
+        if effective_remote:
+            st.caption("Remote: enabled")
+        else:
+            st.caption("Remote: disabled (run `nvidb web --remote` to include remote servers)")
 
-    meta = {}
-    if isinstance(raw_stats_by_client, dict):
-        meta = raw_stats_by_client.get("_nvidb", {}) or {}
-    user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
-    global_user_memory = meta.get("user_memory_global", {}) or {}
+        try:
+            _formatted, raw_stats_by_client = pool.get_client_gpus_info(return_raw=True)
+        except Exception as e:
+            st.error(f"Failed to fetch GPU data: {e}")
+            return
 
-    if global_user_memory:
-        with st.expander("User VRAM totals (all nodes)", expanded=False):
-            summary_df = _user_summary_df(global_user_memory)
-            st.dataframe(summary_df[["user", "vram"]], use_container_width=True)
-
-    multi = len(pool.pool) > 1
-    for idx, client in enumerate(pool.pool):
-        description = getattr(client, "description", "unknown")
+        meta = {}
         if isinstance(raw_stats_by_client, dict):
-            table, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-        else:
-            table, system_info = pd.DataFrame(), {}
+            meta = raw_stats_by_client.get("_nvidb", {}) or {}
+        user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
+        global_user_memory = meta.get("user_memory_global", {}) or {}
 
-        user_summary = {}
-        if isinstance(user_memory_by_client, dict):
-            user_summary = user_memory_by_client.get(idx, {}) or {}
+        if global_user_memory:
+            with st.expander("User VRAM totals (all nodes)", expanded=False):
+                summary_df = _user_summary_df(global_user_memory)
+                st.dataframe(summary_df[["user", "vram"]], use_container_width=True)
 
-        if isinstance(system_info, dict) and system_info.get("error"):
-            title = f"[{idx + 1}] {description} | Error"
+        multi = len(pool.pool) > 1
+        for idx, client in enumerate(pool.pool):
+            description = getattr(client, "description", "unknown")
+            if isinstance(raw_stats_by_client, dict):
+                table, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+            else:
+                table, system_info = pd.DataFrame(), {}
 
-            def body(system_info=system_info):
-                st.error(system_info.get("error", "Unknown error"))
+            user_summary = {}
+            if isinstance(user_memory_by_client, dict):
+                user_summary = user_memory_by_client.get(idx, {}) or {}
 
-        elif table is None or table.empty:
-            title = f"[{idx + 1}] {description} | No GPUs"
+            if isinstance(system_info, dict) and system_info.get("error"):
+                title = f"[{idx + 1}] {description} | Error"
 
-            def body(system_info=system_info, description=description):
-                payload = {"nvidia": system_info or {}}
-                if str(description).startswith("Local Machine"):
-                    payload["system"] = _get_local_system_info()
-                st.json(payload)
+                def body(system_info=system_info):
+                    st.error(system_info.get("error", "Unknown error"))
 
-        else:
-            title = f"[{idx + 1}] {description} | {_server_summary(table)}"
+            elif table is None or table.empty:
+                title = f"[{idx + 1}] {description} | No GPUs"
 
-            def body(table=table, system_info=system_info, user_summary=user_summary):
-                if (
-                    isinstance(system_info, dict)
-                    and any(k in system_info for k in ("driver_version", "cuda_version", "attached_gpus"))
-                ):
-                    st.caption(
-                        f"Driver: {system_info.get('driver_version', 'N/A')} | "
-                        f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
-                        f"GPUs: {system_info.get('attached_gpus', '0')}"
-                    )
+                def body(system_info=system_info, description=description):
+                    payload = {"nvidia": system_info or {}}
+                    if str(description).startswith("Local Machine"):
+                        payload["system"] = _get_local_system_info()
+                    st.json(payload)
 
-                st.dataframe(_style_gpu_table(table), use_container_width=True)
+            else:
+                title = f"[{idx + 1}] {description} | {_server_summary(table)}"
 
-                if user_summary:
-                    with st.expander("User VRAM totals (this node)", expanded=False):
-                        summary_df = _user_summary_df(user_summary)
-                        st.dataframe(summary_df[["user", "vram"]], use_container_width=True)
+                def body(table=table, system_info=system_info, user_summary=user_summary):
+                    if (
+                        isinstance(system_info, dict)
+                        and any(k in system_info for k in ("driver_version", "cuda_version", "attached_gpus"))
+                    ):
+                        st.caption(
+                            f"Driver: {system_info.get('driver_version', 'N/A')} | "
+                            f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
+                            f"GPUs: {system_info.get('attached_gpus', '0')}"
+                        )
 
-        if multi:
-            with st.expander(title, expanded=(idx == 0)):
+                    _render_gpu_table(table)
+
+                    if user_summary:
+                        with st.expander("User VRAM totals (this node)", expanded=False):
+                            summary_df = _user_summary_df(user_summary)
+                            st.dataframe(summary_df[["user", "vram"]], use_container_width=True)
+
+            if multi:
+                with st.expander(title, expanded=(idx == 0)):
+                    body()
+            else:
+                st.subheader(description)
                 body()
-        else:
-            st.subheader(description)
-            body()
 
-    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if use_fragment:
+        render = st.fragment(_render, run_every=run_every)
+        render()
+    else:
+        _autorefresh(refresh_interval, enabled=auto_refresh, key="_nvidb_autorefresh_live")
+        _render()
 
 
 def _build_log_snapshot_table(df):
@@ -556,10 +578,10 @@ def show_logs_dashboard(db_path, session_id=None):
 
         if multi:
             with st.expander(title, expanded=(node == nodes[0])):
-                st.dataframe(_style_gpu_table(table), use_container_width=True)
+                _render_gpu_table(table)
         else:
             st.markdown(f"**{node}**")
-            st.dataframe(_style_gpu_table(table), use_container_width=True)
+            _render_gpu_table(table)
 
     with st.expander("View raw data"):
         st.dataframe(df, use_container_width=True)
