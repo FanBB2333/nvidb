@@ -314,7 +314,7 @@ def _format_gb(mib):
     return f"{gb:.1f}GB"
 
 
-def _server_summary(table):
+def _server_summary(table, system_info=None):
     if table is None or table.empty:
         return "No GPUs"
 
@@ -341,7 +341,39 @@ def _server_summary(table):
         total_sum += total
 
     mem_str = f"{_format_gb(used_sum)}/{_format_gb(total_sum)}" if total_sum else "N/A"
-    return f"{len(table)} GPUs | {idle} idle | {avg_util:.0f}% avg | {mem_str}"
+
+    # Build GPU summary part
+    gpu_summary = f"{len(table)} GPUs | {idle} idle | {avg_util:.0f}% avg | {mem_str}"
+
+    # Extract system stats if available
+    sys_stats = {}
+    if system_info and isinstance(system_info, dict):
+        sys_stats = system_info.get("system_stats", {})
+
+    cpu_cores = sys_stats.get("cpu_cores", 0)
+    cpu_percent = sys_stats.get("cpu_percent", 0.0)
+    mem_used_gb = sys_stats.get("mem_used_gb", 0.0)
+    mem_total_gb = sys_stats.get("mem_total_gb", 0.0)
+    swap_used_gb = sys_stats.get("swap_used_gb", 0.0)
+    swap_total_gb = sys_stats.get("swap_total_gb", 0.0)
+
+    sys_parts = []
+
+    # CPU: utilization first, cores in brackets
+    if cpu_cores > 0:
+        cpu_percent_int = int(round(cpu_percent))
+        sys_parts.append(f"CPU: {cpu_percent_int:>3}%({cpu_cores}C)")
+
+    # Memory: used/total with swap in brackets
+    if mem_total_gb > 0:
+        if swap_total_gb > 0:
+            sys_parts.append(f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G(Swap:{swap_used_gb:.1f}/{swap_total_gb:.0f}G)")
+        else:
+            sys_parts.append(f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G")
+
+    if sys_parts:
+        return f"{gpu_summary} | {' | '.join(sys_parts)}"
+    return gpu_summary
 
 
 def _strip_gpu_name(value):
@@ -1176,7 +1208,7 @@ def show_live_dashboard(*, include_remote):
                     st.json(payload)
 
             else:
-                title = f"[{idx + 1}] {description} | {_server_summary(table)}"
+                title = f"[{idx + 1}] {description} | {_server_summary(table, system_info)}"
 
                 def body(table=table, system_info=system_info, user_summary=user_summary, visible_columns=visible_columns):
                     if (
