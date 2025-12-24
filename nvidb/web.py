@@ -726,14 +726,14 @@ def _render_progress_bar_html(value, max_value=100):
 
     # Color based on percentage using CSS variables
     if pct >= 80:
-        color = "var(--st-red-color, #c92a2a)"
+        color = "var(--nvidb-progress-high, #c92a2a)"
     elif pct >= 50:
-        color = "var(--st-orange-color, #e67700)"
+        color = "var(--nvidb-progress-medium, #e67700)"
     else:
-        color = "var(--st-green-color, #2b8a3e)"
+        color = "var(--nvidb-progress-low, #2b8a3e)"
 
     return f'''<div style="display:flex;align-items:center;justify-content:center;gap:6px;">
-        <div style="width:60px;height:8px;background:var(--st-border-color-light, var(--st-border-color, #ddd));border-radius:4px;overflow:hidden;">
+        <div style="width:60px;height:8px;background:var(--nvidb-progress-bg, #ddd);border-radius:4px;overflow:hidden;">
             <div style="width:{pct:.0f}%;height:100%;background:{color};"></div>
         </div>
         <span style="font-size:0.85em;min-width:35px;">{pct:.0f}%</span>
@@ -761,13 +761,11 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
         return (float(used) / float(total)) * 100
 
     column_order = []
-    column_labels = {}
     for col_name in desired_cols:
         if col_name == "mem%":
             continue
         if col_name in table.columns:
             column_order.append(col_name)
-            column_labels[col_name] = col_name
 
     if not column_order:
         column_order = list(available_cols)
@@ -775,70 +773,47 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     # Create display dataframe
     display = table[column_order].copy()
 
-    # Process util column - convert to progress bar HTML
+    # Process util/mem columns for Streamlit-native rendering.
+    column_config = {}
     if "util" in display.columns:
-        display["util"] = display["util"].map(_parse_percent).map(_render_progress_bar_html)
+        display["util"] = display["util"].map(_parse_percent)
+        column_config["util"] = st.column_config.ProgressColumn(
+            "util",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="primary",
+        )
 
-    # Process mem_util column - convert to progress bar HTML
     if "mem_util" in display.columns:
-        display["mem_util"] = display["mem_util"].map(_parse_percent).map(_render_progress_bar_html)
+        display["mem_util"] = display["mem_util"].map(_parse_percent)
+        column_config["mem_util"] = st.column_config.ProgressColumn(
+            "mem_util",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="primary",
+        )
 
-    # Process memory[used/total] column - convert to progress bar HTML
     if "memory[used/total]" in display.columns:
-        display["memory[used/total]"] = display["memory[used/total]"].map(ratio_percent).map(_render_progress_bar_html)
-        # Rename the column to "mem"
+        display["memory[used/total]"] = display["memory[used/total]"].map(ratio_percent)
         display = display.rename(columns={"memory[used/total]": "mem"})
-        if "memory[used/total]" in column_order:
-            idx = column_order.index("memory[used/total]")
-            column_order[idx] = "mem"
+        column_order = ["mem" if col == "memory[used/total]" else col for col in column_order]
+        display = display[column_order]
+        column_config["mem"] = st.column_config.ProgressColumn(
+            "mem",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+            color="primary",
+        )
 
-    # Build HTML table with centered content
-    html_parts = ['''
-    <style>
-    .nvidb-gpu-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 0.9em;
-    }
-    .nvidb-gpu-table th, .nvidb-gpu-table td {
-        text-align: center;
-        padding: 8px 12px;
-        border-bottom: 1px solid var(--st-dataframe-border-color, var(--st-border-color, #ddd));
-        color: var(--st-text-color, inherit);
-    }
-    .nvidb-gpu-table th {
-        background: var(--st-dataframe-header-background-color, var(--st-secondary-background-color, #f5f5f5));
-        font-weight: 600;
-    }
-    .nvidb-gpu-table tr:hover {
-        background: var(--st-secondary-background-color, #f0f0f0);
-    }
-    </style>
-    <table class="nvidb-gpu-table">
-    <thead><tr>
-    ''']
-
-    for col in column_order:
-        safe_col = str(col).replace("<", "&lt;").replace(">", "&gt;")
-        html_parts.append(f'<th>{safe_col}</th>')
-    html_parts.append('</tr></thead><tbody>')
-
-    for _, row in display.iterrows():
-        html_parts.append('<tr>')
-        for col in column_order:
-            val = row.get(col, "")
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                val = "N/A"
-            # Check if already HTML (progress bar)
-            val_str = str(val)
-            if not val_str.startswith('<div'):
-                val_str = val_str.replace("<", "&lt;").replace(">", "&gt;")
-            html_parts.append(f'<td>{val_str}</td>')
-        html_parts.append('</tr>')
-
-    html_parts.append('</tbody></table>')
-
-    st.html(''.join(html_parts))
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        column_config=column_config,
+    )
 
 
 def _load_server_list():
