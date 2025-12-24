@@ -729,8 +729,7 @@ _GPU_TABLE_COLUMNS = [
     ("rx", "rx"),
     ("tx", "tx"),
     ("power", "power"),
-    ("memory[used/total]", "memory[used/total]"),
-    ("mem%", "mem%"),
+    ("memory[used/total]", "mem"),
     ("processes", "processes"),
 ]
 
@@ -767,10 +766,7 @@ def _render_gpu_column_checkboxes(available_columns, *, key_prefix: str):
         default_checked = col_name in _DEFAULT_GPU_TABLE_COLUMNS
         disabled = False
         if available:
-            if col_name == "mem%":
-                disabled = "memory[used/total]" not in available
-            else:
-                disabled = col_name not in available
+            disabled = col_name not in available
             if disabled:
                 default_checked = False
         checked = grid[idx % 6].checkbox(
@@ -796,11 +792,10 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     table = df.copy()
     available_cols = list(table.columns)
     desired_cols = list(visible_columns) if visible_columns else list(available_cols)
-    if visible_columns is None and "memory[used/total]" in available_cols and "mem%" not in desired_cols:
-        try:
-            desired_cols.insert(desired_cols.index("memory[used/total]") + 1, "mem%")
-        except ValueError:
-            desired_cols.append("mem%")
+
+    # Remove mem% from desired_cols since we'll merge it with memory[used/total]
+    if "mem%" in desired_cols:
+        desired_cols.remove("mem%")
 
     column_config = {}
 
@@ -810,21 +805,9 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
             return None
         return (float(used) / float(total)) * 100
 
-    mem_pct_col = None
-    if "mem%" in desired_cols and "memory[used/total]" in table.columns:
-        mem_pct_col = "_nvidb_mem_pct"
-        table[mem_pct_col] = pd.to_numeric(table["memory[used/total]"].map(ratio_percent), errors="coerce")
-        column_config[mem_pct_col] = st.column_config.NumberColumn(
-            "mem%",
-            width="small",
-            format="%.0f%%",
-        )
-
     column_order = []
     for col_name in desired_cols:
         if col_name == "mem%":
-            if mem_pct_col is not None:
-                column_order.append(mem_pct_col)
             continue
         if col_name in table.columns:
             column_order.append(col_name)
@@ -832,19 +815,41 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     if not column_order:
         column_order = list(available_cols)
 
+    # Create merged memory column with progress bar [used/total percentage]
+    mem_merged_col = None
+    if "memory[used/total]" in column_order and "memory[used/total]" in table.columns:
+        mem_merged_col = "_nvidb_mem_merged"
+        table[mem_merged_col] = pd.to_numeric(table["memory[used/total]"].map(ratio_percent), errors="coerce")
+        column_config[mem_merged_col] = st.column_config.ProgressColumn(
+            "mem",
+            width="small",
+            min_value=0,
+            max_value=100,
+            format="%.0f%%",
+        )
+        # Replace memory[used/total] with merged column in column_order
+        idx = column_order.index("memory[used/total]")
+        column_order[idx] = mem_merged_col
+
+    # Use ProgressColumn for util
     if "util" in column_order and "util" in table.columns:
         table["util"] = pd.to_numeric(table["util"].map(_parse_percent), errors="coerce")
-        column_config["util"] = st.column_config.NumberColumn(
+        column_config["util"] = st.column_config.ProgressColumn(
             "util",
             width="small",
+            min_value=0,
+            max_value=100,
             format="%.0f%%",
         )
 
+    # Use ProgressColumn for mem_util
     if "mem_util" in column_order and "mem_util" in table.columns:
         table["mem_util"] = pd.to_numeric(table["mem_util"].map(_parse_percent), errors="coerce")
-        column_config["mem_util"] = st.column_config.NumberColumn(
+        column_config["mem_util"] = st.column_config.ProgressColumn(
             "mem_util",
             width="small",
+            min_value=0,
+            max_value=100,
             format="%.0f%%",
         )
 
@@ -862,77 +867,20 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
         column_config.setdefault("tx", st.column_config.TextColumn("tx", width="small"))
     if "power" in column_order:
         column_config.setdefault("power", st.column_config.TextColumn("power", width="medium", max_chars=18))
-    if "memory[used/total]" in column_order:
-        column_config.setdefault(
-            "memory[used/total]",
-            st.column_config.TextColumn("memory[used/total]", width="small", max_chars=16),
-        )
     if "processes" in column_order:
         column_config.setdefault(
             "processes",
             st.column_config.TextColumn("processes", width="small", max_chars=24),
         )
 
-    display = table[column_order]
+    display = table[column_order].copy()
 
-    def _cell_color(css_var: str, fallback: str) -> str:
-        return f"var({css_var}, {fallback})"
-
-    def _style_util(value):
-        if value is None or pd.isna(value):
-            return ""
-        try:
-            numeric_value = float(value)
-        except Exception:
-            return ""
-        if numeric_value >= 80:
-            return f"color: {_cell_color('--nvidb-red', '#dc2626')}; font-weight: 600;"
-        if numeric_value >= 50:
-            return f"color: {_cell_color('--nvidb-yellow', '#b45309')}; font-weight: 600;"
-        if numeric_value >= 5:
-            return f"color: {_cell_color('--nvidb-green', '#16a34a')}; font-weight: 600;"
-        return ""
-
-    def _style_mem(value):
-        if value is None or pd.isna(value):
-            return ""
-        try:
-            numeric_value = float(value)
-        except Exception:
-            return ""
-        if numeric_value >= 60:
-            return f"color: {_cell_color('--nvidb-red', '#dc2626')}; font-weight: 600;"
-        if numeric_value >= 10:
-            return f"color: {_cell_color('--nvidb-yellow', '#b45309')}; font-weight: 600;"
-        if numeric_value > 0:
-            return f"color: {_cell_color('--nvidb-green', '#16a34a')}; font-weight: 600;"
-        return ""
-
-    styled = display.style
-    if "util" in display.columns:
-        styled = styled.map(_style_util, subset=["util"])
-    if "mem_util" in display.columns:
-        styled = styled.map(_style_mem, subset=["mem_util"])
-    if mem_pct_col is not None and mem_pct_col in display.columns:
-        styled = styled.map(_style_mem, subset=[mem_pct_col])
-    if "memory[used/total]" in display.columns:
-        styled = styled.map(lambda v: _style_mem(ratio_percent(v)), subset=["memory[used/total]"])
-
-    styled = styled.set_properties(**{"text-align": "center"})
-    styled = styled.set_table_styles(
-        [
-            {"selector": "th", "props": [("text-align", "center")]},
-            {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse")]},
-            {"selector": "td, th", "props": [("padding", "8px"), ("border", "1px solid var(--nvidb-border)")]},
-            {"selector": "th", "props": [("background-color", "var(--nvidb-bg)"), ("color", "var(--nvidb-text)"), ("font-weight", "600")]},
-            {"selector": "td", "props": [("background-color", "var(--nvidb-bg2)")]},
-        ],
-        overwrite=False,
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config=column_config or None,
     )
-
-    # Render as HTML to properly display colors
-    html = styled.to_html()
-    st.html(html)
 
 
 def _load_server_list():
