@@ -406,11 +406,19 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
     theme_css = f"""
         :root {{
           --nvidb-primary: {_TEAL_PRIMARY};
-          --nvidb-bg: #ffffff;
-          --nvidb-bg2: #f6fafb;
+          --nvidb-bg: #f1f5f9;
+          --nvidb-bg2: #ffffff;
           --nvidb-text: #0f172a;
           --nvidb-muted: #64748b;
-          --nvidb-border: rgba(15, 23, 42, 0.14);
+          --nvidb-border: rgba(15, 23, 42, 0.18);
+          --nvidb-red: #dc2626;
+          --nvidb-yellow: #b45309;
+          --nvidb-green: #16a34a;
+          --st-primary-color: {_TEAL_PRIMARY};
+          --st-background-color: #f1f5f9;
+          --st-secondary-background-color: #ffffff;
+          --st-text-color: #0f172a;
+          --st-link-color: {_TEAL_PRIMARY};
         }}
 
         @media (prefers-color-scheme: dark) {{
@@ -420,11 +428,21 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
             --nvidb-text: #e2e8f0;
             --nvidb-muted: #94a3b8;
             --nvidb-border: rgba(226, 232, 240, 0.14);
+            --nvidb-red: #f87171;
+            --nvidb-yellow: #fbbf24;
+            --nvidb-green: #4ade80;
+            --st-primary-color: {_TEAL_PRIMARY};
+            --st-background-color: #0b1220;
+            --st-secondary-background-color: #0f172a;
+            --st-text-color: #e2e8f0;
+            --st-link-color: {_TEAL_PRIMARY};
           }}
         }}
 
         html, body {{
           color-scheme: light dark;
+          background: var(--nvidb-bg) !important;
+          color: var(--nvidb-text) !important;
         }}
 
         [data-testid=\"stAppViewContainer\"], .stApp {{
@@ -447,27 +465,50 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
         hr {{
           border-color: var(--nvidb-border) !important;
         }}
+
+        .vg-tooltip {{
+          background: var(--nvidb-bg2) !important;
+          color: var(--nvidb-text) !important;
+          border: 1px solid var(--nvidb-border) !important;
+          box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15) !important;
+        }}
     """
 
     if theme_mode_norm == "dark":
-        theme_css += """
+        theme_css += f"""
         :root {
           --nvidb-bg: #0b1220;
           --nvidb-bg2: #0f172a;
           --nvidb-text: #e2e8f0;
           --nvidb-muted: #94a3b8;
           --nvidb-border: rgba(226, 232, 240, 0.14);
+          --nvidb-red: #f87171;
+          --nvidb-yellow: #fbbf24;
+          --nvidb-green: #4ade80;
+          --st-primary-color: {_TEAL_PRIMARY};
+          --st-background-color: #0b1220;
+          --st-secondary-background-color: #0f172a;
+          --st-text-color: #e2e8f0;
+          --st-link-color: {_TEAL_PRIMARY};
         }
         html, body { color-scheme: dark; }
         """
     elif theme_mode_norm == "light":
-        theme_css += """
+        theme_css += f"""
         :root {
-          --nvidb-bg: #ffffff;
-          --nvidb-bg2: #f6fafb;
+          --nvidb-bg: #f1f5f9;
+          --nvidb-bg2: #ffffff;
           --nvidb-text: #0f172a;
           --nvidb-muted: #64748b;
-          --nvidb-border: rgba(15, 23, 42, 0.14);
+          --nvidb-border: rgba(15, 23, 42, 0.18);
+          --nvidb-red: #dc2626;
+          --nvidb-yellow: #b45309;
+          --nvidb-green: #16a34a;
+          --st-primary-color: {_TEAL_PRIMARY};
+          --st-background-color: #f1f5f9;
+          --st-secondary-background-color: #ffffff;
+          --st-text-color: #0f172a;
+          --st-link-color: {_TEAL_PRIMARY};
         }
         html, body { color-scheme: light; }
         """
@@ -684,6 +725,24 @@ _GPU_TABLE_COLUMNS = [
 _DEFAULT_GPU_TABLE_COLUMNS = [col_name for col_name, _label in _GPU_TABLE_COLUMNS]
 
 
+def _center_dataframe(df: pd.DataFrame, *, max_cells: int = 8000):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    try:
+        cells = int(df.shape[0]) * int(df.shape[1])
+    except Exception:  # pragma: no cover
+        cells = max_cells + 1
+    if cells > max_cells:
+        return df
+
+    styled = df.style.set_properties(**{"text-align": "center"})
+    styled = styled.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}],
+        overwrite=False,
+    )
+    return styled
+
+
 def _render_gpu_column_checkboxes(available_columns, *, key_prefix: str):
     _ensure_streamlit()
     available = set(available_columns or [])
@@ -743,13 +802,10 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     if "mem%" in desired_cols and "memory[used/total]" in table.columns:
         mem_pct_col = "_nvidb_mem_pct"
         table[mem_pct_col] = pd.to_numeric(table["memory[used/total]"].map(ratio_percent), errors="coerce")
-        column_config[mem_pct_col] = st.column_config.ProgressColumn(
+        column_config[mem_pct_col] = st.column_config.NumberColumn(
             "mem%",
             width="small",
-            min_value=0,
-            max_value=100,
             format="%.0f%%",
-            color="primary",
         )
 
     column_order = []
@@ -766,24 +822,18 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
 
     if "util" in column_order and "util" in table.columns:
         table["util"] = pd.to_numeric(table["util"].map(_parse_percent), errors="coerce")
-        column_config["util"] = st.column_config.ProgressColumn(
+        column_config["util"] = st.column_config.NumberColumn(
             "util",
             width="small",
-            min_value=0,
-            max_value=100,
             format="%.0f%%",
-            color="primary",
         )
 
     if "mem_util" in column_order and "mem_util" in table.columns:
         table["mem_util"] = pd.to_numeric(table["mem_util"].map(_parse_percent), errors="coerce")
-        column_config["mem_util"] = st.column_config.ProgressColumn(
+        column_config["mem_util"] = st.column_config.NumberColumn(
             "mem_util",
             width="small",
-            min_value=0,
-            max_value=100,
             format="%.0f%%",
-            color="primary",
         )
 
     if "GPU" in column_order:
@@ -811,11 +861,63 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
             st.column_config.TextColumn("processes", width="small", max_chars=24),
         )
 
+    display = table[column_order]
+
+    def _cell_color(css_var: str, fallback: str) -> str:
+        return f"var({css_var}, {fallback})"
+
+    def _style_util(value):
+        if value is None or pd.isna(value):
+            return ""
+        try:
+            numeric_value = float(value)
+        except Exception:
+            return ""
+        if numeric_value >= 80:
+            return f"color: {_cell_color('--nvidb-red', '#dc2626')}; font-weight: 600;"
+        if numeric_value >= 50:
+            return f"color: {_cell_color('--nvidb-yellow', '#b45309')}; font-weight: 600;"
+        if numeric_value >= 5:
+            return f"color: {_cell_color('--nvidb-green', '#16a34a')}; font-weight: 600;"
+        return ""
+
+    def _style_mem(value):
+        if value is None or pd.isna(value):
+            return ""
+        try:
+            numeric_value = float(value)
+        except Exception:
+            return ""
+        if numeric_value >= 60:
+            return f"color: {_cell_color('--nvidb-red', '#dc2626')}; font-weight: 600;"
+        if numeric_value >= 10:
+            return f"color: {_cell_color('--nvidb-yellow', '#b45309')}; font-weight: 600;"
+        if numeric_value > 0:
+            return f"color: {_cell_color('--nvidb-green', '#16a34a')}; font-weight: 600;"
+        return ""
+
+    styled = display.style
+    if "util" in display.columns:
+        styled = styled.map(_style_util, subset=["util"])
+    if "mem_util" in display.columns:
+        styled = styled.map(_style_mem, subset=["mem_util"])
+    if mem_pct_col is not None and mem_pct_col in display.columns:
+        styled = styled.map(_style_mem, subset=[mem_pct_col])
+    if "memory[used/total]" in display.columns:
+        styled = styled.map(lambda v: _style_mem(ratio_percent(v)), subset=["memory[used/total]"])
+
+    styled = styled.set_properties(**{"text-align": "center"})
+    styled = styled.set_table_styles(
+        [
+            {"selector": "th", "props": [("text-align", "center")]},
+        ],
+        overwrite=False,
+    )
+
     st.dataframe(
-        table[column_order],
+        styled,
         use_container_width=True,
         hide_index=True,
-        column_order=column_order,
         column_config=column_config or None,
     )
 
@@ -1053,7 +1155,11 @@ def show_live_dashboard(*, include_remote):
         if global_user_memory:
             with st.expander("User VRAM totals (all nodes)", expanded=False):
                 summary_df = _user_summary_df(global_user_memory)
-                st.dataframe(summary_df[["user", "vram"]], use_container_width=True)
+                st.dataframe(
+                    _center_dataframe(summary_df[["user", "vram"]]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         multi = len(pool.pool) > 1
         for idx, client in enumerate(pool.pool):
@@ -1101,7 +1207,11 @@ def show_live_dashboard(*, include_remote):
                     if user_summary:
                         with st.expander("User VRAM totals (this node)", expanded=False):
                             summary_df = _user_summary_df(user_summary)
-                            st.dataframe(summary_df[["user", "vram"]], use_container_width=True)
+                            st.dataframe(
+                                _center_dataframe(summary_df[["user", "vram"]]),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
             if multi:
                 with st.expander(title, expanded=(idx == 0)):
@@ -1282,6 +1392,27 @@ def _render_timeseries_chart(
         st.warning("altair is required for charts.")
         return
 
+    theme_mode_norm = "auto"
+    try:
+        theme_mode_norm = str(st.session_state.get("_nvidb_theme_mode", "Auto") or "Auto").strip().lower()
+    except Exception:  # pragma: no cover
+        theme_mode_norm = "auto"
+    if theme_mode_norm == "dark":
+        axis_label_color = "#cbd5e1"
+        title_color = "#e2e8f0"
+        grid_color = "rgba(148, 163, 184, 0.18)"
+        domain_color = "rgba(148, 163, 184, 0.35)"
+    elif theme_mode_norm == "light":
+        axis_label_color = "#334155"
+        title_color = "#0f172a"
+        grid_color = "rgba(15, 23, 42, 0.08)"
+        domain_color = "rgba(15, 23, 42, 0.18)"
+    else:
+        axis_label_color = "#64748b"
+        title_color = "#475569"
+        grid_color = "rgba(100, 116, 139, 0.20)"
+        domain_color = "rgba(100, 116, 139, 0.35)"
+
     data = df_long.dropna(subset=["timestamp", "gpu_id", "value"]).copy()
     if data.empty:
         st.info("No data to plot.")
@@ -1337,7 +1468,17 @@ def _render_timeseries_chart(
     chart = (
         alt.layer(lines, highlight, points)
         .add_params(hover)
-        .properties(height=height, title=title)
+        .properties(height=height, title=title, background="transparent")
+        .configure_view(strokeOpacity=0)
+        .configure_axis(
+            labelColor=axis_label_color,
+            titleColor=title_color,
+            gridColor=grid_color,
+            domainColor=domain_color,
+            tickColor=domain_color,
+        )
+        .configure_legend(labelColor=axis_label_color, titleColor=title_color)
+        .configure_title(color=title_color)
         .interactive()
     )
     st.altair_chart(chart, use_container_width=True)
@@ -1573,13 +1714,17 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
 
     if overview_rows:
         overview_df = pd.DataFrame(overview_rows)
-        st.dataframe(overview_df, use_container_width=True, hide_index=True)
+        st.dataframe(_center_dataframe(overview_df), use_container_width=True, hide_index=True)
 
     snapshot_user_summary = _user_memory_from_df(snapshot)
     if snapshot_user_summary:
         with st.expander("User VRAM totals @ snapshot (all nodes)", expanded=False):
             summary_df = _user_summary_df(snapshot_user_summary)
-            st.dataframe(summary_df[["user", "vram"]], use_container_width=True, hide_index=True)
+            st.dataframe(
+                _center_dataframe(summary_df[["user", "vram"]]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     parsed_cols = {}
     parsed_sources = []
@@ -1712,7 +1857,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                 st.markdown("**User GPU-time share (selected time range)**")
                 head = time_share_df.head(12)
                 st.dataframe(
-                    head,
+                    _center_dataframe(head),
                     use_container_width=True,
                     hide_index=True,
                     column_config={
@@ -1728,7 +1873,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                 if len(time_share_df) > len(head):
                     with st.expander("Show all users", expanded=False):
                         st.dataframe(
-                            time_share_df,
+                            _center_dataframe(time_share_df),
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -1747,7 +1892,11 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
             if node_snapshot_users:
                 with st.expander("User VRAM totals @ snapshot (this node)", expanded=False):
                     summary_df = _user_summary_df(node_snapshot_users)
-                    st.dataframe(summary_df[["user", "vram"]], use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        _center_dataframe(summary_df[["user", "vram"]]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
             if node_table.empty:
                 st.info("No snapshot data for this node at the selected time.")
@@ -1755,7 +1904,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                 _render_gpu_table(node_table)
 
     with st.expander("View raw data", expanded=False):
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(_center_dataframe(df), use_container_width=True)
 
 
 def main(*, session_id=None, db_path=None):
