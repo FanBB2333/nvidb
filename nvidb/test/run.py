@@ -1039,8 +1039,6 @@ def main():
     log_web_parser.add_argument('--db-path', type=str, default=None, help='Database path')
     log_web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
     web_parser = subparsers.add_parser('web', help='Open web dashboard (Live + Logs)')
-    # Also accept `--remote` after the subcommand (e.g. `nvidb web --remote`)
-    web_parser.add_argument('--remote', action='store_true', default=argparse.SUPPRESS, help='Use remote servers')
     web_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
     web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
@@ -1049,11 +1047,14 @@ def main():
 
     cfg = _load_config_yaml()
     compact = bool(args.compact or _get_basic_compact(cfg))
-    
-    if args.remote:
-        server_list = init()
-    else:
-        server_list = None
+
+    server_list = None
+    remote_requested = bool(getattr(args, "remote", False))
+    if remote_requested:
+        if args.command is None:
+            server_list = init()
+        elif args.command == "log" and getattr(args, "log_command", None) not in {"ls", "info", "web"}:
+            server_list = init()
     
     if args.command == 'ls':
         show_servers(detail=args.detail)
@@ -1075,7 +1076,6 @@ def main():
             run_streamlit_app(
                 db_path=db_path,
                 port=args.port,
-                include_remote=bool(getattr(args, "remote", False)),
             )
         else:
             # Default: start logging
@@ -1089,7 +1089,6 @@ def main():
         run_streamlit_app(
             db_path=getattr(args, "db_path", None),
             port=args.port,
-            include_remote=bool(getattr(args, "remote", False)),
         )
     elif args.command == 'clean':
         interactive_clean(clean_all=(args.target == 'all'))

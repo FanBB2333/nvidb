@@ -2,8 +2,7 @@
 Streamlit web interface for nvidb (Live GPU + Log viewer).
 
 Usage:
-    nvidb web                 # Live view (local)
-    nvidb web --remote        # Live view (local + remote)
+    nvidb web                 # Web dashboard (Live + Logs)
     # Select log sessions from the left sidebar after the server starts.
 """
 
@@ -1014,7 +1013,7 @@ def show_live_dashboard(*, include_remote):
         if effective_remote:
             st.caption("Remote: enabled")
         else:
-            st.caption("Remote: disabled (run `nvidb web --remote` to include remote servers)")
+            st.caption("Remote: disabled (switch to `Live-remote` to include remote servers)")
 
         snapshot = cache.snapshot()
         raw_stats_by_client = snapshot.get("raw_stats_by_client")
@@ -1759,7 +1758,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
         st.dataframe(df, use_container_width=True)
 
 
-def main(*, session_id=None, db_path=None, include_remote=False):
+def main(*, session_id=None, db_path=None):
     _ensure_streamlit()
 
     st.set_page_config(page_title="nvidb web", page_icon="🖥️", layout="wide")
@@ -1770,25 +1769,33 @@ def main(*, session_id=None, db_path=None, include_remote=False):
 
     header_cols = st.columns([3, 2])
 
-    default_view = "Logs" if session_id is not None else "Live"
+    default_view = "Logs" if session_id is not None else "Live-local"
     with header_cols[0]:
         if hasattr(st, "segmented_control"):
             view = st.segmented_control(
                 "View",
-                options=["Live", "Logs"],
+                options=["Live-local", "Live-remote", "Logs"],
                 default=default_view,
                 key="_nvidb_view_v1",
-                format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
+                format_func=lambda v: (
+                    "🟢 Live-local"
+                    if v == "Live-local"
+                    else ("🌐 Live-remote" if v == "Live-remote" else "📜 Logs")
+                ),
             )
         else:  # pragma: no cover
-            default_index = 1 if default_view == "Logs" else 0
+            default_index = 2 if default_view == "Logs" else 0
             view = st.radio(
                 "View",
-                options=["Live", "Logs"],
+                options=["Live-local", "Live-remote", "Logs"],
                 index=default_index,
                 horizontal=True,
                 key="_nvidb_view_v1",
-                format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
+                format_func=lambda v: (
+                    "🟢 Live-local"
+                    if v == "Live-local"
+                    else ("🌐 Live-remote" if v == "Live-remote" else "📜 Logs")
+                ),
             )
 
     with header_cols[1]:
@@ -1808,8 +1815,10 @@ def main(*, session_id=None, db_path=None, include_remote=False):
                 key="_nvidb_theme_mode",
             )
 
-    if view == "Live":
-        show_live_dashboard(include_remote=include_remote)
+    if view == "Live-local":
+        show_live_dashboard(include_remote=False)
+    elif view == "Live-remote":
+        show_live_dashboard(include_remote=True)
     else:
         show_logs_dashboard(db_path=db_path, initial_session_id=session_id)
 
@@ -1837,9 +1846,6 @@ def run_streamlit_app(*, session_id=None, db_path=None, port=8501, include_remot
 
     if db_path is not None:
         cmd.extend(["--db-path", str(db_path)])
-    if include_remote:
-        cmd.append("--include-remote")
-
     print(f"Starting Streamlit on port {port}...")
     print(f"Open http://localhost:{port} in your browser")
     subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent))
@@ -1848,6 +1854,5 @@ def run_streamlit_app(*, session_id=None, db_path=None, port=8501, include_remot
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", type=str, default=None)
-    parser.add_argument("--include-remote", action="store_true", default=False)
     args = parser.parse_args()
-    main(db_path=args.db_path, include_remote=bool(args.include_remote))
+    main(db_path=args.db_path)
