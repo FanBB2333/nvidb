@@ -411,9 +411,9 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
           --nvidb-text: #0f172a;
           --nvidb-muted: #64748b;
           --nvidb-border: rgba(15, 23, 42, 0.18);
-          --nvidb-red: #dc2626;
-          --nvidb-yellow: #b45309;
-          --nvidb-green: #16a34a;
+          --nvidb-red: #c92a2a;
+          --nvidb-yellow: #e67700;
+          --nvidb-green: #2b8a3e;
           --st-primary-color: {_TEAL_PRIMARY};
           --st-background-color: #f1f5f9;
           --st-secondary-background-color: #ffffff;
@@ -428,9 +428,9 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
             --nvidb-text: #e2e8f0;
             --nvidb-muted: #94a3b8;
             --nvidb-border: rgba(226, 232, 240, 0.14);
-            --nvidb-red: #f87171;
-            --nvidb-yellow: #fbbf24;
-            --nvidb-green: #4ade80;
+            --nvidb-red: #ff6b6b;
+            --nvidb-yellow: #ffd93d;
+            --nvidb-green: #6bcf7f;
             --st-primary-color: {_TEAL_PRIMARY};
             --st-background-color: #0b1220;
             --st-secondary-background-color: #0f172a;
@@ -482,9 +482,9 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
           --nvidb-text: #e2e8f0;
           --nvidb-muted: #94a3b8;
           --nvidb-border: rgba(226, 232, 240, 0.14);
-          --nvidb-red: #f87171;
-          --nvidb-yellow: #fbbf24;
-          --nvidb-green: #4ade80;
+          --nvidb-red: #ff6b6b;
+          --nvidb-yellow: #ffd93d;
+          --nvidb-green: #6bcf7f;
           --st-primary-color: {_TEAL_PRIMARY};
           --st-background-color: #0b1220;
           --st-secondary-background-color: #0f172a;
@@ -501,9 +501,9 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
           --nvidb-text: #0f172a;
           --nvidb-muted: #64748b;
           --nvidb-border: rgba(15, 23, 42, 0.18);
-          --nvidb-red: #dc2626;
-          --nvidb-yellow: #b45309;
-          --nvidb-green: #16a34a;
+          --nvidb-red: #c92a2a;
+          --nvidb-yellow: #e67700;
+          --nvidb-green: #2b8a3e;
           --st-primary-color: {_TEAL_PRIMARY};
           --st-background-color: #f1f5f9;
           --st-secondary-background-color: #ffffff;
@@ -534,6 +534,18 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
         div[data-testid="stSegmentedControl"] button {{
           font-size: 1.05rem !important;
           padding: 0.35rem 0.85rem !important;
+        }}
+        /* Force dataframe cell text colors to be visible */
+        [data-testid="stDataFrame"] div[data-testid="glideDataEditor"] {{
+          --gdg-text-dark: var(--nvidb-text) !important;
+          --gdg-text-medium: var(--nvidb-text) !important;
+          --gdg-text-light: var(--nvidb-muted) !important;
+          --gdg-bg-cell: var(--nvidb-bg2) !important;
+          --gdg-bg-header: var(--nvidb-bg) !important;
+          --gdg-border-color: var(--nvidb-border) !important;
+        }}
+        [data-testid="stDataFrame"] [data-testid="glideDataEditor"] div {{
+          color: var(--nvidb-text) !important;
         }}
         </style>
         """,
@@ -910,16 +922,17 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     styled = styled.set_table_styles(
         [
             {"selector": "th", "props": [("text-align", "center")]},
+            {"selector": "table", "props": [("width", "100%"), ("border-collapse", "collapse")]},
+            {"selector": "td, th", "props": [("padding", "8px"), ("border", "1px solid var(--nvidb-border)")]},
+            {"selector": "th", "props": [("background-color", "var(--nvidb-bg)"), ("color", "var(--nvidb-text)"), ("font-weight", "600")]},
+            {"selector": "td", "props": [("background-color", "var(--nvidb-bg2)")]},
         ],
         overwrite=False,
     )
 
-    st.dataframe(
-        styled,
-        use_container_width=True,
-        hide_index=True,
-        column_config=column_config or None,
-    )
+    # Render as HTML to properly display colors
+    html = styled.to_html()
+    st.html(html)
 
 
 def _load_server_list():
