@@ -812,7 +812,7 @@ def _render_progress_bar_html(value, max_value=100):
 def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     _ensure_streamlit()
     if df is None or df.empty:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
         return
 
     table = df.copy()
@@ -1144,7 +1144,7 @@ def show_live_dashboard(*, include_remote):
                 summary_df = _user_summary_df(global_user_memory)
                 st.dataframe(
                     _center_dataframe(summary_df[["user", "vram"]]),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -1196,7 +1196,7 @@ def show_live_dashboard(*, include_remote):
                             summary_df = _user_summary_df(user_summary)
                             st.dataframe(
                                 _center_dataframe(summary_df[["user", "vram"]]),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
 
@@ -1468,7 +1468,7 @@ def _render_timeseries_chart(
         .configure_title(color=title_color)
         .interactive()
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 
 def show_logs_dashboard(db_path, *, initial_session_id=None):
@@ -1701,7 +1701,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
 
     if overview_rows:
         overview_df = pd.DataFrame(overview_rows)
-        st.dataframe(_center_dataframe(overview_df), use_container_width=True, hide_index=True)
+        st.dataframe(_center_dataframe(overview_df), width="stretch", hide_index=True)
 
     snapshot_user_summary = _user_memory_from_df(snapshot)
     if snapshot_user_summary:
@@ -1709,7 +1709,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
             summary_df = _user_summary_df(snapshot_user_summary)
             st.dataframe(
                 _center_dataframe(summary_df[["user", "vram"]]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1845,7 +1845,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                 head = time_share_df.head(12)
                 st.dataframe(
                     _center_dataframe(head),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     column_config={
                         "share": st.column_config.ProgressColumn(
@@ -1861,7 +1861,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                     with st.expander("Show all users", expanded=False):
                         st.dataframe(
                             _center_dataframe(time_share_df),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                             column_config={
                                 "share": st.column_config.ProgressColumn(
@@ -1881,7 +1881,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                     summary_df = _user_summary_df(node_snapshot_users)
                     st.dataframe(
                         _center_dataframe(summary_df[["user", "vram"]]),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
@@ -1891,7 +1891,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                 _render_gpu_table(node_table)
 
     with st.expander("View raw data", expanded=False):
-        st.dataframe(_center_dataframe(df), use_container_width=True)
+        st.dataframe(_center_dataframe(df), width="stretch")
 
 
 def main(*, session_id=None, db_path=None):
