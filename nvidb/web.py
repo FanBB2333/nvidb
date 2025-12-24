@@ -783,6 +783,32 @@ def _render_gpu_column_checkboxes(available_columns, *, key_prefix: str):
     return selected
 
 
+def _render_progress_bar_html(value, max_value=100):
+    """Generate HTML for a progress bar with percentage"""
+    if value is None or pd.isna(value):
+        return "N/A"
+    try:
+        pct = float(value)
+        pct = max(0, min(100, pct))
+    except Exception:
+        return "N/A"
+
+    # Color based on percentage
+    if pct >= 80:
+        color = "var(--nvidb-red, #c92a2a)"
+    elif pct >= 50:
+        color = "var(--nvidb-yellow, #e67700)"
+    else:
+        color = "var(--nvidb-green, #2b8a3e)"
+
+    return f'''<div style="display:flex;align-items:center;justify-content:center;gap:6px;">
+        <div style="width:60px;height:8px;background:var(--nvidb-border, #ddd);border-radius:4px;overflow:hidden;">
+            <div style="width:{pct:.0f}%;height:100%;background:{color};"></div>
+        </div>
+        <span style="font-size:0.85em;min-width:35px;">{pct:.0f}%</span>
+    </div>'''
+
+
 def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     _ensure_streamlit()
     if df is None or df.empty:
@@ -797,8 +823,6 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     if "mem%" in desired_cols:
         desired_cols.remove("mem%")
 
-    column_config = {}
-
     def ratio_percent(value):
         used, total = _parse_mib_pair(value)
         if used is None or total in (None, 0):
@@ -806,81 +830,83 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
         return (float(used) / float(total)) * 100
 
     column_order = []
+    column_labels = {}
     for col_name in desired_cols:
         if col_name == "mem%":
             continue
         if col_name in table.columns:
             column_order.append(col_name)
+            column_labels[col_name] = col_name
 
     if not column_order:
         column_order = list(available_cols)
 
-    # Create merged memory column with progress bar [used/total percentage]
-    mem_merged_col = None
-    if "memory[used/total]" in column_order and "memory[used/total]" in table.columns:
-        mem_merged_col = "_nvidb_mem_merged"
-        table[mem_merged_col] = pd.to_numeric(table["memory[used/total]"].map(ratio_percent), errors="coerce")
-        column_config[mem_merged_col] = st.column_config.ProgressColumn(
-            "mem",
-            width="small",
-            min_value=0,
-            max_value=100,
-            format="%.0f%%",
-        )
-        # Replace memory[used/total] with merged column in column_order
-        idx = column_order.index("memory[used/total]")
-        column_order[idx] = mem_merged_col
-
-    # Use ProgressColumn for util
-    if "util" in column_order and "util" in table.columns:
-        table["util"] = pd.to_numeric(table["util"].map(_parse_percent), errors="coerce")
-        column_config["util"] = st.column_config.ProgressColumn(
-            "util",
-            width="small",
-            min_value=0,
-            max_value=100,
-            format="%.0f%%",
-        )
-
-    # Use ProgressColumn for mem_util
-    if "mem_util" in column_order and "mem_util" in table.columns:
-        table["mem_util"] = pd.to_numeric(table["mem_util"].map(_parse_percent), errors="coerce")
-        column_config["mem_util"] = st.column_config.ProgressColumn(
-            "mem_util",
-            width="small",
-            min_value=0,
-            max_value=100,
-            format="%.0f%%",
-        )
-
-    if "GPU" in column_order:
-        column_config.setdefault("GPU", st.column_config.NumberColumn("GPU", width="small"))
-    if "name" in column_order:
-        column_config.setdefault("name", st.column_config.TextColumn("name", width="small", max_chars=20))
-    if "fan" in column_order:
-        column_config.setdefault("fan", st.column_config.TextColumn("fan", width="small"))
-    if "temp" in column_order:
-        column_config.setdefault("temp", st.column_config.TextColumn("temp", width="small"))
-    if "rx" in column_order:
-        column_config.setdefault("rx", st.column_config.TextColumn("rx", width="small"))
-    if "tx" in column_order:
-        column_config.setdefault("tx", st.column_config.TextColumn("tx", width="small"))
-    if "power" in column_order:
-        column_config.setdefault("power", st.column_config.TextColumn("power", width="medium", max_chars=18))
-    if "processes" in column_order:
-        column_config.setdefault(
-            "processes",
-            st.column_config.TextColumn("processes", width="small", max_chars=24),
-        )
-
+    # Create display dataframe
     display = table[column_order].copy()
 
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        column_config=column_config or None,
-    )
+    # Process util column - convert to progress bar HTML
+    if "util" in display.columns:
+        display["util"] = display["util"].map(_parse_percent).map(_render_progress_bar_html)
+
+    # Process mem_util column - convert to progress bar HTML
+    if "mem_util" in display.columns:
+        display["mem_util"] = display["mem_util"].map(_parse_percent).map(_render_progress_bar_html)
+
+    # Process memory[used/total] column - convert to progress bar HTML
+    if "memory[used/total]" in display.columns:
+        display["memory[used/total]"] = display["memory[used/total]"].map(ratio_percent).map(_render_progress_bar_html)
+        # Rename the column to "mem"
+        display = display.rename(columns={"memory[used/total]": "mem"})
+        if "memory[used/total]" in column_order:
+            idx = column_order.index("memory[used/total]")
+            column_order[idx] = "mem"
+
+    # Build HTML table with centered content
+    html_parts = ['''
+    <style>
+    .nvidb-gpu-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9em;
+    }
+    .nvidb-gpu-table th, .nvidb-gpu-table td {
+        text-align: center;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--nvidb-border, #ddd);
+    }
+    .nvidb-gpu-table th {
+        background: var(--nvidb-bg, #f5f5f5);
+        font-weight: 600;
+    }
+    .nvidb-gpu-table tr:hover {
+        background: var(--nvidb-bg, #f9f9f9);
+    }
+    </style>
+    <table class="nvidb-gpu-table">
+    <thead><tr>
+    ''']
+
+    for col in column_order:
+        safe_col = str(col).replace("<", "&lt;").replace(">", "&gt;")
+        html_parts.append(f'<th>{safe_col}</th>')
+    html_parts.append('</tr></thead><tbody>')
+
+    for _, row in display.iterrows():
+        html_parts.append('<tr>')
+        for col in column_order:
+            val = row.get(col, "")
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                val = "N/A"
+            # Check if already HTML (progress bar)
+            val_str = str(val)
+            if not val_str.startswith('<div'):
+                val_str = val_str.replace("<", "&lt;").replace(">", "&gt;")
+            html_parts.append(f'<td>{val_str}</td>')
+        html_parts.append('</tr>')
+
+    html_parts.append('</tbody></table>')
+
+    st.html(''.join(html_parts))
 
 
 def _load_server_list():
