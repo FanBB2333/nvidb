@@ -400,11 +400,83 @@ _CHART_COLOR_RANGE = [
 ]
 
 
-def _apply_app_styles():
+def _apply_app_styles(*, theme_mode: str = "Auto"):
     _ensure_streamlit()
+    theme_mode_norm = str(theme_mode or "Auto").strip().lower()
+
+    theme_css = f"""
+        :root {{
+          --nvidb-primary: {_TEAL_PRIMARY};
+          --nvidb-bg: #ffffff;
+          --nvidb-bg2: #f6fafb;
+          --nvidb-text: #0f172a;
+          --nvidb-muted: #64748b;
+          --nvidb-border: rgba(15, 23, 42, 0.14);
+        }}
+
+        @media (prefers-color-scheme: dark) {{
+          :root {{
+            --nvidb-bg: #0b1220;
+            --nvidb-bg2: #0f172a;
+            --nvidb-text: #e2e8f0;
+            --nvidb-muted: #94a3b8;
+            --nvidb-border: rgba(226, 232, 240, 0.14);
+          }}
+        }}
+
+        html, body {{
+          color-scheme: light dark;
+        }}
+
+        [data-testid=\"stAppViewContainer\"], .stApp {{
+          background: var(--nvidb-bg) !important;
+          color: var(--nvidb-text) !important;
+        }}
+
+        [data-testid=\"stSidebar\"], section[data-testid=\"stSidebar\"] {{
+          background: var(--nvidb-bg2) !important;
+        }}
+
+        [data-testid=\"stMarkdownContainer\"] {{
+          color: var(--nvidb-text) !important;
+        }}
+
+        a {{
+          color: var(--nvidb-primary) !important;
+        }}
+
+        hr {{
+          border-color: var(--nvidb-border) !important;
+        }}
+    """
+
+    if theme_mode_norm == "dark":
+        theme_css += """
+        :root {
+          --nvidb-bg: #0b1220;
+          --nvidb-bg2: #0f172a;
+          --nvidb-text: #e2e8f0;
+          --nvidb-muted: #94a3b8;
+          --nvidb-border: rgba(226, 232, 240, 0.14);
+        }
+        html, body { color-scheme: dark; }
+        """
+    elif theme_mode_norm == "light":
+        theme_css += """
+        :root {
+          --nvidb-bg: #ffffff;
+          --nvidb-bg2: #f6fafb;
+          --nvidb-text: #0f172a;
+          --nvidb-muted: #64748b;
+          --nvidb-border: rgba(15, 23, 42, 0.14);
+        }
+        html, body { color-scheme: light; }
+        """
+
     st.markdown(
         f"""
         <style>
+        {theme_css}
         section[data-testid="stSidebar"] {{
           min-width: {_SIDEBAR_WIDTH_PX}px !important;
           width: {_SIDEBAR_WIDTH_PX}px !important;
@@ -523,6 +595,76 @@ def _user_summary_df(user_summary: dict) -> pd.DataFrame:
         return pd.DataFrame(columns=["user", "vram", "vram_mib"])
     df = pd.DataFrame(rows).sort_values(by="vram_mib", ascending=False, kind="stable").reset_index(drop=True)
     return df
+
+
+_USER_MEM_RE = re.compile(r"([^\s()]+)\((\d+)\s*M\)", flags=re.IGNORECASE)
+
+
+def _parse_user_memory_compact(value) -> dict:
+    if value is None:
+        return {}
+    text = str(value).strip()
+    if not text or text in ("-", "N/A"):
+        return {}
+    users = {}
+    for username, mib_str in _USER_MEM_RE.findall(text):
+        username = str(username).strip()
+        if not username or username == "N/A":
+            continue
+        try:
+            mib = int(mib_str)
+        except Exception:
+            continue
+        if mib <= 0:
+            continue
+        users[username] = users.get(username, 0) + mib
+    return users
+
+
+def _user_memory_from_df(df: pd.DataFrame) -> dict:
+    totals = {}
+    if df is None or df.empty:
+        return totals
+    if "processes" not in df.columns:
+        return totals
+    for value in df["processes"]:
+        for user, mib in _parse_user_memory_compact(value).items():
+            totals[user] = totals.get(user, 0) + mib
+    return totals
+
+
+def _user_time_share_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["user", "snapshots", "share"])
+    if "timestamp" not in df.columns or "processes" not in df.columns:
+        return pd.DataFrame(columns=["user", "snapshots", "share"])
+
+    timestamps = df["timestamp"].dropna().drop_duplicates().sort_values()
+    total = int(len(timestamps))
+    if total <= 0:
+        return pd.DataFrame(columns=["user", "snapshots", "share"])
+
+    counts = {}
+    for ts, group in df.groupby("timestamp", sort=False):
+        if pd.isna(ts):
+            continue
+        users = set()
+        for value in group["processes"]:
+            users.update(_parse_user_memory_compact(value).keys())
+        for user in users:
+            counts[user] = counts.get(user, 0) + 1
+
+    rows = []
+    for user, snaps in counts.items():
+        try:
+            snaps_int = int(snaps)
+        except Exception:
+            continue
+        share = (snaps_int / total) * 100.0
+        rows.append({"user": user, "snapshots": snaps_int, "share": share})
+    if not rows:
+        return pd.DataFrame(columns=["user", "snapshots", "share"])
+    return pd.DataFrame(rows).sort_values(by="share", ascending=False, kind="stable").reset_index(drop=True)
 
 
 _GPU_TABLE_COLUMNS = [
@@ -1068,7 +1210,7 @@ _LOG_METRICS = {
         "source": "rx",
         "parser": _parse_bandwidth_mbps,
         "tooltip_format": ".2f",
-        "default": False,
+        "default": True,
         "height": 220,
     },
     "tx": {
@@ -1076,7 +1218,7 @@ _LOG_METRICS = {
         "source": "tx",
         "parser": _parse_bandwidth_mbps,
         "tooltip_format": ".2f",
-        "default": False,
+        "default": True,
         "height": 220,
     },
     "fan_speed": {
@@ -1124,7 +1266,15 @@ def _downsample_per_gpu(df: pd.DataFrame, *, max_points_per_gpu: int) -> pd.Data
     return pd.concat(frames, ignore_index=True)
 
 
-def _render_timeseries_chart(df_long: pd.DataFrame, *, title: str, tooltip_format: str, height: int = 220):
+def _render_timeseries_chart(
+    df_long: pd.DataFrame,
+    *,
+    title: str,
+    tooltip_format: str,
+    height: int = 220,
+    series_field: str = "gpu_id",
+    series_title: str = "GPU",
+):
     _ensure_streamlit()
     if df_long is None or df_long.empty:
         st.info("No data to plot.")
@@ -1137,10 +1287,13 @@ def _render_timeseries_chart(df_long: pd.DataFrame, *, title: str, tooltip_forma
     if data.empty:
         st.info("No data to plot.")
         return
-    data["gpu_id"] = data["gpu_id"].astype(str)
+    series_field = str(series_field or "gpu_id")
+    if series_field not in data.columns:
+        series_field = "gpu_id"
+    data[series_field] = data[series_field].astype(str)
 
     hover = alt.selection_point(
-        fields=["gpu_id"],
+        fields=[series_field],
         nearest=True,
         on="mouseover",
         clear="mouseout",
@@ -1162,22 +1315,22 @@ def _render_timeseries_chart(df_long: pd.DataFrame, *, title: str, tooltip_forma
     lines = alt.Chart(data).mark_line().encode(
         x=x,
         y=alt.Y("value:Q", title=None),
-        color=alt.Color("gpu_id:N", title="GPU", scale=color_scale),
+        color=alt.Color(f"{series_field}:N", title=str(series_title or "GPU"), scale=color_scale),
     )
 
     highlight = alt.Chart(data).mark_line(size=4).encode(
         x=x,
         y=alt.Y("value:Q", title=None),
-        color=alt.Color("gpu_id:N", legend=None, scale=color_scale),
+        color=alt.Color(f"{series_field}:N", legend=None, scale=color_scale),
     ).transform_filter(hover)
 
     points = alt.Chart(data).mark_circle(size=60, opacity=0).encode(
         x=x,
         y="value:Q",
-        color=alt.Color("gpu_id:N", legend=None, scale=color_scale),
+        color=alt.Color(f"{series_field}:N", legend=None, scale=color_scale),
         tooltip=[
             alt.Tooltip("timestamp:T", title="Time"),
-            alt.Tooltip("gpu_id:N", title="GPU"),
+            alt.Tooltip(f"{series_field}:N", title=str(series_title or "GPU")),
             alt.Tooltip("value:Q", title=title, format=str(tooltip_format or "")),
         ],
     )
@@ -1367,6 +1520,68 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
     snapshot = df[df["timestamp"] == selected_ts]
     st.subheader(f"Snapshot @ {selected_ts}")
 
+    snapshot_nodes = sorted({str(n) for n in snapshot["node"].dropna().unique()})
+    if snapshot_nodes:
+        node_colors = {node: _CHART_COLOR_RANGE[idx % len(_CHART_COLOR_RANGE)] for idx, node in enumerate(snapshot_nodes)}
+    else:
+        node_colors = {}
+
+    if len(snapshot_nodes) > 1:
+        st.caption("Nodes")
+        chips = []
+        for node in snapshot_nodes:
+            color = node_colors.get(node, _TEAL_PRIMARY)
+            safe_label = str(node).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            chips.append(
+                f"""<span style="display:inline-flex;align-items:center;margin:0 10px 8px 0;">
+                    <span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:{color};margin-right:6px;"></span>
+                    <span style="font-size:0.95rem;color:var(--nvidb-text);">{safe_label}</span>
+                </span>"""
+            )
+        st.markdown("""<div style="display:flex;flex-wrap:wrap;">""" + "".join(chips) + "</div>", unsafe_allow_html=True)
+
+    overview_rows = []
+    for node in snapshot_nodes:
+        node_snapshot = snapshot[snapshot["node"] == node]
+        node_table = _build_log_snapshot_table(node_snapshot)
+        if node_table.empty:
+            continue
+
+        util_values = []
+        used_sum = 0.0
+        total_sum = 0.0
+        for _, row in node_table.iterrows():
+            util_values.append(_parse_percent(row.get("util")))
+            used, total = _parse_mib_pair(row.get("memory[used/total]"))
+            if used is not None and total is not None:
+                used_sum += float(used)
+                total_sum += float(total)
+
+        util_clean = [u for u in util_values if u is not None]
+        idle = sum(1 for u in util_clean if u < 5)
+        avg_util = (sum(util_clean) / len(util_clean)) if util_clean else 0.0
+        mem_str = f"{_format_gb(used_sum)}/{_format_gb(total_sum)}" if total_sum else "N/A"
+
+        overview_rows.append(
+            {
+                "node": node,
+                "gpus": int(len(node_table)),
+                "idle": int(idle),
+                "avg_util": f"{avg_util:.0f}%",
+                "vram_used/total": mem_str,
+            }
+        )
+
+    if overview_rows:
+        overview_df = pd.DataFrame(overview_rows)
+        st.dataframe(overview_df, use_container_width=True, hide_index=True)
+
+    snapshot_user_summary = _user_memory_from_df(snapshot)
+    if snapshot_user_summary:
+        with st.expander("User VRAM totals @ snapshot (all nodes)", expanded=False):
+            summary_df = _user_summary_df(snapshot_user_summary)
+            st.dataframe(summary_df[["user", "vram"]], use_container_width=True, hide_index=True)
+
     parsed_cols = {}
     parsed_sources = []
     for metric_key in selected_metrics:
@@ -1415,6 +1630,33 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                     key=f"_nvidb_node_visible_gpus_{session_id}_{node}",
                 )
 
+            node_time_df = df[df["node"] == node]
+            if visible_node_gpus:
+                node_time_df = node_time_df[node_time_df["gpu_id"].isin(visible_node_gpus)]
+            time_share_df = _user_time_share_df(node_time_df)
+
+            node_snapshot_users = _user_memory_from_df(node_snapshot)
+
+            gpu_names = {}
+            gpu_name_source = node_snapshot if not node_snapshot.empty else node_time_df
+            if gpu_name_source is not None and not gpu_name_source.empty and "name" in gpu_name_source.columns:
+                for _, row in gpu_name_source[["gpu_id", "name"]].dropna().drop_duplicates().iterrows():
+                    try:
+                        gpu_id_int = int(row.get("gpu_id"))
+                    except Exception:
+                        continue
+                    name = _strip_gpu_name(row.get("name"))
+                    if name and name != "N/A" and gpu_id_int not in gpu_names:
+                        gpu_names[gpu_id_int] = name
+
+            gpu_label_map = {}
+            for gpu_id_int in node_gpu_ids:
+                name = gpu_names.get(gpu_id_int)
+                if name:
+                    gpu_label_map[gpu_id_int] = f"GPU {gpu_id_int} ({name})"
+                else:
+                    gpu_label_map[gpu_id_int] = f"GPU {gpu_id_int}"
+
             if selected_metrics:
                 node_df_for_charts = node_df
                 if visible_node_gpus:
@@ -1433,21 +1675,80 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
                             continue
 
                         long_df = node_df_for_charts[["timestamp", "gpu_id", out_col]].rename(columns={out_col: "value"})
+                        def _label_for_gpu(gid):
+                            if pd.isna(gid):
+                                return "GPU ?"
+                            try:
+                                gid_int = int(gid)
+                            except Exception:
+                                return f"GPU {gid}"
+                            return gpu_label_map.get(gid_int, f"GPU {gid_int}")
+
+                        long_df["gpu_label"] = long_df["gpu_id"].map(_label_for_gpu)
                         long_df = long_df.dropna(subset=["value"])
+                        if long_df.empty:
+                            continue
                         long_df = _downsample_per_gpu(long_df, max_points_per_gpu=max_points)
+                        if long_df.empty:
+                            continue
 
                         with cols[chart_slot % 2]:
+                            metric_label = str(spec.get("label") or metric_key)
+                            chart_title = metric_label if len(nodes) <= 1 else f"{node} • {metric_label}"
                             _render_timeseries_chart(
                                 long_df,
-                                title=str(spec.get("label") or metric_key),
+                                title=chart_title,
                                 tooltip_format=str(spec.get("tooltip_format") or ""),
                                 height=int(spec.get("height") or 220),
+                                series_field="gpu_label",
+                                series_title="GPU",
                             )
                         chart_slot += 1
                 else:
                     st.info("No chart data available for the current GPU selection.")
             else:
                 st.info("Select metrics above to show trend charts.")
+
+            if not time_share_df.empty:
+                st.markdown("**User GPU-time share (selected time range)**")
+                head = time_share_df.head(12)
+                st.dataframe(
+                    head,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "share": st.column_config.ProgressColumn(
+                            "share",
+                            min_value=0,
+                            max_value=100,
+                            format="%.0f%%",
+                            color="primary",
+                        )
+                    },
+                )
+                if len(time_share_df) > len(head):
+                    with st.expander("Show all users", expanded=False):
+                        st.dataframe(
+                            time_share_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "share": st.column_config.ProgressColumn(
+                                    "share",
+                                    min_value=0,
+                                    max_value=100,
+                                    format="%.0f%%",
+                                    color="primary",
+                                )
+                            },
+                        )
+            else:
+                st.caption("No user process records in the selected range.")
+
+            if node_snapshot_users:
+                with st.expander("User VRAM totals @ snapshot (this node)", expanded=False):
+                    summary_df = _user_summary_df(node_snapshot_users)
+                    st.dataframe(summary_df[["user", "vram"]], use_container_width=True, hide_index=True)
 
             if node_table.empty:
                 st.info("No snapshot data for this node at the selected time.")
@@ -1462,28 +1763,50 @@ def main(*, session_id=None, db_path=None, include_remote=False):
     _ensure_streamlit()
 
     st.set_page_config(page_title="nvidb web", page_icon="🖥️", layout="wide")
-    _apply_app_styles()
+    theme_mode = st.session_state.get("_nvidb_theme_mode", "Auto")
+    _apply_app_styles(theme_mode=theme_mode)
+
     st.title("nvidb web")
 
+    header_cols = st.columns([3, 2])
+
     default_view = "Logs" if session_id is not None else "Live"
-    if hasattr(st, "segmented_control"):
-        view = st.segmented_control(
-            "View",
-            options=["Live", "Logs"],
-            default=default_view,
-            key="_nvidb_view_v1",
-            format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
-        )
-    else:  # pragma: no cover
-        default_index = 1 if default_view == "Logs" else 0
-        view = st.radio(
-            "View",
-            options=["Live", "Logs"],
-            index=default_index,
-            horizontal=True,
-            key="_nvidb_view_v1",
-            format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
-        )
+    with header_cols[0]:
+        if hasattr(st, "segmented_control"):
+            view = st.segmented_control(
+                "View",
+                options=["Live", "Logs"],
+                default=default_view,
+                key="_nvidb_view_v1",
+                format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
+            )
+        else:  # pragma: no cover
+            default_index = 1 if default_view == "Logs" else 0
+            view = st.radio(
+                "View",
+                options=["Live", "Logs"],
+                index=default_index,
+                horizontal=True,
+                key="_nvidb_view_v1",
+                format_func=lambda v: "🟢 Live" if v == "Live" else "📜 Logs",
+            )
+
+    with header_cols[1]:
+        if hasattr(st, "segmented_control"):
+            st.segmented_control(
+                "Theme",
+                options=["Auto", "Light", "Dark"],
+                default=str(theme_mode or "Auto"),
+                key="_nvidb_theme_mode",
+                format_func=lambda v: {"Auto": "🌓 Auto", "Light": "☀️ Light", "Dark": "🌙 Dark"}.get(v, str(v)),
+            )
+        else:  # pragma: no cover
+            st.selectbox(
+                "Theme",
+                options=["Auto", "Light", "Dark"],
+                index=0,
+                key="_nvidb_theme_mode",
+            )
 
     if view == "Live":
         show_live_dashboard(include_remote=include_remote)
