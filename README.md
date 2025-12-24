@@ -128,6 +128,7 @@ nvidb web --port 8502
 After the server starts:
 - Switch to `Logs` and select a session from the left sidebar.
 - Use `Live-local` / `Live-remote` in the UI to toggle local-only vs local+remote live stats (remote is loaded only when `Live-remote` is selected).
+- Use `Theme` to switch `Light` / `Dark`.
 
 `nvidb log web` is deprecated; use `nvidb web` instead.
 

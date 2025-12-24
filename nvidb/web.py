@@ -431,124 +431,29 @@ _CHART_COLOR_RANGE = [
 ]
 
 
-def _apply_app_styles(*, theme_mode: str = "Auto"):
+def _apply_streamlit_theme(*, theme_mode: str) -> None:
     _ensure_streamlit()
-    theme_mode_norm = str(theme_mode or "Auto").strip().lower()
+    theme_mode_norm = str(theme_mode or "Light").strip().lower()
+    desired_base = "dark" if theme_mode_norm == "dark" else "light"
 
-    theme_css = f"""
-        :root {{
-          --nvidb-primary: {_TEAL_PRIMARY};
-          --nvidb-bg: #f1f5f9;
-          --nvidb-bg2: #ffffff;
-          --nvidb-text: #0f172a;
-          --nvidb-muted: #64748b;
-          --nvidb-border: rgba(15, 23, 42, 0.18);
-          --nvidb-red: #c92a2a;
-          --nvidb-yellow: #e67700;
-          --nvidb-green: #2b8a3e;
-          --st-primary-color: {_TEAL_PRIMARY};
-          --st-background-color: #f1f5f9;
-          --st-secondary-background-color: #ffffff;
-          --st-text-color: #0f172a;
-          --st-link-color: {_TEAL_PRIMARY};
-        }}
+    try:
+        current_base = st._config.get_option("theme.base")
+    except Exception:  # pragma: no cover
+        current_base = None
 
-        @media (prefers-color-scheme: dark) {{
-          :root {{
-            --nvidb-bg: #0b1220;
-            --nvidb-bg2: #0f172a;
-            --nvidb-text: #e2e8f0;
-            --nvidb-muted: #94a3b8;
-            --nvidb-border: rgba(226, 232, 240, 0.14);
-            --nvidb-red: #ff6b6b;
-            --nvidb-yellow: #ffd93d;
-            --nvidb-green: #6bcf7f;
-            --st-primary-color: {_TEAL_PRIMARY};
-            --st-background-color: #0b1220;
-            --st-secondary-background-color: #0f172a;
-            --st-text-color: #e2e8f0;
-            --st-link-color: {_TEAL_PRIMARY};
-          }}
-        }}
+    current_base_norm = str(current_base).strip().lower() if current_base else None
+    if current_base_norm == desired_base:
+        return
 
-        html, body {{
-          color-scheme: light dark;
-          background: var(--nvidb-bg) !important;
-          color: var(--nvidb-text) !important;
-        }}
+    st._config.set_option("theme.base", desired_base)
+    _trigger_rerun()
 
-        [data-testid=\"stAppViewContainer\"], .stApp {{
-          background: var(--nvidb-bg) !important;
-          color: var(--nvidb-text) !important;
-        }}
 
-        [data-testid=\"stSidebar\"], section[data-testid=\"stSidebar\"] {{
-          background: var(--nvidb-bg2) !important;
-        }}
+def _apply_app_styles():
+    _ensure_streamlit()
 
-        [data-testid=\"stMarkdownContainer\"] {{
-          color: var(--nvidb-text) !important;
-        }}
-
-        a {{
-          color: var(--nvidb-primary) !important;
-        }}
-
-        hr {{
-          border-color: var(--nvidb-border) !important;
-        }}
-
-        .vg-tooltip {{
-          background: var(--nvidb-bg2) !important;
-          color: var(--nvidb-text) !important;
-          border: 1px solid var(--nvidb-border) !important;
-          box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15) !important;
-        }}
-    """
-
-    if theme_mode_norm == "dark":
-        theme_css += f"""
-        :root {{
-          --nvidb-bg: #0b1220;
-          --nvidb-bg2: #0f172a;
-          --nvidb-text: #e2e8f0;
-          --nvidb-muted: #94a3b8;
-          --nvidb-border: rgba(226, 232, 240, 0.14);
-          --nvidb-red: #ff6b6b;
-          --nvidb-yellow: #ffd93d;
-          --nvidb-green: #6bcf7f;
-          --st-primary-color: {_TEAL_PRIMARY};
-          --st-background-color: #0b1220;
-          --st-secondary-background-color: #0f172a;
-          --st-text-color: #e2e8f0;
-          --st-link-color: {_TEAL_PRIMARY};
-        }}
-        html, body {{ color-scheme: dark; }}
-        """
-    elif theme_mode_norm == "light":
-        theme_css += f"""
-        :root {{
-          --nvidb-bg: #f1f5f9;
-          --nvidb-bg2: #ffffff;
-          --nvidb-text: #0f172a;
-          --nvidb-muted: #64748b;
-          --nvidb-border: rgba(15, 23, 42, 0.18);
-          --nvidb-red: #c92a2a;
-          --nvidb-yellow: #e67700;
-          --nvidb-green: #2b8a3e;
-          --st-primary-color: {_TEAL_PRIMARY};
-          --st-background-color: #f1f5f9;
-          --st-secondary-background-color: #ffffff;
-          --st-text-color: #0f172a;
-          --st-link-color: {_TEAL_PRIMARY};
-        }}
-        html, body {{ color-scheme: light; }}
-        """
-
-    st.markdown(
-        f"""
-        <style>
-        {theme_css}
+    # Base styles for sidebar and controls (theme colors come from Streamlit).
+    base_css = f"""
         section[data-testid="stSidebar"] {{
           min-width: {_SIDEBAR_WIDTH_PX}px !important;
           width: {_SIDEBAR_WIDTH_PX}px !important;
@@ -560,25 +465,19 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
         section[data-testid="stSidebar"] .stRadio label {{
           font-size: 0.98rem !important;
         }}
-        section[data-testid="stSidebar"] [data-testid=\"stMarkdownContainer\"] p {{
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {{
           font-size: 0.98rem !important;
         }}
         div[data-testid="stSegmentedControl"] button {{
           font-size: 1.05rem !important;
           padding: 0.35rem 0.85rem !important;
         }}
-        /* Force dataframe cell text colors to be visible */
-        [data-testid="stDataFrame"] div[data-testid="glideDataEditor"] {{
-          --gdg-text-dark: var(--nvidb-text) !important;
-          --gdg-text-medium: var(--nvidb-text) !important;
-          --gdg-text-light: var(--nvidb-muted) !important;
-          --gdg-bg-cell: var(--nvidb-bg2) !important;
-          --gdg-bg-header: var(--nvidb-bg) !important;
-          --gdg-border-color: var(--nvidb-border) !important;
-        }}
-        [data-testid="stDataFrame"] [data-testid="glideDataEditor"] div {{
-          color: var(--nvidb-text) !important;
-        }}
+    """
+
+    st.markdown(
+        f"""
+        <style>
+        {base_css}
         </style>
         """,
         unsafe_allow_html=True,
@@ -825,16 +724,16 @@ def _render_progress_bar_html(value, max_value=100):
     except Exception:
         return "N/A"
 
-    # Color based on percentage
+    # Color based on percentage using CSS variables
     if pct >= 80:
-        color = "var(--nvidb-red, #c92a2a)"
+        color = "var(--st-red-color, #c92a2a)"
     elif pct >= 50:
-        color = "var(--nvidb-yellow, #e67700)"
+        color = "var(--st-orange-color, #e67700)"
     else:
-        color = "var(--nvidb-green, #2b8a3e)"
+        color = "var(--st-green-color, #2b8a3e)"
 
     return f'''<div style="display:flex;align-items:center;justify-content:center;gap:6px;">
-        <div style="width:60px;height:8px;background:var(--nvidb-border, #ddd);border-radius:4px;overflow:hidden;">
+        <div style="width:60px;height:8px;background:var(--st-border-color-light, var(--st-border-color, #ddd));border-radius:4px;overflow:hidden;">
             <div style="width:{pct:.0f}%;height:100%;background:{color};"></div>
         </div>
         <span style="font-size:0.85em;min-width:35px;">{pct:.0f}%</span>
@@ -904,14 +803,15 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
     .nvidb-gpu-table th, .nvidb-gpu-table td {
         text-align: center;
         padding: 8px 12px;
-        border-bottom: 1px solid var(--nvidb-border, #ddd);
+        border-bottom: 1px solid var(--st-dataframe-border-color, var(--st-border-color, #ddd));
+        color: var(--st-text-color, inherit);
     }
     .nvidb-gpu-table th {
-        background: var(--nvidb-bg, #f5f5f5);
+        background: var(--st-dataframe-header-background-color, var(--st-secondary-background-color, #f5f5f5));
         font-weight: 600;
     }
     .nvidb-gpu-table tr:hover {
-        background: var(--nvidb-bg, #f9f9f9);
+        background: var(--st-secondary-background-color, #f0f0f0);
     }
     </style>
     <table class="nvidb-gpu-table">
@@ -1411,26 +1311,21 @@ def _render_timeseries_chart(
         st.warning("altair is required for charts.")
         return
 
-    theme_mode_norm = "auto"
+    theme_mode_norm = "light"
     try:
-        theme_mode_norm = str(st.session_state.get("_nvidb_theme_mode", "Auto") or "Auto").strip().lower()
+        theme_mode_norm = str(st.session_state.get("_nvidb_theme_mode", "Light") or "Light").strip().lower()
     except Exception:  # pragma: no cover
-        theme_mode_norm = "auto"
+        theme_mode_norm = "light"
     if theme_mode_norm == "dark":
         axis_label_color = "#cbd5e1"
         title_color = "#e2e8f0"
         grid_color = "rgba(148, 163, 184, 0.18)"
         domain_color = "rgba(148, 163, 184, 0.35)"
-    elif theme_mode_norm == "light":
+    else:
         axis_label_color = "#334155"
         title_color = "#0f172a"
         grid_color = "rgba(15, 23, 42, 0.08)"
         domain_color = "rgba(15, 23, 42, 0.18)"
-    else:
-        axis_label_color = "#64748b"
-        title_color = "#475569"
-        grid_color = "rgba(100, 116, 139, 0.20)"
-        domain_color = "rgba(100, 116, 139, 0.35)"
 
     data = df_long.dropna(subset=["timestamp", "gpu_id", "value"]).copy()
     if data.empty:
@@ -1694,7 +1589,7 @@ def show_logs_dashboard(db_path, *, initial_session_id=None):
             chips.append(
                 f"""<span style="display:inline-flex;align-items:center;margin:0 10px 8px 0;">
                     <span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:{color};margin-right:6px;"></span>
-                    <span style="font-size:0.95rem;color:var(--nvidb-text);">{safe_label}</span>
+                    <span style="font-size:0.95rem;">{safe_label}</span>
                 </span>"""
             )
         st.markdown("""<div style="display:flex;flex-wrap:wrap;">""" + "".join(chips) + "</div>", unsafe_allow_html=True)
@@ -1930,8 +1825,12 @@ def main(*, session_id=None, db_path=None):
     _ensure_streamlit()
 
     st.set_page_config(page_title="nvidb web", page_icon="🖥️", layout="wide")
-    theme_mode = st.session_state.get("_nvidb_theme_mode", "Auto")
-    _apply_app_styles(theme_mode=theme_mode)
+    theme_mode = st.session_state.get("_nvidb_theme_mode", "Light")
+    theme_mode_norm = str(theme_mode or "Light").strip().lower()
+    theme_mode = "Dark" if theme_mode_norm == "dark" else "Light"
+    st.session_state["_nvidb_theme_mode"] = theme_mode
+    _apply_streamlit_theme(theme_mode=theme_mode)
+    _apply_app_styles()
 
     st.title("nvidb web")
 
@@ -1970,16 +1869,17 @@ def main(*, session_id=None, db_path=None):
         if hasattr(st, "segmented_control"):
             st.segmented_control(
                 "Theme",
-                options=["Auto", "Light", "Dark"],
-                default=str(theme_mode or "Auto"),
+                options=["Light", "Dark"],
+                default=str(theme_mode or "Light"),
                 key="_nvidb_theme_mode",
-                format_func=lambda v: {"Auto": "🌓 Auto", "Light": "☀️ Light", "Dark": "🌙 Dark"}.get(v, str(v)),
+                format_func=lambda v: {"Light": "☀️ Light", "Dark": "🌙 Dark"}.get(v, str(v)),
             )
         else:  # pragma: no cover
+            theme_index = 1 if theme_mode == "Dark" else 0
             st.selectbox(
                 "Theme",
-                options=["Auto", "Light", "Dark"],
-                index=0,
+                options=["Light", "Dark"],
+                index=theme_index,
                 key="_nvidb_theme_mode",
             )
 
