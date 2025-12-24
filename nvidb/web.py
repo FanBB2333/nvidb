@@ -724,11 +724,11 @@ _GPU_TABLE_COLUMNS = [
     ("name", "name"),
     ("fan", "fan"),
     ("util", "util (GPU%)"),
-    ("mem_util", "mem_util (mem%)"),
     ("temp", "temp"),
     ("rx", "rx"),
     ("tx", "tx"),
     ("power", "power"),
+    ("mem_util", "mem_util (mem%)"),
     ("memory[used/total]", "mem"),
     ("processes", "processes"),
 ]

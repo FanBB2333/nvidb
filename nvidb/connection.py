@@ -753,10 +753,15 @@ class NVClientPool:
             columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
             stats = stats.drop(columns=columns_to_drop)
             
-            # Reorder columns to put processes at the end
+            # Reorder columns: move mem_util before memory[used/total] and processes at the end
             if 'processes' in stats.columns:
-                other_columns = [col for col in stats.columns if col != 'processes']
-                stats = stats[other_columns + ['processes']]
+                # Define desired column order
+                desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
+                # Only keep columns that exist in stats
+                ordered_columns = [col for col in desired_order if col in stats.columns]
+                # Add any remaining columns that weren't in desired_order
+                remaining_columns = [col for col in stats.columns if col not in ordered_columns]
+                stats = stats[ordered_columns + remaining_columns]
 
             stats_str.append((stats, system_info))
 
@@ -1114,11 +1119,11 @@ class NVClientPool:
                     continue
 
                 if col == "util" and value != "N/A":
-                    cell = f"{value:^{width}}"
-                    color = get_utilization_color(str(raw_value))
-                    if color:
-                        cell = colored(cell, color)
-                    row_parts.append(cell)
+                    percent = parse_percent(raw_value)
+                    display_text = str(raw_value).replace(" ", "")
+                    if percent is not None:
+                        display_text = f"{int(round(percent))}%"
+                    row_parts.append(format_bar_cell(display_text, percent, width))
                     continue
 
                 if col == "mem_util" and value != "N/A":
