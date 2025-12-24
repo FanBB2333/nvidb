@@ -1217,7 +1217,7 @@ class NVClientPool:
 
         if total_mem_total_mib > 0:
             if total_mem_total_mib >= 1024:
-                mem_display = f"{total_mem_used_mib//1024}GB/{total_mem_total_mib//1024}GB"
+                mem_display = f"{round(total_mem_used_mib/1024)}GB/{round(total_mem_total_mib/1024)}GB"
             else:
                 mem_display = f"{total_mem_used_mib}MB/{total_mem_total_mib}MB"
         else:
