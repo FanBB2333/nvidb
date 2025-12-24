@@ -476,7 +476,7 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
 
     if theme_mode_norm == "dark":
         theme_css += f"""
-        :root {
+        :root {{
           --nvidb-bg: #0b1220;
           --nvidb-bg2: #0f172a;
           --nvidb-text: #e2e8f0;
@@ -490,12 +490,12 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
           --st-secondary-background-color: #0f172a;
           --st-text-color: #e2e8f0;
           --st-link-color: {_TEAL_PRIMARY};
-        }
-        html, body { color-scheme: dark; }
+        }}
+        html, body {{ color-scheme: dark; }}
         """
     elif theme_mode_norm == "light":
         theme_css += f"""
-        :root {
+        :root {{
           --nvidb-bg: #f1f5f9;
           --nvidb-bg2: #ffffff;
           --nvidb-text: #0f172a;
@@ -509,8 +509,8 @@ def _apply_app_styles(*, theme_mode: str = "Auto"):
           --st-secondary-background-color: #ffffff;
           --st-text-color: #0f172a;
           --st-link-color: {_TEAL_PRIMARY};
-        }
-        html, body { color-scheme: light; }
+        }}
+        html, body {{ color-scheme: light; }}
         """
 
     st.markdown(
