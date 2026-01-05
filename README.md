@@ -236,6 +236,15 @@ GPU  |    name     |   fan   |  util   | mem_util |  temp   |    rx    |    tx  
 - Database files are stored in `~/.nvidb/gpu_log.db` by default
 - Configuration and logs are stored in `~/.nvidb/` directory
 
-## 6. Acknowledgements
+## 6. Show me the screenshots
+
+![nvidb local](resources/nvidb_local.png)
+
+![nvidb remote](resources/nvidb_remote.png)
+
+---
+
+## 7. Acknowledgements
 
 Thanks to NVIDIA for providing the `nvidia-smi` tool, which is used to query GPU information.
+
