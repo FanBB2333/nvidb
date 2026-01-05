@@ -206,24 +206,6 @@ After function execution, it outputs:
 
 ---
 
-## 3. Sample Output
-
-```bash
-Time: 09:41:00 | Servers: 2 | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit
---------------------------------------------------------------------------------
-* v [1] Local Machine (l1ght@localhost)  1 GPUs | 1 idle | 0% avg | 0GB/24GB
-
-Local Machine (l1ght@localhost)
-Driver: 570.169 | CUDA: 12.8 | GPUs: 1
-GPU  |    name     |   fan   |  util   | mem_util |  temp   |    rx    |    tx    |      power       | memory[used/total] |   processes   
------+-------------+---------+---------+----------+---------+----------+----------+------------------+--------------------+---------------
- 0   | RTX 3090 Ti |   0 %   |   0 %   |   0 %    |  39 C   | 350KB/s  | 500KB/s  | P8 32.72/450.00  |      41/24564      |    gdm(17M)   
-
-  > [2] Server 1  8 GPUs | 0 idle | 78% avg | 156GB/192GB
-```
-
----
-
 ## 4. System Requirements
 
 - NVIDIA driver installed with `nvidia-smi` available in terminal
@@ -238,13 +220,34 @@ GPU  |    name     |   fan   |  util   | mem_util |  temp   |    rx    |    tx  
 
 ## 6. Show me the screenshots
 
+- Monitor local info with `nvidb`:
+
 ![nvidb local](resources/nvidb_local.png)
 
+- Monitor remote info with `nvidb --remote`:
+
 ![nvidb remote](resources/nvidb_remote.png)
+
+- Monitor on web panel with `nvidb web`:
+
+Local info:
+
+![nvidb web local](resources/nvidb_web_local.png)
+
+Remote info:
+
+![nvidb web remote](resources/nvidb_web_remote.png)
 
 ---
 
 ## 7. Acknowledgements
 
-Thanks to NVIDIA for providing the `nvidia-smi` tool, which is used to query GPU information.
+- Thanks to NVIDIA for providing the `nvidia-smi` tool, which is used to query GPU information.
+- Thanks to [nvidia-ml-py](https://pypi.org/project/nvidia-ml-py) (`pynvml`) for Python bindings to NVML, used by the `@nvidb.monitor` decorator.
+- Thanks to [Paramiko](https://github.com/paramiko/paramiko) for powering SSH connections for remote monitoring.
+- Thanks to [PyYAML](https://github.com/yaml/pyyaml) for YAML-based configuration loading and saving.
+- Thanks to [pandas](https://github.com/pandas-dev/pandas) for parsing and processing GPU stats and log data.
+- Thanks to [blessed](https://github.com/jquast/blessed) for building the interactive terminal UI.
+- Thanks to [termcolor](https://github.com/termcolor/termcolor) for colored terminal output.
+- Thanks to [Streamlit](https://github.com/streamlit/streamlit) for providing the web dashboard framework.
 
