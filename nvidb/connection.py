@@ -146,9 +146,13 @@ class BaseClient(ABC):
                 return default
             found = element.find(path)
             return found.text if found is not None else default
-        
+
         try:
             result = self.execute_command('nvidia-smi -q -x')
+            # Check if we got valid output before trying to parse
+            if not result or not result.strip() or not result.strip().startswith('<?xml'):
+                # No NVIDIA GPU or nvidia-smi not available - this is expected on some systems
+                return pd.DataFrame(), {}
             root = ET.fromstring(result)
             driver_version = safe_get_text(root, 'driver_version', 'N/A')
             cuda_version = safe_get_text(root, 'cuda_version', 'N/A')
@@ -221,7 +225,8 @@ class BaseClient(ABC):
             return stats, system_info
             
         except Exception as e:
-            logging.error(msg=f"Failed to get full GPU info: {e}")
+            # Only log at debug level - this is expected on systems without NVIDIA GPUs
+            logging.debug(msg=f"Failed to get full GPU info: {e}")
             return pd.DataFrame(), {}
 
     def get_system_stats(self) -> dict:
@@ -246,13 +251,17 @@ class BaseClient(ABC):
         }
 
         try:
-            # Get CPU cores
+            # Get CPU cores - try Linux first, then macOS
             cpu_output = self.execute_command("nproc")
             if cpu_output and cpu_output.strip().isdigit():
                 result["cpu_cores"] = int(cpu_output.strip())
+            else:
+                # Try macOS sysctl
+                cpu_output = self.execute_command("sysctl -n hw.ncpu")
+                if cpu_output and cpu_output.strip().isdigit():
+                    result["cpu_cores"] = int(cpu_output.strip())
 
-            # Get CPU utilization from /proc/stat (calculate idle percentage)
-            # Use top -bn1 for a quick snapshot of CPU usage
+            # Get CPU utilization - try Linux first
             cpu_usage_output = self.execute_command(
                 "grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'"
             )
@@ -261,12 +270,22 @@ class BaseClient(ABC):
                     result["cpu_percent"] = float(cpu_usage_output.strip())
                 except ValueError:
                     pass
+            else:
+                # Try macOS - use top for CPU usage
+                cpu_usage_output = self.execute_command(
+                    "top -l 1 -n 0 | grep 'CPU usage' | awk '{print $3}' | tr -d '%'"
+                )
+                if cpu_usage_output and cpu_usage_output.strip():
+                    try:
+                        result["cpu_percent"] = float(cpu_usage_output.strip())
+                    except ValueError:
+                        pass
 
-            # Get memory info from /proc/meminfo
+            # Get memory info - try Linux first
             mem_output = self.execute_command(
                 "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo"
             )
-            if mem_output:
+            if mem_output and mem_output.strip():
                 mem_info = {}
                 for line in mem_output.strip().split("\n"):
                     if ":" in line:
@@ -287,9 +306,75 @@ class BaseClient(ABC):
                 result["mem_used_gb"] = (mem_total_kb - mem_available_kb) / (1024 * 1024)
                 result["swap_total_gb"] = swap_total_kb / (1024 * 1024)
                 result["swap_used_gb"] = (swap_total_kb - swap_free_kb) / (1024 * 1024)
+            else:
+                # Try macOS - use sysctl for memory
+                mem_total_output = self.execute_command("sysctl -n hw.memsize")
+                if mem_total_output and mem_total_output.strip().isdigit():
+                    mem_total_bytes = int(mem_total_output.strip())
+                    result["mem_total_gb"] = mem_total_bytes / (1024 * 1024 * 1024)
+
+                    # Get memory usage from vm_stat on macOS
+                    vm_stat_output = self.execute_command("vm_stat")
+                    if vm_stat_output:
+                        page_size = 4096  # Default page size
+                        pages_free = 0
+                        pages_inactive = 0
+                        pages_speculative = 0
+
+                        for line in vm_stat_output.split("\n"):
+                            if "page size of" in line:
+                                try:
+                                    page_size = int(line.split()[-2])
+                                except (ValueError, IndexError):
+                                    pass
+                            elif "Pages free:" in line:
+                                try:
+                                    pages_free = int(line.split()[-1].rstrip('.'))
+                                except (ValueError, IndexError):
+                                    pass
+                            elif "Pages inactive:" in line:
+                                try:
+                                    pages_inactive = int(line.split()[-1].rstrip('.'))
+                                except (ValueError, IndexError):
+                                    pass
+                            elif "Pages speculative:" in line:
+                                try:
+                                    pages_speculative = int(line.split()[-1].rstrip('.'))
+                                except (ValueError, IndexError):
+                                    pass
+
+                        available_bytes = (pages_free + pages_inactive + pages_speculative) * page_size
+                        result["mem_used_gb"] = (mem_total_bytes - available_bytes) / (1024 * 1024 * 1024)
+
+                # Get swap info on macOS
+                swap_output = self.execute_command("sysctl -n vm.swapusage")
+                if swap_output:
+                    # Format: "total = 2048.00M  used = 1024.00M  free = 1024.00M"
+                    for part in swap_output.split():
+                        if part.endswith("M"):
+                            try:
+                                value = float(part[:-1])
+                                # Determine which field based on position
+                            except ValueError:
+                                pass
+                    # Parse more carefully
+                    parts = swap_output.split()
+                    for i, part in enumerate(parts):
+                        if part == "total" and i + 2 < len(parts):
+                            try:
+                                val = parts[i + 2].rstrip("M")
+                                result["swap_total_gb"] = float(val) / 1024
+                            except (ValueError, IndexError):
+                                pass
+                        elif part == "used" and i + 2 < len(parts):
+                            try:
+                                val = parts[i + 2].rstrip("M")
+                                result["swap_used_gb"] = float(val) / 1024
+                            except (ValueError, IndexError):
+                                pass
 
         except Exception as e:
-            logging.error(msg=f"Failed to get system stats: {e}")
+            logging.debug(msg=f"Failed to get system stats: {e}")
 
         return result
 
@@ -649,15 +734,16 @@ class LocalClient(BaseClient):
             # Use shell=True to support pipes and complex commands
             result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
             if result.returncode != 0:
-                logging.error(msg=f"Command '{command}' execution failed with return code {result.returncode}")
-                return "N/A"
+                # Only log at debug level for expected failures on systems without NVIDIA GPUs
+                logging.debug(msg=f"Command '{command}' execution failed with return code {result.returncode}")
+                return ""
             return result.stdout
         except subprocess.CalledProcessError as e:
-            logging.error(msg=f"Command '{command}' execution failed: {e}")
-            return f"Error: {e.stderr}" if e.stderr else f"Command failed with return code {e.returncode}"
+            logging.debug(msg=f"Command '{command}' execution failed: {e}")
+            return ""
         except Exception as e:
-            logging.error(msg=f"Unexpected error executing command: {e}")
-            return f"Unexpected error: {str(e)}"
+            logging.debug(msg=f"Unexpected error executing command: {e}")
+            return ""
 
 
 class NVClientPool:
