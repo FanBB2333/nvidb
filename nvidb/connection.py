@@ -271,13 +271,17 @@ class BaseClient(ABC):
                 except ValueError:
                     pass
             else:
-                # Try macOS - use top for CPU usage
+                # Try macOS - use top for CPU usage (user + sys)
                 cpu_usage_output = self.execute_command(
-                    "top -l 1 -n 0 | grep 'CPU usage' | awk '{print $3}' | tr -d '%'"
+                    "top -l 1 -n 0 | grep 'CPU usage' | awk '{print $3, $5}' | tr -d '%,'"
                 )
                 if cpu_usage_output and cpu_usage_output.strip():
                     try:
-                        result["cpu_percent"] = float(cpu_usage_output.strip())
+                        parts = cpu_usage_output.strip().split()
+                        if len(parts) >= 2:
+                            user_cpu = float(parts[0])
+                            sys_cpu = float(parts[1])
+                            result["cpu_percent"] = user_cpu + sys_cpu
                     except ValueError:
                         pass
 
@@ -1345,8 +1349,28 @@ class NVClientPool:
 
     def _get_server_summary_data(self, stats, system_info=None):
         """Compute summary data for formatting/alignment."""
+        # Extract system stats from system_info if available
+        sys_stats = {}
+        if system_info and isinstance(system_info, dict):
+            sys_stats = system_info.get("system_stats", {})
+
         if stats.empty:
-            return None
+            # Return system stats even when no GPU data
+            return {
+                "gpu_count": 0,
+                "idle_count": 0,
+                "avg_util": 0,
+                "util_color": None,
+                "mem_display": "N/A",
+                "no_gpu": True,
+                # System stats
+                "cpu_cores": sys_stats.get("cpu_cores", 0),
+                "cpu_percent": sys_stats.get("cpu_percent", 0.0),
+                "mem_used_gb": sys_stats.get("mem_used_gb", 0.0),
+                "mem_total_gb": sys_stats.get("mem_total_gb", 0.0),
+                "swap_used_gb": sys_stats.get("swap_used_gb", 0.0),
+                "swap_total_gb": sys_stats.get("swap_total_gb", 0.0),
+            }
 
         def mem_to_mib(value_str) -> int:
             if not value_str or str(value_str).strip() in {"N/A", ""}:
@@ -1420,11 +1444,6 @@ class NVClientPool:
         else:
             util_color = "green"
 
-        # Extract system stats from system_info if available
-        sys_stats = {}
-        if system_info and isinstance(system_info, dict):
-            sys_stats = system_info.get("system_stats", {})
-
         return {
             "gpu_count": gpu_count,
             "idle_count": idle_count,
@@ -1460,6 +1479,7 @@ class NVClientPool:
         avg_util = summary_data["avg_util"]
         util_color = summary_data["util_color"]
         mem_display = summary_data["mem_display"]
+        no_gpu = summary_data.get("no_gpu", False)
 
         # System stats
         cpu_cores = summary_data.get("cpu_cores", 0)
@@ -1468,25 +1488,6 @@ class NVClientPool:
         mem_total_gb = summary_data.get("mem_total_gb", 0.0)
         swap_used_gb = summary_data.get("swap_used_gb", 0.0)
         swap_total_gb = summary_data.get("swap_total_gb", 0.0)
-
-        if widths:
-            gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
-            idle_digits = widths.get("idle_digits", len(str(idle_count)))
-            util_digits = widths.get("util_digits", len(str(avg_util)))
-            mem_width = widths.get("mem_width", len(str(mem_display)))
-            cpu_cores_digits = widths.get("cpu_cores_digits", len(str(cpu_cores)))
-        else:
-            gpu_digits = len(str(gpu_count))
-            idle_digits = len(str(idle_count))
-            util_digits = len(str(avg_util))
-            mem_width = len(str(mem_display))
-            cpu_cores_digits = len(str(cpu_cores))
-
-        gpu_part = f"{gpu_count:>{gpu_digits}} GPUs"
-        idle_part = f"{idle_count:>{idle_digits}} idle"
-        util_plain = f"{avg_util:>{util_digits}}%"
-        util_part = colored(util_plain, util_color) if util_color else util_plain
-        mem_part = f"{str(mem_display):>{mem_width}}"
 
         # Format system stats parts
         # CPU: utilization first, cores in brackets
@@ -1511,6 +1512,32 @@ class NVClientPool:
                 mem_sys_part = f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G"
         else:
             mem_sys_part = ""
+
+        # Handle no GPU case - only show system stats
+        if no_gpu:
+            sys_parts = [p for p in [cpu_part, mem_sys_part] if p]
+            if sys_parts:
+                return "No GPU | " + " | ".join(sys_parts)
+            return "No GPU"
+
+        if widths:
+            gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
+            idle_digits = widths.get("idle_digits", len(str(idle_count)))
+            util_digits = widths.get("util_digits", len(str(avg_util)))
+            mem_width = widths.get("mem_width", len(str(mem_display)))
+            cpu_cores_digits = widths.get("cpu_cores_digits", len(str(cpu_cores)))
+        else:
+            gpu_digits = len(str(gpu_count))
+            idle_digits = len(str(idle_count))
+            util_digits = len(str(avg_util))
+            mem_width = len(str(mem_display))
+            cpu_cores_digits = len(str(cpu_cores))
+
+        gpu_part = f"{gpu_count:>{gpu_digits}} GPUs"
+        idle_part = f"{idle_count:>{idle_digits}} idle"
+        util_plain = f"{avg_util:>{util_digits}}%"
+        util_part = colored(util_plain, util_color) if util_color else util_plain
+        mem_part = f"{str(mem_display):>{mem_width}}"
 
         # Build the summary string
         parts = [f"{gpu_part} | {idle_part} | {util_part} avg | {mem_part}"]
