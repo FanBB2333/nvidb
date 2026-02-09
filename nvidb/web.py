@@ -34,6 +34,11 @@ try:
 except ImportError:  # pragma: no cover
     from . import config
 
+try:
+    from nvidb.metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
+except ImportError:  # pragma: no cover
+    from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
+
 
 def get_db_path():
     return config.get_db_path()
@@ -315,7 +320,15 @@ def _format_gb(mib):
 
 
 def _server_summary(table, system_info=None):
+    source = None
+    if system_info and isinstance(system_info, dict):
+        source = system_info.get("data_source")
+
     if table is None or table.empty:
+        if source == "unsupported":
+            return "Unsupported"
+        if source:
+            return f"No GPUs | src:{source}"
         return "No GPUs"
 
     utils = []
@@ -372,8 +385,13 @@ def _server_summary(table, system_info=None):
             sys_parts.append(f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G")
 
     if sys_parts:
-        return f"{gpu_summary} | {' | '.join(sys_parts)}"
-    return gpu_summary
+        summary = f"{gpu_summary} | {' | '.join(sys_parts)}"
+    else:
+        summary = gpu_summary
+
+    if source:
+        summary = f"{summary} | src:{source}"
+    return summary
 
 
 def _strip_gpu_name(value):
@@ -1074,7 +1092,7 @@ def show_live_dashboard(*, include_remote):
                     st.error(system_info.get("error", "Unknown error"))
 
             elif table is None or table.empty:
-                title = f"[{idx + 1}] {description} | No GPUs"
+                title = f"[{idx + 1}] {description} | {_server_summary(table, system_info)}"
 
                 def body(system_info=system_info, description=description):
                     payload = {"nvidia": system_info or {}}
@@ -1086,17 +1104,66 @@ def show_live_dashboard(*, include_remote):
                 title = f"[{idx + 1}] {description} | {_server_summary(table, system_info)}"
 
                 def body(table=table, system_info=system_info, user_summary=user_summary, visible_columns=visible_columns):
-                    if (
-                        isinstance(system_info, dict)
-                        and any(k in system_info for k in ("driver_version", "cuda_version", "attached_gpus"))
-                    ):
-                        st.caption(
-                            f"Driver: {system_info.get('driver_version', 'N/A')} | "
-                            f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
-                            f"GPUs: {system_info.get('attached_gpus', '0')}"
-                        )
+                    if isinstance(system_info, dict):
+                        parts = []
+                        if any(k in system_info for k in ("driver_version", "cuda_version", "attached_gpus")):
+                            parts.append(
+                                f"Driver: {system_info.get('driver_version', 'N/A')} | "
+                                f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
+                                f"GPUs: {system_info.get('attached_gpus', '0')}"
+                            )
+
+                        source = system_info.get("data_source")
+                        source_detail = system_info.get("data_source_detail")
+                        if source_detail and source_detail not in {"N/A", "-", ""}:
+                            parts.append(f"Source: {source} ({source_detail})")
+                        elif source:
+                            parts.append(f"Source: {source}")
+
+                        if parts:
+                            st.caption(" | ".join(parts))
 
                     _render_gpu_table(table, visible_columns=visible_columns)
+
+                    advanced_supported = (
+                        isinstance(system_info, dict) and system_info.get("advanced_supported") is True
+                    )
+                    advanced_df = system_info.get("advanced_metrics") if isinstance(system_info, dict) else None
+                    if advanced_supported and isinstance(advanced_df, pd.DataFrame) and not advanced_df.empty:
+                        def render_percent_table(df: pd.DataFrame):
+                            if df is None or df.empty:
+                                st.info("No data")
+                                return
+                            display = df.copy()
+                            column_config = {}
+                            for col in list(display.columns):
+                                if col == "GPU":
+                                    continue
+                                display[col] = display[col].map(_parse_percent)
+                                column_config[col] = st.column_config.ProgressColumn(
+                                    col,
+                                    min_value=0,
+                                    max_value=100,
+                                    format="%.0f%%",
+                                    color="primary",
+                                )
+                            st.dataframe(
+                                display,
+                                width="stretch",
+                                hide_index=True,
+                                column_config=column_config,
+                            )
+
+                        with st.expander("Advanced (DCGM)", expanded=False):
+                            st.caption("SOL is derived from DCGM profiling metrics.")
+                            for idx_section, (title, cols) in enumerate(ADVANCED_METRIC_GROUPS):
+                                cols_present = present_columns(advanced_df.columns, list(cols))
+                                if len(cols_present) < 2:
+                                    continue
+                                sub_df = advanced_df[cols_present].copy()
+                                sub_df = sub_df.rename(columns=ADVANCED_METRIC_LABELS)
+                                with st.expander(title, expanded=(idx_section == 0)):
+                                    render_percent_table(sub_df)
 
                     if user_summary:
                         with st.expander("User VRAM totals (this node)", expanded=False):

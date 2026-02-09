@@ -20,6 +20,8 @@ from paramiko.ssh_exception import NoValidConnectionsError, PasswordRequiredExce
 import pandas as pd
 from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
+from .dcgm import make_dcgm_snapshot_command
+from .metrics import ADVANCED_METRIC_GROUPS, present_columns
 from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color, get_memory_ratio_color
 
 
@@ -134,100 +136,249 @@ class BaseClient(ABC):
             return pd.DataFrame()
     
     def get_full_gpu_info(self):
-        """Get complete GPU information from nvidia-smi XML output"""
+        """Get GPU information (base + optional advanced profiling).
+
+        - Base table: always from `nvidia-smi -q -x` (legacy behavior).
+        - Advanced table (DCGM profiling): fetched via DCGM python bindings when available.
+        """
         if getattr(self, "connected", True) is False:
             error_message = getattr(self, "last_connect_error", None) or "Not connected"
             error_type = getattr(self, "last_error_type", None) or "error"
             return pd.DataFrame(), {"error": error_message, "error_type": error_type}
 
         def safe_get_text(element, path, default="N/A"):
-            """Safely get text from XML element, return default if not found"""
+            """Safely get text from XML element, return default if not found."""
             if element is None:
                 return default
             found = element.find(path)
             return found.text if found is not None else default
 
-        try:
-            result = self.execute_command('nvidia-smi -q -x')
-            # Check if we got valid output before trying to parse
-            if not result or not result.strip() or not result.strip().startswith('<?xml'):
-                # No NVIDIA GPU or nvidia-smi not available - this is expected on some systems
-                return pd.DataFrame(), {}
-            root = ET.fromstring(result)
-            driver_version = safe_get_text(root, 'driver_version', 'N/A')
-            cuda_version = safe_get_text(root, 'cuda_version', 'N/A')
-            attached_gpus = safe_get_text(root, 'attached_gpus', '0')
-            gpus = root.findall('gpu')
-            stats = []
-            
-            for gpu_index, gpu in enumerate(gpus):
-                # Safely extract all values with default fallbacks
-                minor_number = safe_get_text(gpu, 'minor_number', 'N/A')
-                product_name = safe_get_text(gpu, 'product_name', 'Unknown GPU')
-                product_architecture = safe_get_text(gpu, 'product_architecture', 'N/A')
-                
-                pci = gpu.find('pci')
-                tx_util = safe_get_text(pci, 'tx_util', 'N/A')
-                rx_util = safe_get_text(pci, 'rx_util', 'N/A')
-                fan_speed = safe_get_text(gpu, 'fan_speed', 'N/A')
-                
-                fb_memory_usage = gpu.find('fb_memory_usage')
-                total = safe_get_text(fb_memory_usage, 'total', 'N/A')
-                used = safe_get_text(fb_memory_usage, 'used', 'N/A')
-                free = safe_get_text(fb_memory_usage, 'free', 'N/A')
-                
-                utilization = gpu.find('utilization')
-                gpu_util = safe_get_text(utilization, 'gpu_util', 'N/A')
-                memory_util = safe_get_text(utilization, 'memory_util', 'N/A')
-                
-                temperature = gpu.find('temperature')
-                gpu_temp = safe_get_text(temperature, 'gpu_temp', 'N/A')
+        def _fetch_nvidia_smi_base():
+            try:
+                result = self.execute_command("nvidia-smi -q -x")
+                if not result or not result.strip() or not result.strip().startswith("<?xml"):
+                    return pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}
 
-                gpu_power_readings = gpu.find('gpu_power_readings')
-                power_state = safe_get_text(gpu_power_readings, 'power_state', 'N/A')
-                
-                # Try to get power_draw, if not available, try instant_power_draw as fallback
-                power_draw = safe_get_text(gpu_power_readings, 'power_draw', None)
-                if power_draw is None or power_draw == 'N/A':
-                    power_draw = safe_get_text(gpu_power_readings, 'instant_power_draw', 'N/A')
-                
-                current_power_limit = safe_get_text(gpu_power_readings, 'current_power_limit', 'N/A')
-                
-                processes = gpu.find('processes')
-                
-                stats.append({
-                    'gpu_index': gpu_index,
-                    'product_name': product_name, 
-                    'product_architecture': product_architecture, 
-                    'tx_util': tx_util, 
-                    'rx_util': rx_util, 
-                    'fan_speed': fan_speed, 
-                    'total': total, 
-                    'used': used, 
-                    'free': free, 
-                    'gpu_util': gpu_util, 
-                    'memory_util': memory_util, 
-                    'gpu_temp': gpu_temp, 
-                    'power_state': power_state, 
-                    'power_draw': power_draw, 
-                    'current_power_limit': current_power_limit,
-                    'processes': processes
-                })
-            
-            stats = pd.DataFrame(stats)
-            
-            # Return both stats and system info
-            system_info = {
-                'driver_version': driver_version,
-                'cuda_version': cuda_version,
-                'attached_gpus': attached_gpus
-            }
+                root = ET.fromstring(result)
+                driver_version = safe_get_text(root, "driver_version", "N/A")
+                cuda_version = safe_get_text(root, "cuda_version", "N/A")
+                attached_gpus = safe_get_text(root, "attached_gpus", "0")
+                gpus = root.findall("gpu")
+                rows = []
+
+                for gpu_index, gpu in enumerate(gpus):
+                    product_name = safe_get_text(gpu, "product_name", "Unknown GPU")
+                    product_architecture = safe_get_text(gpu, "product_architecture", "N/A")
+
+                    pci = gpu.find("pci")
+                    tx_util = safe_get_text(pci, "tx_util", "N/A")
+                    rx_util = safe_get_text(pci, "rx_util", "N/A")
+                    fan_speed = safe_get_text(gpu, "fan_speed", "N/A")
+
+                    fb_memory_usage = gpu.find("fb_memory_usage")
+                    total = safe_get_text(fb_memory_usage, "total", "N/A")
+                    used = safe_get_text(fb_memory_usage, "used", "N/A")
+                    free = safe_get_text(fb_memory_usage, "free", "N/A")
+
+                    utilization = gpu.find("utilization")
+                    gpu_util = safe_get_text(utilization, "gpu_util", "N/A")
+                    memory_util = safe_get_text(utilization, "memory_util", "N/A")
+
+                    temperature = gpu.find("temperature")
+                    gpu_temp = safe_get_text(temperature, "gpu_temp", "N/A")
+
+                    gpu_power_readings = gpu.find("gpu_power_readings")
+                    power_state = safe_get_text(gpu_power_readings, "power_state", "N/A")
+
+                    power_draw = safe_get_text(gpu_power_readings, "power_draw", None)
+                    if power_draw is None or power_draw == "N/A":
+                        power_draw = safe_get_text(gpu_power_readings, "instant_power_draw", "N/A")
+
+                    current_power_limit = safe_get_text(gpu_power_readings, "current_power_limit", "N/A")
+
+                    processes = gpu.find("processes")
+
+                    rows.append(
+                        {
+                            "gpu_index": gpu_index,
+                            "product_name": product_name,
+                            "product_architecture": product_architecture,
+                            "tx_util": tx_util,
+                            "rx_util": rx_util,
+                            "fan_speed": fan_speed,
+                            "total": total,
+                            "used": used,
+                            "free": free,
+                            "gpu_util": gpu_util,
+                            "memory_util": memory_util,
+                            "gpu_temp": gpu_temp,
+                            "power_state": power_state,
+                            "power_draw": power_draw,
+                            "current_power_limit": current_power_limit,
+                            "processes": processes,
+                        }
+                    )
+
+                stats = pd.DataFrame(rows)
+                system_info = {
+                    "driver_version": driver_version,
+                    "cuda_version": cuda_version,
+                    "attached_gpus": attached_gpus,
+                    "data_source": "nvidia-smi",
+                    "data_source_detail": "nvidia-smi -q -x",
+                }
+                return stats, system_info
+
+            except Exception as e:
+                logging.debug(msg=f"Failed to get base GPU info via nvidia-smi: {e}")
+                return pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}
+
+        stats, system_info = _fetch_nvidia_smi_base()
+        if stats.empty:
             return stats, system_info
-            
-        except Exception as e:
-            # Only log at debug level - this is expected on systems without NVIDIA GPUs
-            logging.debug(msg=f"Failed to get full GPU info: {e}")
-            return pd.DataFrame(), {}
+
+        def fmt_percent(value) -> str:
+            if value is None:
+                return "N/A"
+            text = str(value).strip()
+            if not text or text in {"N/A", "-"}:
+                return "N/A"
+            try:
+                num = float(text)
+            except Exception:
+                # Already formatted?
+                return text
+            # Profiling fields may be 0-1 ratios; normalize to 0-100%.
+            if 0.0 <= num <= 1.0:
+                num *= 100.0
+            if num < 0:
+                num = 0.0
+            if num > 100:
+                num = 100.0
+            return f"{num:.0f}%"
+
+        def fmt_temp_c(value) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                num = float(value)
+            except Exception:
+                return "N/A"
+            return f"{num:.0f} C"
+
+        def fmt_watts(value) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                num = float(value)
+            except Exception:
+                return "N/A"
+            return f"{num:.1f} W" if abs(num - int(num)) > 0.01 else f"{int(num)} W"
+
+        # Fetch advanced profiling metrics via DCGM (optional)
+        try:
+            dcgm_cmd = make_dcgm_snapshot_command()
+            dcgm_out = self.execute_command(dcgm_cmd)
+            payload = None
+            if isinstance(dcgm_out, str) and dcgm_out.strip():
+                for line in reversed(dcgm_out.splitlines()):
+                    line = line.strip()
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        payload = json.loads(line)
+                        break
+                    except Exception:
+                        continue
+
+            if isinstance(payload, dict) and payload.get("ok") is True:
+                gpus = payload.get("gpus") or []
+                if isinstance(gpus, list) and gpus:
+                    adv_rows = []
+
+                    for gpu in gpus:
+                        try:
+                            gpu_index = int(gpu.get("gpu_index"))
+                        except Exception:
+                            gpu_index = len(adv_rows)
+
+                        sm_active = gpu.get("sm_active")
+                        sm_occupancy = gpu.get("sm_occupancy")
+                        tensor_active = gpu.get("tensor_active")
+                        fp64_active = gpu.get("fp64_active")
+                        fp32_active = gpu.get("fp32_active")
+                        fp16_active = gpu.get("fp16_active")
+                        int_active = gpu.get("int_active")
+                        dram_active = gpu.get("dram_active")
+
+                        def pct_num(v):
+                            if v is None:
+                                return None
+                            try:
+                                x = float(v)
+                            except Exception:
+                                return None
+                            if 0.0 <= x <= 1.0:
+                                x *= 100.0
+                            if x < 0:
+                                x = 0.0
+                            if x > 100:
+                                x = 100.0
+                            return x
+
+                        pipe_vals = [
+                            pct_num(tensor_active),
+                            pct_num(fp64_active),
+                            pct_num(fp32_active),
+                            pct_num(fp16_active),
+                            pct_num(int_active),
+                        ]
+                        pipe_vals = [v for v in pipe_vals if v is not None]
+                        instr_throughput = max(pipe_vals) if pipe_vals else None
+                        sol = None
+                        dram_pct = pct_num(dram_active)
+                        if instr_throughput is not None and dram_pct is not None:
+                            sol = max(instr_throughput, dram_pct)
+                        elif instr_throughput is not None:
+                            sol = instr_throughput
+                        elif dram_pct is not None:
+                            sol = dram_pct
+
+                        adv_rows.append(
+                            {
+                                "GPU": gpu_index,
+                                "sm_active": fmt_percent(sm_active),
+                                "sm_occupancy": fmt_percent(sm_occupancy),
+                                "instruction_throughput": fmt_percent(instr_throughput),
+                                "sol": fmt_percent(sol),
+                                "tensor_active": fmt_percent(tensor_active),
+                                "fp64_active": fmt_percent(fp64_active),
+                                "fp32_active": fmt_percent(fp32_active),
+                                "fp16_active": fmt_percent(fp16_active),
+                            }
+                        )
+
+                    adv_df = pd.DataFrame(adv_rows)
+                    advanced_supported = False
+                    try:
+                        if not adv_df.empty:
+                            metric_cols = [c for c in adv_df.columns if c != "GPU"]
+                            for col in metric_cols:
+                                values = adv_df[col].astype(str).tolist()
+                                if any(v not in {"N/A", "-", ""} for v in values):
+                                    advanced_supported = True
+                                    break
+                    except Exception:
+                        advanced_supported = False
+
+                    system_info["advanced_source"] = "dcgm"
+                    system_info["advanced_source_detail"] = payload.get("connection") or "N/A"
+                    system_info["advanced_metrics"] = adv_df
+                    system_info["advanced_supported"] = advanced_supported
+        except Exception:
+            # DCGM is optional; ignore failures.
+            pass
+        return stats, system_info
 
     def get_system_stats(self) -> dict:
         """Get system statistics: CPU cores, CPU usage, memory usage, and swap usage.
@@ -986,13 +1137,42 @@ class NVClientPool:
 
             system_info_header = ""
             if system_info:
+                source = system_info.get("data_source", "N/A")
+                source_detail = system_info.get("data_source_detail")
+                if source_detail and source_detail not in {"N/A", "-", ""}:
+                    source_display = f"{source} ({source_detail})"
+                else:
+                    source_display = str(source)
                 system_info_header = (
                     f"Driver: {system_info.get('driver_version', 'N/A')} | "
                     f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
-                    f"GPUs: {system_info.get('attached_gpus', '0')}\n"
+                    f"GPUs: {system_info.get('attached_gpus', '0')} | "
+                    f"Source: {source_display}\n"
                 )
 
-            formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{system_info_header}{formatted_table}")
+            advanced_block = ""
+            advanced_supported = (
+                isinstance(system_info, dict) and system_info.get("advanced_supported") is True
+            )
+            advanced_df = system_info.get("advanced_metrics") if isinstance(system_info, dict) else None
+            if advanced_supported and isinstance(advanced_df, pd.DataFrame) and not advanced_df.empty:
+                try:
+                    sub_blocks = ["Advanced (DCGM)"]
+                    for title, cols in ADVANCED_METRIC_GROUPS:
+                        cols_present = present_columns(advanced_df.columns, list(cols))
+                        if len(cols_present) < 2:
+                            continue
+                        sub_df = advanced_df[cols_present].copy()
+                        sub_table = self._format_fixed_width_table(sub_df, border=True)
+                        sub_blocks.append(f"{title}\n{sub_table}")
+
+                    advanced_block = "\n" + "\n".join(sub_blocks)
+                except Exception:
+                    advanced_block = ""
+
+            formatted_stats.append(
+                f"\n{colored(client.description, 'yellow')}\n{system_info_header}{formatted_table}{advanced_block}"
+            )
         if return_raw:
             return formatted_stats, raw_stats_by_client
         return formatted_stats
@@ -1351,6 +1531,9 @@ class NVClientPool:
         """Compute summary data for formatting/alignment."""
         # Extract system stats from system_info if available
         sys_stats = {}
+        data_source = None
+        if system_info and isinstance(system_info, dict):
+            data_source = system_info.get("data_source")
         if system_info and isinstance(system_info, dict):
             sys_stats = system_info.get("system_stats", {})
 
@@ -1370,6 +1553,7 @@ class NVClientPool:
                 "mem_total_gb": sys_stats.get("mem_total_gb", 0.0),
                 "swap_used_gb": sys_stats.get("swap_used_gb", 0.0),
                 "swap_total_gb": sys_stats.get("swap_total_gb", 0.0),
+                "data_source": data_source,
             }
 
         def mem_to_mib(value_str) -> int:
@@ -1457,6 +1641,7 @@ class NVClientPool:
             "mem_total_gb": sys_stats.get("mem_total_gb", 0.0),
             "swap_used_gb": sys_stats.get("swap_used_gb", 0.0),
             "swap_total_gb": sys_stats.get("swap_total_gb", 0.0),
+            "data_source": data_source,
         }
 
     def _format_server_summary(self, summary_data, widths=None) -> str:
@@ -1515,10 +1700,12 @@ class NVClientPool:
 
         # Handle no GPU case - only show system stats
         if no_gpu:
+            source = summary_data.get("data_source") or "unknown"
+            label = "Unsupported" if source == "unsupported" else "No GPU"
             sys_parts = [p for p in [cpu_part, mem_sys_part] if p]
             if sys_parts:
-                return "No GPU | " + " | ".join(sys_parts)
-            return "No GPU"
+                return f"{label} | src:{source} | " + " | ".join(sys_parts)
+            return f"{label} | src:{source}"
 
         if widths:
             gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
@@ -1544,6 +1731,10 @@ class NVClientPool:
         sys_parts = [p for p in [cpu_part, mem_sys_part] if p]
         if sys_parts:
             parts.append(" | ".join(sys_parts))
+
+        source = summary_data.get("data_source")
+        if source:
+            parts.append(f"src:{source}")
 
         return " | ".join(parts)
 
