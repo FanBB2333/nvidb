@@ -93,6 +93,8 @@ nvidb --once --remote  # Print all servers once and exit
 nvidb --version        # Show version
 ```
 
+> **Tip**: Set `remote: true` under the `basic` section of `~/.nvidb/config.yml` to make plain `nvidb` include remote servers by default (same for `nvidb log`). Pass `--no-remote` for a one-off local-only run.
+
 ### 2.2 Server Management
 
 ```bash

@@ -42,6 +42,13 @@ def _get_basic_compact(cfg: dict) -> bool:
     return bool(basic.get("compact", False))
 
 
+def _get_basic_remote(cfg: dict) -> bool:
+    basic = (cfg or {}).get("basic", {})
+    if not isinstance(basic, dict):
+        basic = {}
+    return bool(basic.get("remote", False))
+
+
 def _is_specific_ssh_host(name: str) -> bool:
     if not name:
         return False
@@ -1009,6 +1016,7 @@ def main():
     parser = argparse.ArgumentParser(prog="nvidb", description="A simple tool to manage NVIDIA GPU servers.")
     parser.add_argument('--version', action='version', version=f'nvidb {config.VERSION}')
     parser.add_argument('--remote', action='store_true', help='Use remote servers')
+    parser.add_argument('--no-remote', action='store_true', help='Ignore `basic.remote` in config and use local machine only')
     parser.add_argument('--once', action='store_true', help='Print GPU stats once and exit (no TUI loop)')
     parser.add_argument(
         '--compact',
@@ -1026,6 +1034,7 @@ def main():
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
     # Also accept `--remote` after the subcommand (e.g. `nvidb log --remote`)
     log_parser.add_argument('--remote', action='store_true', default=argparse.SUPPRESS, help='Use remote servers')
+    log_parser.add_argument('--no-remote', action='store_true', default=argparse.SUPPRESS, help='Ignore `basic.remote` in config and log local machine only')
     log_parser.add_argument('--interval', type=int, default=5, help='Logging interval in seconds (default: 5)')
     log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
     log_subparsers = log_parser.add_subparsers(dest='log_command')
@@ -1050,6 +1059,9 @@ def main():
 
     server_list = None
     remote_requested = bool(getattr(args, "remote", False))
+    if not remote_requested and not getattr(args, "no_remote", False):
+        # `basic.remote: true` in config makes plain `nvidb` behave like `nvidb --remote`
+        remote_requested = _get_basic_remote(cfg)
     if remote_requested:
         if args.command is None:
             server_list = init()

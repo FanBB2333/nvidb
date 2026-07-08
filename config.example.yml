@@ -8,6 +8,12 @@ basic:
   # - true:  compact table width (do not force fill)
   compact: false
 
+  # Always include remote servers (default: false)
+  # - true:  plain `nvidb` behaves like `nvidb --remote`
+  #          (pass `--no-remote` for a one-off local-only run)
+  # - false: remote servers are only used with the `--remote` flag
+  remote: false
+
 servers:
   # Example server with SSH key authentication (recommended)
   - hostname: "server1.example.com"
