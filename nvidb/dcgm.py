@@ -38,6 +38,11 @@ def make_dcgm_snapshot_command(*, python_exe: str = "python3") -> str:
         import os
         import sys
         import time
+        import warnings
+
+        # DCGM 4.6+ bindings emit DeprecationWarnings for legacy field names;
+        # keep stderr clean for callers that log it.
+        warnings.filterwarnings("ignore")
 
         BINDINGS = {list(DCGM_PYTHON_BINDINGS_PATHS)!r}
         for p in BINDINGS:
