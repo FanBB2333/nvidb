@@ -188,7 +188,13 @@ class BaseClient(ABC):
                     gpu_temp = safe_get_text(temperature, "gpu_temp", "N/A")
 
                     gpu_power_readings = gpu.find("gpu_power_readings")
+                    # On newer drivers (e.g. WSL/591.x) the P-state under
+                    # <gpu_power_readings><power_state> is deprecated and returns
+                    # "Requested functionality has been deprecated"; the real perf
+                    # state now lives in <gpu><performance_state>.
                     power_state = safe_get_text(gpu_power_readings, "power_state", "N/A")
+                    if not power_state or power_state == "N/A" or "deprecated" in power_state.lower():
+                        power_state = safe_get_text(gpu, "performance_state", "N/A")
 
                     power_draw = safe_get_text(gpu_power_readings, "power_draw", None)
                     if power_draw is None or power_draw == "N/A":
