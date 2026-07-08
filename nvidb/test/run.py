@@ -1084,10 +1084,11 @@ def main():
             show_log_info(session_id=args.session_id, db_path=db_path)
         elif args.log_command == 'web':
             print("Deprecated: use `nvidb web` instead of `nvidb log web`.")
-            from ..web import run_streamlit_app
-            run_streamlit_app(
+            from ..dashboard import run_dash_app
+            run_dash_app(
                 db_path=db_path,
                 port=args.port,
+                include_remote=remote_requested,
             )
         else:
             # Default: start logging
@@ -1097,10 +1098,11 @@ def main():
                 db_path=db_path
             )
     elif args.command == 'web':
-        from ..web import run_streamlit_app
-        run_streamlit_app(
+        from ..dashboard import run_dash_app
+        run_dash_app(
             db_path=getattr(args, "db_path", None),
             port=args.port,
+            include_remote=remote_requested,
         )
     elif args.command == 'clean':
         interactive_clean(clean_all=(args.target == 'all'))

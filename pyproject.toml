@@ -50,6 +50,3 @@ version = { attr = "nvidb.config.VERSION" }
 
 [tool.setuptools.packages.find]
 include = ["nvidb*"]
-
-[tool.setuptools.package-data]
-nvidb = [".streamlit/config.toml"]

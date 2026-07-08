@@ -118,19 +118,18 @@ Press `Ctrl+C` to stop logging and save data.
 
 ### 2.4 Web Dashboard
 
-Open a Streamlit-based web dashboard to view live GPU info and browse log sessions:
+Open a [Dash](https://github.com/plotly/dash)-based interactive web dashboard to view live GPU info and browse log sessions:
 
 ```bash
-pip install streamlit
+pip install dash
 nvidb web                 # Web dashboard (Live + Logs)
 nvidb web --db-path /path/to/db
 nvidb web --port 8502
 ```
 
-After the server starts:
-- Switch to `Logs` and select a session from the left sidebar.
-- Use `Live-local` / `Live-remote` in the UI to toggle local-only vs local+remote live stats (remote is loaded only when `Live-remote` is selected).
-- Use `Theme` to switch `Light` / `Dark`.
+After the server starts (http://localhost:8501 by default):
+- **Live**: per-server GPU tables plus rolling utilization / VRAM charts; toggle `include remote`, pick the refresh interval, or pause auto-refresh. (`basic.remote: true` or `nvidb --remote web` enables remote by default.)
+- **Logs**: pick a session in the left table, then filter by node / metric / time range. Charts support zoom, pan and legend isolation; **click any chart point to inspect that snapshot**. The raw table supports filtering, sorting and CSV export.
 
 `nvidb log web` is deprecated; use `nvidb web` instead.
 
