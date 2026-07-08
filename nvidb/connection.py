@@ -1149,11 +1149,25 @@ class NVClientPool:
                     source_display = f"{source} ({source_detail})"
                 else:
                     source_display = str(source)
+                # Surface DCGM status: it is easy to mistake a hidden advanced table
+                # for "DCGM not connected" when profiling fields are just unsupported
+                # (DCP metrics are datacenter-GPU only).
+                advanced_display = ""
+                adv_source = system_info.get("advanced_source")
+                if adv_source:
+                    if system_info.get("advanced_supported") is True:
+                        adv_detail = system_info.get("advanced_source_detail")
+                        if adv_detail and adv_detail not in {"N/A", "-", ""}:
+                            advanced_display = f" | Advanced: {adv_source} ({adv_detail})"
+                        else:
+                            advanced_display = f" | Advanced: {adv_source}"
+                    else:
+                        advanced_display = f" | Advanced: {adv_source} (profiling unavailable)"
                 system_info_header = (
                     f"Driver: {system_info.get('driver_version', 'N/A')} | "
                     f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
                     f"GPUs: {system_info.get('attached_gpus', '0')} | "
-                    f"Source: {source_display}\n"
+                    f"Source: {source_display}{advanced_display}\n"
                 )
 
             advanced_block = ""
