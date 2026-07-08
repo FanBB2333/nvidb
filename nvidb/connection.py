@@ -1457,7 +1457,13 @@ class NVClientPool:
             left = "".join(chars[:fill_len])
             right = "".join(chars[fill_len:])
             if fill_len > 0 and fill_bg:
-                left = colored(left, on_color=fill_bg)
+                # Pair the bar background with a contrasting foreground; without a
+                # foreground, the terminal's default (usually white/light) text
+                # sits on a bright yellow/green bar and becomes unreadable. Only the
+                # filled portion is recolored, so text over the unfilled region keeps
+                # the terminal default color.
+                bar_fg = {"on_red": "white", "on_yellow": "black", "on_green": "black"}.get(fill_bg)
+                left = colored(left, bar_fg, on_color=fill_bg)
             return left + right
 
         # Format table header
