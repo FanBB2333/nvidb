@@ -1,0 +1,178 @@
+import pandas as pd
+
+from nvidb.connection import BaseClient
+from nvidb.nvml import REMOTE_NVML_AGENT_SCRIPT, make_nvml_agent_command
+
+
+NVIDIA_SMI_XML = """<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <driver_version>550.54.15</driver_version>
+  <cuda_version>12.4</cuda_version>
+  <attached_gpus>1</attached_gpus>
+  <gpu>
+    <product_name>NVIDIA Test GPU</product_name>
+    <product_architecture>Ampere</product_architecture>
+    <performance_state>P8</performance_state>
+    <fan_speed>30 %</fan_speed>
+    <pci>
+      <tx_util>1 KB/s</tx_util>
+      <rx_util>2 KB/s</rx_util>
+    </pci>
+    <fb_memory_usage>
+      <total>8192 MiB</total>
+      <used>1024 MiB</used>
+      <free>7168 MiB</free>
+    </fb_memory_usage>
+    <utilization>
+      <gpu_util>10 %</gpu_util>
+      <memory_util>20 %</memory_util>
+    </utilization>
+    <temperature>
+      <gpu_temp>40 C</gpu_temp>
+    </temperature>
+    <gpu_power_readings>
+      <power_state>N/A</power_state>
+      <power_draw>50.00 W</power_draw>
+      <current_power_limit>200.00 W</current_power_limit>
+    </gpu_power_readings>
+    <processes />
+  </gpu>
+</nvidia_smi_log>
+"""
+
+
+class FakeClient(BaseClient):
+    def __init__(self, payload, *, nvidia_smi_xml=""):
+        super().__init__()
+        self.connected = True
+        self.payload = payload
+        self.nvidia_smi_xml = nvidia_smi_xml
+        self.commands = []
+
+    def connect(self):
+        self.connected = True
+        return True
+
+    def query_nvml_snapshot(self):
+        return self.payload
+
+    def execute_command(self, command):
+        self.commands.append(command)
+        if command == "nvidia-smi -q -x":
+            return self.nvidia_smi_xml
+        return '{"ok":false,"error":"dcgm unavailable"}'
+
+
+def test_full_gpu_info_uses_nvml_payload_and_native_processes():
+    payload = {
+        "ok": True,
+        "backend": "ctypes",
+        "driver_version": "570.1",
+        "cuda_version": "12.8",
+        "gpus": [
+            {
+                "gpu_index": 3,
+                "name": "NVIDIA Example GPU",
+                "architecture": "Blackwell",
+                "memory_total_bytes": 8 * 1024 * 1024,
+                "memory_used_bytes": 3 * 1024 * 1024,
+                "memory_free_bytes": 5 * 1024 * 1024,
+                "gpu_util_percent": 42,
+                "memory_util_percent": 7,
+                "pcie_tx_kib_per_s": 100,
+                "pcie_rx_kib_per_s": 200,
+                "fan_percent": 30,
+                "temperature_c": 51,
+                "performance_state": 2,
+                "power_usage_mw": 125500,
+                "power_limit_mw": 300000,
+                "processes": [
+                    {
+                        "pid": 123,
+                        "type": "C",
+                        "process_name": "python",
+                        "username": "alice",
+                        "used_gpu_memory_bytes": 2 * 1024 * 1024,
+                        "gpu_instance_id": 0,
+                        "compute_instance_id": 1,
+                    }
+                ],
+            }
+        ],
+    }
+    client = FakeClient(payload)
+
+    stats, system_info = client.get_full_gpu_info()
+
+    assert isinstance(stats, pd.DataFrame)
+    assert system_info["data_source"] == "nvml"
+    assert system_info["data_source_detail"] == "libnvidia-ml.so.1"
+    assert system_info["attached_gpus"] == "1"
+    assert stats.iloc[0]["gpu_index"] == 3
+    assert stats.iloc[0]["used"] == "3 MiB"
+    assert stats.iloc[0]["gpu_util"] == "42 %"
+    assert stats.iloc[0]["power_draw"] == "125.50 W"
+
+    processes, user_summary = client.get_process_summary(stats)
+    assert processes == [
+        {
+            "gpu_instance_id": 0,
+            "compute_instance_id": 1,
+            "pid": 123,
+            "type": "C",
+            "process_name": "python",
+            "used_memory": "2 MiB",
+            "username": "alice",
+            "gpu_index": 3,
+        }
+    ]
+    assert user_summary == {"alice": 2}
+    assert not any(command.startswith("ps ") for command in client.commands)
+    assert "nvidia-smi -q -x" not in client.commands
+
+
+def test_full_gpu_info_falls_back_to_nvidia_smi_when_nvml_fails():
+    client = FakeClient(
+        {
+            "ok": False,
+            "backend": "ctypes",
+            "error": "NVMLError: driver unavailable",
+        },
+        nvidia_smi_xml=NVIDIA_SMI_XML,
+    )
+
+    stats, system_info = client.get_full_gpu_info()
+
+    assert len(stats) == 1
+    assert system_info["data_source"] == "nvidia-smi"
+    assert system_info["fallback_reason"] == "NVMLError: driver unavailable"
+    assert system_info["driver_version"] == "550.54.15"
+    assert client.commands.count("nvidia-smi -q -x") == 1
+
+
+def test_empty_nvml_gpu_list_does_not_trigger_fallback():
+    client = FakeClient(
+        {
+            "ok": True,
+            "backend": "ctypes",
+            "driver_version": "570.1",
+            "cuda_version": "12.8",
+            "gpus": [],
+        },
+        nvidia_smi_xml=NVIDIA_SMI_XML,
+    )
+
+    stats, system_info = client.get_full_gpu_info()
+
+    assert stats.empty
+    assert system_info["data_source"] == "nvml"
+    assert system_info["attached_gpus"] == "0"
+    assert "nvidia-smi -q -x" not in client.commands
+
+
+def test_remote_agent_uses_nvml_without_nvidia_smi():
+    command = make_nvml_agent_command(once=True)
+
+    assert "nvidia-smi" not in REMOTE_NVML_AGENT_SCRIPT
+    assert command.startswith("python3 -S -u -c ")
+    assert command.endswith(" once")

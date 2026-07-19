@@ -95,6 +95,12 @@ nvidb --version        # Show version
 
 > **Tip**: Set `remote: true` under the `basic` section of `~/.nvidb/config.yml` to make plain `nvidb` include remote servers by default (same for `nvidb log`). Pass `--no-remote` for a one-off local-only run.
 
+GPU status is collected directly from NVML. Local collection uses `nvidia-ml-py`;
+remote collection keeps a standard-library Python agent open over SSH and calls
+`libnvidia-ml.so.1` directly, so no Python package needs to be installed on the
+remote host. `nvidia-smi -q -x` is retained only as a compatibility fallback when
+NVML cannot be initialized.
+
 ### 2.2 Server Management
 
 ```bash
@@ -209,13 +215,15 @@ After function execution, it outputs:
 
 ## 4. System Requirements
 
-- NVIDIA driver installed with `nvidia-smi` available in terminal
+- NVIDIA driver with NVML (`libnvidia-ml.so.1`)
 - Python 3.8+
-- SSH access to remote servers (for remote monitoring)
+- Python 3.8+ and SSH access on remote servers
+- `nvidia-smi` is optional and used only as an NVML failure fallback
 
 ## 5. Tips
 
-- Use `nvidia-smi --help-query-gpu` to see available query options
+- The live header shows `Source: nvml` during normal collection and
+  `Source: nvidia-smi` if the compatibility fallback was needed
 - Database files are stored in `~/.nvidb/gpu_log.db` by default
 - Configuration and logs are stored in `~/.nvidb/` directory
 
@@ -243,12 +251,16 @@ Remote info:
 
 ## 7. Acknowledgements
 
-- Thanks to NVIDIA for providing the `nvidia-smi` tool, which is used to query GPU information.
-- Thanks to [nvidia-ml-py](https://pypi.org/project/nvidia-ml-py) (`pynvml`) for Python bindings to NVML, used by the `@nvidb.monitor` decorator.
+- Thanks to NVIDIA for providing NVML and
+  [nvidia-ml-py](https://pypi.org/project/nvidia-ml-py), used for direct GPU
+  telemetry collection.
+- Thanks to [nvitop](https://github.com/XuehaiPan/nvitop) for demonstrating
+  efficient direct NVML polling and metric caching patterns.
+- Thanks to NVIDIA for providing `nvidia-smi`, retained as a compatibility
+  fallback.
 - Thanks to [Paramiko](https://github.com/paramiko/paramiko) for powering SSH connections for remote monitoring.
 - Thanks to [PyYAML](https://github.com/yaml/pyyaml) for YAML-based configuration loading and saving.
 - Thanks to [pandas](https://github.com/pandas-dev/pandas) for parsing and processing GPU stats and log data.
 - Thanks to [blessed](https://github.com/jquast/blessed) for building the interactive terminal UI.
 - Thanks to [termcolor](https://github.com/termcolor/termcolor) for colored terminal output.
 - Thanks to [Streamlit](https://github.com/streamlit/streamlit) for providing the web dashboard framework.
-

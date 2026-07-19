@@ -22,6 +22,7 @@ from termcolor import colored, cprint
 from .data_modules import ServerInfo, ServerListInfo
 from .dcgm import make_dcgm_snapshot_command
 from .metrics import ADVANCED_METRIC_GROUPS, present_columns
+from .nvml import PynvmlCollector, make_nvml_agent_command
 from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color, get_memory_ratio_color
 
 
@@ -62,6 +63,31 @@ class BaseClient(ABC):
     def execute_command(self, command: str) -> str:
         """Execute a command and return the output"""
         pass
+
+    def query_nvml_snapshot(self) -> dict:
+        """Query one NVML snapshot on the target using a short-lived helper."""
+        output = self.execute_command(make_nvml_agent_command(once=True))
+        if not isinstance(output, str):
+            return {
+                "ok": False,
+                "backend": "ctypes",
+                "error": "NVML helper returned no output",
+            }
+        for line in reversed(output.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return {
+            "ok": False,
+            "backend": "ctypes",
+            "error": "NVML helper returned invalid JSON",
+        }
 
     def _chunked(self, items, chunk_size: int):
         for i in range(0, len(items), chunk_size):
@@ -138,7 +164,7 @@ class BaseClient(ABC):
     def get_full_gpu_info(self):
         """Get GPU information (base + optional advanced profiling).
 
-        - Base table: always from `nvidia-smi -q -x` (legacy behavior).
+        - Base table: NVML, with `nvidia-smi -q -x` used only when NVML is unavailable.
         - Advanced table (DCGM profiling): fetched via DCGM python bindings when available.
         """
         if getattr(self, "connected", True) is False:
@@ -152,6 +178,139 @@ class BaseClient(ABC):
                 return default
             found = element.find(path)
             return found.text if found is not None else default
+
+        def _format_percent(value):
+            try:
+                return f"{int(round(float(value)))} %"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        def _format_mib(value):
+            try:
+                return f"{int(round(float(value) / (1024 * 1024)))} MiB"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        def _format_kib_per_second(value):
+            try:
+                return f"{int(round(float(value)))} KB/s"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        def _format_watts(value):
+            try:
+                watts = float(value) / 1000.0
+            except (TypeError, ValueError):
+                return "N/A"
+            return f"{watts:.2f} W"
+
+        def _format_temperature(value):
+            try:
+                return f"{int(round(float(value)))} C"
+            except (TypeError, ValueError):
+                return "N/A"
+
+        def _fetch_nvml_base():
+            try:
+                payload = self.query_nvml_snapshot()
+            except Exception as error:
+                logging.debug(msg=f"Failed to query NVML snapshot: {error}")
+                return (
+                    pd.DataFrame(),
+                    {
+                        "data_source": "nvml",
+                        "nvml_error": f"{type(error).__name__}: {error}",
+                    },
+                    False,
+                )
+
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                error = (
+                    payload.get("error", "NVML snapshot failed")
+                    if isinstance(payload, dict)
+                    else "NVML helper returned an invalid payload"
+                )
+                return (
+                    pd.DataFrame(),
+                    {"data_source": "nvml", "nvml_error": str(error)},
+                    False,
+                )
+
+            gpus = payload.get("gpus")
+            if not isinstance(gpus, list):
+                return (
+                    pd.DataFrame(),
+                    {
+                        "data_source": "nvml",
+                        "nvml_error": "NVML snapshot did not contain a GPU list",
+                    },
+                    False,
+                )
+
+            rows = []
+            for fallback_index, gpu in enumerate(gpus):
+                if not isinstance(gpu, dict):
+                    continue
+                try:
+                    gpu_index = int(gpu.get("gpu_index", fallback_index))
+                except (TypeError, ValueError):
+                    gpu_index = fallback_index
+
+                processes = []
+                for process in gpu.get("processes") or []:
+                    if not isinstance(process, dict):
+                        continue
+                    used_memory = _format_mib(process.get("used_gpu_memory_bytes"))
+                    processes.append(
+                        {
+                            "gpu_instance_id": process.get("gpu_instance_id"),
+                            "compute_instance_id": process.get("compute_instance_id"),
+                            "pid": process.get("pid"),
+                            "type": process.get("type") or "N/A",
+                            "process_name": process.get("process_name") or "N/A",
+                            "used_memory": used_memory,
+                            "username": process.get("username"),
+                        }
+                    )
+
+                performance_state = gpu.get("performance_state")
+                try:
+                    power_state = f"P{int(performance_state)}"
+                except (TypeError, ValueError):
+                    power_state = "N/A"
+
+                rows.append(
+                    {
+                        "gpu_index": gpu_index,
+                        "product_name": gpu.get("name") or "Unknown GPU",
+                        "product_architecture": gpu.get("architecture") or "N/A",
+                        "tx_util": _format_kib_per_second(gpu.get("pcie_tx_kib_per_s")),
+                        "rx_util": _format_kib_per_second(gpu.get("pcie_rx_kib_per_s")),
+                        "fan_speed": _format_percent(gpu.get("fan_percent")),
+                        "total": _format_mib(gpu.get("memory_total_bytes")),
+                        "used": _format_mib(gpu.get("memory_used_bytes")),
+                        "free": _format_mib(gpu.get("memory_free_bytes")),
+                        "gpu_util": _format_percent(gpu.get("gpu_util_percent")),
+                        "memory_util": _format_percent(gpu.get("memory_util_percent")),
+                        "gpu_temp": _format_temperature(gpu.get("temperature_c")),
+                        "power_state": power_state,
+                        "power_draw": _format_watts(gpu.get("power_usage_mw")),
+                        "current_power_limit": _format_watts(gpu.get("power_limit_mw")),
+                        "processes": processes,
+                    }
+                )
+
+            backend = payload.get("backend") or "unknown"
+            detail = "nvidia-ml-py" if backend == "pynvml" else "libnvidia-ml.so.1"
+            system_info = {
+                "driver_version": payload.get("driver_version") or "N/A",
+                "cuda_version": payload.get("cuda_version") or "N/A",
+                "attached_gpus": str(len(rows)),
+                "data_source": "nvml",
+                "data_source_detail": detail,
+                "nvml_backend": backend,
+            }
+            return pd.DataFrame(rows), system_info, True
 
         def _fetch_nvidia_smi_base():
             try:
@@ -239,7 +398,13 @@ class BaseClient(ABC):
                 logging.debug(msg=f"Failed to get base GPU info via nvidia-smi: {e}")
                 return pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}
 
-        stats, system_info = _fetch_nvidia_smi_base()
+        stats, system_info, nvml_ok = _fetch_nvml_base()
+        if not nvml_ok:
+            nvml_error = system_info.get("nvml_error", "NVML unavailable")
+            stats, system_info = _fetch_nvidia_smi_base()
+            system_info["fallback_reason"] = nvml_error
+            if system_info.get("data_source") == "unsupported":
+                system_info["nvml_error"] = nvml_error
         if stats.empty:
             return stats, system_info
 
@@ -565,37 +730,87 @@ class BaseClient(ABC):
             # First pass: extract processes and collect all pids
             for idx, row in stats.iterrows():
                 processes_element = row.get("processes")
-                if processes_element is None or not hasattr(processes_element, "findall"):
-                    continue
-                for process_info in processes_element.findall("process_info"):
-                    pid = safe_get_text(process_info, "pid", "N/A")
-                    process_name = safe_get_text(process_info, "process_name", "N/A")
-                    used_memory = safe_get_text(process_info, "used_memory", "0 MiB")
-                    gpu_instance_id = safe_get_text(process_info, "gpu_instance_id", "N/A")
-                    compute_instance_id = safe_get_text(process_info, "compute_instance_id", "N/A")
-                    process_type = safe_get_text(process_info, "type", "N/A")
+                try:
+                    gpu_index = int(row.get("gpu_index", idx))
+                except (TypeError, ValueError):
+                    gpu_index = idx
 
-                    # Extract memory value in MiB
+                native_processes = (
+                    processes_element if isinstance(processes_element, list) else None
+                )
+                if native_processes is not None:
+                    extracted_processes = [
+                        process for process in native_processes if isinstance(process, dict)
+                    ]
+                elif hasattr(processes_element, "findall"):
+                    extracted_processes = []
+                    for process_info in processes_element.findall("process_info"):
+                        extracted_processes.append(
+                            {
+                                "pid": safe_get_text(process_info, "pid", "N/A"),
+                                "process_name": safe_get_text(
+                                    process_info, "process_name", "N/A"
+                                ),
+                                "used_memory": safe_get_text(
+                                    process_info, "used_memory", "0 MiB"
+                                ),
+                                "gpu_instance_id": safe_get_text(
+                                    process_info, "gpu_instance_id", "N/A"
+                                ),
+                                "compute_instance_id": safe_get_text(
+                                    process_info, "compute_instance_id", "N/A"
+                                ),
+                                "type": safe_get_text(process_info, "type", "N/A"),
+                                "username": safe_get_text(
+                                    process_info, "username", None
+                                ),
+                            }
+                        )
+                else:
+                    extracted_processes = []
+
+                for process in extracted_processes:
+                    pid = process.get("pid", "N/A")
+                    used_memory = process.get("used_memory", "0 MiB")
+                    username = process.get("username")
+                    gpu_instance_id = process.get("gpu_instance_id")
+                    compute_instance_id = process.get("compute_instance_id")
+
                     memory_value = 0
                     if used_memory != "N/A":
                         try:
-                            memory_value = int(str(used_memory).replace("MiB", "").strip())
-                        except Exception:
+                            memory_value = int(
+                                float(str(used_memory).replace("MiB", "").strip())
+                            )
+                        except (TypeError, ValueError):
                             memory_value = 0
 
                     pid_str = str(pid).strip()
-                    if pid_str and pid_str != "N/A":
+                    if (
+                        pid_str
+                        and pid_str != "N/A"
+                        and (not username or username == "N/A")
+                    ):
                         pids.append(pid_str)
 
                     process_entries.append(
                         {
-                            "gpu_instance_id": gpu_instance_id,
-                            "compute_instance_id": compute_instance_id,
+                            "gpu_instance_id": (
+                                gpu_instance_id
+                                if gpu_instance_id is not None
+                                else "N/A"
+                            ),
+                            "compute_instance_id": (
+                                compute_instance_id
+                                if compute_instance_id is not None
+                                else "N/A"
+                            ),
                             "pid": pid,
-                            "type": process_type,
-                            "process_name": process_name,
+                            "type": process.get("type") or "N/A",
+                            "process_name": process.get("process_name") or "N/A",
                             "used_memory": used_memory,
-                            "gpu_index": idx,
+                            "username": username,
+                            "gpu_index": gpu_index,
                             "_memory_value": memory_value,
                         }
                     )
@@ -606,7 +821,13 @@ class BaseClient(ABC):
             user_memory_summary = {}
             for entry in process_entries:
                 pid_str = str(entry.get("pid", "")).strip()
-                username = pid_to_user.get(pid_str, "N/A") if pid_str and pid_str != "N/A" else "N/A"
+                username = entry.get("username")
+                if not username or username == "N/A":
+                    username = (
+                        pid_to_user.get(pid_str, "N/A")
+                        if pid_str and pid_str != "N/A"
+                        else "N/A"
+                    )
 
                 all_processes.append(
                     {
@@ -693,10 +914,99 @@ class RemoteClient(BaseClient):
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         if self.auth in ['auto', 'key']:
             self.client.load_system_host_keys()
+        self._nvml_agent_lock = threading.RLock()
+        self._nvml_agent_stdin = None
+        self._nvml_agent_stdout = None
+        self._nvml_agent_stderr = None
+        self._nvml_agent_channel = None
     
     def __del__(self):
-        self.client.close()
-        logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
+        try:
+            with self._nvml_agent_lock:
+                self._close_nvml_agent_locked()
+        except Exception:
+            pass
+        try:
+            self.client.close()
+            logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
+        except Exception:
+            pass
+
+    def _close_nvml_agent_locked(self):
+        channel = self._nvml_agent_channel
+        if channel is not None:
+            try:
+                if not channel.closed:
+                    channel.sendall(b"quit\n")
+            except Exception:
+                pass
+
+        for stream_name in (
+            "_nvml_agent_stdin",
+            "_nvml_agent_stdout",
+            "_nvml_agent_stderr",
+        ):
+            stream = getattr(self, stream_name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            setattr(self, stream_name, None)
+
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        self._nvml_agent_channel = None
+
+    def _start_nvml_agent_locked(self):
+        stdin, stdout, stderr = self.client.exec_command(
+            command=make_nvml_agent_command()
+        )
+        channel = stdout.channel
+        channel.settimeout(10.0)
+        self._nvml_agent_stdin = stdin
+        self._nvml_agent_stdout = stdout
+        self._nvml_agent_stderr = stderr
+        self._nvml_agent_channel = channel
+
+    def query_nvml_snapshot(self) -> dict:
+        """Query the persistent remote NVML agent, restarting it once on failure."""
+        with self._nvml_agent_lock:
+            last_error = None
+            for _ in range(2):
+                try:
+                    channel = self._nvml_agent_channel
+                    if channel is None or channel.closed or channel.exit_status_ready():
+                        self._close_nvml_agent_locked()
+                        self._start_nvml_agent_locked()
+                        channel = self._nvml_agent_channel
+
+                    channel.sendall(b"snapshot\n")
+                    line = self._nvml_agent_stdout.readline()
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    if not line:
+                        raise RuntimeError("Remote NVML agent closed its output")
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Remote NVML agent returned a non-object payload")
+                    return payload
+                except Exception as error:
+                    last_error = error
+                    self._close_nvml_agent_locked()
+
+            return {
+                "ok": False,
+                "backend": "ctypes",
+                "error": (
+                    f"{type(last_error).__name__}: {last_error}"
+                    if last_error is not None
+                    else "Remote NVML agent failed"
+                ),
+            }
     
     def _authenticate_with_password(self, max_attempts=3, *, prompt_only: bool = False) -> bool:
         """Attempt password authentication with retry limit.
@@ -879,6 +1189,16 @@ class LocalClient(BaseClient):
         self.port = "local"
         self.username = getpass.getuser()
         self.description = f"Local Machine ({self.username}@{self.host})"
+        self._nvml_collector = PynvmlCollector()
+
+    def __del__(self):
+        try:
+            self._nvml_collector.close()
+        except Exception:
+            pass
+
+    def query_nvml_snapshot(self) -> dict:
+        return self._nvml_collector.collect()
         
     def connect(self) -> bool:
         """Local connection is always successful"""
