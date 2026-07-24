@@ -6,6 +6,7 @@ import os
 import subprocess
 import getpass
 import json
+import socket
 import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
@@ -1228,6 +1229,41 @@ class LocalClient(BaseClient):
 
 
 class NVClientPool:
+    DISPLAY_MODE_NODES = "nodes"
+    DISPLAY_MODE_UNIFIED = "unified"
+    UNIFIED_TABLE_COLUMNS = (
+        "Node",
+        "Hostname",
+        "GPU",
+        "name",
+        "util",
+        "memory[used/total]",
+        "temp",
+        "fan",
+        "power",
+        "rx",
+        "tx",
+        "processes",
+    )
+    UNIFIED_TABLE_LABELS = {
+        "Hostname": "Hostname/IP",
+        "name": "Model",
+        "util": "Util",
+        "memory[used/total]": "VRAM U/T MiB",
+        "temp": "Temp",
+        "fan": "Fan",
+        "power": "Power",
+        "rx": "RX",
+        "tx": "TX",
+        "processes": "Processes",
+    }
+    UNIFIED_SORT_MODES = ("node", "available", "utilization")
+    UNIFIED_SORT_LABELS = {
+        "node": "Node",
+        "available": "Available",
+        "utilization": "Util high",
+    }
+
     def __init__(self, server_list: ServerListInfo, *, compact: bool = False):
         self.pool = [LocalClient()]
         if server_list is not None:
@@ -1240,6 +1276,9 @@ class NVClientPool:
         # Collapsible display state - only first server expanded by default
         self.expanded_servers = {0}  # Only first server expanded by default
         self.selected_server = 0  # Currently selected server for navigation
+        self.display_mode = self.DISPLAY_MODE_NODES
+        self.unified_detailed = False
+        self.unified_sort_mode = "node"
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
         self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
         self.cached_stats = None  # Cached GPU stats data
@@ -1517,6 +1556,490 @@ class NVClientPool:
             return formatted_stats, raw_stats_by_client
         return formatted_stats
 
+    def _client_table_identity(self, client_index):
+        """Return compact node and hostname labels for the unified TUI table."""
+        client = self.pool[client_index]
+        description = str(getattr(client, "description", "") or "").strip()
+        configured_host = str(getattr(client, "host", "") or "").strip()
+        is_local = getattr(client, "port", None) == "local" or isinstance(client, LocalClient)
+
+        if is_local:
+            try:
+                hostname = socket.gethostname().strip()
+            except Exception:
+                hostname = ""
+            return "Local", hostname or configured_host or "localhost"
+
+        node = description or configured_host or f"Node {client_index + 1}"
+        return node, configured_host or "N/A"
+
+    def _build_unified_gpu_table(self, raw_stats_by_client):
+        """Combine all available per-node GPU rows into one display table."""
+        frames = []
+        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+
+        for idx in range(len(self.pool)):
+            entry = raw_stats_by_client.get(idx)
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                continue
+            stats, _system_info = entry
+            if not isinstance(stats, pd.DataFrame) or stats.empty:
+                continue
+
+            node, hostname = self._client_table_identity(idx)
+            table = stats.copy()
+            table["Node"] = node
+            table["Hostname"] = hostname
+            columns = [column for column in self.UNIFIED_TABLE_COLUMNS if column in table.columns]
+            frames.append(table[columns])
+
+        if not frames:
+            return pd.DataFrame(columns=list(self.UNIFIED_TABLE_COLUMNS))
+        return pd.concat(frames, ignore_index=True, sort=False).fillna("N/A")
+
+    @staticmethod
+    def _extract_metric_number(value):
+        """Return the first numeric component of a displayed metric."""
+        if value is None:
+            return None
+        try:
+            numbers = extract_numbers(str(value))
+            return float(numbers[0]) if numbers else None
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _unified_gpu_capacity(self, row):
+        """Return utilization and VRAM values used by summaries and sorting."""
+        utilization = self._extract_metric_number(row.get("util"))
+        memory_value = str(row.get("memory[used/total]", "") or "")
+        used_mib = total_mib = None
+        if "/" in memory_value:
+            used_value, total_value = memory_value.split("/", 1)
+            used_mib = self._extract_metric_number(used_value)
+            total_mib = self._extract_metric_number(total_value)
+
+        memory_percent = None
+        free_mib = None
+        if used_mib is not None and total_mib is not None and total_mib > 0:
+            memory_percent = max(0.0, min(100.0, used_mib / total_mib * 100))
+            free_mib = max(0.0, total_mib - used_mib)
+
+        available = (
+            utilization is not None
+            and utilization < 5
+            and memory_percent is not None
+            and memory_percent < 10
+        )
+        return {
+            "utilization": utilization,
+            "used_mib": used_mib,
+            "total_mib": total_mib,
+            "free_mib": free_mib,
+            "memory_percent": memory_percent,
+            "available": available,
+            "busy": utilization is not None and utilization >= 50,
+        }
+
+    def _get_unified_sort_mode(self):
+        mode = getattr(self, "unified_sort_mode", "node")
+        return mode if mode in self.UNIFIED_SORT_MODES else "node"
+
+    def _sort_unified_gpu_table(self, table):
+        """Sort unified rows without changing the cached source table."""
+        mode = self._get_unified_sort_mode()
+        if table.empty or mode == "node":
+            return table.copy()
+
+        sorted_table = table.copy()
+        capacity = [
+            self._unified_gpu_capacity(row)
+            for _, row in sorted_table.iterrows()
+        ]
+        sorted_table["_nvidb_order"] = range(len(sorted_table))
+        sorted_table["_nvidb_available"] = [
+            1 if values["available"] else 0 for values in capacity
+        ]
+        sorted_table["_nvidb_util"] = [
+            values["utilization"]
+            if values["utilization"] is not None
+            else (-1 if mode == "utilization" else 101)
+            for values in capacity
+        ]
+        sorted_table["_nvidb_memory"] = [
+            values["memory_percent"]
+            if values["memory_percent"] is not None
+            else (-1 if mode == "utilization" else 101)
+            for values in capacity
+        ]
+        sorted_table["_nvidb_free"] = [
+            values["free_mib"] if values["free_mib"] is not None else -1
+            for values in capacity
+        ]
+
+        if mode == "available":
+            sort_columns = [
+                "_nvidb_available",
+                "_nvidb_util",
+                "_nvidb_free",
+                "_nvidb_memory",
+                "_nvidb_order",
+            ]
+            ascending = [False, True, False, True, True]
+        else:
+            sort_columns = [
+                "_nvidb_util",
+                "_nvidb_memory",
+                "_nvidb_order",
+            ]
+            ascending = [False, False, True]
+
+        sorted_table = sorted_table.sort_values(
+            sort_columns,
+            ascending=ascending,
+            kind="stable",
+        )
+        return sorted_table.loc[:, table.columns].reset_index(drop=True)
+
+    def _format_unified_capacity_summary(self, table):
+        """Format cluster-wide availability and memory capacity."""
+        if table.empty:
+            return "Capacity: no GPU data"
+
+        capacity = [
+            self._unified_gpu_capacity(row)
+            for _, row in table.iterrows()
+        ]
+        available_count = sum(values["available"] for values in capacity)
+        busy_count = sum(values["busy"] for values in capacity)
+        known_utilization = [
+            values["utilization"]
+            for values in capacity
+            if values["utilization"] is not None
+        ]
+        average_utilization = (
+            sum(known_utilization) / len(known_utilization)
+            if known_utilization
+            else None
+        )
+        known_memory = [
+            values
+            for values in capacity
+            if values["used_mib"] is not None and values["total_mib"] is not None
+        ]
+        used_mib = sum(values["used_mib"] for values in known_memory)
+        total_mib = sum(values["total_mib"] for values in known_memory)
+        free_mib = max(0.0, total_mib - used_mib)
+
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 80
+
+        average_display = (
+            f"{average_utilization:.0f}%"
+            if average_utilization is not None
+            else "N/A"
+        )
+        if total_mib > 0 and terminal_width >= 100:
+            memory_percent = used_mib / total_mib * 100
+            summary = (
+                f"Capacity: available {available_count}/{len(table)} | "
+                f"busy {busy_count} | avg util {average_display} | "
+                f"VRAM {used_mib / 1024:.1f}/{total_mib / 1024:.1f} GiB "
+                f"({memory_percent:.0f}%) | free {free_mib / 1024:.1f} GiB"
+            )
+        elif total_mib > 0:
+            summary = (
+                f"Capacity: avail {available_count}/{len(table)} | "
+                f"busy {busy_count} | avg {average_display} | "
+                f"VRAM {used_mib / 1024:.0f}/{total_mib / 1024:.0f}G | "
+                f"free {free_mib / 1024:.0f}G"
+            )
+        else:
+            summary = (
+                f"Capacity: avail {available_count}/{len(table)} | "
+                f"busy {busy_count} | avg {average_display} | VRAM N/A"
+            )
+
+        if len(summary) > terminal_width:
+            return summary[: max(0, terminal_width - 3)] + "..."
+        return summary
+
+    def _format_unified_detailed_table(self, table):
+        """Format each GPU as a readable, color-aware three-line card."""
+        if table.empty:
+            return "No GPU data available"
+
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 80
+        table_width = max(20, terminal_width)
+        content_width = max(1, table_width - 4)
+
+        def clean(value):
+            if value is None:
+                return "N/A"
+            try:
+                if pd.isna(value):
+                    return "N/A"
+            except (TypeError, ValueError):
+                pass
+            value = str(value).strip()
+            return value if value else "N/A"
+
+        def add_unit(value, unit):
+            value = clean(value)
+            if value in {"N/A", "-"} or unit.lower() in value.lower():
+                return value
+            return f"{value} {unit}"
+
+        def truncate(text, width):
+            text = str(text)
+            if width <= 0:
+                return ""
+            if len(text) <= width:
+                return text
+            if width <= 2:
+                return text[:width]
+            return text[: width - 2] + ".."
+
+        def utilization_status(value):
+            percent = self._extract_metric_number(value)
+            if percent is None:
+                return "UNKNOWN", None
+            if percent >= 80:
+                return "HIGH", "red"
+            if percent >= 50:
+                return "BUSY", "yellow"
+            if percent >= 5:
+                return "ACTIVE", "green"
+            return "IDLE", "cyan"
+
+        def memory_color(value):
+            value = clean(value)
+            if "/" not in value:
+                return None
+            used, total = value.split("/", 1)
+            return get_memory_ratio_color(used, total)
+
+        def make_field(key, text, minimum, color=None, bold=False):
+            return {
+                "key": key,
+                "text": clean(text),
+                "minimum": minimum,
+                "color": color,
+                "bold": bold,
+            }
+
+        def fit_fields(fields, *, drop_order=(), shrink_order=()):
+            active = [dict(field) for field in fields]
+            separator = "  "
+
+            def minimum_total():
+                if not active:
+                    return 0
+                return (
+                    sum(min(len(field["text"]), field["minimum"]) for field in active)
+                    + len(separator) * (len(active) - 1)
+                )
+
+            for key in drop_order:
+                if minimum_total() <= content_width:
+                    break
+                active = [field for field in active if field["key"] != key]
+
+            if not active:
+                return " " * content_width
+
+            widths = [len(field["text"]) for field in active]
+            excess = (
+                sum(widths)
+                + len(separator) * (len(active) - 1)
+                - content_width
+            )
+            for key in shrink_order:
+                if excess <= 0:
+                    break
+                for index, field in enumerate(active):
+                    if field["key"] != key:
+                        continue
+                    minimum = min(len(field["text"]), field["minimum"])
+                    reducible = max(0, widths[index] - minimum)
+                    reduction = min(excess, reducible)
+                    widths[index] -= reduction
+                    excess -= reduction
+                    break
+
+            if excess > 0:
+                for index in reversed(range(len(active))):
+                    if excess <= 0:
+                        break
+                    reducible = max(0, widths[index] - 1)
+                    reduction = min(excess, reducible)
+                    widths[index] -= reduction
+                    excess -= reduction
+
+            plain_parts = [
+                truncate(field["text"], width)
+                for field, width in zip(active, widths)
+            ]
+            plain_length = (
+                sum(len(part) for part in plain_parts)
+                + len(separator) * (len(plain_parts) - 1)
+            )
+            styled_parts = []
+            for field, part in zip(active, plain_parts):
+                color = field.get("color")
+                attrs = ["bold"] if field.get("bold") else None
+                styled_parts.append(
+                    colored(part, color, attrs=attrs) if color else part
+                )
+
+            line = separator.join(styled_parts)
+            return line + " " * max(0, content_width - plain_length)
+
+        border = "+" + "-" * (table_width - 2) + "+"
+        lines = [border]
+        for _, row in table.iterrows():
+            utilization = clean(row.get("util")).replace(" ", "")
+            status, utilization_color = utilization_status(utilization)
+            gpu_badge = f"GPU {clean(row.get('GPU'))} [{status}]"
+            node_identity = (
+                f"Node {clean(row.get('Node'))} "
+                f"({clean(row.get('Hostname'))})"
+            )
+            identity_fields = [
+                make_field(
+                    "gpu",
+                    gpu_badge,
+                    13,
+                    color=utilization_color,
+                    bold=True,
+                ),
+                make_field("model", f"Model {clean(row.get('name'))}", 18),
+                make_field("node", node_identity, 24),
+            ]
+
+            core_metric_fields = [
+                make_field(
+                    "util",
+                    f"Util {utilization}",
+                    8,
+                    color=utilization_color,
+                    bold=True,
+                ),
+                make_field(
+                    "vram",
+                    f"VRAM {add_unit(row.get('memory[used/total]'), 'MiB')}",
+                    18,
+                    color=memory_color(row.get("memory[used/total]")),
+                ),
+                make_field("temp", f"Temp {clean(row.get('temp'))}", 9),
+                make_field(
+                    "power",
+                    f"Power {add_unit(row.get('power'), 'W')}",
+                    18,
+                ),
+            ]
+            auxiliary_fields = [
+                make_field("fan", f"Fan {clean(row.get('fan'))}", 8),
+                make_field("rx", f"RX {clean(row.get('rx'))}", 11),
+                make_field("tx", f"TX {clean(row.get('tx'))}", 11),
+                make_field(
+                    "proc",
+                    f"Proc {clean(row.get('processes'))}",
+                    14,
+                ),
+            ]
+
+            identity_line = fit_fields(
+                identity_fields,
+                shrink_order=("model", "node"),
+            )
+            core_metrics_line = fit_fields(
+                core_metric_fields,
+                drop_order=("power", "temp"),
+                shrink_order=("power", "vram", "temp"),
+            )
+            auxiliary_line = fit_fields(
+                auxiliary_fields,
+                drop_order=("tx", "rx", "fan"),
+                shrink_order=("proc", "rx", "tx", "fan"),
+            )
+            lines.extend(
+                [
+                    f"| {identity_line} |",
+                    f"| {core_metrics_line} |",
+                    f"| {auxiliary_line} |",
+                    border,
+                ]
+            )
+        return "\n".join(lines)
+
+    def _get_unified_node_status_lines(self, raw_stats_by_client, last_update_time):
+        """Describe nodes that cannot contribute rows to the unified table."""
+        if last_update_time is None:
+            return []
+
+        lines = []
+        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        for idx in range(len(self.pool)):
+            node, hostname = self._client_table_identity(idx)
+            stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+            if isinstance(system_info, dict) and system_info.get("error"):
+                message = system_info.get("error", "Error")
+                lines.append(f"! {node} ({hostname}): {message}")
+            elif not isinstance(stats, pd.DataFrame) or stats.empty:
+                lines.append(f"- {node} ({hostname}): No GPU data available")
+        return lines
+
+    def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
+        """Render the unified TUI body from cached per-node GPU data."""
+        if last_update_time is None:
+            return ["Unified GPU table", "Loading GPU data..."]
+
+        source_table = self._build_unified_gpu_table(raw_stats_by_client)
+        if source_table.empty:
+            node_count = 0
+        else:
+            node_count = len(
+                source_table[["Node", "Hostname"]].drop_duplicates()
+            )
+        table = self._sort_unified_gpu_table(source_table)
+
+        detailed = getattr(self, "unified_detailed", False)
+        title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
+        if detailed:
+            rendered_table = self._format_unified_detailed_table(table)
+        else:
+            rendered_table = self._format_fixed_width_table(
+                table,
+                border=True,
+                column_labels=self.UNIFIED_TABLE_LABELS,
+            )
+        lines = [
+            f"{title} | GPUs: {len(table)} | Nodes with GPU: {node_count}/{len(self.pool)}",
+            self._format_unified_capacity_summary(source_table),
+            rendered_table,
+        ]
+        status_lines = self._get_unified_node_status_lines(raw_stats_by_client, last_update_time)
+        if status_lines:
+            lines.append("Node status:")
+            lines.extend(status_lines)
+        return lines
+
+    def _write_tui_lines(self, output_lines):
+        """Write one complete TUI frame to reduce visible flicker."""
+        screen = (
+            self.term.home
+            + "\n".join(self.term.clear_eol + line for line in output_lines)
+            + "\n"
+            + self.term.clear_eos
+        )
+        sys.stdout.write(screen)
+        sys.stdout.flush()
+
     def _format_error_panel(self, message: str, error_type: Optional[str] = None) -> str:
         try:
             width = os.get_terminal_size().columns
@@ -1540,10 +2063,12 @@ class NVClientPool:
             ]
         )
     
-    def _format_fixed_width_table(self, df, border: bool = False):
+    def _format_fixed_width_table(self, df, border: bool = False, column_labels=None):
         """Format fixed-width table display."""
         if df.empty:
             return "No GPU data available"
+
+        column_labels = column_labels or {}
         
         # Get terminal width
         try:
@@ -1553,6 +2078,8 @@ class NVClientPool:
         
         # Define minimum width for each column
         min_widths = {
+            'Node': 12,
+            'Hostname': 15,
             'GPU': 4,
             'name': 12,
             'temp': 8,
@@ -1567,6 +2094,21 @@ class NVClientPool:
         }
 
         all_columns = list(df.columns)
+        is_unified_table = "Node" in all_columns or "Hostname" in all_columns
+        if is_unified_table:
+            min_widths.update(
+                {
+                    "Node": 10,
+                    "Hostname": 13,
+                    "GPU": 3,
+                    "name": 10,
+                    "util": 7,
+                    "memory[used/total]": 13,
+                    "temp": 6,
+                    "power": 12,
+                    "processes": 14,
+                }
+            )
 
         # Calculate widths based on terminal space
         separator_width = 3
@@ -1575,24 +2117,38 @@ class NVClientPool:
 
         # Column importance: larger => dropped earlier when narrow
         importance = {
-            "GPU": 0,
-            "util": 1,
-            "mem_util": 2,
-            "memory[used/total]": 3,
-            "name": 4,
-            "processes": 5,
-            "temp": 6,
-            "power": 7,
-            "rx": 8,
-            "tx": 9,
-            "fan": 10,
+            "Node": 0,
+            "Hostname": 1,
+            "GPU": 2,
+            "util": 3,
+            "memory[used/total]": 4,
+            "name": 5,
+            "processes": 6,
+            "mem_util": 7,
+            "temp": 8,
+            "power": 9,
+            "rx": 10,
+            "tx": 11,
+            "fan": 12,
         }
-        must_keep = [c for c in ("GPU", "util", "mem_util") if c in all_columns]
+        if is_unified_table:
+            must_keep_names = (
+                "Node",
+                "Hostname",
+                "GPU",
+                "name",
+                "util",
+                "memory[used/total]",
+            )
+        else:
+            must_keep_names = ("GPU", "util", "mem_util")
+        must_keep = [column for column in must_keep_names if column in all_columns]
 
         min_widths_for_cols = {}
         for col in all_columns:
             min_width = min_widths.get(col, 12)
-            min_widths_for_cols[col] = max(min_width, len(str(col)))
+            label = column_labels.get(col, col)
+            min_widths_for_cols[col] = max(min_width, len(str(label)))
 
         def min_table_width(cols) -> int:
             if not cols:
@@ -1644,6 +2200,8 @@ class NVClientPool:
         fill_priority = [
             "processes",
             "name",
+            "Hostname",
+            "Node",
             "power",
             "memory[used/total]",
             "rx",
@@ -1804,7 +2362,7 @@ class NVClientPool:
         header_parts = []
         for col in selected_columns:
             width = column_widths.get(col, 12)
-            col_name = truncate_text(str(col), width)
+            col_name = truncate_text(str(column_labels.get(col, col)), width)
             header_parts.append(f"{col_name:^{width}}")
         header = " | ".join(header_parts)
 
@@ -1824,7 +2382,15 @@ class NVClientPool:
             for col in selected_columns:
                 width = column_widths.get(col, 12)
                 raw_value = row.get(col, "")
-                value = truncate_text(raw_value, width, tail_preserve=(col == "name"))
+                value = truncate_text(
+                    raw_value,
+                    width,
+                    tail_preserve=(col == "name" and not is_unified_table),
+                )
+
+                if col in {"Node", "Hostname"}:
+                    row_parts.append(f"{value:<{width}}")
+                    continue
 
                 if col == "GPU":
                     cell = f"{value:^{width}}"
@@ -1863,8 +2429,12 @@ class NVClientPool:
         if border:
             inner_width = len(header)
             top = "+" + "-" * (inner_width + 2) + "+"
-            bottom = top
-            result_lines = [top] + [f"| {line} |" for line in result_lines] + [bottom]
+            middle = "+-" + separator + "-+"
+            result_lines = (
+                [top, f"| {header} |", middle]
+                + [f"| {line} |" for line in data_lines]
+                + [top]
+            )
 
         return "\n".join(result_lines)
     
@@ -2184,13 +2754,31 @@ class NVClientPool:
         output_lines = []
         server_count = len(self.pool)
         server_label = "Server" if server_count == 1 else "Servers"
-        output_lines.append(
-            f"Time: {current_time} | Updated: {update_display}{fetch_display} | {server_label}: {server_count} | [j/k] Navigate [Enter] Toggle [a] Expand All [c] Collapse All [q] Quit{warn_display}"
-        )
         try:
             terminal_width = os.get_terminal_size().columns
         except OSError:
             terminal_width = 80
+
+        display_mode = getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
+        if display_mode == self.DISPLAY_MODE_UNIFIED:
+            detailed = getattr(self, "unified_detailed", False)
+            view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
+            detail_action = "Single-line" if detailed else "Detailed"
+            sort_mode = self._get_unified_sort_mode()
+            sort_label = self.UNIFIED_SORT_LABELS[sort_mode]
+            controls = (
+                f"[v] Per-node  [d] {detail_action}  "
+                f"[s] Sort: {sort_label}  [q] Quit"
+            )
+        else:
+            view_label = "Per-node"
+            controls = "[v] Unified view  [j/k] Select  [Enter] Toggle  [a/c] Expand/Collapse  [q] Quit"
+        output_lines.append(
+            f"Time: {current_time} | Updated: {update_display}{fetch_display} | "
+            f"{server_label}: {server_count} | View: {view_label}{warn_display}"
+        )
+        output_lines.append(controls)
+
         if self.compact:
             separator_width = min(80, terminal_width)
         else:
@@ -2208,6 +2796,13 @@ class NVClientPool:
             if self.term.length(global_line) > terminal_width:
                 global_line = global_line[: max(0, terminal_width - 3)] + "..."
             output_lines.append(global_line)
+
+        if display_mode == self.DISPLAY_MODE_UNIFIED:
+            output_lines.extend(
+                self._render_unified_gpu_lines(raw_stats_by_client, last_update_time)
+            )
+            self._write_tui_lines(output_lines)
+            return
 
         # Align the collapsed server list by padding headers to the same display width
         index_width = len(str(len(self.pool)))
@@ -2288,63 +2883,99 @@ class NVClientPool:
                     output_lines.append(user_line)
                 output_lines.append("")  # Add spacing after expanded server
 
-        # Single write reduces visible flicker vs. clearing + many print() calls
-        screen = self.term.home + "\n".join(self.term.clear_eol + line for line in output_lines) + "\n" + self.term.clear_eos
-        sys.stdout.write(screen)
-        sys.stdout.flush()
+        self._write_tui_lines(output_lines)
+
+    def _request_ui_refresh(self):
+        self.ui_only_refresh = True
+        self.refresh_needed.set()
+
+    def _toggle_display_mode(self):
+        current_mode = getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
+        if current_mode == self.DISPLAY_MODE_UNIFIED:
+            self.display_mode = self.DISPLAY_MODE_NODES
+        else:
+            self.display_mode = self.DISPLAY_MODE_UNIFIED
+        self._request_ui_refresh()
+
+    def _cycle_unified_sort_mode(self):
+        current_mode = self._get_unified_sort_mode()
+        next_index = (
+            self.UNIFIED_SORT_MODES.index(current_mode) + 1
+        ) % len(self.UNIFIED_SORT_MODES)
+        self.unified_sort_mode = self.UNIFIED_SORT_MODES[next_index]
+        self._request_ui_refresh()
+
+    def _handle_keypress(self, key):
+        """Apply one TUI keypress and return whether it changed visible state."""
+        key_name = key.name if hasattr(key, "name") and key.name else str(key)
+        key_lower = str(key).lower()
+
+        if key_lower == "q":
+            self.quit_flag.set()
+            return True
+        if key_lower == "v":
+            self._toggle_display_mode()
+            return True
+        if key_lower == "d":
+            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+                return False
+            self.unified_detailed = not getattr(self, "unified_detailed", False)
+            self._request_ui_refresh()
+            return True
+        if key_lower == "s":
+            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+                return False
+            self._cycle_unified_sort_mode()
+            return True
+        if key_lower == "h":
+            return False
+
+        if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED:
+            return False
+
+        if key_lower == "j" or key_name == "KEY_DOWN":
+            if self.selected_server < len(self.pool) - 1:
+                self.selected_server += 1
+                self._request_ui_refresh()
+                return True
+        elif key_lower == "k" or key_name == "KEY_UP":
+            if self.selected_server > 0:
+                self.selected_server -= 1
+                self._request_ui_refresh()
+                return True
+        elif key_name == "KEY_ENTER" or key_lower == " " or key in {"\n", "\r"}:
+            if self.selected_server in getattr(self, "_toggle_disabled_servers", set()):
+                return False
+            if self.selected_server in self.expanded_servers:
+                self.expanded_servers.discard(self.selected_server)
+            else:
+                self.expanded_servers.add(self.selected_server)
+            self._request_ui_refresh()
+            return True
+        elif key_lower == "a":
+            disabled = getattr(self, "_toggle_disabled_servers", set())
+            self.expanded_servers = {
+                index for index in range(len(self.pool)) if index not in disabled
+            }
+            self._request_ui_refresh()
+            return True
+        elif key_lower == "c":
+            self.expanded_servers.clear()
+            self._request_ui_refresh()
+            return True
+        return False
 
     def _keyboard_listener(self, cbreak_context):
-        """Real-time keyboard listener thread, monitors keys for navigation and control"""
+        """Real-time keyboard listener thread, monitors keys for navigation and control."""
         try:
             while not self.quit_flag.is_set():
                 try:
-                    key = self.term.inkey(timeout=0.1)  # Non-blocking input with timeout
+                    key = self.term.inkey(timeout=0.1)
                     if key:
-                        key_name = key.name if hasattr(key, 'name') and key.name else str(key)
-                        key_lower = str(key).lower()
-                        
-                        if key_lower == 'q':
-                            self.quit_flag.set()
-                            break
-                        elif key_lower == 'h':
-                            # Show help - will be overwritten on next refresh
-                            pass
-                        elif key_lower == 'j' or key_name == 'KEY_DOWN':
-                            # Move selection down
-                            if self.selected_server < len(self.pool) - 1:
-                                self.selected_server += 1
-                                self.ui_only_refresh = True  # Use cached data for fast UI update
-                                self.refresh_needed.set()  # Trigger immediate refresh
-                        elif key_lower == 'k' or key_name == 'KEY_UP':
-                            # Move selection up
-                            if self.selected_server > 0:
-                                self.selected_server -= 1
-                                self.ui_only_refresh = True  # Use cached data for fast UI update
-                                self.refresh_needed.set()  # Trigger immediate refresh
-                        elif key_name == 'KEY_ENTER' or key_lower == ' ' or key == '\n' or key == '\r':
-                            # Toggle expand/collapse for selected server
-                            if self.selected_server in getattr(self, "_toggle_disabled_servers", set()):
-                                continue
-                            if self.selected_server in self.expanded_servers:
-                                self.expanded_servers.discard(self.selected_server)
-                            else:
-                                self.expanded_servers.add(self.selected_server)
-                            self.ui_only_refresh = True  # Use cached data for fast UI update
-                            self.refresh_needed.set()  # Trigger immediate refresh
-                        elif key_lower == 'a':
-                            # Expand all servers
-                            disabled = getattr(self, "_toggle_disabled_servers", set())
-                            self.expanded_servers = set(i for i in range(len(self.pool)) if i not in disabled)
-                            self.ui_only_refresh = True  # Use cached data for fast UI update
-                            self.refresh_needed.set()  # Trigger immediate refresh
-                        elif key_lower == 'c':
-                            # Collapse all servers
-                            self.expanded_servers.clear()
-                            self.ui_only_refresh = True  # Use cached data for fast UI update
-                            self.refresh_needed.set()  # Trigger immediate refresh
+                        self._handle_keypress(key)
                 except KeyboardInterrupt:
                     break
-        except:
+        except Exception:
             pass
 
     def _background_refresh(self, interval_seconds: float = 1.0):
@@ -2386,6 +3017,9 @@ class NVClientPool:
         print("   Enter/Space    : Toggle expand/collapse")
         print("   a              : Expand all")
         print("   c              : Collapse all")
+        print("   v              : Switch unified/per-node view")
+        print("   d              : Toggle unified single-line/detailed rows")
+        print("   s              : Cycle unified sorting")
         print("   q              : Quit")
         print("=" * 60)
         

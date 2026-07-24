@@ -154,12 +154,30 @@ When viewing GPU stats, use these keyboard shortcuts:
 
 | Key               | Action                        |
 | ----------------- | ----------------------------- |
+| `v`               | Switch unified/per-node view  |
+| `d`               | Toggle unified row detail     |
+| `s`               | Cycle unified GPU sorting     |
 | `j` / `↓`         | Move selection down           |
 | `k` / `↑`         | Move selection up             |
 | `Enter` / `Space` | Toggle expand/collapse server |
 | `a`               | Expand all servers            |
 | `c`               | Collapse all servers          |
 | `q`               | Quit                          |
+
+The default per-node view keeps each server's summary and expandable detail
+table. The unified view places GPUs from every node in one table and adds
+`Node` and `Hostname/IP` columns so nicknames and configured hostnames/IP
+addresses remain visible. Columns adapt to the terminal width, with core
+identity, utilization, model, and VRAM fields kept ahead of secondary metrics.
+In the unified view, press `d` to switch between the single-line table and
+Detailed cards. Detailed mode uses three lines per GPU: GPU status and identity,
+core utilization metrics, then fan, PCIe RX/TX, and processes. The status badge
+and utilization use cyan, green, yellow, or red to distinguish idle, active,
+busy, and high utilization while preserving fixed-width alignment.
+The capacity line summarizes available and busy GPUs, average utilization, and
+used/total/free VRAM. Press `s` to cycle between node order, available GPUs
+first, and highest utilization first. A GPU is considered available when its
+utilization is below 5% and its VRAM usage is below 10%.
 
 ### 2.7 GPU Monitor Decorator
 
