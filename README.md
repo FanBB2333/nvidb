@@ -157,6 +157,7 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `v`               | Switch unified/per-node view  |
 | `d`               | Toggle unified row detail     |
 | `s`               | Cycle unified GPU sorting     |
+| `f`               | Cycle unified GPU filters     |
 | `j` / `↓`         | Move server/GPU selection down |
 | `k` / `↑`         | Move server/GPU selection up  |
 | `PgUp` / `PgDn`   | Change unified GPU page       |
@@ -181,6 +182,9 @@ first, and highest utilization first. A GPU is considered available when its
 utilization is below 5% and its VRAM usage is below 10%.
 Unified pages are sized from the current terminal height. The title shows the
 visible GPU range, and `>` marks the selected GPU.
+Press `f` to cycle through all, available, busy, and error-only views. Busy
+means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
+nodes whose latest refresh failed.
 
 ### 2.7 GPU Monitor Decorator
 

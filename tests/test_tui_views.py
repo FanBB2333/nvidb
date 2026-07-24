@@ -49,6 +49,7 @@ def _pool():
     pool.display_mode = pool.DISPLAY_MODE_NODES
     pool.unified_detailed = False
     pool.unified_sort_mode = "node"
+    pool.unified_filter_mode = "all"
     pool.unified_selected_gpu = 0
     pool._unified_gpu_count = 0
     pool._unified_page_size = 1
@@ -189,6 +190,51 @@ def test_unified_capacity_summary_and_sort_modes(monkeypatch):
     ]
 
 
+def test_unified_filter_modes_and_error_view():
+    pool = _pool()
+    table = pd.DataFrame(
+        [
+            _gpu_row(0, "available", "0 %", "0/24576"),
+            _gpu_row(1, "reserved", "0 %", "12000/24576"),
+            _gpu_row(2, "busy", "75 %", "20000/24576"),
+        ]
+    )
+
+    assert pool._filter_unified_gpu_table(table)["name"].tolist() == [
+        "available",
+        "reserved",
+        "busy",
+    ]
+
+    pool.unified_filter_mode = "available"
+    assert pool._filter_unified_gpu_table(table)["name"].tolist() == ["available"]
+
+    pool.unified_filter_mode = "busy"
+    assert pool._filter_unified_gpu_table(table)["name"].tolist() == ["busy"]
+
+    pool.unified_filter_mode = "errors"
+    assert pool._filter_unified_gpu_table(table).empty
+
+    raw_stats = {
+        0: (pd.DataFrame(), {}),
+        1: (
+            pd.DataFrame(),
+            {"error": "Connection timed out", "error_type": "connect"},
+        ),
+    }
+    rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    assert "GPUs: 0/0" in rendered
+    assert "Error filter: GPU rows hidden" in rendered
+    assert "Connection timed out" in rendered
+    assert "Local" not in "\n".join(
+        pool._get_unified_node_status_lines(
+            raw_stats,
+            last_update_time=1,
+            errors_only=True,
+        )
+    )
+
+
 def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
@@ -326,8 +372,10 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
 
     assert pool._handle_keypress("d") is False
     assert pool._handle_keypress("s") is False
+    assert pool._handle_keypress("f") is False
     assert pool.unified_detailed is False
     assert pool.unified_sort_mode == "node"
+    assert pool.unified_filter_mode == "all"
 
     assert pool._handle_keypress("v") is True
     assert pool.display_mode == pool.DISPLAY_MODE_UNIFIED
@@ -351,6 +399,26 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
     pool.refresh_needed.clear()
     assert pool._handle_keypress("s") is True
     assert pool.unified_sort_mode == "node"
+    assert pool.refresh_needed.is_set()
+
+    pool.refresh_needed.clear()
+    assert pool._handle_keypress("f") is True
+    assert pool.unified_filter_mode == "available"
+    assert pool.refresh_needed.is_set()
+
+    pool.refresh_needed.clear()
+    assert pool._handle_keypress("f") is True
+    assert pool.unified_filter_mode == "busy"
+    assert pool.refresh_needed.is_set()
+
+    pool.refresh_needed.clear()
+    assert pool._handle_keypress("f") is True
+    assert pool.unified_filter_mode == "errors"
+    assert pool.refresh_needed.is_set()
+
+    pool.refresh_needed.clear()
+    assert pool._handle_keypress("f") is True
+    assert pool.unified_filter_mode == "all"
     assert pool.refresh_needed.is_set()
 
     pool.refresh_needed.clear()

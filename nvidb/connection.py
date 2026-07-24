@@ -1263,6 +1263,13 @@ class NVClientPool:
         "available": "Available",
         "utilization": "Util high",
     }
+    UNIFIED_FILTER_MODES = ("all", "available", "busy", "errors")
+    UNIFIED_FILTER_LABELS = {
+        "all": "All",
+        "available": "Available",
+        "busy": "Busy",
+        "errors": "Errors",
+    }
 
     def __init__(self, server_list: ServerListInfo, *, compact: bool = False):
         self.pool = [LocalClient()]
@@ -1279,6 +1286,7 @@ class NVClientPool:
         self.display_mode = self.DISPLAY_MODE_NODES
         self.unified_detailed = False
         self.unified_sort_mode = "node"
+        self.unified_filter_mode = "all"
         self.unified_selected_gpu = 0
         self._unified_gpu_count = 0
         self._unified_page_size = 1
@@ -1647,6 +1655,28 @@ class NVClientPool:
         mode = getattr(self, "unified_sort_mode", "node")
         return mode if mode in self.UNIFIED_SORT_MODES else "node"
 
+    def _get_unified_filter_mode(self):
+        mode = getattr(self, "unified_filter_mode", "all")
+        return mode if mode in self.UNIFIED_FILTER_MODES else "all"
+
+    def _filter_unified_gpu_table(self, table):
+        """Filter unified GPU rows by availability or load state."""
+        mode = self._get_unified_filter_mode()
+        if table.empty or mode == "all":
+            return table.copy()
+        if mode == "errors":
+            return table.iloc[0:0].copy()
+
+        matches = []
+        for _, row in table.iterrows():
+            capacity = self._unified_gpu_capacity(row)
+            matches.append(
+                capacity["available"]
+                if mode == "available"
+                else capacity["busy"]
+            )
+        return table.loc[matches].reset_index(drop=True)
+
     def _sort_unified_gpu_table(self, table):
         """Sort unified rows without changing the cached source table."""
         mode = self._get_unified_sort_mode()
@@ -2010,7 +2040,13 @@ class NVClientPool:
             )
         return "\n".join(lines)
 
-    def _get_unified_node_status_lines(self, raw_stats_by_client, last_update_time):
+    def _get_unified_node_status_lines(
+        self,
+        raw_stats_by_client,
+        last_update_time,
+        *,
+        errors_only=False,
+    ):
         """Describe nodes that cannot contribute rows to the unified table."""
         if last_update_time is None:
             return []
@@ -2023,7 +2059,10 @@ class NVClientPool:
             if isinstance(system_info, dict) and system_info.get("error"):
                 message = system_info.get("error", "Error")
                 lines.append(f"! {node} ({hostname}): {message}")
-            elif not isinstance(stats, pd.DataFrame) or stats.empty:
+            elif (
+                not errors_only
+                and (not isinstance(stats, pd.DataFrame) or stats.empty)
+            ):
                 lines.append(f"- {node} ({hostname}): No GPU data available")
         return lines
 
@@ -2040,13 +2079,20 @@ class NVClientPool:
                 source_table[["Node", "Hostname"]].drop_duplicates()
             )
         detailed = getattr(self, "unified_detailed", False)
-        sorted_table = self._sort_unified_gpu_table(source_table)
+        filter_mode = self._get_unified_filter_mode()
+        filtered_table = self._filter_unified_gpu_table(source_table)
+        sorted_table = self._sort_unified_gpu_table(filtered_table)
         table, selected_row, page_status = self._paginate_unified_gpu_table(
             sorted_table,
             detailed=detailed,
         )
         title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
-        if detailed:
+        if filter_mode == "errors":
+            rendered_table = "Error filter: GPU rows hidden"
+        elif table.empty and not source_table.empty:
+            filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
+            rendered_table = f"No GPUs match the {filter_label} filter"
+        elif detailed:
             rendered_table = self._format_unified_detailed_table(
                 table,
                 selected_row=selected_row,
@@ -2068,13 +2114,22 @@ class NVClientPool:
                 column_labels=self.UNIFIED_TABLE_LABELS,
             )
         page_suffix = f" | {page_status}" if page_status else ""
+        gpu_count_display = str(len(source_table))
+        if filter_mode != "all":
+            gpu_count_display = f"{len(filtered_table)}/{len(source_table)}"
         lines = [
-            f"{title} | GPUs: {len(source_table)} | "
+            f"{title} | GPUs: {gpu_count_display} | "
             f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}",
             self._format_unified_capacity_summary(source_table),
             rendered_table,
         ]
-        status_lines = self._get_unified_node_status_lines(raw_stats_by_client, last_update_time)
+        status_lines = self._get_unified_node_status_lines(
+            raw_stats_by_client,
+            last_update_time,
+            errors_only=(filter_mode == "errors"),
+        )
+        if filter_mode == "errors" and not status_lines:
+            status_lines = ["No node errors"]
         if status_lines:
             lines.append("Node status:")
             lines.extend(status_lines)
@@ -2817,9 +2872,11 @@ class NVClientPool:
             detail_action = "Single-line" if detailed else "Detailed"
             sort_mode = self._get_unified_sort_mode()
             sort_label = self.UNIFIED_SORT_LABELS[sort_mode]
+            filter_mode = self._get_unified_filter_mode()
+            filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
             controls = (
-                f"[v] Nodes  [d] {detail_action}  [s] Sort:{sort_label}  "
-                f"[j/k] GPU  [Pg] Page  [q] Quit"
+                f"[v]Nodes [d]{detail_action} [s]{sort_label} "
+                f"[f]{filter_label} [j/k]GPU [Pg]Page [q]Quit"
             )
         else:
             view_label = "Per-node"
@@ -2957,6 +3014,15 @@ class NVClientPool:
         self.unified_selected_gpu = 0
         self._request_ui_refresh()
 
+    def _cycle_unified_filter_mode(self):
+        current_mode = self._get_unified_filter_mode()
+        next_index = (
+            self.UNIFIED_FILTER_MODES.index(current_mode) + 1
+        ) % len(self.UNIFIED_FILTER_MODES)
+        self.unified_filter_mode = self.UNIFIED_FILTER_MODES[next_index]
+        self.unified_selected_gpu = 0
+        self._request_ui_refresh()
+
     def _move_unified_selection(self, delta):
         gpu_count = max(0, int(getattr(self, "_unified_gpu_count", 0) or 0))
         if gpu_count == 0:
@@ -2990,6 +3056,11 @@ class NVClientPool:
             if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
                 return False
             self._cycle_unified_sort_mode()
+            return True
+        if key_lower == "f":
+            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+                return False
+            self._cycle_unified_filter_mode()
             return True
         if key_lower == "h":
             return False
@@ -3097,6 +3168,7 @@ class NVClientPool:
         print("   v              : Switch unified/per-node view")
         print("   d              : Toggle unified single-line/detailed rows")
         print("   s              : Cycle unified sorting")
+        print("   f              : Cycle unified GPU filters")
         print("   q              : Quit")
         print("=" * 60)
         
