@@ -52,8 +52,11 @@ def _pool():
     pool.unified_filter_mode = "all"
     pool.unified_selected_gpu = 0
     pool.unified_show_processes = False
+    pool.unified_show_trends = False
     pool._unified_gpu_count = 0
     pool._unified_page_size = 1
+    pool._unified_gpu_history = {}
+    pool._unified_history_lock = threading.Lock()
     pool.selected_server = 0
     pool.expanded_servers = {0}
     pool._toggle_disabled_servers = set()
@@ -340,6 +343,51 @@ def test_unified_selected_gpu_process_details(monkeypatch):
     assert "python" in rendered
 
 
+def test_unified_gpu_trends_keep_latest_sixty_samples(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_show_trends = True
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((80, 30)))
+
+    raw_stats = {}
+    for sample_index in range(65):
+        raw_stats = {
+            1: (
+                pd.DataFrame(
+                    [
+                        {
+                            **_gpu_row(
+                                0,
+                                "RTX 6000 Ada",
+                                f"{sample_index % 100} %",
+                                f"{sample_index * 100}/49140",
+                            ),
+                            "temp": f"{40 + sample_index % 20} C",
+                        }
+                    ]
+                ),
+                {},
+            )
+        }
+        pool._record_unified_gpu_history(
+            raw_stats,
+            timestamp=sample_index,
+        )
+
+    history = next(iter(pool._unified_gpu_history.values()))
+    assert len(history) == 60
+    assert history[0]["timestamp"] == 5
+    assert history[-1]["timestamp"] == 64
+
+    rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    assert "Trends: training-node GPU 0 | 60/60 samples" in rendered
+    assert "Util" in rendered
+    assert "VRAM" in rendered
+    assert "Temp" in rendered
+    assert any(block in rendered for block in "▁▂▃▄▅▆▇█")
+
+
 def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     pool = _pool()
     pool.unified_detailed = True
@@ -432,6 +480,7 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
     assert pool._handle_keypress("d") is False
     assert pool._handle_keypress("s") is False
     assert pool._handle_keypress("f") is False
+    assert pool._handle_keypress("t") is False
     assert pool.unified_detailed is False
     assert pool.unified_sort_mode == "node"
     assert pool.unified_filter_mode == "all"
@@ -488,6 +537,11 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
     pool._unified_gpu_count = 1
     assert pool._handle_keypress("\n") is True
     assert pool.unified_show_processes is True
+    assert pool.refresh_needed.is_set()
+
+    pool.refresh_needed.clear()
+    assert pool._handle_keypress("t") is True
+    assert pool.unified_show_trends is True
     assert pool.refresh_needed.is_set()
 
     assert pool._handle_keypress("d") is True

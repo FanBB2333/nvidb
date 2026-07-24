@@ -158,6 +158,7 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `d`               | Toggle unified row detail     |
 | `s`               | Cycle unified GPU sorting     |
 | `f`               | Cycle unified GPU filters     |
+| `t`               | Toggle selected GPU trends    |
 | `j` / `↓`         | Move server/GPU selection down |
 | `k` / `↑`         | Move server/GPU selection up  |
 | `PgUp` / `PgDn`   | Change unified GPU page       |
@@ -188,6 +189,9 @@ nodes whose latest refresh failed.
 Press `Enter` or `Space` on a unified GPU to show its cached process details:
 PID, user, VRAM, process type, and command. The panel uses the existing NVML
 snapshot and does not issue another remote command.
+Press `t` to show utilization, VRAM, and temperature sparklines for the selected
+GPU. History is kept in memory for the latest 60 successful refresh samples;
+recording the samples does not add remote requests.
 
 ### 2.7 GPU Monitor Decorator
 

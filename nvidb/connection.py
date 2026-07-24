@@ -10,6 +10,7 @@ import socket
 import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
+from collections import deque
 from io import StringIO
 import threading
 
@@ -1289,8 +1290,11 @@ class NVClientPool:
         self.unified_filter_mode = "all"
         self.unified_selected_gpu = 0
         self.unified_show_processes = False
+        self.unified_show_trends = False
         self._unified_gpu_count = 0
         self._unified_page_size = 1
+        self._unified_gpu_history = {}
+        self._unified_history_lock = threading.Lock()
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
         self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
         self.cached_stats = None  # Cached GPU stats data
@@ -1823,11 +1827,15 @@ class NVClientPool:
             terminal_height = 24
 
         show_processes = bool(getattr(self, "unified_show_processes", False))
+        show_trends = bool(getattr(self, "unified_show_trends", False))
+        extra_lines = (6 if show_processes else 0) + (
+            5 if show_trends else 0
+        )
         if detailed:
-            reserved_lines = 16 if show_processes else 10
+            reserved_lines = 10 + extra_lines
             page_size = max(1, (terminal_height - reserved_lines) // 4)
         else:
-            reserved_lines = 18 if show_processes else 12
+            reserved_lines = 12 + extra_lines
             page_size = max(1, terminal_height - reserved_lines)
 
         total = len(table)
@@ -1915,6 +1923,8 @@ class NVClientPool:
         except OSError:
             terminal_height = 24
         max_processes = max(1, min(5, terminal_height // 6))
+        if getattr(self, "unified_show_trends", False):
+            max_processes = min(max_processes, 2)
         visible_processes = processes[:max_processes]
         process_table = pd.DataFrame(
             [
@@ -1933,6 +1943,127 @@ class NVClientPool:
         if hidden_count > 0:
             panel.append(f"+ {hidden_count} more processes")
         return "\n".join(panel)
+
+    @staticmethod
+    def _unified_gpu_history_key(row):
+        return (
+            str(row.get("Node", "")),
+            str(row.get("Hostname", "")),
+            str(row.get("GPU", "")),
+        )
+
+    def _record_unified_gpu_history(
+        self,
+        raw_stats_by_client,
+        *,
+        timestamp=None,
+    ):
+        """Record one cached telemetry sample per GPU."""
+        table = self._build_unified_gpu_table(raw_stats_by_client)
+        if table.empty:
+            return
+        timestamp = time.time() if timestamp is None else timestamp
+        samples = []
+        for _, row in table.iterrows():
+            capacity = self._unified_gpu_capacity(row)
+            samples.append(
+                (
+                    self._unified_gpu_history_key(row),
+                    {
+                        "timestamp": timestamp,
+                        "utilization": capacity["utilization"],
+                        "memory": capacity["memory_percent"],
+                        "temperature": self._extract_metric_number(
+                            row.get("temp")
+                        ),
+                    },
+                )
+            )
+
+        if not hasattr(self, "_unified_history_lock"):
+            self._unified_history_lock = threading.Lock()
+        if not hasattr(self, "_unified_gpu_history"):
+            self._unified_gpu_history = {}
+        with self._unified_history_lock:
+            for key, sample in samples:
+                history = self._unified_gpu_history.setdefault(
+                    key,
+                    deque(maxlen=60),
+                )
+                history.append(sample)
+
+    def _get_unified_gpu_history(self, selected_row):
+        if selected_row is None:
+            return []
+        key = self._unified_gpu_history_key(selected_row)
+        if not hasattr(self, "_unified_history_lock"):
+            return []
+        with self._unified_history_lock:
+            return list(getattr(self, "_unified_gpu_history", {}).get(key, ()))
+
+    @staticmethod
+    def _sparkline(values, *, minimum, maximum, width):
+        blocks = "▁▂▃▄▅▆▇█"
+        width = max(1, width)
+        values = list(values)[-width:]
+        if not values:
+            return ""
+        span = max(1.0, maximum - minimum)
+        rendered = []
+        for value in values:
+            if value is None:
+                rendered.append("·")
+                continue
+            normalized = max(0.0, min(1.0, (float(value) - minimum) / span))
+            index = min(len(blocks) - 1, int(round(normalized * (len(blocks) - 1))))
+            rendered.append(blocks[index])
+        return "".join(rendered)
+
+    def _format_unified_gpu_trends(self, selected_row):
+        """Format utilization, VRAM, and temperature history sparklines."""
+        if selected_row is None:
+            return "Trends: no GPU selected"
+        history = self._get_unified_gpu_history(selected_row)
+        node = selected_row.get("Node", "N/A")
+        gpu_index = selected_row.get("GPU", "N/A")
+        title = f"Trends: {node} GPU {gpu_index} | {len(history)}/60 samples"
+        if not history:
+            return f"{title}\nWaiting for telemetry samples"
+
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 80
+
+        def metric_line(label, key, minimum, maximum, unit):
+            values = [sample.get(key) for sample in history]
+            known = [float(value) for value in values if value is not None]
+            if not known:
+                return f"{label:<5} N/A"
+            current = known[-1]
+            average = sum(known) / len(known)
+            suffix = f"now {current:.0f}{unit} avg {average:.0f}{unit}"
+            spark_width = max(
+                8,
+                terminal_width - len(label) - len(suffix) - 4,
+            )
+            spark = self._sparkline(
+                values,
+                minimum=minimum,
+                maximum=maximum,
+                width=spark_width,
+            )
+            line = f"{label:<5} {spark} {suffix}"
+            return line[:terminal_width]
+
+        return "\n".join(
+            [
+                title[:terminal_width],
+                metric_line("Util", "utilization", 0, 100, "%"),
+                metric_line("VRAM", "memory", 0, 100, "%"),
+                metric_line("Temp", "temperature", 20, 100, "C"),
+            ]
+        )
 
     def _format_unified_detailed_table(self, table, *, selected_row=None):
         """Format each GPU as a readable, color-aware three-line card."""
@@ -2254,6 +2385,13 @@ class NVClientPool:
                     raw_stats_by_client,
                     selected_gpu_row,
                 )
+            )
+        if (
+            getattr(self, "unified_show_trends", False)
+            and filter_mode != "errors"
+        ):
+            lines.append(
+                self._format_unified_gpu_trends(selected_gpu_row)
             )
         return lines
 
@@ -2933,6 +3071,8 @@ class NVClientPool:
                 fetch_error = e
             fetch_duration = time.time() - fetch_started_at
 
+            if stats_list is not None:
+                self._record_unified_gpu_history(raw_stats_by_client)
             with self._cache_lock:
                 if stats_list is not None:
                     self.cached_stats = stats_list
@@ -3001,8 +3141,8 @@ class NVClientPool:
             filter_mode = self._get_unified_filter_mode()
             filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
             controls = (
-                f"[v]Nodes [d]{detail_action} [s]{sort_label} "
-                f"[f]{filter_label} [j/k]GPU [Pg]Page [Enter]Proc [q]Quit"
+                f"[v]N [d]{detail_action} [s]{sort_label} "
+                f"[f]{filter_label} [j/k]GPU [Pg] [Enter]Proc [t]Trend [q]"
             )
         else:
             view_label = "Per-node"
@@ -3188,6 +3328,18 @@ class NVClientPool:
                 return False
             self._cycle_unified_filter_mode()
             return True
+        if key_lower == "t":
+            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+                return False
+            if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
+                return False
+            self.unified_show_trends = not getattr(
+                self,
+                "unified_show_trends",
+                False,
+            )
+            self._request_ui_refresh()
+            return True
         if key_lower == "h":
             return False
 
@@ -3273,6 +3425,8 @@ class NVClientPool:
                 fetch_error = e
             fetch_duration = time.time() - fetch_started_at
 
+            if stats_list is not None:
+                self._record_unified_gpu_history(raw_stats_by_client)
             with self._cache_lock:
                 if stats_list is not None:
                     self.cached_stats = stats_list
@@ -3305,6 +3459,7 @@ class NVClientPool:
         print("   d              : Toggle unified single-line/detailed rows")
         print("   s              : Cycle unified sorting")
         print("   f              : Cycle unified GPU filters")
+        print("   t              : Toggle selected GPU trends")
         print("   q              : Quit")
         print("=" * 60)
         
