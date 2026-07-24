@@ -157,8 +157,9 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `v`               | Switch unified/per-node view  |
 | `d`               | Toggle unified row detail     |
 | `s`               | Cycle unified GPU sorting     |
-| `j` / `↓`         | Move selection down           |
-| `k` / `↑`         | Move selection up             |
+| `j` / `↓`         | Move server/GPU selection down |
+| `k` / `↑`         | Move server/GPU selection up  |
+| `PgUp` / `PgDn`   | Change unified GPU page       |
 | `Enter` / `Space` | Toggle expand/collapse server |
 | `a`               | Expand all servers            |
 | `c`               | Collapse all servers          |
@@ -178,6 +179,8 @@ The capacity line summarizes available and busy GPUs, average utilization, and
 used/total/free VRAM. Press `s` to cycle between node order, available GPUs
 first, and highest utilization first. A GPU is considered available when its
 utilization is below 5% and its VRAM usage is below 10%.
+Unified pages are sized from the current terminal height. The title shows the
+visible GPU range, and `>` marks the selected GPU.
 
 ### 2.7 GPU Monitor Decorator
 

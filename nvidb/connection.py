@@ -1279,6 +1279,9 @@ class NVClientPool:
         self.display_mode = self.DISPLAY_MODE_NODES
         self.unified_detailed = False
         self.unified_sort_mode = "node"
+        self.unified_selected_gpu = 0
+        self._unified_gpu_count = 0
+        self._unified_page_size = 1
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
         self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
         self.cached_stats = None  # Cached GPU stats data
@@ -1765,7 +1768,36 @@ class NVClientPool:
             return summary[: max(0, terminal_width - 3)] + "..."
         return summary
 
-    def _format_unified_detailed_table(self, table):
+    def _paginate_unified_gpu_table(self, table, *, detailed):
+        """Return the visible GPU page and selected row within that page."""
+        try:
+            terminal_height = os.get_terminal_size().lines
+        except OSError:
+            terminal_height = 24
+
+        if detailed:
+            page_size = max(1, (terminal_height - 10) // 4)
+        else:
+            page_size = max(1, terminal_height - 12)
+
+        total = len(table)
+        selected = int(getattr(self, "unified_selected_gpu", 0) or 0)
+        selected = max(0, min(selected, max(0, total - 1)))
+        self.unified_selected_gpu = selected
+        self._unified_gpu_count = total
+        self._unified_page_size = page_size
+
+        if total == 0:
+            return table.copy(), None, ""
+
+        page_start = (selected // page_size) * page_size
+        page_end = min(total, page_start + page_size)
+        visible_table = table.iloc[page_start:page_end].reset_index(drop=True)
+        selected_on_page = selected - page_start
+        page_status = f"Rows {page_start + 1}-{page_end}/{total}"
+        return visible_table, selected_on_page, page_status
+
+    def _format_unified_detailed_table(self, table, *, selected_row=None):
         """Format each GPU as a readable, color-aware three-line card."""
         if table.empty:
             return "No GPU data available"
@@ -1901,10 +1933,11 @@ class NVClientPool:
 
         border = "+" + "-" * (table_width - 2) + "+"
         lines = [border]
-        for _, row in table.iterrows():
+        for row_index, (_, row) in enumerate(table.iterrows()):
             utilization = clean(row.get("util")).replace(" ", "")
             status, utilization_color = utilization_status(utilization)
-            gpu_badge = f"GPU {clean(row.get('GPU'))} [{status}]"
+            marker = "> " if row_index == selected_row else "  "
+            gpu_badge = f"{marker}GPU {clean(row.get('GPU'))} [{status}]"
             node_identity = (
                 f"Node {clean(row.get('Node'))} "
                 f"({clean(row.get('Hostname'))})"
@@ -1913,7 +1946,7 @@ class NVClientPool:
                 make_field(
                     "gpu",
                     gpu_badge,
-                    13,
+                    15,
                     color=utilization_color,
                     bold=True,
                 ),
@@ -2006,20 +2039,38 @@ class NVClientPool:
             node_count = len(
                 source_table[["Node", "Hostname"]].drop_duplicates()
             )
-        table = self._sort_unified_gpu_table(source_table)
-
         detailed = getattr(self, "unified_detailed", False)
+        sorted_table = self._sort_unified_gpu_table(source_table)
+        table, selected_row, page_status = self._paginate_unified_gpu_table(
+            sorted_table,
+            detailed=detailed,
+        )
         title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
         if detailed:
-            rendered_table = self._format_unified_detailed_table(table)
-        else:
-            rendered_table = self._format_fixed_width_table(
+            rendered_table = self._format_unified_detailed_table(
                 table,
+                selected_row=selected_row,
+            )
+        else:
+            display_table = table.copy()
+            if not display_table.empty:
+                markers = [
+                    "> " if index == selected_row else "  "
+                    for index in range(len(display_table))
+                ]
+                display_table["Node"] = [
+                    marker + str(node)
+                    for marker, node in zip(markers, display_table["Node"])
+                ]
+            rendered_table = self._format_fixed_width_table(
+                display_table,
                 border=True,
                 column_labels=self.UNIFIED_TABLE_LABELS,
             )
+        page_suffix = f" | {page_status}" if page_status else ""
         lines = [
-            f"{title} | GPUs: {len(table)} | Nodes with GPU: {node_count}/{len(self.pool)}",
+            f"{title} | GPUs: {len(source_table)} | "
+            f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}",
             self._format_unified_capacity_summary(source_table),
             rendered_table,
         ]
@@ -2767,8 +2818,8 @@ class NVClientPool:
             sort_mode = self._get_unified_sort_mode()
             sort_label = self.UNIFIED_SORT_LABELS[sort_mode]
             controls = (
-                f"[v] Per-node  [d] {detail_action}  "
-                f"[s] Sort: {sort_label}  [q] Quit"
+                f"[v] Nodes  [d] {detail_action}  [s] Sort:{sort_label}  "
+                f"[j/k] GPU  [Pg] Page  [q] Quit"
             )
         else:
             view_label = "Per-node"
@@ -2903,7 +2954,20 @@ class NVClientPool:
             self.UNIFIED_SORT_MODES.index(current_mode) + 1
         ) % len(self.UNIFIED_SORT_MODES)
         self.unified_sort_mode = self.UNIFIED_SORT_MODES[next_index]
+        self.unified_selected_gpu = 0
         self._request_ui_refresh()
+
+    def _move_unified_selection(self, delta):
+        gpu_count = max(0, int(getattr(self, "_unified_gpu_count", 0) or 0))
+        if gpu_count == 0:
+            return False
+        current = int(getattr(self, "unified_selected_gpu", 0) or 0)
+        selected = max(0, min(current + delta, gpu_count - 1))
+        if selected == current:
+            return False
+        self.unified_selected_gpu = selected
+        self._request_ui_refresh()
+        return True
 
     def _handle_keypress(self, key):
         """Apply one TUI keypress and return whether it changed visible state."""
@@ -2931,6 +2995,18 @@ class NVClientPool:
             return False
 
         if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED:
+            if key_lower == "j" or key_name == "KEY_DOWN":
+                return self._move_unified_selection(1)
+            if key_lower == "k" or key_name == "KEY_UP":
+                return self._move_unified_selection(-1)
+            if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN"}:
+                return self._move_unified_selection(
+                    max(1, int(getattr(self, "_unified_page_size", 1) or 1))
+                )
+            if key_name in {"KEY_PPAGE", "KEY_PAGEUP"}:
+                return self._move_unified_selection(
+                    -max(1, int(getattr(self, "_unified_page_size", 1) or 1))
+                )
             return False
 
         if key_lower == "j" or key_name == "KEY_DOWN":
@@ -3013,7 +3089,8 @@ class NVClientPool:
         """Real-time GPU status display with global keyboard monitoring"""
         print("GPU monitoring starting...")
         print("Controls:")
-        print("   j/k or Up/Down : Navigate between servers")
+        print("   j/k or Up/Down : Navigate between servers or unified GPUs")
+        print("   PgUp/PgDn      : Change unified GPU page")
         print("   Enter/Space    : Toggle expand/collapse")
         print("   a              : Expand all")
         print("   c              : Collapse all")

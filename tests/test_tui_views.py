@@ -49,6 +49,9 @@ def _pool():
     pool.display_mode = pool.DISPLAY_MODE_NODES
     pool.unified_detailed = False
     pool.unified_sort_mode = "node"
+    pool.unified_selected_gpu = 0
+    pool._unified_gpu_count = 0
+    pool._unified_page_size = 1
     pool.selected_server = 0
     pool.expanded_servers = {0}
     pool._toggle_disabled_servers = set()
@@ -111,7 +114,7 @@ def test_unified_table_keeps_identity_and_core_metrics_on_narrow_terminals(monke
     assert "Model" in rendered
     assert "Util" in rendered
     assert "VRAM U/T MiB" in rendered
-    assert "training" in rendered
+    assert "train" in rendered
     assert "100.64.0.42" in rendered
     assert "Processes" not in rendered
 
@@ -184,6 +187,52 @@ def test_unified_capacity_summary_and_sort_modes(monkeypatch):
         "large-free",
         "small-free",
     ]
+
+
+def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    raw_stats = {
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(0, "GPU A", "0 %", "0/24576"),
+                    _gpu_row(1, "GPU B", "10 %", "1024/24576"),
+                    _gpu_row(2, "GPU C", "90 %", "20000/24576"),
+                ]
+            ),
+            {},
+        ),
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((80, 16)))
+
+    first_page = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+
+    assert "Rows 1-1/3" in first_page
+    assert "> GPU 0 [IDLE]" in first_page
+    assert "Model GPU A" in first_page
+    assert "Model GPU B" not in first_page
+    assert pool._unified_page_size == 1
+
+    assert pool._handle_keypress("j") is True
+    second_page = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+
+    assert "Rows 2-2/3" in second_page
+    assert "> GPU 1 [ACTIVE]" in second_page
+    assert "Model GPU B" in second_page
+
+    page_down = SimpleNamespace(name="KEY_NPAGE")
+    assert pool._handle_keypress(page_down) is True
+    third_page = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+    assert "Rows 3-3/3" in third_page
+    assert "> GPU 2 [HIGH]" in third_page
 
 
 def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
