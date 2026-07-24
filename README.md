@@ -161,7 +161,7 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `j` / `↓`         | Move server/GPU selection down |
 | `k` / `↑`         | Move server/GPU selection up  |
 | `PgUp` / `PgDn`   | Change unified GPU page       |
-| `Enter` / `Space` | Toggle expand/collapse server |
+| `Enter` / `Space` | Toggle server/GPU details      |
 | `a`               | Expand all servers            |
 | `c`               | Collapse all servers          |
 | `q`               | Quit                          |
@@ -185,6 +185,9 @@ visible GPU range, and `>` marks the selected GPU.
 Press `f` to cycle through all, available, busy, and error-only views. Busy
 means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
 nodes whose latest refresh failed.
+Press `Enter` or `Space` on a unified GPU to show its cached process details:
+PID, user, VRAM, process type, and command. The panel uses the existing NVML
+snapshot and does not issue another remote command.
 
 ### 2.7 GPU Monitor Decorator
 

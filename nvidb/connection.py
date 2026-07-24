@@ -1288,6 +1288,7 @@ class NVClientPool:
         self.unified_sort_mode = "node"
         self.unified_filter_mode = "all"
         self.unified_selected_gpu = 0
+        self.unified_show_processes = False
         self._unified_gpu_count = 0
         self._unified_page_size = 1
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
@@ -1373,6 +1374,7 @@ class NVClientPool:
         raw_stats_by_client = {}
         user_memory_by_client = {}
         global_user_memory = {}
+        process_details_by_client = {}
         for idx, client in enumerate(self.pool):
             result = client.get_full_gpu_info()
             
@@ -1399,6 +1401,7 @@ class NVClientPool:
                 raw_stats_by_client[idx] = (stats.copy() if not stats.empty else stats, system_info)
                 stats_str.append((stats, system_info))
                 user_memory_by_client[idx] = {}
+                process_details_by_client[idx] = {}
                 continue
             
             # Optimize rx/tx display - split into two columns
@@ -1426,10 +1429,21 @@ class NVClientPool:
                 all_processes, user_summary_for_client = client.get_process_summary(stats)
 
                 per_gpu_user_summary = {}
+                per_gpu_process_details = {}
                 for proc in all_processes:
                     gpu_idx = proc.get("gpu_index")
+                    gpu_key = str(gpu_idx)
                     username = proc.get("username")
                     used_memory = proc.get("used_memory", "0 MiB")
+                    per_gpu_process_details.setdefault(gpu_key, []).append(
+                        {
+                            "pid": proc.get("pid", "N/A"),
+                            "username": username or "N/A",
+                            "used_memory": used_memory,
+                            "type": proc.get("type", "N/A"),
+                            "process_name": proc.get("process_name", "N/A"),
+                        }
+                    )
 
                     if not username or username == "N/A":
                         continue
@@ -1449,10 +1463,12 @@ class NVClientPool:
                         process_list.append(client.format_user_memory_compact(user_summary))
                     else:
                         process_list.append("-")
+                process_details_by_client[idx] = per_gpu_process_details
             except Exception as e:
                 logging.warning(f"Failed to get process info: {e}")
                 process_list = ["-" for _ in range(len(stats))]
                 user_summary_for_client = {}
+                process_details_by_client[idx] = {}
             
             stats['processes'] = process_list
 
@@ -1496,6 +1512,7 @@ class NVClientPool:
         raw_stats_by_client["_nvidb"] = {
             "user_memory_by_client": user_memory_by_client,
             "user_memory_global": global_user_memory,
+            "process_details_by_client": process_details_by_client,
         }
         # reformat the str into a single string with fixed width formatting
         formatted_stats = []
@@ -1805,10 +1822,13 @@ class NVClientPool:
         except OSError:
             terminal_height = 24
 
+        show_processes = bool(getattr(self, "unified_show_processes", False))
         if detailed:
-            page_size = max(1, (terminal_height - 10) // 4)
+            reserved_lines = 16 if show_processes else 10
+            page_size = max(1, (terminal_height - reserved_lines) // 4)
         else:
-            page_size = max(1, terminal_height - 12)
+            reserved_lines = 18 if show_processes else 12
+            page_size = max(1, terminal_height - reserved_lines)
 
         total = len(table)
         selected = int(getattr(self, "unified_selected_gpu", 0) or 0)
@@ -1826,6 +1846,93 @@ class NVClientPool:
         selected_on_page = selected - page_start
         page_status = f"Rows {page_start + 1}-{page_end}/{total}"
         return visible_table, selected_on_page, page_status
+
+    def _get_unified_process_details(self, raw_stats_by_client, selected_row):
+        """Return cached process rows for one selected unified GPU."""
+        if selected_row is None:
+            return []
+        node = str(selected_row.get("Node", ""))
+        hostname = str(selected_row.get("Hostname", ""))
+        client_index = None
+        for index in range(len(self.pool)):
+            client_node, client_hostname = self._client_table_identity(index)
+            if client_node == node and client_hostname == hostname:
+                client_index = index
+                break
+        if client_index is None:
+            return []
+
+        meta = (
+            raw_stats_by_client.get("_nvidb", {})
+            if isinstance(raw_stats_by_client, dict)
+            else {}
+        )
+        process_details_by_client = (
+            meta.get("process_details_by_client", {})
+            if isinstance(meta, dict)
+            else {}
+        )
+        client_details = process_details_by_client.get(client_index, {})
+        if not isinstance(client_details, dict):
+            return []
+        gpu_key = str(selected_row.get("GPU", ""))
+        processes = client_details.get(gpu_key, [])
+        return [
+            process
+            for process in processes
+            if isinstance(process, dict)
+        ]
+
+    def _format_unified_process_details(
+        self,
+        raw_stats_by_client,
+        selected_row,
+    ):
+        """Format a width-aware process panel for the selected GPU."""
+        if selected_row is None:
+            return "Process details: no GPU selected"
+
+        node = selected_row.get("Node", "N/A")
+        hostname = selected_row.get("Hostname", "N/A")
+        gpu_index = selected_row.get("GPU", "N/A")
+        title = f"Processes: {node} ({hostname}) GPU {gpu_index}"
+        processes = self._get_unified_process_details(
+            raw_stats_by_client,
+            selected_row,
+        )
+        if not processes:
+            return f"{title}\nNo active GPU processes"
+
+        processes = sorted(
+            processes,
+            key=lambda process: (
+                self._extract_metric_number(process.get("used_memory")) or 0
+            ),
+            reverse=True,
+        )
+        try:
+            terminal_height = os.get_terminal_size().lines
+        except OSError:
+            terminal_height = 24
+        max_processes = max(1, min(5, terminal_height // 6))
+        visible_processes = processes[:max_processes]
+        process_table = pd.DataFrame(
+            [
+                {
+                    "PID": process.get("pid", "N/A"),
+                    "User": process.get("username", "N/A"),
+                    "VRAM": process.get("used_memory", "N/A"),
+                    "Type": process.get("type", "N/A"),
+                    "Command": process.get("process_name", "N/A"),
+                }
+                for process in visible_processes
+            ]
+        )
+        panel = [title, self._format_fixed_width_table(process_table, border=True)]
+        hidden_count = len(processes) - len(visible_processes)
+        if hidden_count > 0:
+            panel.append(f"+ {hidden_count} more processes")
+        return "\n".join(panel)
 
     def _format_unified_detailed_table(self, table, *, selected_row=None):
         """Format each GPU as a readable, color-aware three-line card."""
@@ -2113,6 +2220,11 @@ class NVClientPool:
                 border=True,
                 column_labels=self.UNIFIED_TABLE_LABELS,
             )
+        selected_gpu_row = (
+            table.iloc[selected_row]
+            if selected_row is not None and not table.empty
+            else None
+        )
         page_suffix = f" | {page_status}" if page_status else ""
         gpu_count_display = str(len(source_table))
         if filter_mode != "all":
@@ -2133,6 +2245,16 @@ class NVClientPool:
         if status_lines:
             lines.append("Node status:")
             lines.extend(status_lines)
+        if (
+            getattr(self, "unified_show_processes", False)
+            and filter_mode != "errors"
+        ):
+            lines.append(
+                self._format_unified_process_details(
+                    raw_stats_by_client,
+                    selected_gpu_row,
+                )
+            )
         return lines
 
     def _write_tui_lines(self, output_lines):
@@ -2871,12 +2993,16 @@ class NVClientPool:
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
             detail_action = "Single-line" if detailed else "Detailed"
             sort_mode = self._get_unified_sort_mode()
-            sort_label = self.UNIFIED_SORT_LABELS[sort_mode]
+            sort_label = {
+                "node": "Node",
+                "available": "Free",
+                "utilization": "Util",
+            }[sort_mode]
             filter_mode = self._get_unified_filter_mode()
             filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
             controls = (
                 f"[v]Nodes [d]{detail_action} [s]{sort_label} "
-                f"[f]{filter_label} [j/k]GPU [Pg]Page [q]Quit"
+                f"[f]{filter_label} [j/k]GPU [Pg]Page [Enter]Proc [q]Quit"
             )
         else:
             view_label = "Per-node"
@@ -3078,6 +3204,16 @@ class NVClientPool:
                 return self._move_unified_selection(
                     -max(1, int(getattr(self, "_unified_page_size", 1) or 1))
                 )
+            if key_name == "KEY_ENTER" or key_lower == " " or key in {"\n", "\r"}:
+                if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
+                    return False
+                self.unified_show_processes = not getattr(
+                    self,
+                    "unified_show_processes",
+                    False,
+                )
+                self._request_ui_refresh()
+                return True
             return False
 
         if key_lower == "j" or key_name == "KEY_DOWN":
@@ -3162,7 +3298,7 @@ class NVClientPool:
         print("Controls:")
         print("   j/k or Up/Down : Navigate between servers or unified GPUs")
         print("   PgUp/PgDn      : Change unified GPU page")
-        print("   Enter/Space    : Toggle expand/collapse")
+        print("   Enter/Space    : Toggle server or unified GPU details")
         print("   a              : Expand all")
         print("   c              : Collapse all")
         print("   v              : Switch unified/per-node view")

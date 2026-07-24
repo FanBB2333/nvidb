@@ -51,6 +51,7 @@ def _pool():
     pool.unified_sort_mode = "node"
     pool.unified_filter_mode = "all"
     pool.unified_selected_gpu = 0
+    pool.unified_show_processes = False
     pool._unified_gpu_count = 0
     pool._unified_page_size = 1
     pool.selected_server = 0
@@ -281,6 +282,64 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
     assert "> GPU 2 [HIGH]" in third_page
 
 
+def test_unified_selected_gpu_process_details(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_show_processes = True
+    raw_stats = {
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(
+                        0,
+                        "RTX 6000 Ada",
+                        "75 %",
+                        "24000/49140",
+                        "alice(24G)",
+                    )
+                ]
+            ),
+            {},
+        ),
+        "_nvidb": {
+            "process_details_by_client": {
+                1: {
+                    "0": [
+                        {
+                            "pid": 4242,
+                            "username": "alice",
+                            "used_memory": "16384 MiB",
+                            "type": "C",
+                            "process_name": "python",
+                        },
+                        {
+                            "pid": 5252,
+                            "username": "bob",
+                            "used_memory": "4096 MiB",
+                            "type": "C",
+                            "process_name": "torchrun",
+                        },
+                    ]
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((80, 30)))
+
+    rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+
+    assert "Processes: training-node (100.64.0.42) GPU 0" in rendered
+    assert "PID" in rendered
+    assert "User" in rendered
+    assert "VRAM" in rendered
+    assert "Command" in rendered
+    assert "4242" in rendered
+    assert "alice" in rendered
+    assert "16384 MiB" in rendered
+    assert "python" in rendered
+
+
 def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     pool = _pool()
     pool.unified_detailed = True
@@ -425,6 +484,11 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
     assert pool._handle_keypress("j") is False
     assert pool.selected_server == 0
     assert not pool.refresh_needed.is_set()
+
+    pool._unified_gpu_count = 1
+    assert pool._handle_keypress("\n") is True
+    assert pool.unified_show_processes is True
+    assert pool.refresh_needed.is_set()
 
     assert pool._handle_keypress("d") is True
     assert pool.unified_detailed is False
