@@ -2,6 +2,7 @@
 nvidb configuration module.
 Centralized configuration for working directory and other settings.
 """
+import json
 import os
 from pathlib import Path
 
@@ -11,6 +12,25 @@ VERSION = "1.7.1"
 # Default working directory for nvidb data (config, logs, database)
 # Can be overridden by NVIDB_HOME environment variable
 WORKING_DIR = Path(os.environ.get('NVIDB_HOME', '~/.nvidb')).expanduser()
+
+# TUI display state persisted under the `view` section of config.yml so the
+# next run starts with the layout the user left behind.
+DEFAULT_VIEW_SETTINGS = {
+    "mode": "nodes",
+    "detailed": False,
+    "sort": "node",
+    "filter": "all",
+    "processes": False,
+    "trends": False,
+    "group_by_node": True,
+    "hide_unsupported": True,
+}
+
+VIEW_SETTING_CHOICES = {
+    "mode": ("nodes", "unified"),
+    "sort": ("node", "available", "utilization"),
+    "filter": ("all", "available", "busy", "errors"),
+}
 
 def get_config_path():
     """Get the path to the config file."""
@@ -23,3 +43,213 @@ def get_db_path():
 def ensure_working_dir():
     """Ensure the working directory exists."""
     WORKING_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_config(config_path=None) -> dict:
+    """Load config.yml, returning an empty dict when it is missing or invalid."""
+    import yaml
+
+    path = Path(config_path or get_config_path()).expanduser()
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            cfg = yaml.load(handle, Loader=yaml.FullLoader) or {}
+    except Exception:
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _dq(value) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def format_servers_yaml(servers) -> str:
+    """Render the `servers` section with one readable block per server."""
+    lines = ["servers:"]
+    for i, server in enumerate(servers):
+        if i > 0:
+            lines.append("")
+        hostname = server.get("hostname") or server.get("host") or ""
+        lines.append(f"  - hostname: {_dq(hostname)}")
+
+        port = server.get("port", 22)
+        try:
+            port_int = int(port)
+        except Exception:
+            port_int = 22
+        lines.append(f"    port: {port_int}")
+
+        username = server.get("username")
+        if username is not None:
+            lines.append(f"    username: {_dq(username)}")
+
+        password = server.get("password")
+        if password:
+            lines.append(f"    password: {_dq(password)}")
+
+        nickname = server.get("nickname")
+        if nickname is None:
+            nickname = server.get("description")
+        if nickname is not None:
+            lines.append(f"    nickname: {_dq(nickname)}")
+
+        auth = server.get("auth", "auto")
+        if auth is not None:
+            lines.append(f"    auth: {_dq(auth)}")
+
+        identityfile = server.get("identityfile")
+        if auth in ("auto", "key") and identityfile:
+            lines.append(f"    identityfile: {_dq(identityfile)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def format_config_yaml(cfg: dict) -> str:
+    """Render the whole config file: `basic`, other sections, then `servers`."""
+    import yaml
+
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    servers = cfg.get("servers", []) or []
+
+    header_cfg = {}
+    if "basic" in cfg:
+        header_cfg["basic"] = cfg.get("basic")
+    else:
+        header_cfg["basic"] = {"compact": False}
+    for key, value in cfg.items():
+        if key in {"basic", "servers"}:
+            continue
+        header_cfg[key] = value
+
+    header_text = yaml.safe_dump(
+        header_cfg,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    ).rstrip("\n")
+    servers_text = format_servers_yaml(servers).rstrip("\n")
+    return f"{header_text}\n\n{servers_text}\n"
+
+
+def _write_text_atomic(path: Path, text: str):
+    """Replace a file in one step so an interrupted write cannot truncate it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def write_config(cfg: dict, config_path=None):
+    """Write config.yml, creating the working directory when needed."""
+    path = Path(config_path or get_config_path()).expanduser()
+    _write_text_atomic(path, format_config_yaml(cfg))
+
+
+def normalize_view_settings(raw) -> dict:
+    """Merge stored view settings over the defaults, dropping invalid values."""
+    settings = dict(DEFAULT_VIEW_SETTINGS)
+    if not isinstance(raw, dict):
+        return settings
+
+    for key, default in DEFAULT_VIEW_SETTINGS.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        choices = VIEW_SETTING_CHOICES.get(key)
+        if choices is not None:
+            if isinstance(value, str) and value in choices:
+                settings[key] = value
+            continue
+        if isinstance(default, bool):
+            settings[key] = bool(value)
+    return settings
+
+
+def load_view_settings(config_path=None, cfg=None) -> dict:
+    """Return persisted TUI view settings merged over the defaults."""
+    if cfg is None:
+        cfg = load_config(config_path)
+    return normalize_view_settings((cfg or {}).get("view"))
+
+
+def _render_view_block(settings) -> str:
+    lines = ["view:"]
+    for key in DEFAULT_VIEW_SETTINGS:
+        value = settings[key]
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        lines.append(f"  {key}: {value}")
+    return "\n".join(lines) + "\n"
+
+
+def _is_block_continuation(line: str) -> bool:
+    """True while a line still belongs to the current top-level block."""
+    return not line.strip() or line[0].isspace() or line.lstrip().startswith("#")
+
+
+def _replace_top_level_block(text: str, key: str, block: str) -> str:
+    """Swap one top-level YAML block, leaving every other line untouched.
+
+    The view section is rewritten on each key press, so a full re-serialization
+    would silently drop the comments users keep next to their server entries.
+    """
+    lines = text.splitlines(keepends=True)
+
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith(f"{key}:"):
+            start = index
+            break
+
+    if start is None:
+        insert_at = len(lines)
+        for index, line in enumerate(lines):
+            if line.startswith("servers:"):
+                insert_at = index
+                # Keep comments that introduce the servers section with it.
+                while insert_at > 0 and lines[insert_at - 1].lstrip().startswith("#"):
+                    insert_at -= 1
+                break
+        head = "".join(lines[:insert_at])
+        if head and not head.endswith("\n"):
+            head += "\n"
+        tail = "".join(lines[insert_at:])
+        return f"{head}{block}\n{tail}" if tail else f"{head}{block}"
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if not _is_block_continuation(lines[index]):
+            end = index
+            break
+    # Blank lines and comments trailing the block belong to whatever follows.
+    while end > start + 1 and (
+        not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")
+    ):
+        end -= 1
+    return "".join(lines[:start]) + block + "".join(lines[end:])
+
+
+def save_view_settings(settings, config_path=None) -> bool:
+    """Persist TUI view settings, keeping the rest of config.yml untouched."""
+    path = Path(config_path or get_config_path()).expanduser()
+    settings = normalize_view_settings(settings)
+    try:
+        if not path.exists():
+            write_config({"view": settings}, path)
+            return True
+        text = path.read_text(encoding="utf-8")
+        updated = _replace_top_level_block(text, "view", _render_view_block(settings))
+        if updated != text:
+            _write_text_atomic(path, updated)
+        return True
+    except Exception:
+        return False
