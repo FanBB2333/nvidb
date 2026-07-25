@@ -1352,36 +1352,6 @@ class NVClientPool:
         "tx": "TX",
         "processes": "Processes",
     }
-    # Process panel columns, ordered from "always keep" to "drop first" when the
-    # terminal is too narrow to show every htop-style field.
-    PROCESS_TABLE_MIN_WIDTHS = {
-        "PID": 7,
-        "User": 8,
-        "Type": 4,
-        "VRAM": 9,
-        "CPU%": 5,
-        "MEM%": 5,
-        "RSS": 6,
-        "Time": 10,
-        "THR": 4,
-        "S": 3,
-        # Wide enough that narrow terminals drop secondary columns instead of
-        # cutting the command line down to a useless stub.
-        "Command": 40,
-    }
-    PROCESS_TABLE_IMPORTANCE = {
-        "PID": 0,
-        "Command": 1,
-        "User": 2,
-        "VRAM": 3,
-        "CPU%": 4,
-        "MEM%": 5,
-        "RSS": 6,
-        "Time": 7,
-        "S": 8,
-        "THR": 9,
-        "Type": 10,
-    }
     UNIFIED_SORT_MODES = ("node", "available", "utilization")
     UNIFIED_SORT_LABELS = {
         "node": "Node",
@@ -1432,20 +1402,32 @@ class NVClientPool:
         self.unified_sort_mode = settings["sort"]
         self.unified_filter_mode = settings["filter"]
         self.unified_selected_gpu = 0
+        self.unified_selected_gpu_key = None
         self.unified_show_processes = settings["processes"]
         self.unified_show_trends = settings["trends"]
         self.unified_group_by_node = settings["group_by_node"]
         self.hide_unsupported = settings["hide_unsupported"]
         self.mouse_enabled = settings["mouse"]
-        self.unified_focus = False
-        self.focus_selected_process = 0
-        self._focus_process_count = 0
+        # Detailed unified mode has two selectable panes.  The GPU cards stay
+        # on screen while the lower pane shows and controls their processes.
+        self.unified_active_pane = "gpu"
+        self.unified_selected_process = 0
+        self.unified_selected_process_pid = None
+        self._unified_process_count = 0
+        self.unified_command_scroll = 0
+        self._unified_command_line_count = 0
+        self._unified_command_page_size = 0
+        self._pending_process_signal = None
+        self._process_action_notice = None
         self._click_targets = {}
+        self._click_regions = []
         self._body_click_targets = {}
+        self._body_click_regions = []
         self._unified_page_start = 0
         self._unified_gpu_count = 0
         self._unified_page_size = 1
         self._unified_gpu_history = {}
+        self._unified_process_history = {}
         self._unified_history_lock = threading.Lock()
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
         self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
@@ -1532,12 +1514,13 @@ class NVClientPool:
         global_user_memory = {}
         process_details_by_client = {}
         # The htop-style process panel needs one extra `ps` call per host, so it
-        # is only collected while that panel is on screen.
+        # is only collected while that panel is on screen. Detailed mode always
+        # includes the panel; single-line mode keeps the explicit toggle.
         want_process_details = (
             getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED
             and (
-                bool(getattr(self, "unified_show_processes", False))
-                or bool(getattr(self, "unified_focus", False))
+                bool(getattr(self, "unified_detailed", False))
+                or bool(getattr(self, "unified_show_processes", False))
             )
         )
         for idx, client in enumerate(self.pool):
@@ -2065,11 +2048,13 @@ class NVClientPool:
         except OSError:
             terminal_height = 24
 
-        show_processes = bool(getattr(self, "unified_show_processes", False))
+        show_processes = bool(
+            detailed or getattr(self, "unified_show_processes", False)
+        )
         show_trends = bool(getattr(self, "unified_show_trends", False))
         extra_lines = (
-            (8 if show_processes else 0)
-            + (5 if show_trends else 0)
+            (18 if show_processes else 0)
+            + (6 if show_trends else 0)
             # Room for the "filter is hiding GPUs" warning line.
             + (1 if self._get_unified_filter_mode() != "all" else 0)
         )
@@ -2077,22 +2062,48 @@ class NVClientPool:
         # detailed view (the block reuses one card border), one otherwise.
         group_count = 0
         if (
-            self._unified_grouping_active()
+            not detailed
+            and self._unified_grouping_active()
             and not table.empty
             and "Node" in table.columns
         ):
             group_count = len(table[["Node", "Hostname"]].drop_duplicates())
         if detailed:
             reserved_lines = 10 + extra_lines + group_count * 2
-            page_size = max(1, (terminal_height - reserved_lines) // 4)
+            page_size = max(1, (terminal_height - reserved_lines) // 5)
         else:
             reserved_lines = 12 + extra_lines + group_count
             page_size = max(1, terminal_height - reserved_lines)
 
         total = len(table)
         selected = int(getattr(self, "unified_selected_gpu", 0) or 0)
+        selected_key = getattr(self, "unified_selected_gpu_key", None)
+        if selected_key is not None:
+            for position, (_, row) in enumerate(table.iterrows()):
+                if self._unified_gpu_history_key(row) == selected_key:
+                    selected = position
+                    break
         selected = max(0, min(selected, max(0, total - 1)))
         self.unified_selected_gpu = selected
+        new_selected_key = (
+            self._unified_gpu_history_key(table.iloc[selected])
+            if total
+            else None
+        )
+        self.unified_selected_gpu_key = new_selected_key
+        if (
+            selected_key is not None
+            and new_selected_key != selected_key
+        ):
+            self.unified_selected_process = 0
+            self.unified_selected_process_pid = None
+            self.unified_command_scroll = 0
+            if getattr(self, "_pending_process_signal", None):
+                self._pending_process_signal = None
+                self._set_process_action_notice(
+                    "Selected GPU changed; signal cancelled",
+                    "yellow",
+                )
         self._unified_gpu_count = total
         self._unified_page_size = page_size
 
@@ -2108,18 +2119,21 @@ class NVClientPool:
         page_status = f"Rows {page_start + 1}-{page_end}/{total}"
         return visible_table, selected_on_page, page_status
 
-    def _get_unified_process_details(self, raw_stats_by_client, selected_row):
-        """Return cached process rows for one selected unified GPU."""
+    def _unified_client_index_for_row(self, selected_row):
+        """Resolve a unified-table row back to its local/remote client."""
         if selected_row is None:
-            return []
+            return None
         node = str(selected_row.get("Node", ""))
         hostname = str(selected_row.get("Hostname", ""))
-        client_index = None
         for index in range(len(self.pool)):
             client_node, client_hostname = self._client_table_identity(index)
             if client_node == node and client_hostname == hostname:
-                client_index = index
-                break
+                return index
+        return None
+
+    def _get_unified_process_details(self, raw_stats_by_client, selected_row):
+        """Return cached process rows for one selected unified GPU."""
+        client_index = self._unified_client_index_for_row(selected_row)
         if client_index is None:
             return []
 
@@ -2144,6 +2158,22 @@ class NVClientPool:
             if isinstance(process, dict)
         ]
 
+    def _get_sorted_unified_processes(
+        self,
+        raw_stats_by_client,
+        selected_row,
+    ):
+        return sorted(
+            self._get_unified_process_details(
+                raw_stats_by_client,
+                selected_row,
+            ),
+            key=lambda process: (
+                self._extract_metric_number(process.get("used_memory")) or 0
+            ),
+            reverse=True,
+        )
+
     @staticmethod
     def _format_memory_kb(value):
         """Render a KiB reading from `ps` as a compact K/M/G string."""
@@ -2160,99 +2190,1007 @@ class NVClientPool:
         return f"{kib:.0f}K"
 
     @staticmethod
-    def _format_process_percent(value):
-        if value is None:
-            return "-"
+    def _process_metric_color(value, warning, critical, default="green"):
         try:
-            return f"{float(value):.1f}"
+            number = float(value)
         except (TypeError, ValueError):
-            return "-"
+            return None
+        if number >= critical:
+            return "red"
+        if number >= warning:
+            return "yellow"
+        return default
 
-    def _format_process_row(self, process):
-        """Build one htop-style row for the unified process panel."""
-        threads = process.get("threads")
+    @staticmethod
+    def _process_accent_color(process):
+        palette = ("cyan", "green", "magenta", "blue", "yellow")
         try:
-            threads_display = "-" if threads is None else str(int(threads))
+            index = int(process.get("pid", 0)) % len(palette)
         except (TypeError, ValueError):
-            threads_display = "-"
-        return {
-            "PID": process.get("pid", "N/A"),
-            "User": process.get("username", "N/A"),
-            "Type": process.get("type", "N/A"),
-            "VRAM": process.get("used_memory", "N/A"),
-            "CPU%": self._format_process_percent(process.get("cpu_percent")),
-            "MEM%": self._format_process_percent(process.get("mem_percent")),
-            "RSS": self._format_memory_kb(process.get("rss_kb")),
-            "Time": process.get("elapsed") or "-",
-            "THR": threads_display,
-            "S": process.get("state") or "-",
-            "Command": process.get("command") or process.get("process_name", "N/A"),
-        }
+            index = 0
+        return palette[index]
+
+    def _format_unified_process_history(
+        self,
+        selected_row,
+        process,
+        width,
+        *,
+        include_gpu=False,
+    ):
+        """Return plain/styled rows for the selected process history."""
+        history = self._get_unified_process_history(selected_row, process)
+        gpu_history = (
+            self._get_unified_gpu_history(selected_row)
+            if include_gpu
+            else []
+        )
+        title = (
+            f"History  GPU {len(gpu_history)}/60 | process {len(history)}/60"
+            if include_gpu
+            else f"History  {len(history)}/60 samples"
+        )
+        if not history and not gpu_history:
+            plain = f"{title} | waiting for samples"[:width]
+            return [(plain, colored(plain, "magenta"))]
+
+        rows = [(title, colored(title, "magenta", attrs=["bold"]))]
+
+        def metric_row(
+            label,
+            key,
+            formatter,
+            maximum,
+            color,
+            samples,
+            *,
+            minimum=0,
+        ):
+            values = [sample.get(key) for sample in samples]
+            known = [float(value) for value in values if value is not None]
+            if not known:
+                plain = f"{label:<7}N/A"
+                return plain, colored(plain, color)
+
+            current = known[-1]
+            average = sum(known) / len(known)
+            peak = max(known)
+            suffix = (
+                f"now {formatter(current)}  avg {formatter(average)}  "
+                f"max {formatter(peak)}"
+            )
+            spark_width = max(6, width - 8 - len(suffix) - 1)
+            spark = self._sparkline(
+                values,
+                minimum=minimum,
+                maximum=max(maximum, peak),
+                width=spark_width,
+            )
+            plain = f"{label:<7}{spark} {suffix}"
+            if len(plain) > width:
+                plain = plain[: max(0, width - 2)] + ".."
+                return plain, colored(plain, color)
+            styled = (
+                colored(f"{label:<7}", color, attrs=["bold"])
+                + colored(spark, color)
+                + f" {suffix}"
+            )
+            return plain, styled
+
+        if include_gpu:
+            rows.extend(
+                [
+                    metric_row(
+                        "GPU U",
+                        "utilization",
+                        lambda value: f"{value:.0f}%",
+                        100,
+                        "green",
+                        gpu_history,
+                    ),
+                    metric_row(
+                        "GPU M",
+                        "memory",
+                        lambda value: f"{value:.0f}%",
+                        100,
+                        "yellow",
+                        gpu_history,
+                    ),
+                    metric_row(
+                        "GPU T",
+                        "temperature",
+                        lambda value: f"{value:.0f}C",
+                        100,
+                        "red",
+                        gpu_history,
+                        minimum=20,
+                    ),
+                ]
+            )
+
+        rss_values = [
+            float(sample["rss_kb"])
+            for sample in history
+            if sample.get("rss_kb") is not None
+        ]
+        rows.extend(
+            [
+                metric_row(
+                    "CPU",
+                    "cpu_percent",
+                    lambda value: f"{value:.1f}%",
+                    100,
+                    "green",
+                    history,
+                ),
+                metric_row(
+                    "VRAM",
+                    "gpu_vram_percent",
+                    lambda value: f"{value:.1f}%",
+                    100,
+                    "yellow",
+                    history,
+                ),
+                metric_row(
+                    "RAM",
+                    "mem_percent",
+                    lambda value: f"{value:.1f}%",
+                    100,
+                    "magenta",
+                    history,
+                ),
+                metric_row(
+                    "RSS",
+                    "rss_kb",
+                    self._format_memory_kb,
+                    max([1] + rss_values),
+                    "cyan",
+                    history,
+                ),
+            ]
+        )
+        return rows
 
     def _format_unified_process_details(
         self,
         raw_stats_by_client,
         selected_row,
+        *,
+        height_budget=None,
+        process_line_map=None,
+        command_line_map=None,
+        action_regions=None,
     ):
-        """Format a width-aware process panel for the selected GPU."""
+        """Format the selectable htop-style process pane below GPU cards."""
         if selected_row is None:
+            self._unified_process_count = 0
+            self._unified_command_line_count = 0
+            self._unified_command_page_size = 0
             return "Process details: no GPU selected"
 
-        node = selected_row.get("Node", "N/A")
-        hostname = selected_row.get("Hostname", "N/A")
-        gpu_index = selected_row.get("GPU", "N/A")
-        title = f"Processes: {node} ({hostname}) GPU {gpu_index}"
-        processes = self._get_unified_process_details(
-            raw_stats_by_client,
-            selected_row,
-        )
-        if not processes:
-            return f"{title}\nNo active GPU processes"
-
-        processes = sorted(
-            processes,
-            key=lambda process: (
-                self._extract_metric_number(process.get("used_memory")) or 0
-            ),
-            reverse=True,
-        )
         try:
             terminal_size = os.get_terminal_size()
             terminal_width, terminal_height = terminal_size.columns, terminal_size.lines
         except OSError:
             terminal_width, terminal_height = 80, 24
-        max_processes = max(1, min(5, terminal_height // 6))
-        if getattr(self, "unified_show_trends", False):
-            max_processes = min(max_processes, 2)
-        visible_processes = processes[:max_processes]
-        process_table = pd.DataFrame(
-            [self._format_process_row(process) for process in visible_processes]
+        width = max(20, terminal_width)
+        inner_width = max(1, width - 4)
+        height_budget = max(
+            8,
+            int(height_budget if height_budget is not None else terminal_height),
         )
-        rendered_table = self._format_fixed_width_table(
-            process_table,
-            border=True,
-            min_width_overrides=self.PROCESS_TABLE_MIN_WIDTHS,
-            importance_overrides=self.PROCESS_TABLE_IMPORTANCE,
-            must_keep_columns=("PID", "User", "VRAM", "Command"),
-            left_align_columns=("Command",),
-            fill_columns=("Command",),
+        compact_layout = (
+            terminal_height < 28
+            or height_budget <= 16
+            or (
+                width < 70
+                and height_budget < 24
+                and bool(getattr(self, "unified_show_trends", False))
+            )
         )
-        panel = [title, rendered_table]
-        # A table cell rarely fits a training command line, so spell the longest
-        # ones out below the table where the full terminal width is available.
-        for process in visible_processes:
-            command = str(
-                process.get("command") or process.get("process_name") or ""
-            ).strip()
-            if not command or command in rendered_table:
-                continue
-            panel.append(f"  {process.get('pid', 'N/A')}: {command}"[:terminal_width])
-            if len(panel) >= 4:
+        compact_process_list = terminal_height < 36 or height_budget < 20
+        ultra_compact = height_budget < 12
+        compact_history = (
+            terminal_height < 36
+            and bool(getattr(self, "unified_show_trends", False))
+        )
+        process_line_map = process_line_map if process_line_map is not None else {}
+        command_line_map = command_line_map if command_line_map is not None else {}
+        action_regions = action_regions if action_regions is not None else []
+
+        def trim(text, limit):
+            text = str(text)
+            if len(text) <= limit:
+                return text
+            if limit <= 2:
+                return text[:limit]
+            return text[: limit - 2] + ".."
+
+        def panel_rule(label, *, bottom=False):
+            left, right = ("└", "┘") if bottom else ("├", "┤")
+            if not label:
+                plain = left + "─" * max(0, width - 2) + right
+                return colored(plain, "cyan", attrs=["dark"])
+            label = trim(f"─ {label} ", max(0, width - 2))
+            plain = left + label + "─" * max(0, width - 2 - len(label)) + right
+            return colored(plain, "cyan", attrs=["dark"])
+
+        def panel_line(plain, styled=None):
+            original_plain = str(plain)
+            plain = trim(original_plain, inner_width)
+            if styled is None or plain != original_plain:
+                styled = plain
+            padding = " " * max(0, inner_width - len(plain))
+            return (
+                colored("│ ", "cyan", attrs=["dark"])
+                + (styled if styled is not None else plain)
+                + padding
+                + colored(" │", "cyan", attrs=["dark"])
+            )
+
+        def pack_fields(label, fields):
+            """Pack colored detail fields onto as many panel rows as needed."""
+            prefix = f"{label:<9}"
+            continuation = " " * len(prefix)
+            packed = []
+            current = []
+            current_length = len(prefix)
+            for text, color in fields:
+                separator_length = 3 if current else 0
+                if (
+                    current
+                    and current_length + separator_length + len(text) > inner_width
+                ):
+                    packed.append((prefix, current))
+                    prefix = continuation
+                    current = []
+                    current_length = len(prefix)
+                    separator_length = 0
+                current.append((text, color))
+                current_length += separator_length + len(text)
+            packed.append((prefix, current))
+
+            rows = []
+            for row_prefix, row_fields in packed:
+                plain = row_prefix + " | ".join(
+                    text for text, _color in row_fields
+                )
+                styled = colored(
+                    row_prefix,
+                    "cyan",
+                    attrs=["bold"] if row_prefix.strip() else None,
+                ) + " | ".join(
+                    colored(text, color, attrs=["bold"])
+                    if color
+                    else text
+                    for text, color in row_fields
+                )
+                rows.append((plain, styled))
+            return rows
+
+        processes = self._get_sorted_unified_processes(
+            raw_stats_by_client,
+            selected_row,
+        )
+        self._unified_process_count = len(processes)
+        selected_index = int(
+            getattr(self, "unified_selected_process", 0) or 0
+        )
+        selected_pid = getattr(self, "unified_selected_process_pid", None)
+        if selected_pid is not None:
+            for index, process in enumerate(processes):
+                if str(process.get("pid", "")) == str(selected_pid):
+                    selected_index = index
+                    break
+        selected_index = max(
+            0,
+            min(selected_index, max(0, len(processes) - 1)),
+        )
+        self.unified_selected_process = selected_index
+        self.unified_selected_process_pid = (
+            str(processes[selected_index].get("pid", ""))
+            if processes
+            else None
+        )
+        if (
+            selected_pid is not None
+            and self.unified_selected_process_pid != str(selected_pid)
+        ):
+            self.unified_command_scroll = 0
+            pending = getattr(self, "_pending_process_signal", None)
+            if pending:
+                self._pending_process_signal = None
+                self._set_process_action_notice(
+                    "Selected process changed; signal cancelled",
+                    "yellow",
+                )
+
+        capacity = self._unified_gpu_capacity(selected_row)
+        node = selected_row.get("Node", "N/A")
+        hostname = selected_row.get("Hostname", "N/A")
+        gpu_index = selected_row.get("GPU", "N/A")
+        pane_focused = getattr(self, "unified_active_pane", "gpu") == "process"
+        focus_label = "[FOCUS]" if pane_focused else "[Tab focus]"
+        title = (
+            f"Processes | {node} ({hostname}) | GPU {gpu_index} | "
+            f"{focus_label} | {len(processes)} active"
+        )
+        top_label = trim(f"─ {title} ", max(0, width - 2))
+        top = (
+            "┌"
+            + top_label
+            + "─" * max(0, width - 2 - len(top_label))
+            + "┐"
+        )
+        lines = [colored(top, "cyan", attrs=["bold"] if pane_focused else None)]
+
+        total_process_vram = sum(
+            self._extract_metric_number(process.get("used_memory")) or 0
+            for process in processes
+        )
+        total_gpu_mib = capacity.get("total_mib")
+        vram_summary = f"{total_process_vram / 1024:.1f} GiB"
+        if total_gpu_mib:
+            vram_summary += (
+                f" ({total_process_vram / total_gpu_mib * 100:.1f}% of GPU VRAM)"
+            )
+        visible_summary = (
+            f"{len(processes)} active | process VRAM {vram_summary}"
+            + (
+                f" | selected {selected_index + 1}/{len(processes)}"
+                if processes
+                else ""
+            )
+        )
+        if terminal_height >= 28:
+            lines.append(
+                panel_line(
+                    visible_summary,
+                    colored(visible_summary, "cyan", attrs=["bold"]),
+                )
+            )
+
+        if not processes:
+            self._unified_command_line_count = 0
+            self._unified_command_page_size = 0
+            self.unified_command_scroll = 0
+            lines.append(panel_rule("PROCESS LIST"))
+            empty = "No active GPU processes"
+            lines.append(panel_line(empty, colored(empty, "green")))
+            lines.append(panel_rule("ACTIONS"))
+            history_label = (
+                "[t] History ON"
+                if getattr(self, "unified_show_trends", False)
+                else "[t] History OFF"
+            )
+            action_line_index = len(lines)
+            action_plain = f"Actions  {history_label}"
+            action_start = action_plain.index(history_label)
+            action_regions.append(
+                (
+                    action_line_index,
+                    2 + action_start,
+                    2 + action_start + len(history_label) - 1,
+                    ("toggle_trends", None),
+                )
+            )
+            lines.append(
+                panel_line(
+                    action_plain,
+                    "Actions  " + colored(history_label, "magenta", attrs=["bold"]),
+                )
+            )
+            notice = getattr(self, "_process_action_notice", None)
+            if notice and notice.get("expires_at", 0) > time.monotonic():
+                message = str(notice.get("message", ""))
+                lines.append(
+                    panel_line(
+                        message,
+                        colored(
+                            message,
+                            notice.get("color") or "white",
+                            attrs=["bold"],
+                        ),
+                    )
+                )
+            elif notice:
+                self._process_action_notice = None
+            lines.append(panel_rule("", bottom=True))
+            return "\n".join(lines)
+
+        column_specs = [
+            {"key": "sel", "label": "", "minimum": 1, "align": "left"},
+            {"key": "pid", "label": "PID", "minimum": 7, "align": "right"},
+            {"key": "user", "label": "USER", "minimum": 9, "align": "left"},
+            {"key": "vram", "label": "VRAM", "minimum": 10, "align": "right"},
+            {"key": "gpu", "label": "VRAM%", "minimum": 6, "align": "right"},
+            {"key": "cpu", "label": "CPU%", "minimum": 6, "align": "right"},
+            {"key": "mem", "label": "MEM%", "minimum": 6, "align": "right"},
+            {"key": "rss", "label": "RSS", "minimum": 7, "align": "right"},
+            {"key": "time", "label": "TIME", "minimum": 9, "align": "right"},
+            {"key": "state", "label": "S", "minimum": 3, "align": "left"},
+            {
+                "key": "command",
+                "label": "COMMAND",
+                "minimum": 12,
+                "align": "left",
+            },
+        ]
+
+        def columns_width(columns):
+            return sum(column["minimum"] for column in columns) + max(
+                0, len(columns) - 1
+            )
+
+        columns = list(column_specs)
+        for optional_key in (
+            "state",
+            "time",
+            "rss",
+            "mem",
+            "user",
+            "gpu",
+            "cpu",
+            "vram",
+        ):
+            if columns_width(columns) <= inner_width:
                 break
-        hidden_count = len(processes) - len(visible_processes)
-        if hidden_count > 0:
-            panel.append(f"+ {hidden_count} more processes")
-        return "\n".join(panel)
+            columns = [
+                column for column in columns if column["key"] != optional_key
+            ]
+        if columns_width(columns) > inner_width:
+            for column in columns:
+                if column["key"] == "pid":
+                    column["minimum"] = 5
+                elif column["key"] == "command":
+                    column["minimum"] = max(4, inner_width - 8)
+
+        extra_width = max(0, inner_width - columns_width(columns))
+        for column in columns:
+            column["width"] = column["minimum"]
+            if column["key"] == "command":
+                column["width"] += extra_width
+
+        def padded_cell(value, column):
+            value = trim(value, column["width"])
+            if column["align"] == "right":
+                return value.rjust(column["width"])
+            return value.ljust(column["width"])
+
+        def process_cells(process, index):
+            vram_mib = self._extract_metric_number(process.get("used_memory"))
+            gpu_percent = (
+                vram_mib / total_gpu_mib * 100
+                if vram_mib is not None and total_gpu_mib
+                else None
+            )
+            cpu_percent = self._extract_metric_number(process.get("cpu_percent"))
+            mem_percent = self._extract_metric_number(process.get("mem_percent"))
+            rss_kb = self._extract_metric_number(process.get("rss_kb"))
+            state = str(process.get("state") or "-")
+            command = str(
+                process.get("command")
+                or process.get("process_name")
+                or "N/A"
+            )
+            values = {
+                "sel": ">" if index == selected_index else " ",
+                "pid": str(process.get("pid", "N/A")),
+                "user": str(process.get("username", "N/A")),
+                "vram": (
+                    f"{vram_mib:.0f} MiB" if vram_mib is not None else "-"
+                ),
+                "gpu": (
+                    f"{gpu_percent:.1f}" if gpu_percent is not None else "-"
+                ),
+                "cpu": (
+                    f"{cpu_percent:.1f}" if cpu_percent is not None else "-"
+                ),
+                "mem": (
+                    f"{mem_percent:.1f}" if mem_percent is not None else "-"
+                ),
+                "rss": self._format_memory_kb(rss_kb),
+                "time": str(process.get("elapsed") or "-"),
+                "state": state,
+                "command": command,
+            }
+            colors = {
+                "sel": "cyan",
+                "pid": self._process_accent_color(process),
+                "user": "magenta",
+                "vram": self._process_metric_color(
+                    gpu_percent, 20, 50, default="green"
+                ),
+                "gpu": self._process_metric_color(
+                    gpu_percent, 20, 50, default="green"
+                ),
+                "cpu": self._process_metric_color(
+                    cpu_percent, 50, 100, default="green"
+                ),
+                "mem": self._process_metric_color(
+                    mem_percent, 10, 25, default="green"
+                ),
+                "rss": "cyan",
+                "time": "blue",
+                "state": (
+                    "green"
+                    if state.startswith("R")
+                    else "red"
+                    if state.startswith(("D", "Z", "X"))
+                    else "blue"
+                ),
+                "command": self._process_accent_color(process),
+            }
+            return values, colors
+
+        header_plain = " ".join(
+            padded_cell(column["label"], column) for column in columns
+        )
+        header_styled = colored(header_plain, "white", attrs=["bold", "dark"])
+        if not ultra_compact:
+            if compact_layout:
+                lines.append(panel_line(header_plain, header_styled))
+            else:
+                lines.extend(
+                    [
+                        panel_rule("PROCESS LIST"),
+                        panel_line(header_plain, header_styled),
+                    ]
+                )
+
+        max_visible = (
+            1
+            if compact_process_list
+            else max(
+                1,
+                min(6, terminal_height // 8, max(1, height_budget // 5)),
+            )
+        )
+        start = max(
+            0,
+            min(
+                selected_index - max_visible // 2,
+                max(0, len(processes) - max_visible),
+            ),
+        )
+        end = min(len(processes), start + max_visible)
+        for index in range(start, end):
+            process = processes[index]
+            values, colors = process_cells(process, index)
+            cells = [padded_cell(values[column["key"]], column) for column in columns]
+            plain = " ".join(cells)
+            if index == selected_index:
+                styled = colored(
+                    plain,
+                    "black",
+                    "on_cyan",
+                    attrs=["bold"],
+                )
+            else:
+                styled = " ".join(
+                    colored(
+                        cell,
+                        colors.get(column["key"]),
+                        attrs=["bold"]
+                        if column["key"] in {"pid", "command"}
+                        else None,
+                    )
+                    if colors.get(column["key"])
+                    else cell
+                    for cell, column in zip(cells, columns)
+                )
+            process_line_map[len(lines)] = index
+            lines.append(panel_line(plain, styled))
+
+        if terminal_height >= 28 and (start > 0 or end < len(processes)):
+            scroll_status = f"Rows {start + 1}-{end}/{len(processes)} | wheel or j/k"
+            lines.append(panel_line(scroll_status, colored(scroll_status, "blue")))
+
+        process = processes[selected_index]
+        selected_pid = process.get("pid", "N/A")
+        if not compact_history:
+            selected_label = f"SELECTED PROCESS | PID {selected_pid}"
+            if compact_layout:
+                selected_label += (
+                    f" | {process.get('username', 'N/A')}"
+                    f" | {process.get('type', 'N/A')}"
+                    f" | {process.get('state') or '-'}"
+                )
+            lines.append(panel_rule(selected_label))
+        vram_mib = self._extract_metric_number(process.get("used_memory"))
+        gpu_percent = (
+            vram_mib / total_gpu_mib * 100
+            if vram_mib is not None and total_gpu_mib
+            else None
+        )
+        gpu_used_mib = capacity.get("used_mib")
+        used_share = (
+            vram_mib / gpu_used_mib * 100
+            if vram_mib is not None and gpu_used_mib
+            else None
+        )
+        cpu_percent = self._extract_metric_number(process.get("cpu_percent"))
+        mem_percent = self._extract_metric_number(process.get("mem_percent"))
+        usage_fields = [
+            (
+                (
+                    f"VRAM {vram_mib:,.0f} MiB"
+                    if vram_mib is not None
+                    else "VRAM N/A"
+                ),
+                self._process_metric_color(gpu_percent, 20, 50, "green"),
+            ),
+            (
+                (
+                    f"{gpu_percent:.1f}% of GPU VRAM"
+                    if gpu_percent is not None
+                    else "% of GPU VRAM N/A"
+                ),
+                "yellow",
+            ),
+            (
+                (
+                    f"{used_share:.1f}% of used VRAM"
+                    if used_share is not None
+                    else "% of used VRAM N/A"
+                ),
+                "yellow",
+            ),
+            (
+                (
+                    f"CPU {cpu_percent:.1f}%"
+                    if cpu_percent is not None
+                    else "CPU N/A"
+                ),
+                self._process_metric_color(cpu_percent, 50, 100, "green"),
+            ),
+            (
+                (
+                    f"Host MEM {mem_percent:.1f}%"
+                    if mem_percent is not None
+                    else "Host MEM N/A"
+                ),
+                self._process_metric_color(mem_percent, 10, 25, "green"),
+            ),
+            (
+                f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
+                "cyan",
+            ),
+        ]
+        if compact_layout:
+            if vram_mib is not None:
+                compact_vram = f"VRAM {vram_mib:,.0f}M"
+            else:
+                compact_vram = "VRAM N/A"
+            usage_fields = [
+                (
+                    compact_vram,
+                    self._process_metric_color(
+                        gpu_percent,
+                        20,
+                        50,
+                        "green",
+                    ),
+                ),
+            ]
+            if gpu_percent is not None:
+                usage_fields.append((f"{gpu_percent:.1f}% total", "yellow"))
+            if used_share is not None:
+                usage_fields.append((f"{used_share:.1f}% used", "yellow"))
+            usage_fields.extend(
+                [
+                    (
+                        (
+                            f"CPU {cpu_percent:.1f}%"
+                            if cpu_percent is not None
+                            else "CPU N/A"
+                        ),
+                        self._process_metric_color(
+                            cpu_percent,
+                            50,
+                            100,
+                            "green",
+                        ),
+                    ),
+                    (
+                        (
+                            f"MEM {mem_percent:.1f}%"
+                            if mem_percent is not None
+                            else "MEM N/A"
+                        ),
+                        self._process_metric_color(
+                            mem_percent,
+                            10,
+                            25,
+                            "green",
+                        ),
+                    ),
+                    (
+                        f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
+                        "cyan",
+                    ),
+                ]
+            )
+        threads = process.get("threads")
+        try:
+            threads_display = (
+                "-"
+                if threads is None
+                else str(int(float(threads)))
+            )
+        except (TypeError, ValueError):
+            threads_display = str(threads or "-")
+        detail_fields = [
+            (f"User {process.get('username', 'N/A')}", "magenta"),
+            (f"Type {process.get('type', 'N/A')}", "blue"),
+            (f"State {process.get('state') or '-'}", "green"),
+            (f"Threads {threads_display}", "cyan"),
+            (f"Elapsed {process.get('elapsed') or '-'}", "blue"),
+        ]
+        if not compact_history:
+            for plain, styled in pack_fields("Usage", usage_fields):
+                process_line_map[len(lines)] = selected_index
+                lines.append(panel_line(plain, styled))
+            if not compact_layout:
+                for plain, styled in pack_fields("Details", detail_fields):
+                    process_line_map[len(lines)] = selected_index
+                    lines.append(panel_line(plain, styled))
+
+        command = str(
+            process.get("command") or process.get("process_name") or "N/A"
+        ).strip()
+        command_prefix = "Command  "
+        command_width = max(1, inner_width - len(command_prefix))
+        all_command_parts = textwrap.wrap(
+            command,
+            width=command_width,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or ["N/A"]
+        history_rows = (
+            self._format_unified_process_history(
+                selected_row,
+                process,
+                inner_width,
+                include_gpu=compact_history,
+            )
+            if getattr(self, "unified_show_trends", False)
+            else []
+        )
+        if compact_history and ultra_compact:
+            compact_labels = ("History", "GPU U", "CPU", "VRAM", "RSS")
+            history_rows = [
+                row
+                for row in history_rows
+                if row[0].lstrip().startswith(compact_labels)
+            ]
+        history_rule_lines = (
+            0
+            if compact_history and ultra_compact
+            else (1 if history_rows else 0)
+        )
+        reserved_after_command = (
+            history_rule_lines
+            + len(history_rows)
+            + (0 if compact_layout else 1)
+            + 1  # action row
+            + 1  # confirmation or action notice
+            + 1  # bottom border
+        )
+        available_command_lines = max(
+            1,
+            height_budget - len(lines) - reserved_after_command,
+        )
+        command_page_cap = (
+            5
+            if compact_layout
+            else max(5, min(12, height_budget // 2))
+        )
+        command_page_size = (
+            0
+            if compact_history
+            else min(
+                len(all_command_parts),
+                command_page_cap,
+                available_command_lines,
+            )
+        )
+        command_start = (
+            int(getattr(self, "unified_command_scroll", 0) or 0)
+            if 0 < command_page_size < len(all_command_parts)
+            else 0
+        )
+        command_start = max(
+            0,
+            min(
+                command_start,
+                max(0, len(all_command_parts) - command_page_size),
+            ),
+        )
+        command_end = min(
+            len(all_command_parts),
+            command_start + command_page_size,
+        )
+        command_parts = all_command_parts[command_start:command_end]
+        self.unified_command_scroll = command_start
+        self._unified_command_line_count = len(all_command_parts)
+        self._unified_command_page_size = command_page_size
+        if not compact_history:
+            for command_index, command_part in enumerate(command_parts):
+                prefix = (
+                    command_prefix
+                    if command_index == 0
+                    else " " * len(command_prefix)
+                )
+                plain = prefix + command_part
+                styled = (
+                    colored(
+                        prefix,
+                        "cyan",
+                        attrs=["bold"] if command_index == 0 else None,
+                    )
+                    + colored(
+                        command_part,
+                        self._process_accent_color(process),
+                        attrs=["bold"] if command_index == 0 else None,
+                    )
+                )
+                process_line_map[len(lines)] = selected_index
+                command_line_map[len(lines)] = selected_index
+                lines.append(panel_line(plain, styled))
+
+        if history_rows:
+            if history_rule_lines:
+                lines.append(panel_rule("SELECTED PROCESS HISTORY"))
+            for plain, styled in history_rows:
+                lines.append(panel_line(plain, styled))
+
+        if not compact_layout:
+            lines.append(panel_rule("ACTIONS"))
+        command_paged = (
+            not compact_history
+            and command_page_size < len(all_command_parts)
+        )
+        history_enabled = bool(getattr(self, "unified_show_trends", False))
+        compact_actions = inner_width < 70
+        tiny_actions = inner_width < 56
+        action_separator = " " if compact_actions else "  "
+        history_action_label = (
+            f"t:{1 if history_enabled else 0}"
+            if tiny_actions
+            else f"[t]H:{'ON' if history_enabled else 'OFF'}"
+            if compact_actions
+            else (
+                f"[t]Hist {'ON' if history_enabled else 'OFF'}"
+                if command_paged
+                else f"[t] History {'ON' if history_enabled else 'OFF'}"
+            )
+        )
+        action_segments = []
+        if not compact_actions:
+            action_segments.append(("Actions", None, None))
+        action_segments.extend(
+            [
+                (
+                    (
+                        "i:INT"
+                        if tiny_actions
+                        else "[i]INT"
+                        if compact_actions
+                        else "[i] INT"
+                    ),
+                    "cyan",
+                    ("signal", "INT"),
+                ),
+                (
+                    (
+                        "T:TERM"
+                        if tiny_actions
+                        else "[T]TERM"
+                        if compact_actions
+                        else "[T] TERM"
+                    ),
+                    "yellow",
+                    ("signal", "TERM"),
+                ),
+                (
+                    (
+                        "K:KILL"
+                        if tiny_actions
+                        else "[K]KILL"
+                        if compact_actions
+                        else "[K] KILL"
+                    ),
+                    "red",
+                    ("signal", "KILL"),
+                ),
+            ]
+        )
+        action_segments.append(
+            (
+                history_action_label,
+                "magenta",
+                ("toggle_trends", None),
+            )
+        )
+        if command_paged:
+            if tiny_actions:
+                action_segments.extend(
+                    [
+                        ("<", "blue", ("command_scroll", -1)),
+                        (
+                            f"{command_start + 1}/{len(all_command_parts)}",
+                            "blue",
+                            None,
+                        ),
+                        (">", "blue", ("command_scroll", 1)),
+                    ]
+                )
+            else:
+                action_segments.extend(
+                    [
+                        ("[<]Cmd", "blue", ("command_scroll", -1)),
+                        (
+                            f"{command_start + 1}-{command_end}/"
+                            f"{len(all_command_parts)}",
+                            "blue",
+                            None,
+                        ),
+                        ("[>]Cmd", "blue", ("command_scroll", 1)),
+                    ]
+                )
+        action_plain = action_separator.join(
+            text for text, _color, _target in action_segments
+        )
+        action_styled = action_separator.join(
+            colored(text, color, attrs=["bold"]) if color else text
+            for text, color, _target in action_segments
+        )
+        action_line_index = len(lines)
+        search_from = 0
+        for text, _color, target in action_segments:
+            start_column = action_plain.find(text, search_from)
+            search_from = start_column + len(text)
+            if target and start_column < inner_width:
+                action_regions.append(
+                    (
+                        action_line_index,
+                        2 + start_column,
+                        2 + min(inner_width, start_column + len(text)) - 1,
+                        target,
+                    )
+                )
+        lines.append(panel_line(action_plain, action_styled))
+
+        pending = getattr(self, "_pending_process_signal", None)
+        if pending and pending.get("expires_at", 0) <= time.monotonic():
+            self._pending_process_signal = None
+            pending = None
+        if pending:
+            message = (
+                f"Confirm SIG{pending['signal']} -> PID {pending['pid']}: "
+                "Enter / same action again | Esc cancels"
+            )
+            lines.append(panel_line(message, colored(message, "yellow", attrs=["bold"])))
+        else:
+            notice = getattr(self, "_process_action_notice", None)
+            if notice and notice.get("expires_at", 0) > time.monotonic():
+                message = str(notice.get("message", ""))
+                lines.append(
+                    panel_line(
+                        message,
+                        colored(
+                            message,
+                            notice.get("color") or "white",
+                            attrs=["bold"],
+                        ),
+                    )
+                )
+            elif notice:
+                self._process_action_notice = None
+
+        lines.append(panel_rule("", bottom=True))
+        return "\n".join(lines)
 
     @staticmethod
     def _unified_gpu_history_key(row):
@@ -2261,6 +3199,10 @@ class NVClientPool:
             str(row.get("Hostname", "")),
             str(row.get("GPU", "")),
         )
+
+    @classmethod
+    def _unified_process_history_key(cls, row, process):
+        return cls._unified_gpu_history_key(row) + (str(process.get("pid", "")),)
 
     def _record_unified_gpu_history(
         self,
@@ -2273,10 +3215,11 @@ class NVClientPool:
         if table.empty:
             return
         timestamp = time.time() if timestamp is None else timestamp
-        samples = []
+        gpu_samples = []
+        process_samples = []
         for _, row in table.iterrows():
             capacity = self._unified_gpu_capacity(row)
-            samples.append(
+            gpu_samples.append(
                 (
                     self._unified_gpu_history_key(row),
                     {
@@ -2289,18 +3232,76 @@ class NVClientPool:
                     },
                 )
             )
+            total_mib = capacity.get("total_mib")
+            for process in self._get_unified_process_details(
+                raw_stats_by_client,
+                row,
+            ):
+                pid = str(process.get("pid", "")).strip()
+                if not pid or not pid.isdigit():
+                    continue
+                vram_mib = self._extract_metric_number(
+                    process.get("used_memory")
+                )
+                gpu_vram_percent = None
+                if (
+                    vram_mib is not None
+                    and total_mib is not None
+                    and total_mib > 0
+                ):
+                    gpu_vram_percent = vram_mib / total_mib * 100
+                process_samples.append(
+                    (
+                        self._unified_process_history_key(row, process),
+                        {
+                            "timestamp": timestamp,
+                            "cpu_percent": self._extract_metric_number(
+                                process.get("cpu_percent")
+                            ),
+                            "mem_percent": self._extract_metric_number(
+                                process.get("mem_percent")
+                            ),
+                            "rss_kb": self._extract_metric_number(
+                                process.get("rss_kb")
+                            ),
+                            "vram_mib": vram_mib,
+                            "gpu_vram_percent": gpu_vram_percent,
+                        },
+                    )
+                )
 
         if not hasattr(self, "_unified_history_lock"):
             self._unified_history_lock = threading.Lock()
         if not hasattr(self, "_unified_gpu_history"):
             self._unified_gpu_history = {}
+        if not hasattr(self, "_unified_process_history"):
+            self._unified_process_history = {}
         with self._unified_history_lock:
-            for key, sample in samples:
+            for key, sample in gpu_samples:
                 history = self._unified_gpu_history.setdefault(
                     key,
                     deque(maxlen=60),
                 )
                 history.append(sample)
+            for key, sample in process_samples:
+                history = self._unified_process_history.setdefault(
+                    key,
+                    deque(maxlen=60),
+                )
+                history.append(sample)
+
+            # PID churn should not grow a long-running TUI without bound. Keep
+            # exited-process history around for an hour so a just-finished job
+            # can still be inspected.
+            stale_before = timestamp - 3600
+            stale_keys = [
+                key
+                for key, history in self._unified_process_history.items()
+                if history
+                and history[-1].get("timestamp", timestamp) < stale_before
+            ]
+            for key in stale_keys:
+                self._unified_process_history.pop(key, None)
 
     def _get_unified_gpu_history(self, selected_row):
         if selected_row is None:
@@ -2310,6 +3311,17 @@ class NVClientPool:
             return []
         with self._unified_history_lock:
             return list(getattr(self, "_unified_gpu_history", {}).get(key, ()))
+
+    def _get_unified_process_history(self, selected_row, process):
+        if selected_row is None or process is None:
+            return []
+        key = self._unified_process_history_key(selected_row, process)
+        if not hasattr(self, "_unified_history_lock"):
+            return []
+        with self._unified_history_lock:
+            return list(
+                getattr(self, "_unified_process_history", {}).get(key, ())
+            )
 
     @staticmethod
     def _sparkline(values, *, minimum, maximum, width):
@@ -2322,7 +3334,7 @@ class NVClientPool:
         rendered = []
         for value in values:
             if value is None:
-                rendered.append("·")
+                rendered.append(".")
                 continue
             normalized = max(0.0, min(1.0, (float(value) - minimum) / span))
             index = min(len(blocks) - 1, int(round(normalized * (len(blocks) - 1))))
@@ -2345,11 +3357,11 @@ class NVClientPool:
         except OSError:
             terminal_width = 80
 
-        def metric_line(label, key, minimum, maximum, unit):
+        def metric_line(label, key, minimum, maximum, unit, color):
             values = [sample.get(key) for sample in history]
             known = [float(value) for value in values if value is not None]
             if not known:
-                return f"{label:<5} N/A"
+                return colored(f"{label:<5} N/A", color)
             current = known[-1]
             average = sum(known) / len(known)
             suffix = f"now {current:.0f}{unit} avg {average:.0f}{unit}"
@@ -2364,14 +3376,21 @@ class NVClientPool:
                 width=spark_width,
             )
             line = f"{label:<5} {spark} {suffix}"
-            return line[:terminal_width]
+            if len(line) > terminal_width:
+                return colored(line[:terminal_width], color)
+            return (
+                colored(f"{label:<5}", color, attrs=["bold"])
+                + " "
+                + colored(spark, color)
+                + f" {suffix}"
+            )
 
         return "\n".join(
             [
-                title[:terminal_width],
-                metric_line("Util", "utilization", 0, 100, "%"),
-                metric_line("VRAM", "memory", 0, 100, "%"),
-                metric_line("Temp", "temperature", 20, 100, "C"),
+                colored(title[:terminal_width], "cyan", attrs=["bold"]),
+                metric_line("Util", "utilization", 0, 100, "%", "green"),
+                metric_line("VRAM", "memory", 0, 100, "%", "yellow"),
+                metric_line("Temp", "temperature", 20, 100, "C", "red"),
             ]
         )
 
@@ -2383,7 +3402,7 @@ class NVClientPool:
         section_headers=None,
         row_line_map=None,
     ):
-        """Format each GPU as a readable, color-aware three-line card.
+        """Format each GPU as a readable, color-aware four-line card.
 
         `row_line_map` is filled in with line offset -> row index so a click
         anywhere on a card can be traced back to its GPU.
@@ -2443,6 +3462,16 @@ class NVClientPool:
                 return None
             used, total = value.split("/", 1)
             return get_memory_ratio_color(used, total)
+
+        def threshold_color(value, warning, critical, default="green"):
+            number = self._extract_metric_number(value)
+            if number is None:
+                return None
+            if number >= critical:
+                return "red"
+            if number >= warning:
+                return "yellow"
+            return default
 
         def make_field(key, text, minimum, color=None, bold=False):
             return {
@@ -2557,6 +3586,7 @@ class NVClientPool:
                 f"GPU {clean(row.get('GPU'))} [{status}]"
             )
             identity_fields = [
+                make_field("section", "GPU", 3, color="cyan", bold=True),
                 make_field(
                     "gpu",
                     gpu_badge,
@@ -2564,13 +3594,24 @@ class NVClientPool:
                     color=utilization_color,
                     bold=True,
                 ),
-                make_field("model", f"Model {clean(row.get('name'))}", 18),
-                make_field("host", clean(row.get("Hostname")), 13),
+                make_field(
+                    "model",
+                    f"Model {clean(row.get('name'))}",
+                    18,
+                    color="white",
+                ),
+                make_field(
+                    "host",
+                    clean(row.get("Hostname")),
+                    13,
+                    color="blue",
+                ),
             ]
 
             utilization_percent = self._extract_metric_number(row.get("util"))
             memory_percent = self._unified_gpu_capacity(row)["memory_percent"]
-            core_metric_fields = [
+            load_fields = [
+                make_field("section", "LOAD", 4, color="cyan", bold=True),
                 make_field(
                     "util",
                     f"Util {utilization}{progress_bar(utilization_percent)}",
@@ -2579,27 +3620,54 @@ class NVClientPool:
                     bold=True,
                 ),
                 make_field(
+                    "power",
+                    f"Power {add_unit(row.get('power'), 'W')}",
+                    18,
+                    color="magenta",
+                ),
+            ]
+            memory_fields = [
+                make_field("section", "MEM/TEMP", 8, color="cyan", bold=True),
+                make_field(
                     "vram",
                     f"VRAM {add_unit(row.get('memory[used/total]'), 'MiB')}"
                     f"{progress_bar(memory_percent, 8)}",
                     18,
                     color=memory_color(row.get("memory[used/total]")),
+                    bold=True,
                 ),
-                make_field("temp", f"Temp {clean(row.get('temp'))}", 9),
                 make_field(
-                    "power",
-                    f"Power {add_unit(row.get('power'), 'W')}",
-                    18,
+                    "temp",
+                    f"Temp {clean(row.get('temp'))}",
+                    9,
+                    color=threshold_color(row.get("temp"), 70, 85),
+                ),
+                make_field(
+                    "fan",
+                    f"Fan {clean(row.get('fan'))}",
+                    8,
+                    color="blue",
                 ),
             ]
             auxiliary_fields = [
-                make_field("fan", f"Fan {clean(row.get('fan'))}", 8),
-                make_field("rx", f"RX {clean(row.get('rx'))}", 11),
-                make_field("tx", f"TX {clean(row.get('tx'))}", 11),
+                make_field("section", "I/O", 3, color="cyan", bold=True),
+                make_field(
+                    "rx",
+                    f"RX {clean(row.get('rx'))}",
+                    11,
+                    color="blue",
+                ),
+                make_field(
+                    "tx",
+                    f"TX {clean(row.get('tx'))}",
+                    11,
+                    color="blue",
+                ),
                 make_field(
                     "proc",
                     f"Proc {clean(row.get('processes'))}",
                     14,
+                    color="magenta",
                 ),
             ]
 
@@ -2608,23 +3676,29 @@ class NVClientPool:
                 drop_order=("host",),
                 shrink_order=("model", "host", "gpu"),
             )
-            core_metrics_line = fit_fields(
-                core_metric_fields,
-                drop_order=("power", "temp"),
-                shrink_order=("power", "vram", "temp"),
+            load_line = fit_fields(
+                load_fields,
+                drop_order=("power",),
+                shrink_order=("power", "util"),
+            )
+            memory_line = fit_fields(
+                memory_fields,
+                drop_order=("fan", "temp"),
+                shrink_order=("vram", "temp", "fan"),
             )
             auxiliary_line = fit_fields(
                 auxiliary_fields,
-                drop_order=("tx", "rx", "fan"),
-                shrink_order=("proc", "rx", "tx", "fan"),
+                drop_order=("tx", "rx"),
+                shrink_order=("proc", "rx", "tx"),
             )
             if row_line_map is not None:
-                for offset in range(3):
+                for offset in range(4):
                     row_line_map[len(lines) + offset] = row_index
             lines.extend(
                 [
                     f"| {identity_line} |",
-                    f"| {core_metrics_line} |",
+                    f"| {load_line} |",
+                    f"| {memory_line} |",
                     f"| {auxiliary_line} |",
                     border,
                 ]
@@ -2706,177 +3780,24 @@ class NVClientPool:
         if table.empty:
             return None
         selected = int(getattr(self, "unified_selected_gpu", 0) or 0)
+        selected_key = getattr(self, "unified_selected_gpu_key", None)
+        if selected_key is not None:
+            for position, (_, row) in enumerate(table.iterrows()):
+                if self._unified_gpu_history_key(row) == selected_key:
+                    selected = position
+                    break
         selected = max(0, min(selected, len(table) - 1))
         self.unified_selected_gpu = selected
+        self.unified_selected_gpu_key = self._unified_gpu_history_key(
+            table.iloc[selected]
+        )
         self._unified_gpu_count = len(table)
         return table.iloc[selected]
 
-    def _format_focus_process_block(self, process, *, selected, width):
-        """Render one process as a header line plus its wrapped command."""
-        threads = process.get("threads")
-        try:
-            threads_display = "-" if threads is None else str(int(threads))
-        except (TypeError, ValueError):
-            threads_display = "-"
-        head = "  ".join(
-            [
-                f"{'>' if selected else ' '} PID {process.get('pid', 'N/A')}",
-                f"User {process.get('username', 'N/A')}",
-                f"Type {process.get('type', 'N/A')}",
-                f"VRAM {process.get('used_memory', 'N/A')}",
-                f"CPU {self._format_process_percent(process.get('cpu_percent'))}%",
-                f"MEM {self._format_process_percent(process.get('mem_percent'))}%",
-                f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
-                f"Time {process.get('elapsed') or '-'}",
-                f"THR {threads_display}",
-                f"S {process.get('state') or '-'}",
-            ]
-        )
-        # This view exists to show everything, so narrow terminals wrap the
-        # header fields instead of cutting them off.
-        lines = [
-            colored(part, attrs=["bold"]) if selected else part
-            for part in textwrap.wrap(
-                head,
-                width=max(20, width),
-                subsequent_indent="    ",
-                break_long_words=False,
-                break_on_hyphens=False,
-            )
-            or [head[:width]]
-        ]
-
-        command = str(
-            process.get("command") or process.get("process_name") or ""
-        ).strip()
-        indent = "      "
-        wrapped = textwrap.wrap(
-            command or "N/A",
-            width=max(20, width - len(indent)),
-            break_long_words=True,
-            break_on_hyphens=False,
-        )
-        # One pathological command should not push every other process off screen.
-        if len(wrapped) > 6:
-            wrapped = wrapped[:6]
-            wrapped[-1] = wrapped[-1][: max(0, width - len(indent) - 3)] + "..."
-        lines.extend(f"{indent}{part}" for part in wrapped)
-        return lines
-
-    def _render_unified_focus_lines(self, raw_stats_by_client, last_update_time):
-        """Render the drill-down for one GPU: its metrics and full commands."""
-        self._body_click_targets = {}
-        if last_update_time is None:
-            return ["GPU focus", "Loading GPU data..."]
-
-        try:
-            terminal_size = os.get_terminal_size()
-            width, height = terminal_size.columns, terminal_size.lines
-        except OSError:
-            width, height = 80, 24
-
-        row = self._selected_unified_row(raw_stats_by_client)
-        if row is None:
-            self._focus_process_count = 0
-            return ["GPU focus", "No GPU to show ([<-] back)"]
-
-        node = row.get("Node", "N/A")
-        hostname = row.get("Hostname", "N/A")
-        gpu_index = row.get("GPU", "N/A")
-        capacity = self._unified_gpu_capacity(row)
-        memory_percent = capacity["memory_percent"]
-        memory_suffix = (
-            f" ({memory_percent:.0f}%)" if memory_percent is not None else ""
-        )
-        # The title doubles as the "go back" click target, so it says so.
-        title = (
-            f"< Back | GPU focus: {node} ({hostname}) GPU {gpu_index} | "
-            f"{row.get('name', 'N/A')}"
-        )
-        metrics = " | ".join(
-            [
-                f"Util {str(row.get('util', 'N/A')).replace(' ', '')}",
-                f"VRAM {row.get('memory[used/total]', 'N/A')} MiB{memory_suffix}",
-                f"Temp {row.get('temp', 'N/A')}",
-                f"Power {row.get('power', 'N/A')} W",
-                f"Fan {row.get('fan', 'N/A')}",
-            ]
-        )
-
-        processes = sorted(
-            self._get_unified_process_details(raw_stats_by_client, row),
-            key=lambda process: (
-                self._extract_metric_number(process.get("used_memory")) or 0
-            ),
-            reverse=True,
-        )
-        self._focus_process_count = len(processes)
-        selected_process = max(
-            0,
-            min(
-                int(getattr(self, "focus_selected_process", 0) or 0),
-                max(0, len(processes) - 1),
-            ),
-        )
-        self.focus_selected_process = selected_process
-
-        header = [
-            colored(title[:width], "cyan", attrs=["bold"]),
-            metrics[:width],
-        ]
-        if not processes:
-            header.append("Processes: none")
-            self._body_click_targets = {0: ("back", None)}
-            lines = header + ["No active GPU processes"]
-            if getattr(self, "unified_show_trends", False):
-                lines.append(self._format_unified_gpu_trends(row))
-            return lines
-
-        blocks = [
-            self._format_focus_process_block(
-                process,
-                selected=(index == selected_process),
-                width=width,
-            )
-            for index, process in enumerate(processes)
-        ]
-
-        show_trends = bool(getattr(self, "unified_show_trends", False))
-        # Scroll the block list so the selected process is always on screen.
-        available = max(3, height - len(header) - 4 - (4 if show_trends else 0))
-        start = min(selected_process, len(blocks) - 1)
-        used = len(blocks[start])
-        while start > 0 and used + len(blocks[start - 1]) <= available:
-            start -= 1
-            used += len(blocks[start])
-
-        end = start
-        used = 0
-        for index in range(start, len(blocks)):
-            if used + len(blocks[index]) > available and index > start:
-                break
-            used += len(blocks[index])
-            end = index
-
-        header.append(
-            f"Processes: {start + 1}-{end + 1}/{len(processes)} | "
-            f"selected {selected_process + 1}"[:width]
-        )
-
-        lines = list(header)
-        body_targets = {}
-        for index in range(start, end + 1):
-            for offset in range(len(blocks[index])):
-                body_targets[len(lines) + offset] = ("process", index)
-            lines.extend(blocks[index])
-
-        self._body_click_targets = {0: ("back", None), **body_targets}
-        if show_trends:
-            lines.append(self._format_unified_gpu_trends(row))
-        return lines
-
     def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
         """Render the unified TUI body from cached per-node GPU data."""
+        self._body_click_targets = {}
+        self._body_click_regions = []
         if last_update_time is None:
             return ["Unified GPU table", "Loading GPU data..."]
 
@@ -2888,7 +3809,22 @@ class NVClientPool:
                 source_table[["Node", "Hostname"]].drop_duplicates()
             )
         detailed = getattr(self, "unified_detailed", False)
+        try:
+            terminal_size = os.get_terminal_size()
+            terminal_width = terminal_size.columns
+            terminal_height = terminal_size.lines
+        except OSError:
+            terminal_width = 80
+            terminal_height = 24
         filter_mode = self._get_unified_filter_mode()
+        show_process_panel = (
+            detailed or getattr(self, "unified_show_processes", False)
+        ) and filter_mode != "errors"
+        compact_history = (
+            show_process_panel
+            and terminal_height < 36
+            and bool(getattr(self, "unified_show_trends", False))
+        )
         filtered_table = self._filter_unified_gpu_table(source_table)
         sorted_table = self._sort_unified_gpu_table(filtered_table)
         table, selected_row, page_status = self._paginate_unified_gpu_table(
@@ -2896,7 +3832,13 @@ class NVClientPool:
             detailed=detailed,
         )
         title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
-        section_headers = self._unified_section_headers(table, sorted_table)
+        # Detailed cards already repeat node identity, so node bands only spend
+        # scarce vertical space there. Keep the bands for the compact table.
+        section_headers = (
+            {}
+            if detailed
+            else self._unified_section_headers(table, sorted_table)
+        )
         row_line_map = {}
         if filter_mode == "errors":
             rendered_table = "Error filter: GPU rows hidden"
@@ -2944,11 +3886,19 @@ class NVClientPool:
         gpu_count_display = str(len(source_table))
         if filter_mode != "all":
             gpu_count_display = f"{len(filtered_table)}/{len(source_table)}"
-        lines = [
+        title_line = (
             f"{title} | GPUs: {gpu_count_display} | "
-            f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}",
-            self._format_unified_capacity_summary(source_table),
-        ]
+            f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}"
+        )
+        if len(title_line) > terminal_width:
+            title_line = (
+                title_line[: max(0, terminal_width - 2)] + ".."
+                if terminal_width >= 2
+                else title_line[:terminal_width]
+            )
+        lines = [title_line]
+        if not compact_history:
+            lines.append(self._format_unified_capacity_summary(source_table))
         # The filter is restored from config.yml, so say it out loud whenever it
         # is the reason a GPU is missing from the table.
         hidden_by_filter = len(source_table) - len(filtered_table)
@@ -2970,33 +3920,100 @@ class NVClientPool:
             for line_index, row_index in row_line_map.items()
         }
         lines.append(rendered_table)
+
+        if show_process_panel:
+            process_line_map = {}
+            command_line_map = {}
+            action_regions = []
+            process_offset = self._screen_line_count(lines)
+            compact_frame = detailed and (
+                terminal_height < 28
+                or (
+                    terminal_height < 36
+                    and bool(getattr(self, "unified_show_trends", False))
+                )
+            )
+            frame_reserve = 3 if compact_frame else 4
+            selected_processes = self._get_sorted_unified_processes(
+                raw_stats_by_client,
+                selected_gpu_row,
+            )
+            future_trend_lines = (
+                4
+                if getattr(self, "unified_show_trends", False)
+                and (not compact_history or not selected_processes)
+                else 0
+            )
+            process_height_budget = max(
+                8,
+                terminal_height
+                - frame_reserve
+                - process_offset
+                - future_trend_lines,
+            )
+            process_panel = self._format_unified_process_details(
+                raw_stats_by_client,
+                selected_gpu_row,
+                height_budget=process_height_budget,
+                process_line_map=process_line_map,
+                command_line_map=command_line_map,
+                action_regions=action_regions,
+            )
+            self._body_click_targets.update(
+                {
+                    process_offset + line_index: ("process", process_index)
+                    for line_index, process_index in process_line_map.items()
+                }
+            )
+            self._body_click_targets.update(
+                {
+                    process_offset + line_index: ("command", process_index)
+                    for line_index, process_index in command_line_map.items()
+                }
+            )
+            self._body_click_regions.extend(
+                (
+                    process_offset + line_index,
+                    start_column,
+                    end_column,
+                    target,
+                )
+                for line_index, start_column, end_column, target in action_regions
+            )
+            lines.append(process_panel)
+        else:
+            self._unified_process_count = 0
+            self._unified_command_line_count = 0
+            self._unified_command_page_size = 0
+            self.unified_command_scroll = 0
+            if getattr(self, "unified_active_pane", "gpu") == "process":
+                self.unified_active_pane = "gpu"
+
+        if (
+            getattr(self, "unified_show_trends", False)
+            and filter_mode != "errors"
+            and (
+                not compact_history
+                or int(getattr(self, "_unified_process_count", 0) or 0) == 0
+            )
+        ):
+            lines.append(
+                self._format_unified_gpu_trends(selected_gpu_row)
+            )
+
         status_lines = self._get_unified_node_status_lines(
             raw_stats_by_client,
             last_update_time,
-            errors_only=(filter_mode == "errors"),
+            # Detailed mode reserves the lower half for process interaction.
+            # Still show real node errors, but omit the routine "unsupported
+            # node hidden" reminder that is already reflected in the title.
+            errors_only=(filter_mode == "errors" or detailed),
         )
         if filter_mode == "errors" and not status_lines:
             status_lines = ["No node errors"]
         if status_lines:
             lines.append("Node status:")
             lines.extend(status_lines)
-        if (
-            getattr(self, "unified_show_processes", False)
-            and filter_mode != "errors"
-        ):
-            lines.append(
-                self._format_unified_process_details(
-                    raw_stats_by_client,
-                    selected_gpu_row,
-                )
-            )
-        if (
-            getattr(self, "unified_show_trends", False)
-            and filter_mode != "errors"
-        ):
-            lines.append(
-                self._format_unified_gpu_trends(selected_gpu_row)
-            )
         return lines
 
     def _write_tui_lines(self, output_lines):
@@ -3824,23 +4841,15 @@ class NVClientPool:
         server_count = len(self.pool)
         server_label = "Server" if server_count == 1 else "Servers"
         try:
-            terminal_width = os.get_terminal_size().columns
+            terminal_size = os.get_terminal_size()
+            terminal_width = terminal_size.columns
+            terminal_height = terminal_size.lines
         except OSError:
             terminal_width = 80
+            terminal_height = 24
 
         display_mode = getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
-        focused = display_mode == self.DISPLAY_MODE_UNIFIED and getattr(
-            self, "unified_focus", False
-        )
-        if focused:
-            view_label = "Unified/GPU focus"
-            controls = (
-                "[<-/h]Back [j/k]Process [click]Select [t]Trend [q] "
-                "| click the title line to go back"
-            )
-            if len(controls) > terminal_width:
-                controls = controls[: max(0, terminal_width - 3)] + "..."
-        elif display_mode == self.DISPLAY_MODE_UNIFIED:
+        if display_mode == self.DISPLAY_MODE_UNIFIED:
             detailed = getattr(self, "unified_detailed", False)
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
             detail_action = "Single-line" if detailed else "Detailed"
@@ -3860,8 +4869,8 @@ class NVClientPool:
             )
             controls = (
                 f"[v]N [d]{detail_action} [s]{sort_label} [f]{filter_label} "
-                f"[g]{group_label} [u]{unsupported_label} "
-                f"[j/k]GPU [Pg] [Enter]Proc [t]Trend [q]"
+                f"[g]{group_label} [u]{unsupported_label} [Tab/←→]Pane "
+                f"[j/k]Select [i/T/K]Signal [t]History [q]"
             )
             if len(controls) > terminal_width:
                 controls = controls[: max(0, terminal_width - 3)] + "..."
@@ -3886,7 +4895,18 @@ class NVClientPool:
         user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
         global_user_memory = meta.get("user_memory_global", {}) or {}
 
-        if global_user_memory:
+        compact_detailed_screen = (
+            display_mode == self.DISPLAY_MODE_UNIFIED
+            and bool(getattr(self, "unified_detailed", False))
+            and (
+                terminal_height < 28
+                or (
+                    terminal_height < 36
+                    and bool(getattr(self, "unified_show_trends", False))
+                )
+            )
+        )
+        if global_user_memory and not compact_detailed_screen:
             global_line = f"Users (all nodes): {self._format_user_memory_totals(global_user_memory, max_users=12)}"
             if self.term.length(global_line) > terminal_width:
                 global_line = global_line[: max(0, terminal_width - 3)] + "..."
@@ -3894,27 +4914,29 @@ class NVClientPool:
 
         if display_mode == self.DISPLAY_MODE_UNIFIED:
             body_offset = self._screen_line_count(output_lines)
-            if focused:
-                body = self._render_unified_focus_lines(
-                    raw_stats_by_client,
-                    last_update_time,
-                )
-            else:
-                body = self._render_unified_gpu_lines(
-                    raw_stats_by_client,
-                    last_update_time,
-                )
+            body = self._render_unified_gpu_lines(
+                raw_stats_by_client,
+                last_update_time,
+            )
             output_lines.extend(body)
             # Translate the body-relative hit boxes into absolute screen rows.
             self._click_targets = {
                 body_offset + line: target
                 for line, target in (getattr(self, "_body_click_targets", {}) or {}).items()
             }
+            self._click_regions = [
+                (body_offset + line, start, end, target)
+                for line, start, end, target in (
+                    getattr(self, "_body_click_regions", []) or []
+                )
+            ]
             self._write_tui_lines(output_lines)
             return
 
         self._click_targets = {}
+        self._click_regions = []
         self._body_click_targets = {}
+        self._body_click_regions = []
 
         # Align the collapsed server list by padding headers to the same display width
         index_width = len(str(len(self.pool)))
@@ -4040,6 +5062,10 @@ class NVClientPool:
             self.display_mode = self.DISPLAY_MODE_NODES
         else:
             self.display_mode = self.DISPLAY_MODE_UNIFIED
+        self.unified_active_pane = "gpu"
+        self.unified_selected_process_pid = None
+        self.unified_command_scroll = 0
+        self._pending_process_signal = None
         self._apply_view_change()
 
     def _cycle_unified_sort_mode(self):
@@ -4049,6 +5075,11 @@ class NVClientPool:
         ) % len(self.UNIFIED_SORT_MODES)
         self.unified_sort_mode = self.UNIFIED_SORT_MODES[next_index]
         self.unified_selected_gpu = 0
+        self.unified_selected_gpu_key = None
+        self.unified_selected_process = 0
+        self.unified_selected_process_pid = None
+        self.unified_command_scroll = 0
+        self._pending_process_signal = None
         self._apply_view_change()
 
     def _cycle_unified_filter_mode(self):
@@ -4058,6 +5089,12 @@ class NVClientPool:
         ) % len(self.UNIFIED_FILTER_MODES)
         self.unified_filter_mode = self.UNIFIED_FILTER_MODES[next_index]
         self.unified_selected_gpu = 0
+        self.unified_selected_gpu_key = None
+        self.unified_selected_process = 0
+        self.unified_selected_process_pid = None
+        self.unified_command_scroll = 0
+        self.unified_active_pane = "gpu"
+        self._pending_process_signal = None
         self._apply_view_change()
 
     def _move_unified_selection(self, delta):
@@ -4069,38 +5106,258 @@ class NVClientPool:
         if selected == current:
             return False
         self.unified_selected_gpu = selected
+        self.unified_selected_gpu_key = None
+        self.unified_selected_process = 0
+        self.unified_selected_process_pid = None
+        self.unified_command_scroll = 0
+        self._pending_process_signal = None
         self._request_ui_refresh()
         return True
 
-    def _move_focus_process_selection(self, delta):
-        count = max(0, int(getattr(self, "_focus_process_count", 0) or 0))
+    def _move_unified_process_selection(self, delta):
+        count = max(0, int(getattr(self, "_unified_process_count", 0) or 0))
         if count == 0:
             return False
-        current = int(getattr(self, "focus_selected_process", 0) or 0)
+        current = int(getattr(self, "unified_selected_process", 0) or 0)
         selected = max(0, min(current + delta, count - 1))
         if selected == current:
             return False
-        self.focus_selected_process = selected
+        self.unified_selected_process = selected
+        self.unified_selected_process_pid = None
+        self.unified_command_scroll = 0
+        self._pending_process_signal = None
         self._request_ui_refresh()
         return True
 
-    def _enter_gpu_focus(self):
-        """Open the single-GPU drill-down for the current selection."""
-        if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+    def _scroll_unified_command(self, page_delta):
+        line_count = max(
+            0,
+            int(getattr(self, "_unified_command_line_count", 0) or 0),
+        )
+        page_size = max(
+            0,
+            int(getattr(self, "_unified_command_page_size", 0) or 0),
+        )
+        if page_size <= 0 or line_count <= page_size:
             return False
-        if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
+        current = max(
+            0,
+            int(getattr(self, "unified_command_scroll", 0) or 0),
+        )
+        selected = max(
+            0,
+            min(
+                current + int(page_delta) * page_size,
+                line_count - page_size,
+            ),
+        )
+        if selected == current:
             return False
-        if getattr(self, "unified_focus", False):
-            return False
-        self.unified_focus = True
-        self.focus_selected_process = 0
+        self.unified_command_scroll = selected
         self._request_ui_refresh()
         return True
 
-    def _leave_gpu_focus(self):
-        if not getattr(self, "unified_focus", False):
+    def _process_panel_visible(self):
+        return (
+            getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
+            == self.DISPLAY_MODE_UNIFIED
+            and (
+                bool(getattr(self, "unified_detailed", False))
+                or bool(getattr(self, "unified_show_processes", False))
+            )
+            and self._get_unified_filter_mode() != "errors"
+        )
+
+    def _set_unified_active_pane(self, pane):
+        if pane not in {"gpu", "process"}:
             return False
-        self.unified_focus = False
+        if pane == "process" and not self._process_panel_visible():
+            return False
+        if pane == getattr(self, "unified_active_pane", "gpu"):
+            return False
+        self.unified_active_pane = pane
+        self._pending_process_signal = None
+        self._request_ui_refresh()
+        return True
+
+    def _toggle_unified_active_pane(self):
+        if not self._process_panel_visible():
+            return False
+        pane = getattr(self, "unified_active_pane", "gpu")
+        return self._set_unified_active_pane(
+            "gpu" if pane == "process" else "process"
+        )
+
+    def _selected_process_context(self):
+        raw_stats = getattr(self, "cached_raw_stats", {}) or {}
+        row = self._selected_unified_row(raw_stats)
+        if row is None:
+            return None
+        processes = self._get_sorted_unified_processes(raw_stats, row)
+        if not processes:
+            return None
+        index = int(getattr(self, "unified_selected_process", 0) or 0)
+        selected_pid = getattr(self, "unified_selected_process_pid", None)
+        if selected_pid is not None:
+            for process_index, process in enumerate(processes):
+                if str(process.get("pid", "")) == str(selected_pid):
+                    index = process_index
+                    break
+        index = max(
+            0,
+            min(index, len(processes) - 1),
+        )
+        process = processes[index]
+        self.unified_selected_process = index
+        self.unified_selected_process_pid = str(process.get("pid", ""))
+        client_index = self._unified_client_index_for_row(row)
+        if client_index is None or not 0 <= client_index < len(self.pool):
+            return None
+        return {
+            "row": row,
+            "process": process,
+            "client_index": client_index,
+        }
+
+    def _set_process_action_notice(self, message, color):
+        self._process_action_notice = {
+            "message": str(message),
+            "color": color,
+            "expires_at": time.monotonic() + 8,
+        }
+
+    def _request_process_signal(self, signal_name):
+        """Arm a process signal, or send it when the same action is confirmed."""
+        signal_name = str(signal_name).upper()
+        if signal_name not in {"INT", "TERM", "KILL"}:
+            return False
+        if not self._process_panel_visible():
+            return False
+        context = self._selected_process_context()
+        if context is None:
+            self._pending_process_signal = None
+            self._set_process_action_notice(
+                "No selected process is available",
+                "yellow",
+            )
+            self._request_ui_refresh()
+            return True
+
+        process = context["process"]
+        pid_text = str(process.get("pid", "")).strip()
+        if not pid_text.isdigit() or int(pid_text) <= 1:
+            self._pending_process_signal = None
+            self._set_process_action_notice(
+                f"Refusing to signal invalid PID {pid_text or 'N/A'}",
+                "red",
+            )
+            self._request_ui_refresh()
+            return True
+
+        pending = getattr(self, "_pending_process_signal", None)
+        same_action = (
+            pending
+            and pending.get("expires_at", 0) > time.monotonic()
+            and pending.get("signal") == signal_name
+            and pending.get("pid") == int(pid_text)
+            and pending.get("client_index") == context["client_index"]
+        )
+        if same_action:
+            return self._confirm_process_signal()
+
+        self._process_action_notice = None
+        self._pending_process_signal = {
+            "signal": signal_name,
+            "pid": int(pid_text),
+            "client_index": context["client_index"],
+            "node": str(context["row"].get("Node", "N/A")),
+            "command": str(
+                process.get("command")
+                or process.get("process_name")
+                or ""
+            ),
+            "expires_at": time.monotonic() + 5,
+        }
+        self._request_ui_refresh()
+        return True
+
+    def _confirm_process_signal(self):
+        pending = getattr(self, "_pending_process_signal", None)
+        if not pending:
+            return False
+        if pending.get("expires_at", 0) <= time.monotonic():
+            self._pending_process_signal = None
+            self._set_process_action_notice(
+                "Signal confirmation expired",
+                "yellow",
+            )
+            self._request_ui_refresh()
+            return True
+
+        context = self._selected_process_context()
+        if context is None:
+            self._pending_process_signal = None
+            self._set_process_action_notice(
+                "The selected process is no longer available",
+                "yellow",
+            )
+            self._request_ui_refresh()
+            return True
+
+        pid_text = str(context["process"].get("pid", "")).strip()
+        if (
+            not pid_text.isdigit()
+            or int(pid_text) != pending.get("pid")
+            or context["client_index"] != pending.get("client_index")
+            or str(
+                context["process"].get("command")
+                or context["process"].get("process_name")
+                or ""
+            )
+            != pending.get("command")
+        ):
+            self._pending_process_signal = None
+            self._set_process_action_notice(
+                "Selection changed; signal cancelled",
+                "yellow",
+            )
+            self._request_ui_refresh()
+            return True
+
+        signal_name = pending["signal"]
+        pid = pending["pid"]
+        client = self.pool[pending["client_index"]]
+        marker = "__NVIDB_SIGNAL_STATUS__:"
+        command = (
+            f"kill -s {signal_name} -- {pid} 2>&1; "
+            f"status=$?; printf '\\n{marker}%s\\n' \"$status\""
+        )
+        self._pending_process_signal = None
+        try:
+            output = client.execute_command(command)
+            output = "" if output is None else str(output)
+            if marker not in output:
+                raise RuntimeError("target did not return a signal status")
+            message, status_text = output.rsplit(marker, 1)
+            status = int(status_text.strip().splitlines()[0])
+            if status == 0:
+                self._set_process_action_notice(
+                    f"SIG{signal_name} sent to PID {pid} on {pending['node']}",
+                    "green",
+                )
+            else:
+                error = " ".join(message.strip().split())
+                if not error:
+                    error = f"kill exited with status {status}"
+                self._set_process_action_notice(
+                    f"SIG{signal_name} failed for PID {pid}: {error}",
+                    "red",
+                )
+        except Exception as error:
+            self._set_process_action_notice(
+                f"SIG{signal_name} failed for PID {pid}: {error}",
+                "red",
+            )
         self._request_ui_refresh()
         return True
 
@@ -4120,6 +5377,18 @@ class NVClientPool:
         if not getattr(self, "mouse_enabled", True):
             return False
 
+        row = event.row - 1
+        column = event.column - 1
+        target = None
+        for region_row, start, end, region_target in (
+            getattr(self, "_click_regions", []) or []
+        ):
+            if region_row == row and start <= column <= end:
+                target = region_target
+                break
+        if target is None:
+            target = (getattr(self, "_click_targets", {}) or {}).get(row)
+
         if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
             if event.is_wheel_up or event.is_wheel_down:
                 delta = -1 if event.is_wheel_up else 1
@@ -4134,7 +5403,6 @@ class NVClientPool:
                 return True
             if not event.is_left_press:
                 return False
-            target = (getattr(self, "_click_targets", {}) or {}).get(event.row - 1)
             if target is None or target[0] != "server":
                 return False
             index = target[1]
@@ -4145,79 +5413,115 @@ class NVClientPool:
             self._request_ui_refresh()
             return True
 
-        focused = bool(getattr(self, "unified_focus", False))
-        if event.is_wheel_up:
-            return (
-                self._move_focus_process_selection(-1)
-                if focused
-                else self._move_unified_selection(-1)
-            )
-        if event.is_wheel_down:
-            return (
-                self._move_focus_process_selection(1)
-                if focused
-                else self._move_unified_selection(1)
-            )
+        if event.is_wheel_up or event.is_wheel_down:
+            delta = -1 if event.is_wheel_up else 1
+            kind = target[0] if target else None
+            if kind == "gpu":
+                self.unified_active_pane = "gpu"
+                return self._move_unified_selection(delta)
+            if kind in {"command", "command_scroll"}:
+                self.unified_active_pane = "process"
+                return self._scroll_unified_command(delta)
+            if kind in {"process", "signal", "toggle_trends"}:
+                self.unified_active_pane = "process"
+                return self._move_unified_process_selection(delta)
+            if getattr(self, "unified_active_pane", "gpu") == "process":
+                return self._move_unified_process_selection(delta)
+            return self._move_unified_selection(delta)
         if not event.is_left_press:
             return False
 
-        target = (getattr(self, "_click_targets", {}) or {}).get(event.row - 1)
         if target is None:
             return False
         kind, value = target
-        if kind == "back":
-            return self._leave_gpu_focus()
+        if kind == "command_scroll":
+            self.unified_active_pane = "process"
+            return self._scroll_unified_command(value)
+        if kind == "signal":
+            self.unified_active_pane = "process"
+            return self._request_process_signal(value)
+        if kind == "toggle_trends":
+            self.unified_active_pane = "process"
+            self.unified_show_trends = not getattr(
+                self,
+                "unified_show_trends",
+                False,
+            )
+            self._apply_view_change()
+            return True
         if kind == "process":
-            if value == int(getattr(self, "focus_selected_process", 0) or 0):
+            changed = (
+                value
+                != int(getattr(self, "unified_selected_process", 0) or 0)
+                or getattr(self, "unified_active_pane", "gpu") != "process"
+            )
+            if not changed:
                 return False
-            self.focus_selected_process = value
+            self.unified_selected_process = value
+            self.unified_selected_process_pid = None
+            self.unified_command_scroll = 0
+            self.unified_active_pane = "process"
+            self._pending_process_signal = None
+            self._request_ui_refresh()
+            return True
+        if kind == "command":
+            changed = (
+                value
+                != int(getattr(self, "unified_selected_process", 0) or 0)
+                or getattr(self, "unified_active_pane", "gpu") != "process"
+            )
+            if not changed:
+                return False
+            self.unified_selected_process = value
+            self.unified_selected_process_pid = None
+            self.unified_command_scroll = 0
+            self.unified_active_pane = "process"
+            self._pending_process_signal = None
             self._request_ui_refresh()
             return True
         if kind == "gpu":
-            # First click selects; clicking the selected GPU opens its detail view.
-            if value == int(getattr(self, "unified_selected_gpu", 0) or 0):
-                return self._enter_gpu_focus()
+            changed = (
+                value != int(getattr(self, "unified_selected_gpu", 0) or 0)
+                or getattr(self, "unified_active_pane", "gpu") != "gpu"
+            )
+            if not changed:
+                return False
             self.unified_selected_gpu = value
+            self.unified_selected_gpu_key = None
+            self.unified_selected_process = 0
+            self.unified_selected_process_pid = None
+            self.unified_command_scroll = 0
+            self.unified_active_pane = "gpu"
+            self._pending_process_signal = None
             self._request_ui_refresh()
             return True
         return False
 
     def _handle_keypress(self, key):
         """Apply one TUI keypress and return whether it changed visible state."""
-        key_name = key.name if hasattr(key, "name") and key.name else str(key)
-        key_lower = str(key).lower()
+        key_text = str(key)
+        key_name = key.name if hasattr(key, "name") and key.name else key_text
+        key_lower = key_text.lower()
 
         if key_lower == "q":
             self.quit_flag.set()
             return True
 
-        # The GPU drill-down is modal: only navigation keys apply while it is up.
-        if (
-            getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED
-            and getattr(self, "unified_focus", False)
-        ):
-            if key_name == "KEY_LEFT" or key_lower == "h":
-                return self._leave_gpu_focus()
-            if key_lower == "j" or key_name == "KEY_DOWN":
-                return self._move_focus_process_selection(1)
-            if key_lower == "k" or key_name == "KEY_UP":
-                return self._move_focus_process_selection(-1)
-            if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN"}:
-                return self._move_focus_process_selection(5)
-            if key_name in {"KEY_PPAGE", "KEY_PAGEUP"}:
-                return self._move_focus_process_selection(-5)
-            if key_lower == "t":
-                self.unified_show_trends = not getattr(
-                    self,
-                    "unified_show_trends",
-                    False,
-                )
-                self._apply_view_change()
+        if key_name == "KEY_ESCAPE" or key_text == "\x1b":
+            if getattr(self, "_pending_process_signal", None):
+                self._pending_process_signal = None
+                self._set_process_action_notice("Signal cancelled", "yellow")
+                self._request_ui_refresh()
                 return True
             return False
 
-        if key_name == "KEY_RIGHT" or key_lower == "l":
-            return self._enter_gpu_focus()
+        enter_pressed = (
+            key_name == "KEY_ENTER"
+            or key_text in {"\n", "\r"}
+        )
+        if enter_pressed and getattr(self, "_pending_process_signal", None):
+            return self._confirm_process_signal()
+
         if key_lower == "v":
             self._toggle_display_mode()
             return True
@@ -4225,6 +5529,11 @@ class NVClientPool:
             if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
                 return False
             self.unified_detailed = not getattr(self, "unified_detailed", False)
+            self.unified_active_pane = "gpu"
+            self.unified_selected_process = 0
+            self.unified_selected_process_pid = None
+            self.unified_command_scroll = 0
+            self._pending_process_signal = None
             self._apply_view_change()
             return True
         if key_lower == "g":
@@ -4253,42 +5562,76 @@ class NVClientPool:
                 return False
             self._cycle_unified_filter_mode()
             return True
-        if key_lower == "t":
-            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
-                return False
-            if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
-                return False
-            self.unified_show_trends = not getattr(
-                self,
-                "unified_show_trends",
-                False,
-            )
-            self._apply_view_change()
-            return True
-        if key_lower == "h":
-            return False
-
         if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED:
+            if key_text == "i" or key_name == "KEY_F7":
+                return self._request_process_signal("INT")
+            if key_text == "T" or key_name == "KEY_F8":
+                return self._request_process_signal("TERM")
+            if key_text == "K" or key_name == "KEY_F9":
+                return self._request_process_signal("KILL")
+            if key_lower == "t":
+                if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
+                    return False
+                self.unified_show_trends = not getattr(
+                    self,
+                    "unified_show_trends",
+                    False,
+                )
+                self._apply_view_change()
+                return True
+            if key_name in {"KEY_TAB", "KEY_BTAB"} or key_text == "\t":
+                return self._toggle_unified_active_pane()
+            if key_name == "KEY_RIGHT" or key_lower == "l":
+                return self._set_unified_active_pane("process")
+            if key_name == "KEY_LEFT" or key_lower == "h":
+                return self._set_unified_active_pane("gpu")
+            if key_text == "[":
+                self.unified_active_pane = "process"
+                return self._scroll_unified_command(-1)
+            if key_text == "]":
+                self.unified_active_pane = "process"
+                return self._scroll_unified_command(1)
+
+            process_pane = (
+                getattr(self, "unified_active_pane", "gpu") == "process"
+                and self._process_panel_visible()
+            )
             if key_lower == "j" or key_name == "KEY_DOWN":
+                if process_pane:
+                    return self._move_unified_process_selection(1)
                 return self._move_unified_selection(1)
             if key_lower == "k" or key_name == "KEY_UP":
+                if process_pane:
+                    return self._move_unified_process_selection(-1)
                 return self._move_unified_selection(-1)
             if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN"}:
+                if process_pane:
+                    return self._move_unified_process_selection(5)
                 return self._move_unified_selection(
                     max(1, int(getattr(self, "_unified_page_size", 1) or 1))
                 )
             if key_name in {"KEY_PPAGE", "KEY_PAGEUP"}:
+                if process_pane:
+                    return self._move_unified_process_selection(-5)
                 return self._move_unified_selection(
                     -max(1, int(getattr(self, "_unified_page_size", 1) or 1))
                 )
-            if key_name == "KEY_ENTER" or key_lower == " " or key in {"\n", "\r"}:
+            if enter_pressed or key_text == " ":
                 if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
                     return False
+                if getattr(self, "unified_detailed", False):
+                    return self._toggle_unified_active_pane()
                 self.unified_show_processes = not getattr(
                     self,
                     "unified_show_processes",
                     False,
                 )
+                self.unified_active_pane = (
+                    "process" if self.unified_show_processes else "gpu"
+                )
+                self.unified_selected_process = 0
+                self.unified_selected_process_pid = None
+                self.unified_command_scroll = 0
                 self._apply_view_change()
                 return True
             return False
@@ -4303,7 +5646,7 @@ class NVClientPool:
                 self.selected_server -= 1
                 self._request_ui_refresh()
                 return True
-        elif key_name == "KEY_ENTER" or key_lower == " " or key in {"\n", "\r"}:
+        elif enter_pressed or key_text == " ":
             return self._toggle_server_expansion(self.selected_server)
         elif key_lower == "a":
             disabled = getattr(self, "_toggle_disabled_servers", set())
@@ -4404,9 +5747,9 @@ class NVClientPool:
         """Real-time GPU status display with global keyboard monitoring"""
         print("GPU monitoring starting...")
         print("Controls:")
-        print("   j/k or Up/Down : Navigate between servers or unified GPUs")
+        print("   j/k or Up/Down : Move the active selection")
         print("   PgUp/PgDn      : Change unified GPU page")
-        print("   Enter/Space    : Toggle server or unified GPU details")
+        print("   Enter/Space    : Toggle details/pane or confirm a signal")
         print("   a              : Expand all")
         print("   c              : Collapse all")
         print("   v              : Switch unified/per-node view")
@@ -4415,10 +5758,11 @@ class NVClientPool:
         print("   f              : Cycle unified GPU filters")
         print("   g              : Toggle unified per-node grouping")
         print("   u              : Show/hide nodes without GPU support")
-        print("   t              : Toggle selected GPU trends")
-        print("   Right/l        : Open the selected GPU (full process commands)")
-        print("   Left/h         : Leave the GPU detail view")
-        print("   Mouse          : Click a GPU to select, click again to open it")
+        print("   t              : Toggle GPU and selected-process history")
+        print("   Tab/Left/Right : Switch between GPU and process panes")
+        print("   [ / ]          : Page through a long wrapped command")
+        print("   i / T / K      : Confirmed SIGINT / SIGTERM / SIGKILL")
+        print("   Mouse          : Select GPUs/processes, use actions, wheel to scroll")
         print("   q              : Quit")
         print("=" * 60)
 

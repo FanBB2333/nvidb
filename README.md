@@ -166,35 +166,39 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `f`               | Cycle unified GPU filters     |
 | `g`               | Toggle unified per-node grouping |
 | `u`               | Show/hide nodes without GPU support |
-| `t`               | Toggle selected GPU trends    |
-| `→` / `l`         | Open the selected GPU's detail view |
-| `←` / `h`         | Leave the GPU detail view     |
-| `j` / `↓`         | Move server/GPU/process selection down |
-| `k` / `↑`         | Move server/GPU/process selection up |
-| `PgUp` / `PgDn`   | Change unified GPU page       |
-| Mouse             | Click to select, click again to open, wheel to scroll |
-| `Enter` / `Space` | Toggle server/GPU details      |
+| `t`               | Toggle GPU and selected-process history |
+| `Tab` / `h` / `l` / `←` / `→` | Switch between GPU and process panes |
+| `j` / `↓`         | Move the active-pane selection down |
+| `k` / `↑`         | Move the active-pane selection up |
+| `PgUp` / `PgDn`   | Move the active-pane selection by a page |
+| `[` / `]`         | Page through a long wrapped command |
+| `i` / `T` / `K`   | Arm SIGINT / SIGTERM / SIGKILL for the selected process |
+| `Esc`             | Cancel an armed process signal |
+| Mouse             | Select GPUs/processes, click actions, or scroll either pane |
+| `Enter` / `Space` | Toggle server/process details or confirm a signal |
 | `a`               | Expand all servers            |
 | `c`               | Collapse all servers          |
 | `q`               | Quit                          |
 
 The default per-node view keeps each server's summary and expandable detail
-table. The unified view places GPUs from every node in one table. By default
-rows are grouped into per-node blocks: a band names the node in bold cyan
-followed by its hostname/IP, GPU count, free GPUs, average utilization, and
-VRAM, with a dim rule filling the rest of the line, and the rows below it drop
-the redundant `Node` / `Hostname/IP` columns so more width goes to the GPU
-metrics. Press `g` to turn grouping off (or sort by anything other than
-node order) and the flat table with `Node` and `Hostname/IP` columns comes back.
+table. The unified view places GPUs from every node in one table. By default,
+single-line rows are grouped into per-node blocks: a band names the node in
+bold cyan followed by its hostname/IP, GPU count, free GPUs, average
+utilization, and VRAM, with a dim rule filling the rest of the line. The rows
+below it drop the redundant `Node` / `Hostname/IP` columns so more width goes
+to the GPU metrics. Press `g` to turn grouping off (or sort by anything other
+than node order) and the flat table with `Node` and `Hostname/IP` columns comes
+back.
+Detailed cards include node identity themselves and omit the redundant band.
 Columns adapt to the terminal width, with core identity, utilization, model, and
 VRAM fields kept ahead of secondary metrics.
 In the unified view, press `d` to switch between the single-line table and
-Detailed cards. Detailed mode uses three lines per GPU: node name, GPU index and
-status, then core utilization metrics (with block bars on terminals at least 100
-columns wide), then fan, PCIe RX/TX, and processes. The node name comes before
-the GPU index so the machine is the first thing you read. The status badge
-and utilization use cyan, green, yellow, or red to distinguish idle, active,
-busy, and high utilization while preserving fixed-width alignment.
+Detailed cards. Each card is divided into four labelled rows: `GPU` identity,
+`LOAD`, `MEM/TEMP`, and `I/O`. Utilization and VRAM gain block bars on terminals
+at least 100 columns wide. Labels, model/host identity, utilization, VRAM,
+temperature, power, network traffic, and process summaries use distinct colors;
+threshold-sensitive values change from green to yellow and red. The node name
+comes before the GPU index so the machine is the first thing you read.
 The capacity line summarizes available and busy GPUs, average utilization, and
 used/total/free VRAM. Press `s` to cycle between node order, available GPUs
 first, and highest utilization first. A GPU is considered available when its
@@ -206,31 +210,43 @@ means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
 nodes whose latest refresh failed. Because the filter is restored from the
 config on the next run, a warning line above the table spells out how many GPUs
 it is hiding.
-Press `Enter` or `Space` on a unified GPU to show its process details: PID,
-user, type, VRAM, plus htop-style CPU%, MEM%, RSS, elapsed time, thread count,
-process state, and the full command line. Commands too long for the table cell
-are printed in full underneath it. GPU processes come from the existing NVML
-snapshot; the htop-style fields add one batched `ps` call per host, issued only
-while this panel is open.
-Press `→` (or `l`) to open the selected GPU on its own screen: the GPU's
-metrics, then one block per process with its htop-style fields and the complete
-command wrapped over as many lines as it needs, instead of the single truncated
-table cell. `j` / `k` move between processes, `t` adds the sparklines, and `←`
-(or `h`) returns to the table.
-Mouse reporting is on by default: click a GPU row to select it, click the
-selected row again to open its detail view, click the title line of that view to
-go back, click a process to select it, and use the wheel to scroll. While mouse
-reporting is active most terminals need `Shift` (or `Option`) held down for
-their own drag-to-select; set `mouse: false` under `view` in the config to turn
-the mouse handling off entirely.
-Press `t` to show utilization, VRAM, and temperature sparklines for the selected
-GPU. History is kept in memory for the latest 60 successful refresh samples;
-recording the samples does not add remote requests.
+Detailed mode always places the selected GPU's process pane directly below the
+cards; there is no separate drill-down screen. In single-line mode, `Enter` or
+`Space` toggles the same pane. Its table shows PID, user, process VRAM, percentage
+of total GPU VRAM, CPU%, host MEM%, RSS, elapsed time, state, and command. Narrow
+terminals discard secondary columns first. The selected process gets an
+htop-style cyan highlight, and its block below the table spells out both
+percentage of the whole GPU and percentage of currently used GPU memory,
+threads, state, elapsed time, and the complete wrapped command line.
+When a wrapped command would push the action bar off-screen, it automatically
+uses height-aware pages (at most five command lines on terminals shorter than
+28 rows). Use `[`/`]`, the clickable command buttons, or the wheel over the
+command to see every line.
+
+Use `Tab`, `←`/`→`, or `h`/`l` to switch pane focus, then `j`/`k` or the arrow
+keys to move the highlighted row. Mouse reporting is on by default: click any
+GPU card or process row to select it, use the wheel over either pane to scroll
+that pane, and click the action buttons directly. Most terminals need `Shift`
+(or `Option`) held down for their own drag-to-select while mouse reporting is
+active; set `mouse: false` under `view` to disable TUI mouse handling.
+
+The process action bar exposes `SIGINT`, `SIGTERM`, and `SIGKILL` as `i`, `T`,
+and `K`. Every signal requires a second identical click/key press or `Enter`
+within five seconds; `Esc` cancels it. Signals run on the node that owns the
+selected GPU and report permission or command failures in the pane.
+
+Press `t` (or click History) to show utilization, VRAM, and temperature for the
+selected GPU plus CPU, GPU VRAM share, host memory, and RSS for the selected
+process. Both histories retain the latest 60 successful refresh samples in
+memory and do not add remote requests. On terminals shorter than 36 lines, the
+history rows temporarily replace the selected process's command block so the
+action buttons remain visible; toggle History off to restore the command.
+
 Machines without NVIDIA GPUs (a macOS laptop, a CPU-only host) are not expanded
 by default in the per-node view and are collapsed into a single "hidden" line in
 the unified node status. Press `u` to show them.
-Every one of these view keys is written back to the `view` section of
-`~/.nvidb/config.yml`, so the next `nvidb` run starts with the same layout.
+Layout toggles are written back to the `view` section of `~/.nvidb/config.yml`,
+so the next `nvidb` run starts with the same layout.
 
 ### 2.7 GPU Monitor Decorator
 

@@ -53,20 +53,30 @@ def _pool():
     pool.unified_sort_mode = "node"
     pool.unified_filter_mode = "all"
     pool.unified_selected_gpu = 0
+    pool.unified_selected_gpu_key = None
     pool.unified_show_processes = False
     pool.unified_show_trends = False
     pool.unified_group_by_node = True
     pool.hide_unsupported = True
     pool.mouse_enabled = True
-    pool.unified_focus = False
-    pool.focus_selected_process = 0
-    pool._focus_process_count = 0
+    pool.unified_active_pane = "gpu"
+    pool.unified_selected_process = 0
+    pool.unified_selected_process_pid = None
+    pool._unified_process_count = 0
+    pool.unified_command_scroll = 0
+    pool._unified_command_line_count = 0
+    pool._unified_command_page_size = 0
+    pool._pending_process_signal = None
+    pool._process_action_notice = None
     pool._click_targets = {}
+    pool._click_regions = []
     pool._body_click_targets = {}
+    pool._body_click_regions = []
     pool._unified_page_start = 0
     pool._unified_gpu_count = 0
     pool._unified_page_size = 1
     pool._unified_gpu_history = {}
+    pool._unified_process_history = {}
     pool._unified_history_lock = threading.Lock()
     pool.selected_server = 0
     pool.expanded_servers = {0}
@@ -296,6 +306,36 @@ def test_unified_capacity_summary_and_sort_modes(monkeypatch):
     ]
 
 
+def test_gpu_selection_stays_on_the_same_card_when_live_sort_order_changes(
+    monkeypatch,
+):
+    pool = _pool()
+    pool.unified_sort_mode = "utilization"
+    pool.unified_selected_gpu = 1
+    raw_stats = {
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(0, "GPU A", "90 %", "20000/49140"),
+                    _gpu_row(1, "GPU B", "10 %", "4000/49140"),
+                ]
+            ),
+            {},
+        )
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 30)))
+
+    pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    assert pool.unified_selected_gpu == 1
+    assert pool.unified_selected_gpu_key[-1] == "1"
+
+    raw_stats[1][0].loc[0, "util"] = "5 %"
+    raw_stats[1][0].loc[1, "util"] = "99 %"
+    pool._render_unified_gpu_lines(raw_stats, last_update_time=2)
+    assert pool.unified_selected_gpu == 0
+    assert pool.unified_selected_gpu_key[-1] == "1"
+
+
 def test_unified_filter_modes_and_error_view():
     pool = _pool()
     table = pd.DataFrame(
@@ -434,14 +474,16 @@ def test_unified_selected_gpu_process_details(monkeypatch):
 
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
 
-    assert "Processes: training-node (100.64.0.42) GPU 0" in rendered
+    assert "Processes | training-node (100.64.0.42) | GPU 0" in rendered
     assert "PID" in rendered
-    assert "User" in rendered
+    assert "USER" in rendered
     assert "VRAM" in rendered
-    assert "Command" in rendered
+    assert "COMMAND" in rendered
     assert "4242" in rendered
     assert "alice" in rendered
-    assert "16384 MiB" in rendered
+    assert "16,384 MiB" in rendered
+    assert "33.3% of GPU VRAM" in rendered
+    assert "68.3% of used VRAM" in rendered
     assert "python" in rendered
 
 
@@ -449,6 +491,9 @@ def test_unified_process_panel_shows_htop_fields_and_full_command(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
     pool.unified_show_processes = True
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("ANSI_COLORS_DISABLED", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
     command = (
         "/usr/bin/python3 train.py --config configs/qwen3-vl-32b.yaml --deepspeed zero3"
     )
@@ -482,18 +527,28 @@ def test_unified_process_panel_shows_htop_fields_and_full_command(monkeypatch):
     }
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 40)))
 
-    rendered = _without_ansi(
-        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    styled = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     )
+    rendered = _without_ansi(styled)
 
-    for header in ("PID", "User", "VRAM", "CPU%", "MEM%", "RSS", "Time", "Command"):
+    for header in ("PID", "USER", "VRAM", "CPU%", "MEM%", "RSS", "TIME", "COMMAND"):
         assert header in rendered
     assert "412.5" in rendered
     assert "18.4" in rendered
     assert "12.0G" in rendered
     assert "2-03:21:07" in rendered
-    # Truncated inside the table cell, spelled out in full underneath it.
-    assert f"  4242: {command}" in rendered
+    # Truncated inside the table row, wrapped in full in the selected block.
+    for fragment in command.split():
+        assert fragment in rendered
+    assert "\x1b[46m" in styled  # htop-style cyan selected row
+    assert "\x1b[31m" in styled  # high CPU value
+    assert "\x1b[35m" in styled  # user / host-memory fields
+    assert all(
+        len(line) == 120
+        for line in rendered.splitlines()
+        if line.startswith(("┌", "├", "└", "│"))
+    )
 
 
 def test_process_details_are_only_collected_while_the_panel_is_open():
@@ -544,11 +599,43 @@ def test_process_details_are_only_collected_while_the_panel_is_open():
     pool.get_client_gpus_info(return_raw=True)
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
     pool.get_client_gpus_info(return_raw=True)
+    pool.unified_detailed = True
+    pool.get_client_gpus_info(return_raw=True)
+    pool.unified_detailed = False
     pool.unified_show_processes = True
     pool.get_client_gpus_info(return_raw=True)
 
     # The extra `ps` call per host is only worth paying for while the panel is up.
-    assert calls == [False, False, True]
+    assert calls == [False, False, True, True]
+
+
+def test_process_selection_stays_on_the_same_pid_when_vram_sorting_changes(
+    monkeypatch,
+):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_selected_process = 1
+    raw_stats = _focus_raw_stats("python train.py")
+    processes = raw_stats["_nvidb"]["process_details_by_client"][1]["0"]
+    processes.append(
+        {
+            **processes[0],
+            "pid": 5252,
+            "used_memory": "4000 MiB",
+            "command": "python eval.py",
+        }
+    )
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 40)))
+
+    pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    assert pool.unified_selected_process == 1
+    assert pool.unified_selected_process_pid == "5252"
+
+    processes[1]["used_memory"] = "30000 MiB"
+    pool._render_unified_gpu_lines(raw_stats, last_update_time=2)
+    assert pool.unified_selected_process == 0
+    assert pool.unified_selected_process_pid == "5252"
 
 
 def test_unified_gpu_trends_keep_latest_sixty_samples(monkeypatch):
@@ -596,9 +683,43 @@ def test_unified_gpu_trends_keep_latest_sixty_samples(monkeypatch):
     assert any(block in rendered for block in "▁▂▃▄▅▆▇█")
 
 
+def test_selected_process_history_tracks_cpu_vram_ram_and_rss(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_show_trends = True
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 40)))
+
+    raw_stats = _focus_raw_stats("python train.py --steps 100")
+    process = raw_stats["_nvidb"]["process_details_by_client"][1]["0"][0]
+    for sample_index in range(4):
+        process["cpu_percent"] = 40 + sample_index * 10
+        process["mem_percent"] = 2 + sample_index
+        process["rss_kb"] = 1024 * (1000 + sample_index * 100)
+        process["used_memory"] = f"{20000 + sample_index * 1000} MiB"
+        pool._record_unified_gpu_history(raw_stats, timestamp=sample_index)
+
+    history = next(iter(pool._unified_process_history.values()))
+    assert len(history) == 4
+    assert history[-1]["cpu_percent"] == 70
+    assert history[-1]["mem_percent"] == 5
+    assert history[-1]["rss_kb"] == 1331200
+    assert history[-1]["vram_mib"] == 23000
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    )
+    assert "SELECTED PROCESS HISTORY" in rendered
+    assert "History  4/60 samples" in rendered
+    for label in ("CPU", "VRAM", "RAM", "RSS"):
+        assert label in rendered
+    assert any(block in rendered for block in "▁▂▃▄▅▆▇█")
+
+
 def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     pool = _pool()
     pool.unified_detailed = True
+    pool.unified_selected_gpu = 1
     raw_stats = {
         0: (
             pd.DataFrame([_gpu_row(0, "RTX 4090", "10 %", "1024/24576")]),
@@ -622,9 +743,9 @@ def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     content_lines = [line for line in detailed_lines if line.startswith("|")]
 
     assert "Unified GPU table (Detailed) | GPUs: 3" in rendered
-    assert len(content_lines) == 9
+    assert len(content_lines) == 12
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
-    assert "training-node (100.64.0.42) -- 2 GPUs" in _without_ansi(rendered)
+    assert "training-node (100.64.0.42) -- 2 GPUs" not in _without_ansi(rendered)
     assert "training-node GPU 0 [BUSY]" in rendered
     assert "100.64.0.42" in rendered
     assert "Model RTX 6000 Ada" in rendered
@@ -799,10 +920,10 @@ def _focus_raw_stats(command):
     }
 
 
-def test_gpu_focus_view_shows_the_whole_command_wrapped(monkeypatch):
+def test_detailed_process_pane_shows_the_whole_command_wrapped(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
-    pool.unified_focus = True
+    pool.unified_detailed = True
     command = (
         "/home/l1ght/anaconda3/envs/c14/bin/python /home/l1ght/cc_scripts/"
         "diag_math500_format.py --model /mnt/z/models/Qwen3-1.7B --math500 "
@@ -811,13 +932,14 @@ def test_gpu_focus_view_shows_the_whole_command_wrapped(monkeypatch):
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((90, 30)))
 
     rendered = _without_ansi(
-        "\n".join(pool._render_unified_focus_lines(_focus_raw_stats(command), 1))
+        "\n".join(pool._render_unified_gpu_lines(_focus_raw_stats(command), 1))
     )
 
-    assert "< Back | GPU focus: training-node (100.64.0.42) GPU 0" in rendered
-    assert "Util 94% | VRAM 24000/49140 MiB (49%)" in rendered
-    assert "> PID 4242  User alice" in rendered
-    assert "CPU 99.4%" in rendered and "THR 33" in rendered
+    assert "training-node GPU 0 [HIGH]" in rendered
+    assert "Processes | training-node (100.64.0.42) | GPU 0" in rendered
+    assert "VRAM 23,000 MiB" in rendered
+    assert "CPU 99.4%" in rendered and "Threads 33" in rendered
+    assert "GPU focus" not in rendered
     # The command is wrapped over several lines rather than cut off.
     assert command not in rendered
     for fragment in command.split():
@@ -825,36 +947,201 @@ def test_gpu_focus_view_shows_the_whole_command_wrapped(monkeypatch):
     assert all(len(line) <= 90 for line in rendered.splitlines())
 
 
-def test_arrow_keys_open_and_close_the_gpu_focus_view():
+def test_detailed_process_actions_stay_visible_on_a_24_line_terminal(
+    monkeypatch,
+):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    command = (
+        "/opt/conda/bin/python train.py --model /models/Qwen "
+        "--dataset /data/test.jsonl --batch 16 --max-new 2048"
+    )
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((80, 24)))
+    raw_stats = _focus_raw_stats(command)
+    raw_stats["_nvidb"]["process_details_by_client"][1]["0"].append(
+        {
+            "pid": 5252,
+            "username": "bob",
+            "used_memory": "1000 MiB",
+            "type": "C",
+            "process_name": "python",
+            "command": "python eval.py",
+        }
+    )
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 1))
+    )
+
+    # print_stats adds three fixed header rows above this body.
+    assert len(rendered.splitlines()) <= 21
+    assert "2 active" in rendered
+    assert "[i] INT  [T] TERM  [K] KILL" in rendered
+    for fragment in command.split():
+        assert fragment in rendered
+
+    pool.unified_show_trends = True
+    for sample_index in range(3):
+        pool._record_unified_gpu_history(raw_stats, timestamp=sample_index)
+    history_view = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 2))
+    )
+    assert len(history_view.splitlines()) <= 21
+    assert "GPU U" in history_view
+    assert "CPU" in history_view
+    assert "[i] INT  [T] TERM  [K] KILL" in history_view
+
+
+def test_long_command_uses_scrollable_pages_on_short_terminals(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_active_pane = "process"
+    command = (
+        "/home/alice/conda/bin/python /workspace/train.py "
+        "--model /models/Qwen3-32B --adapter /experiments/checkpoints/adapter "
+        "--dataset /datasets/math/test.jsonl "
+        "--output /experiments/results/long-name/result.jsonl "
+        "--batch-size 16 --max-new-tokens 4096"
+    )
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((60, 24)))
+    raw_stats = _focus_raw_stats(command)
+
+    first_page = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 1))
+    )
+    assert len(first_page.splitlines()) <= 21
+    assert "[<]Cmd" in first_page and "[>]Cmd" in first_page
+    assert pool._unified_command_line_count > pool._unified_command_page_size
+    assert "--max-new-tokens 4096" not in first_page
+
+    pool._click_targets = dict(pool._body_click_targets)
+    command_row = next(
+        row
+        for row, (kind, _value) in pool._click_targets.items()
+        if kind == "command"
+    )
+    assert pool._handle_mouse_event(
+        MouseEvent(button=65, column=10, row=command_row + 1, pressed=True)
+    ) is True
+    assert pool.unified_command_scroll > 0
+
+    pool.unified_command_scroll = 0
+    assert pool._handle_keypress("]") is True
+    last_page = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 2))
+    )
+    assert len(last_page.splitlines()) <= 21
+    assert "/experiments/results/long-name/result.jsonl" in last_page
+    assert "--max-new-tokens 4096" in last_page
+
+
+def test_detailed_process_layout_stays_inside_terminal_bounds(monkeypatch):
+    command = " ".join(
+        ["/opt/conda/bin/python", "/workspace/train.py"]
+        + [
+            f"--option-{index} /very/long/path/to/checkpoint-{index}/adapter.bin"
+            for index in range(18)
+        ]
+    )
+    cases = (
+        (40, 20, False),
+        (40, 20, True),
+        (40, 28, False),
+        (60, 36, True),
+        (80, 36, True),
+        (120, 40, False),
+    )
+
+    for width, height, history_enabled in cases:
+        pool = _pool()
+        pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+        pool.unified_detailed = True
+        pool.unified_active_pane = "process"
+        pool.unified_show_trends = history_enabled
+        raw_stats = _focus_raw_stats(command)
+        monkeypatch.setattr(
+            os,
+            "get_terminal_size",
+            lambda width=width, height=height: os.terminal_size(
+                (width, height)
+            ),
+        )
+        if history_enabled:
+            for sample_index in range(3):
+                pool._record_unified_gpu_history(
+                    raw_stats,
+                    timestamp=sample_index,
+                )
+
+        rendered = _without_ansi(
+            "\n".join(pool._render_unified_gpu_lines(raw_stats, 1))
+        )
+        lines = rendered.splitlines()
+        frame_reserve = (
+            3
+            if height < 28 or (height < 36 and history_enabled)
+            else 4
+        )
+
+        assert all(len(line) <= width for line in lines)
+        assert len(lines) <= height - frame_reserve
+        signal_targets = {
+            target
+            for _row, _start, _end, target in pool._body_click_regions
+            if target[0] == "signal"
+        }
+        assert signal_targets == {
+            ("signal", "INT"),
+            ("signal", "TERM"),
+            ("signal", "KILL"),
+        }
+        if not history_enabled:
+            assert (
+                pool._unified_command_line_count
+                > pool._unified_command_page_size
+            )
+            pager_targets = {
+                target
+                for _row, _start, _end, target in pool._body_click_regions
+                if target[0] == "command_scroll"
+            }
+            assert pager_targets == {
+                ("command_scroll", -1),
+                ("command_scroll", 1),
+            }
+
+
+def test_arrow_keys_switch_gpu_and_process_panes_without_leaving_detailed_view():
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool._unified_gpu_count = 2
+    pool._unified_process_count = 3
 
     right = SimpleNamespace(name="KEY_RIGHT")
-    assert pool._handle_keypress(right) is False  # nothing selected yet
-
-    pool._unified_gpu_count = 2
     assert pool._handle_keypress(right) is True
-    assert pool.unified_focus is True
+    assert pool.unified_active_pane == "process"
+    assert pool.unified_detailed is True
 
-    # Layout keys are inert while the drill-down is open.
-    assert pool._handle_keypress("d") is False
-    assert pool.unified_detailed is False
-
-    pool._focus_process_count = 3
     assert pool._handle_keypress("j") is True
-    assert pool.focus_selected_process == 1
+    assert pool.unified_selected_process == 1
     assert pool._handle_keypress("k") is True
-    assert pool.focus_selected_process == 0
+    assert pool.unified_selected_process == 0
 
     assert pool._handle_keypress(SimpleNamespace(name="KEY_LEFT")) is True
-    assert pool.unified_focus is False
+    assert pool.unified_active_pane == "gpu"
+    assert pool._handle_keypress("j") is True
+    assert pool.unified_selected_gpu == 1
     assert pool._handle_keypress("h") is False
 
 
-def test_clicking_a_gpu_row_selects_it_then_opens_the_focus_view(monkeypatch, capsys):
+def test_mouse_selects_gpus_processes_and_signal_actions(monkeypatch, capsys):
     pool = _pool()
     pool.term = Terminal(force_styling=False)
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
     pool.cached_stats = ["", ""]
     pool.cached_raw_stats = _focus_raw_stats("python train.py")
     pool._last_update_time = 1
@@ -876,26 +1163,42 @@ def test_clicking_a_gpu_row_selects_it_then_opens_the_focus_view(monkeypatch, ca
     # A click on another GPU only moves the selection.
     assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is True
     assert pool.unified_selected_gpu == 1
-    assert pool.unified_focus is False
 
-    # Clicking the already-selected GPU opens its detail view.
-    assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is True
-    assert pool.unified_focus is True
+    # Clicking the selected GPU is inert; no separate modal view is opened.
+    assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is False
+    assert pool.unified_active_pane == "gpu"
+    assert pool._handle_mouse_event(_click(gpu_rows[0] + 1)) is True
+    assert pool.unified_selected_gpu == 0
 
     pool.print_stats(use_cache=True)
     capsys.readouterr()
-    back_rows = [
-        row for row, (kind, _value) in pool._click_targets.items() if kind == "back"
+    process_rows = [
+        row
+        for row, (kind, _value) in pool._click_targets.items()
+        if kind == "process"
     ]
-    assert back_rows
-    assert pool._handle_mouse_event(_click(back_rows[0] + 1)) is True
-    assert pool.unified_focus is False
+    assert process_rows
+    assert pool._handle_mouse_event(_click(process_rows[0] + 1)) is True
+    assert pool.unified_active_pane == "process"
+    assert pool.unified_selected_process == 0
 
-    # The wheel moves the GPU selection without any clicking.
+    term_region = next(
+        region
+        for region in pool._click_regions
+        if region[3] == ("signal", "TERM")
+    )
+    row, start, _end, _target = term_region
     assert pool._handle_mouse_event(
-        MouseEvent(button=64, column=1, row=1, pressed=True)
+        MouseEvent(button=0, column=start + 1, row=row + 1, pressed=True)
     ) is True
-    assert pool.unified_selected_gpu == 0
+    assert pool._pending_process_signal["signal"] == "TERM"
+    assert pool._pending_process_signal["pid"] == 4242
+
+    # The wheel over a GPU card moves the GPU selection.
+    assert pool._handle_mouse_event(
+        MouseEvent(button=65, column=4, row=gpu_rows[0] + 1, pressed=True)
+    ) is True
+    assert pool.unified_selected_gpu == 1
 
 
 def test_clicking_a_server_row_selects_then_expands_it(monkeypatch, capsys):
@@ -943,6 +1246,62 @@ def test_mouse_can_be_turned_off():
 
     assert pool._handle_mouse_event(_click(6)) is False
     assert pool.unified_selected_gpu == 0
+
+
+def test_process_signals_require_confirmation_and_target_the_selected_host():
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    commands = []
+
+    class SignalClient:
+        description = "training-node"
+        host = "100.64.0.42"
+        port = 22
+        status = 0
+
+        def execute_command(self, command):
+            commands.append(command)
+            if self.status:
+                return (
+                    "kill: Operation not permitted\n"
+                    f"__NVIDB_SIGNAL_STATUS__:{self.status}\n"
+                )
+            return "\n__NVIDB_SIGNAL_STATUS__:0\n"
+
+    signal_client = SignalClient()
+    pool.pool[1] = signal_client
+    pool.cached_raw_stats = _focus_raw_stats("python train.py")
+    pool._unified_gpu_count = 2
+    pool._unified_process_count = 1
+
+    assert pool._handle_keypress("T") is True
+    assert commands == []
+    assert pool._pending_process_signal["signal"] == "TERM"
+    assert pool._pending_process_signal["pid"] == 4242
+
+    assert pool._handle_keypress("\n") is True
+    assert len(commands) == 1
+    assert "kill -s TERM -- 4242" in commands[0]
+    assert "__NVIDB_SIGNAL_STATUS__" in commands[0]
+    assert pool._pending_process_signal is None
+    assert "SIGTERM sent to PID 4242 on training-node" in (
+        pool._process_action_notice["message"]
+    )
+
+    assert pool._handle_keypress("K") is True
+    assert pool._pending_process_signal["signal"] == "KILL"
+    assert pool._handle_keypress(SimpleNamespace(name="KEY_ESCAPE")) is True
+    assert pool._pending_process_signal is None
+    assert len(commands) == 1
+
+    signal_client.status = 1
+    assert pool._handle_keypress("i") is True
+    assert pool._handle_keypress("i") is True
+    assert len(commands) == 2
+    assert "kill -s INT -- 4242" in commands[-1]
+    assert "Operation not permitted" in pool._process_action_notice["message"]
+    assert pool._process_action_notice["color"] == "red"
 
 
 def test_view_changes_are_persisted_to_config(monkeypatch):
@@ -1039,7 +1398,8 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
 
     pool._unified_gpu_count = 1
     assert pool._handle_keypress("\n") is True
-    assert pool.unified_show_processes is True
+    assert pool.unified_active_pane == "process"
+    assert pool.unified_show_processes is False
     assert pool.refresh_needed.is_set()
 
     pool.refresh_needed.clear()
