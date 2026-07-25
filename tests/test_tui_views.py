@@ -4,8 +4,10 @@ import threading
 from types import SimpleNamespace
 
 import pandas as pd
+from blessed import Terminal
 
 from nvidb.connection import NVClientPool
+from nvidb.mouse import MouseEvent
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
@@ -55,6 +57,13 @@ def _pool():
     pool.unified_show_trends = False
     pool.unified_group_by_node = True
     pool.hide_unsupported = True
+    pool.mouse_enabled = True
+    pool.unified_focus = False
+    pool.focus_selected_process = 0
+    pool._focus_process_count = 0
+    pool._click_targets = {}
+    pool._body_click_targets = {}
+    pool._unified_page_start = 0
     pool._unified_gpu_count = 0
     pool._unified_page_size = 1
     pool._unified_gpu_history = {}
@@ -750,6 +759,192 @@ def test_default_expansion_skips_nodes_without_gpus():
     assert touched.expanded_servers == {0}
 
 
+def _click(row):
+    return MouseEvent(button=0, column=4, row=row, pressed=True)
+
+
+def _focus_raw_stats(command):
+    return {
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(0, "RTX 6000 Ada", "94 %", "24000/49140", "alice(23G)"),
+                    _gpu_row(1, "RTX 6000 Ada", "0 %", "0/49140"),
+                ]
+            ),
+            {},
+        ),
+        "_nvidb": {
+            "process_details_by_client": {
+                1: {
+                    "0": [
+                        {
+                            "pid": 4242,
+                            "username": "alice",
+                            "used_memory": "23000 MiB",
+                            "type": "C",
+                            "process_name": "python",
+                            "command": command,
+                            "cpu_percent": 99.4,
+                            "mem_percent": 2.6,
+                            "rss_kb": 1677721,
+                            "elapsed": "32:05",
+                            "state": "RNl",
+                            "threads": 33,
+                        }
+                    ]
+                }
+            }
+        },
+    }
+
+
+def test_gpu_focus_view_shows_the_whole_command_wrapped(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_focus = True
+    command = (
+        "/home/l1ght/anaconda3/envs/c14/bin/python /home/l1ght/cc_scripts/"
+        "diag_math500_format.py --model /mnt/z/models/Qwen3-1.7B --math500 "
+        "/mnt/z/datasets/MATH-500/test.jsonl --out /mnt/z/results/qwen3.jsonl"
+    )
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((90, 30)))
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_focus_lines(_focus_raw_stats(command), 1))
+    )
+
+    assert "< Back | GPU focus: training-node (100.64.0.42) GPU 0" in rendered
+    assert "Util 94% | VRAM 24000/49140 MiB (49%)" in rendered
+    assert "> PID 4242  User alice" in rendered
+    assert "CPU 99.4%" in rendered and "THR 33" in rendered
+    # The command is wrapped over several lines rather than cut off.
+    assert command not in rendered
+    for fragment in command.split():
+        assert fragment in rendered
+    assert all(len(line) <= 90 for line in rendered.splitlines())
+
+
+def test_arrow_keys_open_and_close_the_gpu_focus_view():
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+
+    right = SimpleNamespace(name="KEY_RIGHT")
+    assert pool._handle_keypress(right) is False  # nothing selected yet
+
+    pool._unified_gpu_count = 2
+    assert pool._handle_keypress(right) is True
+    assert pool.unified_focus is True
+
+    # Layout keys are inert while the drill-down is open.
+    assert pool._handle_keypress("d") is False
+    assert pool.unified_detailed is False
+
+    pool._focus_process_count = 3
+    assert pool._handle_keypress("j") is True
+    assert pool.focus_selected_process == 1
+    assert pool._handle_keypress("k") is True
+    assert pool.focus_selected_process == 0
+
+    assert pool._handle_keypress(SimpleNamespace(name="KEY_LEFT")) is True
+    assert pool.unified_focus is False
+    assert pool._handle_keypress("h") is False
+
+
+def test_clicking_a_gpu_row_selects_it_then_opens_the_focus_view(monkeypatch, capsys):
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.cached_stats = ["", ""]
+    pool.cached_raw_stats = _focus_raw_stats("python train.py")
+    pool._last_update_time = 1
+    pool._last_fetch_duration = 0.1
+    pool._last_fetch_error = None
+    pool._cache_lock = threading.Lock()
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 40)))
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    gpu_rows = {
+        gpu: row
+        for row, (kind, gpu) in pool._click_targets.items()
+        if kind == "gpu"
+    }
+    assert set(gpu_rows) == {0, 1}
+
+    # A click on another GPU only moves the selection.
+    assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is True
+    assert pool.unified_selected_gpu == 1
+    assert pool.unified_focus is False
+
+    # Clicking the already-selected GPU opens its detail view.
+    assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is True
+    assert pool.unified_focus is True
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+    back_rows = [
+        row for row, (kind, _value) in pool._click_targets.items() if kind == "back"
+    ]
+    assert back_rows
+    assert pool._handle_mouse_event(_click(back_rows[0] + 1)) is True
+    assert pool.unified_focus is False
+
+    # The wheel moves the GPU selection without any clicking.
+    assert pool._handle_mouse_event(
+        MouseEvent(button=64, column=1, row=1, pressed=True)
+    ) is True
+    assert pool.unified_selected_gpu == 0
+
+
+def test_clicking_a_server_row_selects_then_expands_it(monkeypatch, capsys):
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool.expanded_servers = set()
+    pool._default_expansion_applied = True  # isolate clicks from the startup default
+    pool.cached_stats = ["", ""]
+    pool.cached_raw_stats = {
+        0: (pd.DataFrame(), {}),
+        1: (
+            pd.DataFrame([_gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140")]),
+            {},
+        ),
+    }
+    pool._last_update_time = 1
+    pool._last_fetch_duration = 0.1
+    pool._last_fetch_error = None
+    pool._cache_lock = threading.Lock()
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 40)))
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    server_rows = {
+        index: row
+        for row, (kind, index) in pool._click_targets.items()
+        if kind == "server"
+    }
+    assert set(server_rows) == {0, 1}
+
+    assert pool._handle_mouse_event(_click(server_rows[1] + 1)) is True
+    assert pool.selected_server == 1
+    assert pool.expanded_servers == set()
+
+    assert pool._handle_mouse_event(_click(server_rows[1] + 1)) is True
+    assert pool.expanded_servers == {1}
+
+
+def test_mouse_can_be_turned_off():
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.mouse_enabled = False
+    pool._click_targets = {5: ("gpu", 1)}
+
+    assert pool._handle_mouse_event(_click(6)) is False
+    assert pool.unified_selected_gpu == 0
+
+
 def test_view_changes_are_persisted_to_config(monkeypatch):
     pool = _pool()
     pool._persist_view_enabled = True
@@ -773,6 +968,7 @@ def test_view_changes_are_persisted_to_config(monkeypatch):
         "trends": False,
         "group_by_node": False,
         "hide_unsupported": True,
+        "mouse": True,
     }
     # Moving the selection is not a layout change and must not rewrite the file.
     saved.clear()

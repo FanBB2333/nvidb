@@ -24,6 +24,7 @@ DEFAULT_VIEW_SETTINGS = {
     "trends": False,
     "group_by_node": True,
     "hide_unsupported": True,
+    "mouse": True,
 }
 
 VIEW_SETTING_CHOICES = {

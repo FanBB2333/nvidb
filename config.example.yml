@@ -27,6 +27,10 @@ view:
   trends: false          # sparklines for the selected GPU     ([t])
   group_by_node: true    # node bands in the unified view      ([g])
   hide_unsupported: true # skip nodes without NVIDIA GPUs       ([u])
+  # Click a GPU to select it, click it again to open its detail view, wheel to
+  # scroll. Set to false if you would rather keep the terminal's own mouse
+  # selection (with mouse reporting on, most terminals need Shift to drag-select).
+  mouse: true
 
 servers:
   # Example server with SSH key authentication (recommended)

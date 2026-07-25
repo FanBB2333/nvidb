@@ -7,6 +7,7 @@ import subprocess
 import getpass
 import json
 import socket
+import textwrap
 import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
@@ -25,6 +26,11 @@ from . import config as nvidb_config
 from .data_modules import ServerInfo, ServerListInfo
 from .dcgm import make_dcgm_snapshot_command
 from .metrics import ADVANCED_METRIC_GROUPS, present_columns
+from .mouse import (
+    DISABLE_SEQUENCE as MOUSE_DISABLE_SEQUENCE,
+    ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
+    MouseSequenceParser,
+)
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color, get_memory_ratio_color
 
@@ -1430,6 +1436,13 @@ class NVClientPool:
         self.unified_show_trends = settings["trends"]
         self.unified_group_by_node = settings["group_by_node"]
         self.hide_unsupported = settings["hide_unsupported"]
+        self.mouse_enabled = settings["mouse"]
+        self.unified_focus = False
+        self.focus_selected_process = 0
+        self._focus_process_count = 0
+        self._click_targets = {}
+        self._body_click_targets = {}
+        self._unified_page_start = 0
         self._unified_gpu_count = 0
         self._unified_page_size = 1
         self._unified_gpu_history = {}
@@ -1522,7 +1535,10 @@ class NVClientPool:
         # is only collected while that panel is on screen.
         want_process_details = (
             getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED
-            and bool(getattr(self, "unified_show_processes", False))
+            and (
+                bool(getattr(self, "unified_show_processes", False))
+                or bool(getattr(self, "unified_focus", False))
+            )
         )
         for idx, client in enumerate(self.pool):
             result = client.get_full_gpu_info()
@@ -2081,9 +2097,11 @@ class NVClientPool:
         self._unified_page_size = page_size
 
         if total == 0:
+            self._unified_page_start = 0
             return table.copy(), None, ""
 
         page_start = (selected // page_size) * page_size
+        self._unified_page_start = page_start
         page_end = min(total, page_start + page_size)
         visible_table = table.iloc[page_start:page_end].reset_index(drop=True)
         selected_on_page = selected - page_start
@@ -2363,8 +2381,13 @@ class NVClientPool:
         *,
         selected_row=None,
         section_headers=None,
+        row_line_map=None,
     ):
-        """Format each GPU as a readable, color-aware three-line card."""
+        """Format each GPU as a readable, color-aware three-line card.
+
+        `row_line_map` is filled in with line offset -> row index so a click
+        anywhere on a card can be traced back to its GPU.
+        """
         if table.empty:
             return "No GPU data available"
 
@@ -2595,6 +2618,9 @@ class NVClientPool:
                 drop_order=("tx", "rx", "fan"),
                 shrink_order=("proc", "rx", "tx", "fan"),
             )
+            if row_line_map is not None:
+                for offset in range(3):
+                    row_line_map[len(lines) + offset] = row_index
             lines.extend(
                 [
                     f"| {identity_line} |",
@@ -2665,6 +2691,190 @@ class NVClientPool:
                 return
         self.expanded_servers = set()
 
+    @staticmethod
+    def _screen_line_count(elements):
+        """Count the terminal rows a list of frame elements occupies."""
+        return sum(len(str(element).split("\n")) for element in elements)
+
+    def _selected_unified_row(self, raw_stats_by_client):
+        """Return the currently selected GPU row across filtering and sorting."""
+        table = self._sort_unified_gpu_table(
+            self._filter_unified_gpu_table(
+                self._build_unified_gpu_table(raw_stats_by_client)
+            )
+        )
+        if table.empty:
+            return None
+        selected = int(getattr(self, "unified_selected_gpu", 0) or 0)
+        selected = max(0, min(selected, len(table) - 1))
+        self.unified_selected_gpu = selected
+        self._unified_gpu_count = len(table)
+        return table.iloc[selected]
+
+    def _format_focus_process_block(self, process, *, selected, width):
+        """Render one process as a header line plus its wrapped command."""
+        threads = process.get("threads")
+        try:
+            threads_display = "-" if threads is None else str(int(threads))
+        except (TypeError, ValueError):
+            threads_display = "-"
+        head = "  ".join(
+            [
+                f"{'>' if selected else ' '} PID {process.get('pid', 'N/A')}",
+                f"User {process.get('username', 'N/A')}",
+                f"Type {process.get('type', 'N/A')}",
+                f"VRAM {process.get('used_memory', 'N/A')}",
+                f"CPU {self._format_process_percent(process.get('cpu_percent'))}%",
+                f"MEM {self._format_process_percent(process.get('mem_percent'))}%",
+                f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
+                f"Time {process.get('elapsed') or '-'}",
+                f"THR {threads_display}",
+                f"S {process.get('state') or '-'}",
+            ]
+        )
+        # This view exists to show everything, so narrow terminals wrap the
+        # header fields instead of cutting them off.
+        lines = [
+            colored(part, attrs=["bold"]) if selected else part
+            for part in textwrap.wrap(
+                head,
+                width=max(20, width),
+                subsequent_indent="    ",
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or [head[:width]]
+        ]
+
+        command = str(
+            process.get("command") or process.get("process_name") or ""
+        ).strip()
+        indent = "      "
+        wrapped = textwrap.wrap(
+            command or "N/A",
+            width=max(20, width - len(indent)),
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+        # One pathological command should not push every other process off screen.
+        if len(wrapped) > 6:
+            wrapped = wrapped[:6]
+            wrapped[-1] = wrapped[-1][: max(0, width - len(indent) - 3)] + "..."
+        lines.extend(f"{indent}{part}" for part in wrapped)
+        return lines
+
+    def _render_unified_focus_lines(self, raw_stats_by_client, last_update_time):
+        """Render the drill-down for one GPU: its metrics and full commands."""
+        self._body_click_targets = {}
+        if last_update_time is None:
+            return ["GPU focus", "Loading GPU data..."]
+
+        try:
+            terminal_size = os.get_terminal_size()
+            width, height = terminal_size.columns, terminal_size.lines
+        except OSError:
+            width, height = 80, 24
+
+        row = self._selected_unified_row(raw_stats_by_client)
+        if row is None:
+            self._focus_process_count = 0
+            return ["GPU focus", "No GPU to show ([<-] back)"]
+
+        node = row.get("Node", "N/A")
+        hostname = row.get("Hostname", "N/A")
+        gpu_index = row.get("GPU", "N/A")
+        capacity = self._unified_gpu_capacity(row)
+        memory_percent = capacity["memory_percent"]
+        memory_suffix = (
+            f" ({memory_percent:.0f}%)" if memory_percent is not None else ""
+        )
+        # The title doubles as the "go back" click target, so it says so.
+        title = (
+            f"< Back | GPU focus: {node} ({hostname}) GPU {gpu_index} | "
+            f"{row.get('name', 'N/A')}"
+        )
+        metrics = " | ".join(
+            [
+                f"Util {str(row.get('util', 'N/A')).replace(' ', '')}",
+                f"VRAM {row.get('memory[used/total]', 'N/A')} MiB{memory_suffix}",
+                f"Temp {row.get('temp', 'N/A')}",
+                f"Power {row.get('power', 'N/A')} W",
+                f"Fan {row.get('fan', 'N/A')}",
+            ]
+        )
+
+        processes = sorted(
+            self._get_unified_process_details(raw_stats_by_client, row),
+            key=lambda process: (
+                self._extract_metric_number(process.get("used_memory")) or 0
+            ),
+            reverse=True,
+        )
+        self._focus_process_count = len(processes)
+        selected_process = max(
+            0,
+            min(
+                int(getattr(self, "focus_selected_process", 0) or 0),
+                max(0, len(processes) - 1),
+            ),
+        )
+        self.focus_selected_process = selected_process
+
+        header = [
+            colored(title[:width], "cyan", attrs=["bold"]),
+            metrics[:width],
+        ]
+        if not processes:
+            header.append("Processes: none")
+            self._body_click_targets = {0: ("back", None)}
+            lines = header + ["No active GPU processes"]
+            if getattr(self, "unified_show_trends", False):
+                lines.append(self._format_unified_gpu_trends(row))
+            return lines
+
+        blocks = [
+            self._format_focus_process_block(
+                process,
+                selected=(index == selected_process),
+                width=width,
+            )
+            for index, process in enumerate(processes)
+        ]
+
+        show_trends = bool(getattr(self, "unified_show_trends", False))
+        # Scroll the block list so the selected process is always on screen.
+        available = max(3, height - len(header) - 4 - (4 if show_trends else 0))
+        start = min(selected_process, len(blocks) - 1)
+        used = len(blocks[start])
+        while start > 0 and used + len(blocks[start - 1]) <= available:
+            start -= 1
+            used += len(blocks[start])
+
+        end = start
+        used = 0
+        for index in range(start, len(blocks)):
+            if used + len(blocks[index]) > available and index > start:
+                break
+            used += len(blocks[index])
+            end = index
+
+        header.append(
+            f"Processes: {start + 1}-{end + 1}/{len(processes)} | "
+            f"selected {selected_process + 1}"[:width]
+        )
+
+        lines = list(header)
+        body_targets = {}
+        for index in range(start, end + 1):
+            for offset in range(len(blocks[index])):
+                body_targets[len(lines) + offset] = ("process", index)
+            lines.extend(blocks[index])
+
+        self._body_click_targets = {0: ("back", None), **body_targets}
+        if show_trends:
+            lines.append(self._format_unified_gpu_trends(row))
+        return lines
+
     def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
         """Render the unified TUI body from cached per-node GPU data."""
         if last_update_time is None:
@@ -2687,6 +2897,7 @@ class NVClientPool:
         )
         title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
         section_headers = self._unified_section_headers(table, sorted_table)
+        row_line_map = {}
         if filter_mode == "errors":
             rendered_table = "Error filter: GPU rows hidden"
         elif table.empty and not source_table.empty:
@@ -2697,6 +2908,7 @@ class NVClientPool:
                 table,
                 selected_row=selected_row,
                 section_headers=section_headers,
+                row_line_map=row_line_map,
             )
         else:
             display_table = table.copy()
@@ -2721,6 +2933,7 @@ class NVClientPool:
                 column_labels=self.UNIFIED_TABLE_LABELS,
                 fixed_width_columns=("sel",),
                 section_headers=section_headers,
+                row_line_map=row_line_map,
             )
         selected_gpu_row = (
             table.iloc[selected_row]
@@ -2749,6 +2962,13 @@ class NVClientPool:
                     attrs=["bold"],
                 )
             )
+        # Remember where each GPU row landed so a click can select it.
+        table_offset = self._screen_line_count(lines)
+        page_start = int(getattr(self, "_unified_page_start", 0) or 0)
+        self._body_click_targets = {
+            table_offset + line_index: ("gpu", page_start + row_index)
+            for line_index, row_index in row_line_map.items()
+        }
         lines.append(rendered_table)
         status_lines = self._get_unified_node_status_lines(
             raw_stats_by_client,
@@ -2863,6 +3083,7 @@ class NVClientPool:
         fill_columns=None,
         fixed_width_columns=(),
         section_headers=None,
+        row_line_map=None,
     ):
         """Format fixed-width table display.
 
@@ -2870,6 +3091,8 @@ class NVClientPool:
         non-GPU tables: column minimum widths, drop priority, columns that must
         survive on narrow terminals, left-aligned and space-absorbing columns,
         plus `section_headers` (row index -> banner text) for grouped views.
+        `row_line_map` is filled in with line offset -> data row index so callers
+        can turn a mouse click into a row.
         """
         if df.empty:
             return "No GPU data available"
@@ -3207,10 +3430,12 @@ class NVClientPool:
         # Format data rows
         inner_width = len(header)
         data_lines = []
+        row_lines = {}
         for row_index, (_, row) in enumerate(df_display.iterrows()):
             band = section_headers.get(row_index)
             if band:
                 data_lines.append(self._format_section_band(*band, inner_width))
+            row_lines[len(data_lines)] = row_index
             row_parts = []
             row_util = str(row.get("util", "0"))
             row_util_color = get_utilization_color(row_util)
@@ -3261,6 +3486,7 @@ class NVClientPool:
             data_lines.append(" | ".join(row_parts))
 
         result_lines = [header, separator] + data_lines
+        data_offset = 2
         if border:
             top = "+" + "-" * (inner_width + 2) + "+"
             middle = "+-" + separator + "-+"
@@ -3269,6 +3495,11 @@ class NVClientPool:
                 + [f"| {line} |" for line in data_lines]
                 + [top]
             )
+            data_offset = 3
+
+        if row_line_map is not None:
+            for line_index, row_index in row_lines.items():
+                row_line_map[data_offset + line_index] = row_index
 
         return "\n".join(result_lines)
     
@@ -3598,7 +3829,18 @@ class NVClientPool:
             terminal_width = 80
 
         display_mode = getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
-        if display_mode == self.DISPLAY_MODE_UNIFIED:
+        focused = display_mode == self.DISPLAY_MODE_UNIFIED and getattr(
+            self, "unified_focus", False
+        )
+        if focused:
+            view_label = "Unified/GPU focus"
+            controls = (
+                "[<-/h]Back [j/k]Process [click]Select [t]Trend [q] "
+                "| click the title line to go back"
+            )
+            if len(controls) > terminal_width:
+                controls = controls[: max(0, terminal_width - 3)] + "..."
+        elif display_mode == self.DISPLAY_MODE_UNIFIED:
             detailed = getattr(self, "unified_detailed", False)
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
             detail_action = "Single-line" if detailed else "Detailed"
@@ -3651,11 +3893,28 @@ class NVClientPool:
             output_lines.append(global_line)
 
         if display_mode == self.DISPLAY_MODE_UNIFIED:
-            output_lines.extend(
-                self._render_unified_gpu_lines(raw_stats_by_client, last_update_time)
-            )
+            body_offset = self._screen_line_count(output_lines)
+            if focused:
+                body = self._render_unified_focus_lines(
+                    raw_stats_by_client,
+                    last_update_time,
+                )
+            else:
+                body = self._render_unified_gpu_lines(
+                    raw_stats_by_client,
+                    last_update_time,
+                )
+            output_lines.extend(body)
+            # Translate the body-relative hit boxes into absolute screen rows.
+            self._click_targets = {
+                body_offset + line: target
+                for line, target in (getattr(self, "_body_click_targets", {}) or {}).items()
+            }
             self._write_tui_lines(output_lines)
             return
+
+        self._click_targets = {}
+        self._body_click_targets = {}
 
         # Align the collapsed server list by padding headers to the same display width
         index_width = len(str(len(self.pool)))
@@ -3720,6 +3979,7 @@ class NVClientPool:
 
             # Header with summary on same line (summary aligned)
             summary = self._format_server_summary(summary_data, widths=widths)
+            self._click_targets[self._screen_line_count(output_lines)] = ("server", idx)
             output_lines.append(f"{header_display}  {summary}")
 
             # If expanded, print the full stats table (already formatted from get_client_gpus_info)
@@ -3758,6 +4018,7 @@ class NVClientPool:
             "trends": bool(getattr(self, "unified_show_trends", False)),
             "group_by_node": bool(getattr(self, "unified_group_by_node", True)),
             "hide_unsupported": bool(getattr(self, "hide_unsupported", True)),
+            "mouse": bool(getattr(self, "mouse_enabled", True)),
         }
 
     def _persist_view_settings(self):
@@ -3811,6 +4072,116 @@ class NVClientPool:
         self._request_ui_refresh()
         return True
 
+    def _move_focus_process_selection(self, delta):
+        count = max(0, int(getattr(self, "_focus_process_count", 0) or 0))
+        if count == 0:
+            return False
+        current = int(getattr(self, "focus_selected_process", 0) or 0)
+        selected = max(0, min(current + delta, count - 1))
+        if selected == current:
+            return False
+        self.focus_selected_process = selected
+        self._request_ui_refresh()
+        return True
+
+    def _enter_gpu_focus(self):
+        """Open the single-GPU drill-down for the current selection."""
+        if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+            return False
+        if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
+            return False
+        if getattr(self, "unified_focus", False):
+            return False
+        self.unified_focus = True
+        self.focus_selected_process = 0
+        self._request_ui_refresh()
+        return True
+
+    def _leave_gpu_focus(self):
+        if not getattr(self, "unified_focus", False):
+            return False
+        self.unified_focus = False
+        self._request_ui_refresh()
+        return True
+
+    def _toggle_server_expansion(self, index):
+        if index in getattr(self, "_toggle_disabled_servers", set()):
+            return False
+        if index in self.expanded_servers:
+            self.expanded_servers.discard(index)
+        else:
+            self.expanded_servers.add(index)
+        self._expansion_touched = True
+        self._request_ui_refresh()
+        return True
+
+    def _handle_mouse_event(self, event):
+        """Apply one mouse event and report whether the frame changed."""
+        if not getattr(self, "mouse_enabled", True):
+            return False
+
+        if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+            if event.is_wheel_up or event.is_wheel_down:
+                delta = -1 if event.is_wheel_up else 1
+                selected = max(
+                    0,
+                    min(self.selected_server + delta, len(self.pool) - 1),
+                )
+                if selected == self.selected_server:
+                    return False
+                self.selected_server = selected
+                self._request_ui_refresh()
+                return True
+            if not event.is_left_press:
+                return False
+            target = (getattr(self, "_click_targets", {}) or {}).get(event.row - 1)
+            if target is None or target[0] != "server":
+                return False
+            index = target[1]
+            # First click selects the node; clicking it again expands/collapses.
+            if index == self.selected_server:
+                return self._toggle_server_expansion(index)
+            self.selected_server = index
+            self._request_ui_refresh()
+            return True
+
+        focused = bool(getattr(self, "unified_focus", False))
+        if event.is_wheel_up:
+            return (
+                self._move_focus_process_selection(-1)
+                if focused
+                else self._move_unified_selection(-1)
+            )
+        if event.is_wheel_down:
+            return (
+                self._move_focus_process_selection(1)
+                if focused
+                else self._move_unified_selection(1)
+            )
+        if not event.is_left_press:
+            return False
+
+        target = (getattr(self, "_click_targets", {}) or {}).get(event.row - 1)
+        if target is None:
+            return False
+        kind, value = target
+        if kind == "back":
+            return self._leave_gpu_focus()
+        if kind == "process":
+            if value == int(getattr(self, "focus_selected_process", 0) or 0):
+                return False
+            self.focus_selected_process = value
+            self._request_ui_refresh()
+            return True
+        if kind == "gpu":
+            # First click selects; clicking the selected GPU opens its detail view.
+            if value == int(getattr(self, "unified_selected_gpu", 0) or 0):
+                return self._enter_gpu_focus()
+            self.unified_selected_gpu = value
+            self._request_ui_refresh()
+            return True
+        return False
+
     def _handle_keypress(self, key):
         """Apply one TUI keypress and return whether it changed visible state."""
         key_name = key.name if hasattr(key, "name") and key.name else str(key)
@@ -3819,6 +4190,34 @@ class NVClientPool:
         if key_lower == "q":
             self.quit_flag.set()
             return True
+
+        # The GPU drill-down is modal: only navigation keys apply while it is up.
+        if (
+            getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED
+            and getattr(self, "unified_focus", False)
+        ):
+            if key_name == "KEY_LEFT" or key_lower == "h":
+                return self._leave_gpu_focus()
+            if key_lower == "j" or key_name == "KEY_DOWN":
+                return self._move_focus_process_selection(1)
+            if key_lower == "k" or key_name == "KEY_UP":
+                return self._move_focus_process_selection(-1)
+            if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN"}:
+                return self._move_focus_process_selection(5)
+            if key_name in {"KEY_PPAGE", "KEY_PAGEUP"}:
+                return self._move_focus_process_selection(-5)
+            if key_lower == "t":
+                self.unified_show_trends = not getattr(
+                    self,
+                    "unified_show_trends",
+                    False,
+                )
+                self._apply_view_change()
+                return True
+            return False
+
+        if key_name == "KEY_RIGHT" or key_lower == "l":
+            return self._enter_gpu_focus()
         if key_lower == "v":
             self._toggle_display_mode()
             return True
@@ -3905,15 +4304,7 @@ class NVClientPool:
                 self._request_ui_refresh()
                 return True
         elif key_name == "KEY_ENTER" or key_lower == " " or key in {"\n", "\r"}:
-            if self.selected_server in getattr(self, "_toggle_disabled_servers", set()):
-                return False
-            if self.selected_server in self.expanded_servers:
-                self.expanded_servers.discard(self.selected_server)
-            else:
-                self.expanded_servers.add(self.selected_server)
-            self._expansion_touched = True
-            self._request_ui_refresh()
-            return True
+            return self._toggle_server_expansion(self.selected_server)
         elif key_lower == "a":
             disabled = getattr(self, "_toggle_disabled_servers", set())
             self.expanded_servers = {
@@ -3931,14 +4322,48 @@ class NVClientPool:
 
     def _keyboard_listener(self, cbreak_context):
         """Real-time keyboard listener thread, monitors keys for navigation and control."""
+        parser = MouseSequenceParser()
         try:
             while not self.quit_flag.is_set():
                 try:
                     key = self.term.inkey(timeout=0.1)
-                    if key:
-                        self._handle_keypress(key)
+                    if not key:
+                        # An escape that never became a mouse report is just Esc.
+                        for pending in parser.flush():
+                            self._handle_keypress(pending)
+                        continue
+                    events, keys = parser.feed(key)
+                    for event in events:
+                        self._handle_mouse_event(event)
+                    for pending in keys:
+                        self._handle_keypress(pending)
                 except KeyboardInterrupt:
                     break
+        except Exception:
+            pass
+
+    def _start_mouse_reporting(self):
+        """Ask the terminal for SGR mouse reports, when the user wants them."""
+        self._mouse_reporting = False
+        if not getattr(self, "mouse_enabled", True):
+            return
+        try:
+            if not sys.stdout.isatty():
+                return
+            sys.stdout.write(MOUSE_ENABLE_SEQUENCE)
+            sys.stdout.flush()
+            self._mouse_reporting = True
+        except Exception as error:
+            logging.debug(msg=f"Failed to enable mouse reporting: {error}")
+
+    def _stop_mouse_reporting(self):
+        """Always restore normal terminal selection behaviour on the way out."""
+        if not getattr(self, "_mouse_reporting", False):
+            return
+        self._mouse_reporting = False
+        try:
+            sys.stdout.write(MOUSE_DISABLE_SEQUENCE)
+            sys.stdout.flush()
         except Exception:
             pass
 
@@ -3991,13 +4416,17 @@ class NVClientPool:
         print("   g              : Toggle unified per-node grouping")
         print("   u              : Show/hide nodes without GPU support")
         print("   t              : Toggle selected GPU trends")
+        print("   Right/l        : Open the selected GPU (full process commands)")
+        print("   Left/h         : Leave the GPU detail view")
+        print("   Mouse          : Click a GPU to select, click again to open it")
         print("   q              : Quit")
         print("=" * 60)
-        
+
         # Use cbreak context in main thread for proper cleanup on Ctrl+C
         cbreak_ctx = self.term.cbreak()
         cbreak_ctx.__enter__()
-        
+        self._start_mouse_reporting()
+
         try:
             # Start keyboard listener thread (uses cbreak mode from main thread)
             keyboard_thread = threading.Thread(target=self._keyboard_listener, args=(cbreak_ctx,), daemon=True)
@@ -4025,6 +4454,7 @@ class NVClientPool:
             print(f"\n\n Error occurred: {e}")
         finally:
             self.quit_flag.set()  # Ensure thread exits
+            self._stop_mouse_reporting()
             # Explicitly exit cbreak mode to restore terminal state
             try:
                 cbreak_ctx.__exit__(None, None, None)

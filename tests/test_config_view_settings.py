@@ -49,6 +49,7 @@ def test_view_settings_round_trip_keeps_servers_and_basic(monkeypatch, tmp_path)
     assert stored["servers"][0]["nickname"] == "training-node"
     assert stored["servers"][0]["port"] == 2222
     assert config.load_view_settings() == {
+        **config.DEFAULT_VIEW_SETTINGS,
         "mode": "unified",
         "detailed": True,
         "sort": "available",

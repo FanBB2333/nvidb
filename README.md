@@ -167,9 +167,12 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `g`               | Toggle unified per-node grouping |
 | `u`               | Show/hide nodes without GPU support |
 | `t`               | Toggle selected GPU trends    |
-| `j` / `↓`         | Move server/GPU selection down |
-| `k` / `↑`         | Move server/GPU selection up  |
+| `→` / `l`         | Open the selected GPU's detail view |
+| `←` / `h`         | Leave the GPU detail view     |
+| `j` / `↓`         | Move server/GPU/process selection down |
+| `k` / `↑`         | Move server/GPU/process selection up |
 | `PgUp` / `PgDn`   | Change unified GPU page       |
+| Mouse             | Click to select, click again to open, wheel to scroll |
 | `Enter` / `Space` | Toggle server/GPU details      |
 | `a`               | Expand all servers            |
 | `c`               | Collapse all servers          |
@@ -209,6 +212,17 @@ process state, and the full command line. Commands too long for the table cell
 are printed in full underneath it. GPU processes come from the existing NVML
 snapshot; the htop-style fields add one batched `ps` call per host, issued only
 while this panel is open.
+Press `→` (or `l`) to open the selected GPU on its own screen: the GPU's
+metrics, then one block per process with its htop-style fields and the complete
+command wrapped over as many lines as it needs, instead of the single truncated
+table cell. `j` / `k` move between processes, `t` adds the sparklines, and `←`
+(or `h`) returns to the table.
+Mouse reporting is on by default: click a GPU row to select it, click the
+selected row again to open its detail view, click the title line of that view to
+go back, click a process to select it, and use the wheel to scroll. While mouse
+reporting is active most terminals need `Shift` (or `Option`) held down for
+their own drag-to-select; set `mouse: false` under `view` in the config to turn
+the mouse handling off entirely.
 Press `t` to show utilization, VRAM, and temperature sparklines for the selected
 GPU. History is kept in memory for the latest 60 successful refresh samples;
 recording the samples does not add remote requests.
