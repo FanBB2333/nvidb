@@ -69,6 +69,12 @@ servers:
 
 > **Warning**: Storing passwords in plaintext in the configuration file is **NOT RECOMMENDED** for security reasons. Consider using SSH key-based authentication (`auth: key`) instead.
 
+The same file also holds a `view` section that nvidb maintains itself: every TUI
+layout key (`v`, `d`, `s`, `f`, `g`, `u`, `t`, `Enter`) writes the new state back
+so the next run opens with the same view. See
+[2.6 Interactive TUI Navigation](#26-interactive-tui-navigation) for what each
+setting does.
+
 #### Environment Variables
 
 You can customize the working directory by setting `NVIDB_HOME`:
@@ -158,6 +164,8 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `d`               | Toggle unified row detail     |
 | `s`               | Cycle unified GPU sorting     |
 | `f`               | Cycle unified GPU filters     |
+| `g`               | Toggle unified per-node grouping |
+| `u`               | Show/hide nodes without GPU support |
 | `t`               | Toggle selected GPU trends    |
 | `j` / `↓`         | Move server/GPU selection down |
 | `k` / `↑`         | Move server/GPU selection up  |
@@ -168,13 +176,19 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `q`               | Quit                          |
 
 The default per-node view keeps each server's summary and expandable detail
-table. The unified view places GPUs from every node in one table and adds
-`Node` and `Hostname/IP` columns so nicknames and configured hostnames/IP
-addresses remain visible. Columns adapt to the terminal width, with core
-identity, utilization, model, and VRAM fields kept ahead of secondary metrics.
+table. The unified view places GPUs from every node in one table. By default
+rows are grouped into per-node blocks: a colored band names the node, its
+hostname/IP, GPU count, free GPUs, average utilization, and VRAM, and the rows
+below it drop the redundant `Node` / `Hostname/IP` columns so more width goes to
+the GPU metrics. Press `g` to turn grouping off (or sort by anything other than
+node order) and the flat table with `Node` and `Hostname/IP` columns comes back.
+Columns adapt to the terminal width, with core identity, utilization, model, and
+VRAM fields kept ahead of secondary metrics.
 In the unified view, press `d` to switch between the single-line table and
-Detailed cards. Detailed mode uses three lines per GPU: GPU status and identity,
-core utilization metrics, then fan, PCIe RX/TX, and processes. The status badge
+Detailed cards. Detailed mode uses three lines per GPU: node name, GPU index and
+status, then core utilization metrics (with block bars on terminals at least 100
+columns wide), then fan, PCIe RX/TX, and processes. The node name comes before
+the GPU index so the machine is the first thing you read. The status badge
 and utilization use cyan, green, yellow, or red to distinguish idle, active,
 busy, and high utilization while preserving fixed-width alignment.
 The capacity line summarizes available and busy GPUs, average utilization, and
@@ -186,12 +200,20 @@ visible GPU range, and `>` marks the selected GPU.
 Press `f` to cycle through all, available, busy, and error-only views. Busy
 means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
 nodes whose latest refresh failed.
-Press `Enter` or `Space` on a unified GPU to show its cached process details:
-PID, user, VRAM, process type, and command. The panel uses the existing NVML
-snapshot and does not issue another remote command.
+Press `Enter` or `Space` on a unified GPU to show its process details: PID,
+user, type, VRAM, plus htop-style CPU%, MEM%, RSS, elapsed time, thread count,
+process state, and the full command line. Commands too long for the table cell
+are printed in full underneath it. GPU processes come from the existing NVML
+snapshot; the htop-style fields add one batched `ps` call per host, issued only
+while this panel is open.
 Press `t` to show utilization, VRAM, and temperature sparklines for the selected
 GPU. History is kept in memory for the latest 60 successful refresh samples;
 recording the samples does not add remote requests.
+Machines without NVIDIA GPUs (a macOS laptop, a CPU-only host) are not expanded
+by default in the per-node view and are collapsed into a single "hidden" line in
+the unified node status. Press `u` to show them.
+Every one of these view keys is written back to the `view` section of
+`~/.nvidb/config.yml`, so the next `nvidb` run starts with the same layout.
 
 ### 2.7 GPU Monitor Decorator
 

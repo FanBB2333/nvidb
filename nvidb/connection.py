@@ -21,11 +21,25 @@ from paramiko.client import SSHClient, AutoAddPolicy
 from paramiko.ssh_exception import NoValidConnectionsError, PasswordRequiredException
 import pandas as pd
 from termcolor import colored, cprint
+from . import config as nvidb_config
 from .data_modules import ServerInfo, ServerListInfo
 from .dcgm import make_dcgm_snapshot_command
 from .metrics import ADVANCED_METRIC_GROUPS, present_columns
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color, get_memory_ratio_color
+
+
+def parse_leading_float(value):
+    """Return the first numeric component of a text field, or None."""
+    if value is None:
+        return None
+    numbers = extract_numbers(str(value))
+    if not numbers:
+        return None
+    try:
+        return float(numbers[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def nvidbInit():
@@ -95,15 +109,12 @@ class BaseClient(ABC):
         for i in range(0, len(items), chunk_size):
             yield items[i : i + chunk_size]
 
-    def get_pid_user_map(self, pids, chunk_size: int = 128):
-        """Batch query pid -> username mapping via a single ps call (or a few chunked calls)."""
-        if not pids:
-            return {}
-
-        # Clean and de-duplicate PIDs (preserve order)
+    @staticmethod
+    def _unique_pids(pids):
+        """Clean and de-duplicate PIDs (preserve order)."""
         seen = set()
         unique_pids = []
-        for pid in pids:
+        for pid in pids or ():
             pid_str = str(pid).strip()
             if not pid_str or pid_str == "N/A":
                 continue
@@ -111,7 +122,11 @@ class BaseClient(ABC):
                 continue
             seen.add(pid_str)
             unique_pids.append(pid_str)
+        return unique_pids
 
+    def get_pid_user_map(self, pids, chunk_size: int = 128):
+        """Batch query pid -> username mapping via a single ps call (or a few chunked calls)."""
+        unique_pids = self._unique_pids(pids)
         if not unique_pids:
             return {}
 
@@ -133,7 +148,59 @@ class BaseClient(ABC):
                     pid_to_user[pid_str] = username
 
         return pid_to_user
-    
+
+    # `ps` keyword sets tried in order: Linux (with thread count), BSD/macOS,
+    # then the minimal set every ps implementation supports. `args` stays last
+    # because it is the only field that may contain spaces.
+    PROCESS_DETAIL_FIELD_SETS = (
+        ("pid", "user", "pcpu", "pmem", "rss", "etime", "stat", "nlwp", "args"),
+        ("pid", "user", "pcpu", "pmem", "rss", "etime", "stat", "args"),
+        ("pid", "user", "args"),
+    )
+
+    def _query_pid_details(self, pids, fields, chunk_size: int):
+        selector = ",".join(f"{field}=" for field in fields)
+        details = {}
+        for pid_chunk in self._chunked(pids, chunk_size):
+            pid_list = ",".join(pid_chunk)
+            output = self.execute_command(f"ps -o {selector} -p {pid_list}")
+            if not isinstance(output, str) or not output.strip():
+                continue
+            for line in output.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, len(fields) - 1)
+                if len(parts) < len(fields):
+                    continue
+                values = dict(zip(fields, parts))
+                pid_str = values.get("pid", "").strip()
+                if not pid_str:
+                    continue
+                details[pid_str] = {
+                    "username": values.get("user") or None,
+                    "cpu_percent": parse_leading_float(values.get("pcpu")),
+                    "mem_percent": parse_leading_float(values.get("pmem")),
+                    "rss_kb": parse_leading_float(values.get("rss")),
+                    "elapsed": (values.get("etime") or "").strip() or None,
+                    "state": (values.get("stat") or "").strip() or None,
+                    "threads": parse_leading_float(values.get("nlwp")),
+                    "command": (values.get("args") or "").strip() or None,
+                }
+        return details
+
+    def get_pid_process_info(self, pids, chunk_size: int = 128):
+        """Batch query htop-style details (CPU, RSS, state, full command) per pid."""
+        unique_pids = self._unique_pids(pids)
+        if not unique_pids:
+            return {}
+
+        for fields in self.PROCESS_DETAIL_FIELD_SETS:
+            details = self._query_pid_details(unique_pids, fields, chunk_size)
+            if details:
+                return details
+        return {}
+
     def test(self):
         """Test connection with ls command"""
         try:
@@ -710,8 +777,13 @@ class BaseClient(ABC):
         """Return the client object"""
         return self
     
-    def get_process_summary(self, gpu_stats=None):
-        """Get detailed GPU processes information with user summary"""
+    def get_process_summary(self, gpu_stats=None, detailed: bool = False):
+        """Get detailed GPU processes information with user summary.
+
+        With `detailed`, one extra batched `ps` call per host enriches every GPU
+        process with htop-style fields (CPU/MEM share, RSS, elapsed time, state,
+        thread count) and the full command line.
+        """
         def safe_get_text(element, path, default="N/A"):
             """Safely get text from XML element, return default if not found"""
             if element is None:
@@ -728,6 +800,7 @@ class BaseClient(ABC):
             
             process_entries = []
             pids = []
+            all_pids = []
 
             # First pass: extract processes and collect all pids
             for idx, row in stats.iterrows():
@@ -788,12 +861,10 @@ class BaseClient(ABC):
                             memory_value = 0
 
                     pid_str = str(pid).strip()
-                    if (
-                        pid_str
-                        and pid_str != "N/A"
-                        and (not username or username == "N/A")
-                    ):
-                        pids.append(pid_str)
+                    if pid_str and pid_str != "N/A":
+                        all_pids.append(pid_str)
+                        if not username or username == "N/A":
+                            pids.append(pid_str)
 
                     process_entries.append(
                         {
@@ -817,13 +888,22 @@ class BaseClient(ABC):
                         }
                     )
 
-            pid_to_user = self.get_pid_user_map(pids)
+            pid_details = self.get_pid_process_info(all_pids) if detailed else {}
+            missing_user_pids = [
+                pid_str
+                for pid_str in pids
+                if not (pid_details.get(pid_str) or {}).get("username")
+            ]
+            pid_to_user = self.get_pid_user_map(missing_user_pids)
 
             all_processes = []
             user_memory_summary = {}
             for entry in process_entries:
                 pid_str = str(entry.get("pid", "")).strip()
+                details = pid_details.get(pid_str) or {}
                 username = entry.get("username")
+                if not username or username == "N/A":
+                    username = details.get("username")
                 if not username or username == "N/A":
                     username = (
                         pid_to_user.get(pid_str, "N/A")
@@ -841,6 +921,13 @@ class BaseClient(ABC):
                         "used_memory": entry.get("used_memory", "0 MiB"),
                         "username": username,
                         "gpu_index": entry.get("gpu_index"),
+                        "command": details.get("command") or entry.get("process_name", "N/A"),
+                        "cpu_percent": details.get("cpu_percent"),
+                        "mem_percent": details.get("mem_percent"),
+                        "rss_kb": details.get("rss_kb"),
+                        "elapsed": details.get("elapsed"),
+                        "state": details.get("state"),
+                        "threads": details.get("threads"),
                     }
                 )
 
@@ -1247,6 +1334,7 @@ class NVClientPool:
         "processes",
     )
     UNIFIED_TABLE_LABELS = {
+        "sel": "",
         "Hostname": "Hostname/IP",
         "name": "Model",
         "util": "Util",
@@ -1257,6 +1345,36 @@ class NVClientPool:
         "rx": "RX",
         "tx": "TX",
         "processes": "Processes",
+    }
+    # Process panel columns, ordered from "always keep" to "drop first" when the
+    # terminal is too narrow to show every htop-style field.
+    PROCESS_TABLE_MIN_WIDTHS = {
+        "PID": 7,
+        "User": 8,
+        "Type": 4,
+        "VRAM": 9,
+        "CPU%": 5,
+        "MEM%": 5,
+        "RSS": 6,
+        "Time": 10,
+        "THR": 4,
+        "S": 3,
+        # Wide enough that narrow terminals drop secondary columns instead of
+        # cutting the command line down to a useless stub.
+        "Command": 40,
+    }
+    PROCESS_TABLE_IMPORTANCE = {
+        "PID": 0,
+        "Command": 1,
+        "User": 2,
+        "VRAM": 3,
+        "CPU%": 4,
+        "MEM%": 5,
+        "RSS": 6,
+        "Time": 7,
+        "S": 8,
+        "THR": 9,
+        "Type": 10,
     }
     UNIFIED_SORT_MODES = ("node", "available", "utilization")
     UNIFIED_SORT_LABELS = {
@@ -1272,7 +1390,18 @@ class NVClientPool:
         "errors": "Errors",
     }
 
-    def __init__(self, server_list: ServerListInfo, *, compact: bool = False):
+    def __init__(
+        self,
+        server_list: ServerListInfo,
+        *,
+        compact: bool = False,
+        view_settings=None,
+    ):
+        """Build the client pool.
+
+        `view_settings` restores the layout persisted in config.yml; passing it
+        also enables writing later view changes back to that file.
+        """
         self.pool = [LocalClient()]
         if server_list is not None:
             self.pool += [RemoteClient(server) for server in server_list]
@@ -1284,13 +1413,23 @@ class NVClientPool:
         # Collapsible display state - only first server expanded by default
         self.expanded_servers = {0}  # Only first server expanded by default
         self.selected_server = 0  # Currently selected server for navigation
-        self.display_mode = self.DISPLAY_MODE_NODES
-        self.unified_detailed = False
-        self.unified_sort_mode = "node"
-        self.unified_filter_mode = "all"
+        self._persist_view_enabled = view_settings is not None
+        self._default_expansion_applied = False
+        self._expansion_touched = False
+        settings = nvidb_config.normalize_view_settings(view_settings)
+        self.display_mode = (
+            self.DISPLAY_MODE_UNIFIED
+            if settings["mode"] == "unified"
+            else self.DISPLAY_MODE_NODES
+        )
+        self.unified_detailed = settings["detailed"]
+        self.unified_sort_mode = settings["sort"]
+        self.unified_filter_mode = settings["filter"]
         self.unified_selected_gpu = 0
-        self.unified_show_processes = False
-        self.unified_show_trends = False
+        self.unified_show_processes = settings["processes"]
+        self.unified_show_trends = settings["trends"]
+        self.unified_group_by_node = settings["group_by_node"]
+        self.hide_unsupported = settings["hide_unsupported"]
         self._unified_gpu_count = 0
         self._unified_page_size = 1
         self._unified_gpu_history = {}
@@ -1379,6 +1518,12 @@ class NVClientPool:
         user_memory_by_client = {}
         global_user_memory = {}
         process_details_by_client = {}
+        # The htop-style process panel needs one extra `ps` call per host, so it
+        # is only collected while that panel is on screen.
+        want_process_details = (
+            getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED
+            and bool(getattr(self, "unified_show_processes", False))
+        )
         for idx, client in enumerate(self.pool):
             result = client.get_full_gpu_info()
             
@@ -1430,7 +1575,10 @@ class NVClientPool:
             # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)
             process_list = []
             try:
-                all_processes, user_summary_for_client = client.get_process_summary(stats)
+                all_processes, user_summary_for_client = client.get_process_summary(
+                    stats,
+                    detailed=want_process_details,
+                )
 
                 per_gpu_user_summary = {}
                 per_gpu_process_details = {}
@@ -1446,6 +1594,13 @@ class NVClientPool:
                             "used_memory": used_memory,
                             "type": proc.get("type", "N/A"),
                             "process_name": proc.get("process_name", "N/A"),
+                            "command": proc.get("command") or proc.get("process_name", "N/A"),
+                            "cpu_percent": proc.get("cpu_percent"),
+                            "mem_percent": proc.get("mem_percent"),
+                            "rss_kb": proc.get("rss_kb"),
+                            "elapsed": proc.get("elapsed"),
+                            "state": proc.get("state"),
+                            "threads": proc.get("threads"),
                         }
                     )
 
@@ -1819,6 +1974,75 @@ class NVClientPool:
             return summary[: max(0, terminal_width - 3)] + "..."
         return summary
 
+    def _unified_grouping_active(self):
+        """Group rows into node blocks only while the table follows node order."""
+        return (
+            bool(getattr(self, "unified_group_by_node", True))
+            and self._get_unified_sort_mode() == "node"
+        )
+
+    def _format_unified_node_band(self, node, hostname, rows):
+        """Summarize one node's GPUs for the band above its block of rows."""
+        capacity = [self._unified_gpu_capacity(row) for row in rows]
+        count = len(capacity)
+        available = sum(1 for values in capacity if values["available"])
+        utilizations = [
+            values["utilization"]
+            for values in capacity
+            if values["utilization"] is not None
+        ]
+        used_mib = sum(
+            values["used_mib"] for values in capacity if values["used_mib"] is not None
+        )
+        total_mib = sum(
+            values["total_mib"] for values in capacity if values["total_mib"] is not None
+        )
+
+        parts = [
+            f"{node} ({hostname})",
+            f"{count} GPU" if count == 1 else f"{count} GPUs",
+            f"free {available}",
+            (
+                f"avg {sum(utilizations) / len(utilizations):.0f}%"
+                if utilizations
+                else "avg N/A"
+            ),
+        ]
+        if total_mib > 0:
+            parts.append(f"VRAM {used_mib / 1024:.0f}/{total_mib / 1024:.0f}G")
+        return " | ".join(parts)
+
+    def _unified_section_headers(self, visible_table, scope_table):
+        """Map visible row index -> node band text for the grouped views."""
+        headers = {}
+        if (
+            not self._unified_grouping_active()
+            or visible_table.empty
+            or "Node" not in visible_table.columns
+        ):
+            return headers
+
+        def identity(row):
+            return str(row.get("Node", "")), str(row.get("Hostname", ""))
+
+        previous_key = None
+        for position, (_, row) in enumerate(visible_table.iterrows()):
+            key = identity(row)
+            if key == previous_key:
+                continue
+            previous_key = key
+            node_rows = [
+                node_row
+                for _, node_row in scope_table.iterrows()
+                if identity(node_row) == key
+            ]
+            headers[position] = self._format_unified_node_band(
+                key[0],
+                key[1],
+                node_rows or [row],
+            )
+        return headers
+
     def _paginate_unified_gpu_table(self, table, *, detailed):
         """Return the visible GPU page and selected row within that page."""
         try:
@@ -1828,14 +2052,23 @@ class NVClientPool:
 
         show_processes = bool(getattr(self, "unified_show_processes", False))
         show_trends = bool(getattr(self, "unified_show_trends", False))
-        extra_lines = (6 if show_processes else 0) + (
+        extra_lines = (8 if show_processes else 0) + (
             5 if show_trends else 0
         )
+        # Node bands take screen space too: two extra lines per block in the
+        # detailed view (the block reuses one card border), one otherwise.
+        group_count = 0
+        if (
+            self._unified_grouping_active()
+            and not table.empty
+            and "Node" in table.columns
+        ):
+            group_count = len(table[["Node", "Hostname"]].drop_duplicates())
         if detailed:
-            reserved_lines = 10 + extra_lines
+            reserved_lines = 10 + extra_lines + group_count * 2
             page_size = max(1, (terminal_height - reserved_lines) // 4)
         else:
-            reserved_lines = 12 + extra_lines
+            reserved_lines = 12 + extra_lines + group_count
             page_size = max(1, terminal_height - reserved_lines)
 
         total = len(table)
@@ -1891,6 +2124,51 @@ class NVClientPool:
             if isinstance(process, dict)
         ]
 
+    @staticmethod
+    def _format_memory_kb(value):
+        """Render a KiB reading from `ps` as a compact K/M/G string."""
+        if value is None:
+            return "-"
+        try:
+            kib = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        if kib >= 1024 * 1024:
+            return f"{kib / (1024 * 1024):.1f}G"
+        if kib >= 1024:
+            return f"{kib / 1024:.0f}M"
+        return f"{kib:.0f}K"
+
+    @staticmethod
+    def _format_process_percent(value):
+        if value is None:
+            return "-"
+        try:
+            return f"{float(value):.1f}"
+        except (TypeError, ValueError):
+            return "-"
+
+    def _format_process_row(self, process):
+        """Build one htop-style row for the unified process panel."""
+        threads = process.get("threads")
+        try:
+            threads_display = "-" if threads is None else str(int(threads))
+        except (TypeError, ValueError):
+            threads_display = "-"
+        return {
+            "PID": process.get("pid", "N/A"),
+            "User": process.get("username", "N/A"),
+            "Type": process.get("type", "N/A"),
+            "VRAM": process.get("used_memory", "N/A"),
+            "CPU%": self._format_process_percent(process.get("cpu_percent")),
+            "MEM%": self._format_process_percent(process.get("mem_percent")),
+            "RSS": self._format_memory_kb(process.get("rss_kb")),
+            "Time": process.get("elapsed") or "-",
+            "THR": threads_display,
+            "S": process.get("state") or "-",
+            "Command": process.get("command") or process.get("process_name", "N/A"),
+        }
+
     def _format_unified_process_details(
         self,
         raw_stats_by_client,
@@ -1919,26 +2197,38 @@ class NVClientPool:
             reverse=True,
         )
         try:
-            terminal_height = os.get_terminal_size().lines
+            terminal_size = os.get_terminal_size()
+            terminal_width, terminal_height = terminal_size.columns, terminal_size.lines
         except OSError:
-            terminal_height = 24
+            terminal_width, terminal_height = 80, 24
         max_processes = max(1, min(5, terminal_height // 6))
         if getattr(self, "unified_show_trends", False):
             max_processes = min(max_processes, 2)
         visible_processes = processes[:max_processes]
         process_table = pd.DataFrame(
-            [
-                {
-                    "PID": process.get("pid", "N/A"),
-                    "User": process.get("username", "N/A"),
-                    "VRAM": process.get("used_memory", "N/A"),
-                    "Type": process.get("type", "N/A"),
-                    "Command": process.get("process_name", "N/A"),
-                }
-                for process in visible_processes
-            ]
+            [self._format_process_row(process) for process in visible_processes]
         )
-        panel = [title, self._format_fixed_width_table(process_table, border=True)]
+        rendered_table = self._format_fixed_width_table(
+            process_table,
+            border=True,
+            min_width_overrides=self.PROCESS_TABLE_MIN_WIDTHS,
+            importance_overrides=self.PROCESS_TABLE_IMPORTANCE,
+            must_keep_columns=("PID", "User", "VRAM", "Command"),
+            left_align_columns=("Command",),
+            fill_columns=("Command",),
+        )
+        panel = [title, rendered_table]
+        # A table cell rarely fits a training command line, so spell the longest
+        # ones out below the table where the full terminal width is available.
+        for process in visible_processes:
+            command = str(
+                process.get("command") or process.get("process_name") or ""
+            ).strip()
+            if not command or command in rendered_table:
+                continue
+            panel.append(f"  {process.get('pid', 'N/A')}: {command}"[:terminal_width])
+            if len(panel) >= 4:
+                break
         hidden_count = len(processes) - len(visible_processes)
         if hidden_count > 0:
             panel.append(f"+ {hidden_count} more processes")
@@ -2065,7 +2355,13 @@ class NVClientPool:
             ]
         )
 
-    def _format_unified_detailed_table(self, table, *, selected_row=None):
+    def _format_unified_detailed_table(
+        self,
+        table,
+        *,
+        selected_row=None,
+        section_headers=None,
+    ):
         """Format each GPU as a readable, color-aware three-line card."""
         if table.empty:
             return "No GPU data available"
@@ -2199,40 +2495,68 @@ class NVClientPool:
             line = separator.join(styled_parts)
             return line + " " * max(0, content_width - plain_length)
 
+        def progress_bar(percent, width=10):
+            """Render a compact block bar; empty when the metric is unknown."""
+            if percent is None or table_width < 100:
+                return ""
+            try:
+                value = max(0.0, min(100.0, float(percent)))
+            except (TypeError, ValueError):
+                return ""
+            filled = int(round(value / 100.0 * width))
+            if value > 0 and filled == 0:
+                filled = 1
+            return " [" + "█" * filled + "░" * (width - filled) + "]"
+
         border = "+" + "-" * (table_width - 2) + "+"
+        section_headers = section_headers or {}
         lines = [border]
         for row_index, (_, row) in enumerate(table.iterrows()):
+            band_text = section_headers.get(row_index)
+            if band_text:
+                if lines and lines[-1] == border:
+                    lines.pop()
+                lines.extend(
+                    [
+                        border,
+                        f"| {self._format_section_band(band_text, table_width - 4)} |",
+                        border,
+                    ]
+                )
             utilization = clean(row.get("util")).replace(" ", "")
             status, utilization_color = utilization_status(utilization)
             marker = "> " if row_index == selected_row else "  "
-            gpu_badge = f"{marker}GPU {clean(row.get('GPU'))} [{status}]"
-            node_identity = (
-                f"Node {clean(row.get('Node'))} "
-                f"({clean(row.get('Hostname'))})"
+            # Node name first: the node is what users scan for before the GPU index.
+            gpu_badge = (
+                f"{marker}{clean(row.get('Node'))} "
+                f"GPU {clean(row.get('GPU'))} [{status}]"
             )
             identity_fields = [
                 make_field(
                     "gpu",
                     gpu_badge,
-                    15,
+                    20,
                     color=utilization_color,
                     bold=True,
                 ),
                 make_field("model", f"Model {clean(row.get('name'))}", 18),
-                make_field("node", node_identity, 24),
+                make_field("host", clean(row.get("Hostname")), 13),
             ]
 
+            utilization_percent = self._extract_metric_number(row.get("util"))
+            memory_percent = self._unified_gpu_capacity(row)["memory_percent"]
             core_metric_fields = [
                 make_field(
                     "util",
-                    f"Util {utilization}",
+                    f"Util {utilization}{progress_bar(utilization_percent)}",
                     8,
                     color=utilization_color,
                     bold=True,
                 ),
                 make_field(
                     "vram",
-                    f"VRAM {add_unit(row.get('memory[used/total]'), 'MiB')}",
+                    f"VRAM {add_unit(row.get('memory[used/total]'), 'MiB')}"
+                    f"{progress_bar(memory_percent, 8)}",
                     18,
                     color=memory_color(row.get("memory[used/total]")),
                 ),
@@ -2256,7 +2580,8 @@ class NVClientPool:
 
             identity_line = fit_fields(
                 identity_fields,
-                shrink_order=("model", "node"),
+                drop_order=("host",),
+                shrink_order=("model", "host", "gpu"),
             )
             core_metrics_line = fit_fields(
                 core_metric_fields,
@@ -2289,7 +2614,9 @@ class NVClientPool:
         if last_update_time is None:
             return []
 
+        hide_unsupported = bool(getattr(self, "hide_unsupported", True))
         lines = []
+        hidden_count = 0
         raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
         for idx in range(len(self.pool)):
             node, hostname = self._client_table_identity(idx)
@@ -2301,8 +2628,40 @@ class NVClientPool:
                 not errors_only
                 and (not isinstance(stats, pd.DataFrame) or stats.empty)
             ):
+                # Machines without NVIDIA GPUs (e.g. a macOS laptop) would
+                # otherwise repeat the same "no data" line on every refresh.
+                if hide_unsupported:
+                    hidden_count += 1
+                    continue
                 lines.append(f"- {node} ({hostname}): No GPU data available")
+        if hidden_count:
+            label = "node" if hidden_count == 1 else "nodes"
+            lines.append(
+                f"- {hidden_count} {label} without GPU support hidden ([u] to show)"
+            )
         return lines
+
+    def _apply_default_expansion(self, raw_stats_by_client, last_update_time):
+        """Expand the first node that actually reports GPUs, once data arrives.
+
+        Without this the local machine stays expanded even when it has no
+        NVIDIA GPU (macOS, CPU-only hosts), pushing real nodes off screen.
+        """
+        if last_update_time is None or getattr(self, "_default_expansion_applied", False):
+            return
+        self._default_expansion_applied = True
+        if getattr(self, "_expansion_touched", False):
+            return
+        if not bool(getattr(self, "hide_unsupported", True)):
+            return
+
+        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        for idx in range(len(self.pool)):
+            stats, _system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+            if isinstance(stats, pd.DataFrame) and not stats.empty:
+                self.expanded_servers = {idx}
+                return
+        self.expanded_servers = set()
 
     def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
         """Render the unified TUI body from cached per-node GPU data."""
@@ -2325,6 +2684,7 @@ class NVClientPool:
             detailed=detailed,
         )
         title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
+        section_headers = self._unified_section_headers(table, sorted_table)
         if filter_mode == "errors":
             rendered_table = "Error filter: GPU rows hidden"
         elif table.empty and not source_table.empty:
@@ -2334,22 +2694,31 @@ class NVClientPool:
             rendered_table = self._format_unified_detailed_table(
                 table,
                 selected_row=selected_row,
+                section_headers=section_headers,
             )
         else:
             display_table = table.copy()
             if not display_table.empty:
-                markers = [
-                    "> " if index == selected_row else "  "
-                    for index in range(len(display_table))
-                ]
-                display_table["Node"] = [
-                    marker + str(node)
-                    for marker, node in zip(markers, display_table["Node"])
-                ]
+                display_table.insert(
+                    0,
+                    "sel",
+                    [
+                        ">" if index == selected_row else " "
+                        for index in range(len(display_table))
+                    ],
+                )
+                if section_headers:
+                    # Node identity already lives in the band above each block.
+                    display_table = display_table.drop(
+                        columns=["Node", "Hostname"],
+                        errors="ignore",
+                    )
             rendered_table = self._format_fixed_width_table(
                 display_table,
                 border=True,
                 column_labels=self.UNIFIED_TABLE_LABELS,
+                fixed_width_columns=("sel",),
+                section_headers=section_headers,
             )
         selected_gpu_row = (
             table.iloc[selected_row]
@@ -2429,13 +2798,45 @@ class NVClientPool:
             ]
         )
     
-    def _format_fixed_width_table(self, df, border: bool = False, column_labels=None):
-        """Format fixed-width table display."""
+    @staticmethod
+    def _format_section_band(text, width):
+        """Render a full-width grouping band used to separate node blocks."""
+        if width <= 0:
+            return ""
+        text = str(text)
+        if len(text) > width:
+            text = text[: width - 2] + ".." if width > 2 else text[:width]
+        return colored(f"{text:<{width}}", "white", "on_blue", attrs=["bold"])
+
+    def _format_fixed_width_table(
+        self,
+        df,
+        border: bool = False,
+        column_labels=None,
+        *,
+        min_width_overrides=None,
+        importance_overrides=None,
+        must_keep_columns=None,
+        left_align_columns=None,
+        fill_columns=None,
+        fixed_width_columns=(),
+        section_headers=None,
+    ):
+        """Format fixed-width table display.
+
+        Optional keyword arguments let callers reuse the layout engine for
+        non-GPU tables: column minimum widths, drop priority, columns that must
+        survive on narrow terminals, left-aligned and space-absorbing columns,
+        plus `section_headers` (row index -> banner text) for grouped views.
+        """
         if df.empty:
             return "No GPU data available"
 
         column_labels = column_labels or {}
-        
+        section_headers = section_headers or {}
+        left_align_columns = set(left_align_columns or ()) | {"Node", "Hostname"}
+        fixed_width_columns = set(fixed_width_columns or ())
+
         # Get terminal width
         try:
             terminal_width = os.get_terminal_size().columns
@@ -2460,10 +2861,15 @@ class NVClientPool:
         }
 
         all_columns = list(df.columns)
-        is_unified_table = "Node" in all_columns or "Hostname" in all_columns
+        # "sel" is the selection marker column; it only exists in the unified table,
+        # which may drop Node/Hostname when rows are grouped into node blocks.
+        is_unified_table = any(
+            column in all_columns for column in ("Node", "Hostname", "sel")
+        )
         if is_unified_table:
             min_widths.update(
                 {
+                    "sel": 1,
                     "Node": 10,
                     "Hostname": 13,
                     "GPU": 3,
@@ -2475,6 +2881,7 @@ class NVClientPool:
                     "processes": 14,
                 }
             )
+        min_widths.update(min_width_overrides or {})
 
         # Calculate widths based on terminal space
         separator_width = 3
@@ -2483,6 +2890,7 @@ class NVClientPool:
 
         # Column importance: larger => dropped earlier when narrow
         importance = {
+            "sel": -1,
             "Node": 0,
             "Hostname": 1,
             "GPU": 2,
@@ -2497,8 +2905,12 @@ class NVClientPool:
             "tx": 11,
             "fan": 12,
         }
-        if is_unified_table:
+        importance.update(importance_overrides or {})
+        if must_keep_columns is not None:
+            must_keep_names = tuple(must_keep_columns)
+        elif is_unified_table:
             must_keep_names = (
+                "sel",
                 "Node",
                 "Hostname",
                 "GPU",
@@ -2578,20 +2990,31 @@ class NVClientPool:
             "mem_util",
             "GPU",
         ]
+        if fill_columns:
+            fill_priority = list(fill_columns) + [
+                col for col in fill_priority if col not in fill_columns
+            ]
 
         if available_width >= desired_total:
             column_widths = dict(desired_widths)
             extra = available_width - desired_total
             if extra > 0 and not self.compact:
-                fill_columns = list(selected_columns)
-                share, remainder = divmod(extra, len(fill_columns))
+                if fill_columns:
+                    spread_columns = [c for c in fill_columns if c in selected_columns]
+                else:
+                    spread_columns = [
+                        c for c in selected_columns if c not in fixed_width_columns
+                    ]
+                if not spread_columns:
+                    spread_columns = list(selected_columns)
+                share, remainder = divmod(extra, len(spread_columns))
                 if share:
-                    for col in fill_columns:
+                    for col in spread_columns:
                         column_widths[col] += share
                 if remainder:
-                    offset = terminal_width % len(fill_columns)
+                    offset = terminal_width % len(spread_columns)
                     for i in range(remainder):
-                        column_widths[fill_columns[(offset + i) % len(fill_columns)]] += 1
+                        column_widths[spread_columns[(offset + i) % len(spread_columns)]] += 1
         elif available_width >= min_total:
             column_widths = dict(min_widths_selected)
             extra = available_width - min_total
@@ -2740,8 +3163,12 @@ class NVClientPool:
         separator = "-+-".join(separator_parts)
 
         # Format data rows
+        inner_width = len(header)
         data_lines = []
-        for _, row in df_display.iterrows():
+        for row_index, (_, row) in enumerate(df_display.iterrows()):
+            band_text = section_headers.get(row_index)
+            if band_text:
+                data_lines.append(self._format_section_band(band_text, inner_width))
             row_parts = []
             row_util = str(row.get("util", "0"))
             row_util_color = get_utilization_color(row_util)
@@ -2754,7 +3181,7 @@ class NVClientPool:
                     tail_preserve=(col == "name" and not is_unified_table),
                 )
 
-                if col in {"Node", "Hostname"}:
+                if col in left_align_columns:
                     row_parts.append(f"{value:<{width}}")
                     continue
 
@@ -2793,7 +3220,6 @@ class NVClientPool:
 
         result_lines = [header, separator] + data_lines
         if border:
-            inner_width = len(header)
             top = "+" + "-" * (inner_width + 2) + "+"
             middle = "+-" + separator + "-+"
             result_lines = (
@@ -3092,6 +3518,8 @@ class NVClientPool:
         if not isinstance(raw_stats_by_client, dict):
             raw_stats_by_client = {}
 
+        self._apply_default_expansion(raw_stats_by_client, last_update_time)
+
         # Disable expand/collapse for servers with auth errors (e.g., password incorrect)
         try:
             disabled = set()
@@ -3140,10 +3568,19 @@ class NVClientPool:
             }[sort_mode]
             filter_mode = self._get_unified_filter_mode()
             filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
-            controls = (
-                f"[v]N [d]{detail_action} [s]{sort_label} "
-                f"[f]{filter_label} [j/k]GPU [Pg] [Enter]Proc [t]Trend [q]"
+            group_label = (
+                "Group" if getattr(self, "unified_group_by_node", True) else "Flat"
             )
+            unsupported_label = (
+                "Show" if getattr(self, "hide_unsupported", True) else "Hide"
+            )
+            controls = (
+                f"[v]N [d]{detail_action} [s]{sort_label} [f]{filter_label} "
+                f"[g]{group_label} [u]{unsupported_label} "
+                f"[j/k]GPU [Pg] [Enter]Proc [t]Trend [q]"
+            )
+            if len(controls) > terminal_width:
+                controls = controls[: max(0, terminal_width - 3)] + "..."
         else:
             view_label = "Per-node"
             controls = "[v] Unified view  [j/k] Select  [Enter] Toggle  [a/c] Expand/Collapse  [q] Quit"
@@ -3263,13 +3700,44 @@ class NVClientPool:
         self.ui_only_refresh = True
         self.refresh_needed.set()
 
+    def _current_view_settings(self):
+        """Snapshot the layout state persisted between runs."""
+        return {
+            "mode": (
+                "unified"
+                if getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
+                == self.DISPLAY_MODE_UNIFIED
+                else "nodes"
+            ),
+            "detailed": bool(getattr(self, "unified_detailed", False)),
+            "sort": self._get_unified_sort_mode(),
+            "filter": self._get_unified_filter_mode(),
+            "processes": bool(getattr(self, "unified_show_processes", False)),
+            "trends": bool(getattr(self, "unified_show_trends", False)),
+            "group_by_node": bool(getattr(self, "unified_group_by_node", True)),
+            "hide_unsupported": bool(getattr(self, "hide_unsupported", True)),
+        }
+
+    def _persist_view_settings(self):
+        """Write the current layout to config.yml; never break the TUI on error."""
+        if not getattr(self, "_persist_view_enabled", False):
+            return
+        try:
+            nvidb_config.save_view_settings(self._current_view_settings())
+        except Exception as error:
+            logging.debug(msg=f"Failed to persist view settings: {error}")
+
+    def _apply_view_change(self):
+        self._request_ui_refresh()
+        self._persist_view_settings()
+
     def _toggle_display_mode(self):
         current_mode = getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
         if current_mode == self.DISPLAY_MODE_UNIFIED:
             self.display_mode = self.DISPLAY_MODE_NODES
         else:
             self.display_mode = self.DISPLAY_MODE_UNIFIED
-        self._request_ui_refresh()
+        self._apply_view_change()
 
     def _cycle_unified_sort_mode(self):
         current_mode = self._get_unified_sort_mode()
@@ -3278,7 +3746,7 @@ class NVClientPool:
         ) % len(self.UNIFIED_SORT_MODES)
         self.unified_sort_mode = self.UNIFIED_SORT_MODES[next_index]
         self.unified_selected_gpu = 0
-        self._request_ui_refresh()
+        self._apply_view_change()
 
     def _cycle_unified_filter_mode(self):
         current_mode = self._get_unified_filter_mode()
@@ -3287,7 +3755,7 @@ class NVClientPool:
         ) % len(self.UNIFIED_FILTER_MODES)
         self.unified_filter_mode = self.UNIFIED_FILTER_MODES[next_index]
         self.unified_selected_gpu = 0
-        self._request_ui_refresh()
+        self._apply_view_change()
 
     def _move_unified_selection(self, delta):
         gpu_count = max(0, int(getattr(self, "_unified_gpu_count", 0) or 0))
@@ -3316,7 +3784,23 @@ class NVClientPool:
             if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
                 return False
             self.unified_detailed = not getattr(self, "unified_detailed", False)
-            self._request_ui_refresh()
+            self._apply_view_change()
+            return True
+        if key_lower == "g":
+            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+                return False
+            self.unified_group_by_node = not getattr(
+                self,
+                "unified_group_by_node",
+                True,
+            )
+            self._apply_view_change()
+            return True
+        if key_lower == "u":
+            if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
+                return False
+            self.hide_unsupported = not getattr(self, "hide_unsupported", True)
+            self._apply_view_change()
             return True
         if key_lower == "s":
             if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
@@ -3338,7 +3822,7 @@ class NVClientPool:
                 "unified_show_trends",
                 False,
             )
-            self._request_ui_refresh()
+            self._apply_view_change()
             return True
         if key_lower == "h":
             return False
@@ -3364,7 +3848,7 @@ class NVClientPool:
                     "unified_show_processes",
                     False,
                 )
-                self._request_ui_refresh()
+                self._apply_view_change()
                 return True
             return False
 
@@ -3385,6 +3869,7 @@ class NVClientPool:
                 self.expanded_servers.discard(self.selected_server)
             else:
                 self.expanded_servers.add(self.selected_server)
+            self._expansion_touched = True
             self._request_ui_refresh()
             return True
         elif key_lower == "a":
@@ -3392,10 +3877,12 @@ class NVClientPool:
             self.expanded_servers = {
                 index for index in range(len(self.pool)) if index not in disabled
             }
+            self._expansion_touched = True
             self._request_ui_refresh()
             return True
         elif key_lower == "c":
             self.expanded_servers.clear()
+            self._expansion_touched = True
             self._request_ui_refresh()
             return True
         return False
@@ -3459,6 +3946,8 @@ class NVClientPool:
         print("   d              : Toggle unified single-line/detailed rows")
         print("   s              : Cycle unified sorting")
         print("   f              : Cycle unified GPU filters")
+        print("   g              : Toggle unified per-node grouping")
+        print("   u              : Show/hide nodes without GPU support")
         print("   t              : Toggle selected GPU trends")
         print("   q              : Quit")
         print("=" * 60)

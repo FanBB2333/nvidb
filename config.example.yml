@@ -14,6 +14,20 @@ basic:
   # - false: remote servers are only used with the `--remote` flag
   remote: false
 
+# TUI layout. nvidb rewrites this block whenever you change the view with a key
+# press, so the next run starts where you left off. The rest of the file
+# (including your comments) is left untouched, but comments placed *inside* this
+# block are not preserved.
+view:
+  mode: nodes            # nodes | unified          ([v])
+  detailed: false        # unified card layout      ([d])
+  sort: node             # node | available | utilization ([s])
+  filter: all            # all | available | busy | errors ([f])
+  processes: false       # process panel for the selected GPU ([Enter])
+  trends: false          # sparklines for the selected GPU     ([t])
+  group_by_node: true    # node bands in the unified view      ([g])
+  hide_unsupported: true # skip nodes without NVIDIA GPUs       ([u])
+
 servers:
   # Example server with SSH key authentication (recommended)
   - hostname: "server1.example.com"

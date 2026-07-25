@@ -3,7 +3,6 @@ import getpass
 import logging
 import argparse
 import shutil
-import json
 import re
 from pathlib import Path
 from paramiko import SSHConfig
@@ -24,15 +23,7 @@ def _warn_if_deprecated_config_keys(servers):
 
 
 def _load_config_yaml(config_path=None) -> dict:
-    config_path = Path(config_path or config.get_config_path()).expanduser()
-    if not config_path.exists():
-        return {}
-    try:
-        with open(config_path, "r") as f:
-            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
-        return cfg if isinstance(cfg, dict) else {}
-    except Exception:
-        return {}
+    return config.load_config(config_path)
 
 
 def _get_basic_compact(cfg: dict) -> bool:
@@ -261,80 +252,12 @@ def init(config_path=None):
     return server_list
 
 
-def _dq(value: str) -> str:
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def _format_servers_yaml(servers) -> str:
-    lines = ["servers:"]
-    for i, server in enumerate(servers):
-        if i > 0:
-            lines.append("")
-        hostname = server.get("hostname") or server.get("host") or ""
-        lines.append(f"  - hostname: {_dq(hostname)}")
-
-        port = server.get("port", 22)
-        try:
-            port_int = int(port)
-        except Exception:
-            port_int = 22
-        lines.append(f"    port: {port_int}")
-
-        username = server.get("username")
-        if username is not None:
-            lines.append(f"    username: {_dq(username)}")
-
-        password = server.get("password")
-        if password:
-            lines.append(f"    password: {_dq(password)}")
-
-        nickname = server.get("nickname")
-        if nickname is None:
-            nickname = server.get("description")
-        if nickname is not None:
-            lines.append(f"    nickname: {_dq(nickname)}")
-
-        auth = server.get("auth", "auto")
-        if auth is not None:
-            lines.append(f"    auth: {_dq(auth)}")
-
-        identityfile = server.get("identityfile")
-        if auth in ("auto", "key") and identityfile:
-            lines.append(f"    identityfile: {_dq(identityfile)}")
-
-    return "\n".join(lines) + "\n"
-
-
-def _format_config_yaml(cfg: dict) -> str:
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    servers = cfg.get("servers", []) or []
-
-    header_cfg = {}
-    if "basic" in cfg:
-        header_cfg["basic"] = cfg.get("basic")
-    else:
-        header_cfg["basic"] = {"compact": False}
-    for key, value in cfg.items():
-        if key in {"basic", "servers"}:
-            continue
-        header_cfg[key] = value
-
-    header_text = yaml.safe_dump(
-        header_cfg,
-        sort_keys=False,
-        allow_unicode=True,
-        default_flow_style=False,
-    ).rstrip("\n")
-    servers_text = _format_servers_yaml(servers).rstrip("\n")
-    return f"{header_text}\n\n{servers_text}\n"
+_format_servers_yaml = config.format_servers_yaml
+_format_config_yaml = config.format_config_yaml
 
 
 def _write_config_yaml(config_path: Path, cfg: dict):
-    config_path = Path(config_path).expanduser()
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(_format_config_yaml(cfg), encoding="utf-8")
+    config.write_config(cfg, config_path)
 
 
 def interactive_add_server(config_path=None):
@@ -1108,7 +1031,11 @@ def main():
         interactive_clean(clean_all=(args.target == 'all'))
     else:
         # Default action: run interactive monitoring
-        pool = NVClientPool(server_list, compact=compact)
+        pool = NVClientPool(
+            server_list,
+            compact=compact,
+            view_settings=config.load_view_settings(cfg=cfg),
+        )
         if args.once:
             pool.print_once()
         else:

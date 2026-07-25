@@ -53,6 +53,8 @@ def _pool():
     pool.unified_selected_gpu = 0
     pool.unified_show_processes = False
     pool.unified_show_trends = False
+    pool.unified_group_by_node = True
+    pool.hide_unsupported = True
     pool._unified_gpu_count = 0
     pool._unified_page_size = 1
     pool._unified_gpu_history = {}
@@ -60,6 +62,9 @@ def _pool():
     pool.selected_server = 0
     pool.expanded_servers = {0}
     pool._toggle_disabled_servers = set()
+    pool._default_expansion_applied = False
+    pool._expansion_touched = False
+    pool._persist_view_enabled = False
     pool.quit_flag = threading.Event()
     pool.refresh_needed = threading.Event()
     pool.ui_only_refresh = False
@@ -97,6 +102,7 @@ def test_unified_table_adds_node_and_hostname_and_uses_summary_columns():
 
 def test_unified_table_keeps_identity_and_core_metrics_on_narrow_terminals(monkeypatch):
     pool = _pool()
+    pool.unified_group_by_node = False
     raw_stats = {
         0: (
             pd.DataFrame([_gpu_row(0, "RTX 4090", "10 %", "1024/24576")]),
@@ -122,6 +128,45 @@ def test_unified_table_keeps_identity_and_core_metrics_on_narrow_terminals(monke
     assert "train" in rendered
     assert "100.64.0.42" in rendered
     assert "Processes" not in rendered
+
+
+def test_grouped_unified_table_uses_node_bands_instead_of_node_columns(monkeypatch):
+    pool = _pool()
+    raw_stats = {
+        0: (
+            pd.DataFrame([_gpu_row(0, "RTX 4090", "10 %", "1024/24576")]),
+            {},
+        ),
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140"),
+                    _gpu_row(1, "RTX 6000 Ada", "0 %", "0/49140"),
+                ]
+            ),
+            {},
+        ),
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 30)))
+
+    lines = pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    rendered = _without_ansi("\n".join(lines))
+
+    assert "training-node (100.64.0.42) | 2 GPUs | free 1 | avg 38%" in rendered
+    assert "VRAM 23/96G" in rendered
+    # Node identity moved into the band, freeing the columns for GPU metrics.
+    assert "Hostname/IP" not in rendered
+    assert all(
+        len(_without_ansi(line)) == 100
+        for line in rendered.splitlines()
+        if line.startswith("|")
+    )
+
+    # Grouping only applies while rows follow node order.
+    pool.unified_sort_mode = "utilization"
+    flat = _without_ansi("\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1)))
+    assert "Hostname/IP" in flat
+    assert "training-node (100.64.0.42) | 2 GPUs" not in flat
 
 
 def test_unified_view_reports_nodes_without_gpu_rows():
@@ -262,7 +307,7 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
     )
 
     assert "Rows 1-1/3" in first_page
-    assert "> GPU 0 [IDLE]" in first_page
+    assert "> training-node GPU 0 [IDLE]" in first_page
     assert "Model GPU A" in first_page
     assert "Model GPU B" not in first_page
     assert pool._unified_page_size == 1
@@ -273,7 +318,7 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
     )
 
     assert "Rows 2-2/3" in second_page
-    assert "> GPU 1 [ACTIVE]" in second_page
+    assert "> training-node GPU 1 [ACTIVE]" in second_page
     assert "Model GPU B" in second_page
 
     page_down = SimpleNamespace(name="KEY_NPAGE")
@@ -282,7 +327,7 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
         pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     )
     assert "Rows 3-3/3" in third_page
-    assert "> GPU 2 [HIGH]" in third_page
+    assert "> training-node GPU 2 [HIGH]" in third_page
 
 
 def test_unified_selected_gpu_process_details(monkeypatch):
@@ -341,6 +386,112 @@ def test_unified_selected_gpu_process_details(monkeypatch):
     assert "alice" in rendered
     assert "16384 MiB" in rendered
     assert "python" in rendered
+
+
+def test_unified_process_panel_shows_htop_fields_and_full_command(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_show_processes = True
+    command = (
+        "/usr/bin/python3 train.py --config configs/qwen3-vl-32b.yaml --deepspeed zero3"
+    )
+    raw_stats = {
+        1: (
+            pd.DataFrame([_gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140")]),
+            {},
+        ),
+        "_nvidb": {
+            "process_details_by_client": {
+                1: {
+                    "0": [
+                        {
+                            "pid": 4242,
+                            "username": "alice",
+                            "used_memory": "16384 MiB",
+                            "type": "C",
+                            "process_name": "python3",
+                            "command": command,
+                            "cpu_percent": 412.5,
+                            "mem_percent": 18.4,
+                            "rss_kb": 12582912,
+                            "elapsed": "2-03:21:07",
+                            "state": "Rl",
+                            "threads": 57,
+                        }
+                    ]
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 40)))
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    )
+
+    for header in ("PID", "User", "VRAM", "CPU%", "MEM%", "RSS", "Time", "Command"):
+        assert header in rendered
+    assert "412.5" in rendered
+    assert "18.4" in rendered
+    assert "12.0G" in rendered
+    assert "2-03:21:07" in rendered
+    # Truncated inside the table cell, spelled out in full underneath it.
+    assert f"  4242: {command}" in rendered
+
+
+def test_process_details_are_only_collected_while_the_panel_is_open():
+    pool = _pool()
+    calls = []
+
+    class FakeClient:
+        description = "training-node"
+        host = "100.64.0.42"
+        port = 22
+
+        def get_full_gpu_info(self):
+            return (
+                pd.DataFrame(
+                    [
+                        {
+                            "gpu_index": 0,
+                            "product_name": "NVIDIA RTX 6000 Ada",
+                            "product_architecture": "Ada",
+                            "tx_util": "2 KB/s",
+                            "rx_util": "1 KB/s",
+                            "fan_speed": "30 %",
+                            "total": "49140 MiB",
+                            "used": "24000 MiB",
+                            "free": "25140 MiB",
+                            "gpu_util": "75 %",
+                            "memory_util": "25 %",
+                            "gpu_temp": "48 C",
+                            "power_state": "P2",
+                            "power_draw": "80.00 W",
+                            "current_power_limit": "200.00 W",
+                            "processes": [],
+                        }
+                    ]
+                ),
+                {},
+            )
+
+        def get_system_stats(self):
+            return {}
+
+        def get_process_summary(self, stats=None, detailed=False):
+            calls.append(detailed)
+            return [], {}
+
+    pool.pool = [FakeClient()]
+
+    pool.get_client_gpus_info(return_raw=True)
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.get_client_gpus_info(return_raw=True)
+    pool.unified_show_processes = True
+    pool.get_client_gpus_info(return_raw=True)
+
+    # The extra `ps` call per host is only worth paying for while the panel is up.
+    assert calls == [False, False, True]
 
 
 def test_unified_gpu_trends_keep_latest_sixty_samples(monkeypatch):
@@ -416,8 +567,9 @@ def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     assert "Unified GPU table (Detailed) | GPUs: 3" in rendered
     assert len(content_lines) == 9
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
-    assert "Node training-node (100.64.0.42)" in rendered
-    assert "GPU 0 [BUSY]" in rendered
+    assert "training-node (100.64.0.42) | 2 GPUs" in _without_ansi(rendered)
+    assert "training-node GPU 0 [BUSY]" in rendered
+    assert "100.64.0.42" in rendered
     assert "Model RTX 6000 Ada" in rendered
     assert "Util 75%" in rendered
     assert "VRAM 24000/49140 MiB" in rendered
@@ -472,6 +624,113 @@ def test_detailed_view_colors_status_without_breaking_alignment(monkeypatch):
     assert "GPU 0 [HIGH]" in plain_rendered
     assert "GPU 1 [IDLE]" in plain_rendered
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
+
+
+def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkeypatch):
+    pool = _pool()
+    pool.unified_detailed = True
+    table = pd.DataFrame(
+        [
+            _gpu_row(0, "RTX 6000 Ada", "85 %", "40000/49140"),
+            _gpu_row(1, "RTX 6000 Ada", "0 %", "0/49140"),
+        ]
+    )
+    table["Node"] = "training-node"
+    table["Hostname"] = "100.64.0.42"
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((140, 40)))
+
+    rendered = pool._format_unified_detailed_table(
+        table,
+        selected_row=0,
+        section_headers={0: "training-node (100.64.0.42) | 2 GPUs"},
+    )
+    plain = _without_ansi(rendered)
+
+    assert "training-node (100.64.0.42) | 2 GPUs" in plain
+    assert "█" in plain and "░" in plain
+    assert all(len(line) == 140 for line in plain.splitlines())
+
+
+def test_unsupported_nodes_are_hidden_until_toggled(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    raw_stats = {
+        0: (pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}),
+        1: (
+            pd.DataFrame([_gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140")]),
+            {},
+        ),
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 30)))
+
+    hidden = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    )
+    assert "1 node without GPU support hidden ([u] to show)" in hidden
+    assert "No GPU data available" not in hidden
+
+    assert pool._handle_keypress("u") is True
+    assert pool.hide_unsupported is False
+    shown = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    )
+    assert "Local" in shown
+    assert "No GPU data available" in shown
+
+
+def test_default_expansion_skips_nodes_without_gpus():
+    pool = _pool()
+    raw_stats = {
+        0: (pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}),
+        1: (
+            pd.DataFrame([_gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140")]),
+            {},
+        ),
+    }
+
+    pool._apply_default_expansion(raw_stats, last_update_time=1)
+    assert pool.expanded_servers == {1}
+
+    # Applied once only, and never against a user's own expand/collapse choice.
+    pool.expanded_servers = {0}
+    pool._apply_default_expansion(raw_stats, last_update_time=1)
+    assert pool.expanded_servers == {0}
+
+    touched = _pool()
+    touched._expansion_touched = True
+    touched._apply_default_expansion(raw_stats, last_update_time=1)
+    assert touched.expanded_servers == {0}
+
+
+def test_view_changes_are_persisted_to_config(monkeypatch):
+    pool = _pool()
+    pool._persist_view_enabled = True
+    saved = []
+    monkeypatch.setattr(
+        "nvidb.connection.nvidb_config.save_view_settings",
+        lambda settings: saved.append(settings) or True,
+    )
+
+    assert pool._handle_keypress("v") is True
+    assert pool._handle_keypress("d") is True
+    assert pool._handle_keypress("g") is True
+
+    assert pool.unified_group_by_node is False
+    assert saved[-1] == {
+        "mode": "unified",
+        "detailed": True,
+        "sort": "node",
+        "filter": "all",
+        "processes": False,
+        "trends": False,
+        "group_by_node": False,
+        "hide_unsupported": True,
+    }
+    # Moving the selection is not a layout change and must not rewrite the file.
+    saved.clear()
+    pool._unified_gpu_count = 4
+    assert pool._handle_keypress("j") is True
+    assert saved == []
 
 
 def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view():

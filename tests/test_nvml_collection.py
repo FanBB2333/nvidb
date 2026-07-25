@@ -42,11 +42,12 @@ NVIDIA_SMI_XML = """<?xml version="1.0" ?>
 
 
 class FakeClient(BaseClient):
-    def __init__(self, payload, *, nvidia_smi_xml=""):
+    def __init__(self, payload, *, nvidia_smi_xml="", ps_output=""):
         super().__init__()
         self.connected = True
         self.payload = payload
         self.nvidia_smi_xml = nvidia_smi_xml
+        self.ps_output = ps_output
         self.commands = []
 
     def connect(self):
@@ -60,6 +61,8 @@ class FakeClient(BaseClient):
         self.commands.append(command)
         if command == "nvidia-smi -q -x":
             return self.nvidia_smi_xml
+        if command.startswith("ps "):
+            return self.ps_output
         return '{"ok":false,"error":"dcgm unavailable"}'
 
 
@@ -124,11 +127,70 @@ def test_full_gpu_info_uses_nvml_payload_and_native_processes():
             "used_memory": "2 MiB",
             "username": "alice",
             "gpu_index": 3,
+            "command": "python",
+            "cpu_percent": None,
+            "mem_percent": None,
+            "rss_kb": None,
+            "elapsed": None,
+            "state": None,
+            "threads": None,
         }
     ]
     assert user_summary == {"alice": 2}
     assert not any(command.startswith("ps ") for command in client.commands)
     assert "nvidia-smi -q -x" not in client.commands
+
+
+def test_detailed_process_summary_adds_htop_style_fields():
+    payload = {
+        "ok": True,
+        "backend": "ctypes",
+        "driver_version": "570.1",
+        "cuda_version": "12.8",
+        "gpus": [
+            {
+                "gpu_index": 0,
+                "name": "NVIDIA RTX 6000 Ada",
+                "memory_total_bytes": 49140 * 1024 * 1024,
+                "memory_used_bytes": 2 * 1024 * 1024,
+                "processes": [
+                    {
+                        "pid": 4242,
+                        "type": "C",
+                        "process_name": "python",
+                        "used_gpu_memory_bytes": 2 * 1024 * 1024,
+                        "username": None,
+                    }
+                ],
+            }
+        ],
+    }
+    client = FakeClient(payload)
+    client.ps_output = (
+        "4242 alice 91.5 12.3 8388608 03:21:07 Rl 24 "
+        "/usr/bin/python3 train.py --config configs/big.yaml\n"
+    )
+
+    stats, _system_info = client.get_full_gpu_info()
+    processes, user_summary = client.get_process_summary(stats, detailed=True)
+
+    assert user_summary == {"alice": 2}
+    process = processes[0]
+    assert process["username"] == "alice"
+    assert process["cpu_percent"] == 91.5
+    assert process["mem_percent"] == 12.3
+    assert process["rss_kb"] == 8388608
+    assert process["elapsed"] == "03:21:07"
+    assert process["state"] == "Rl"
+    assert process["threads"] == 24
+    assert process["command"] == (
+        "/usr/bin/python3 train.py --config configs/big.yaml"
+    )
+    ps_commands = [command for command in client.commands if command.startswith("ps ")]
+    assert len(ps_commands) == 1
+    assert ps_commands[0].startswith(
+        "ps -o pid=,user=,pcpu=,pmem=,rss=,etime=,stat=,nlwp=,args= -p"
+    )
 
 
 def test_full_gpu_info_falls_back_to_nvidia_smi_when_nvml_fails():
