@@ -152,7 +152,7 @@ def test_grouped_unified_table_uses_node_bands_instead_of_node_columns(monkeypat
     lines = pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     rendered = _without_ansi("\n".join(lines))
 
-    assert "training-node (100.64.0.42) | 2 GPUs | free 1 | avg 38%" in rendered
+    assert "training-node (100.64.0.42) -- 2 GPUs | free 1 | avg 38%" in rendered
     assert "VRAM 23/96G" in rendered
     # Node identity moved into the band, freeing the columns for GPU metrics.
     assert "Hostname/IP" not in rendered
@@ -166,7 +166,55 @@ def test_grouped_unified_table_uses_node_bands_instead_of_node_columns(monkeypat
     pool.unified_sort_mode = "utilization"
     flat = _without_ansi("\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1)))
     assert "Hostname/IP" in flat
-    assert "training-node (100.64.0.42) | 2 GPUs" not in flat
+    assert "training-node (100.64.0.42) -- 2 GPUs" not in flat
+
+
+def test_node_band_uses_a_dim_rule_instead_of_a_background_block(monkeypatch):
+    pool = _pool()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("ANSI_COLORS_DISABLED", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+
+    band = pool._format_section_band("training-node (10.0.0.1)", "2 GPUs | free 1", 60)
+
+    assert len(_without_ansi(band)) == 60
+    assert _without_ansi(band).startswith("training-node (10.0.0.1) -- 2 GPUs | free 1 ---")
+    assert "\x1b[36m" in band  # cyan node name
+    assert "\x1b[2m" in band  # dim separator and rule
+    assert "on_blue" not in band and "\x1b[44m" not in band
+
+    # Narrow bands drop the stats before they touch the node name.
+    narrow = _without_ansi(pool._format_section_band("training-node", "2 GPUs | free 1", 20))
+    assert narrow.startswith("training-node")
+    assert len(narrow) == 20
+
+
+def test_active_filter_warns_when_it_hides_gpus(monkeypatch):
+    pool = _pool()
+    pool.unified_filter_mode = "available"
+    raw_stats = {
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140"),
+                    _gpu_row(1, "RTX 6000 Ada", "0 %", "0/49140"),
+                ]
+            ),
+            {},
+        ),
+    }
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 30)))
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    )
+    assert "Filter Available: 1 of 2 GPUs hidden ([f] to change)" in rendered
+
+    pool.unified_filter_mode = "all"
+    unfiltered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
+    )
+    assert "GPUs hidden" not in unfiltered
 
 
 def test_unified_view_reports_nodes_without_gpu_rows():
@@ -567,7 +615,7 @@ def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     assert "Unified GPU table (Detailed) | GPUs: 3" in rendered
     assert len(content_lines) == 9
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
-    assert "training-node (100.64.0.42) | 2 GPUs" in _without_ansi(rendered)
+    assert "training-node (100.64.0.42) -- 2 GPUs" in _without_ansi(rendered)
     assert "training-node GPU 0 [BUSY]" in rendered
     assert "100.64.0.42" in rendered
     assert "Model RTX 6000 Ada" in rendered
@@ -642,11 +690,11 @@ def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkey
     rendered = pool._format_unified_detailed_table(
         table,
         selected_row=0,
-        section_headers={0: "training-node (100.64.0.42) | 2 GPUs"},
+        section_headers={0: ("training-node (100.64.0.42)", "2 GPUs | free 1")},
     )
     plain = _without_ansi(rendered)
 
-    assert "training-node (100.64.0.42) | 2 GPUs" in plain
+    assert "training-node (100.64.0.42) -- 2 GPUs | free 1" in plain
     assert "█" in plain and "░" in plain
     assert all(len(line) == 140 for line in plain.splitlines())
 

@@ -1982,7 +1982,7 @@ class NVClientPool:
         )
 
     def _format_unified_node_band(self, node, hostname, rows):
-        """Summarize one node's GPUs for the band above its block of rows."""
+        """Return (label, stats) describing one node's block of GPU rows."""
         capacity = [self._unified_gpu_capacity(row) for row in rows]
         count = len(capacity)
         available = sum(1 for values in capacity if values["available"])
@@ -1999,7 +1999,6 @@ class NVClientPool:
         )
 
         parts = [
-            f"{node} ({hostname})",
             f"{count} GPU" if count == 1 else f"{count} GPUs",
             f"free {available}",
             (
@@ -2010,7 +2009,7 @@ class NVClientPool:
         ]
         if total_mib > 0:
             parts.append(f"VRAM {used_mib / 1024:.0f}/{total_mib / 1024:.0f}G")
-        return " | ".join(parts)
+        return f"{node} ({hostname})", " | ".join(parts)
 
     def _unified_section_headers(self, visible_table, scope_table):
         """Map visible row index -> node band text for the grouped views."""
@@ -2052,8 +2051,11 @@ class NVClientPool:
 
         show_processes = bool(getattr(self, "unified_show_processes", False))
         show_trends = bool(getattr(self, "unified_show_trends", False))
-        extra_lines = (8 if show_processes else 0) + (
-            5 if show_trends else 0
+        extra_lines = (
+            (8 if show_processes else 0)
+            + (5 if show_trends else 0)
+            # Room for the "filter is hiding GPUs" warning line.
+            + (1 if self._get_unified_filter_mode() != "all" else 0)
         )
         # Node bands take screen space too: two extra lines per block in the
         # detailed view (the block reuses one card border), one otherwise.
@@ -2512,14 +2514,14 @@ class NVClientPool:
         section_headers = section_headers or {}
         lines = [border]
         for row_index, (_, row) in enumerate(table.iterrows()):
-            band_text = section_headers.get(row_index)
-            if band_text:
+            band = section_headers.get(row_index)
+            if band:
                 if lines and lines[-1] == border:
                     lines.pop()
                 lines.extend(
                     [
                         border,
-                        f"| {self._format_section_band(band_text, table_width - 4)} |",
+                        f"| {self._format_section_band(*band, table_width - 4)} |",
                         border,
                     ]
                 )
@@ -2733,8 +2735,21 @@ class NVClientPool:
             f"{title} | GPUs: {gpu_count_display} | "
             f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}",
             self._format_unified_capacity_summary(source_table),
-            rendered_table,
         ]
+        # The filter is restored from config.yml, so say it out loud whenever it
+        # is the reason a GPU is missing from the table.
+        hidden_by_filter = len(source_table) - len(filtered_table)
+        if filter_mode != "all" and hidden_by_filter > 0:
+            filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
+            lines.append(
+                colored(
+                    f"Filter {filter_label}: {hidden_by_filter} of "
+                    f"{len(source_table)} GPUs hidden ([f] to change)",
+                    "yellow",
+                    attrs=["bold"],
+                )
+            )
+        lines.append(rendered_table)
         status_lines = self._get_unified_node_status_lines(
             raw_stats_by_client,
             last_update_time,
@@ -2799,14 +2814,41 @@ class NVClientPool:
         )
     
     @staticmethod
-    def _format_section_band(text, width):
-        """Render a full-width grouping band used to separate node blocks."""
+    def _format_section_band(label, detail, width):
+        """Render a node band: bold label, plain stats, dim rule to full width.
+
+        Deliberately background-free; a full-width color block reads as an alert
+        rather than a section divider.
+        """
         if width <= 0:
             return ""
-        text = str(text)
-        if len(text) > width:
-            text = text[: width - 2] + ".." if width > 2 else text[:width]
-        return colored(f"{text:<{width}}", "white", "on_blue", attrs=["bold"])
+        label = str(label)
+        detail = str(detail)
+        separator = " -- "
+
+        if len(label) >= width:
+            label = label[: width - 2] + ".." if width > 2 else label[:width]
+            separator = ""
+            detail = ""
+        elif len(label) + len(separator) + len(detail) > width:
+            room = width - len(label) - len(separator)
+            if room <= 3:
+                separator = ""
+                detail = ""
+            else:
+                detail = detail[: room - 2] + ".."
+
+        pieces = [colored(label, "cyan", attrs=["bold"])]
+        if separator:
+            pieces.append(colored(separator, attrs=["dark"]))
+        if detail:
+            pieces.append(detail)
+        tail = width - len(label) - len(separator) - len(detail)
+        if tail == 1:
+            pieces.append(" ")
+        elif tail > 1:
+            pieces.append(" " + colored("-" * (tail - 1), attrs=["dark"]))
+        return "".join(pieces)
 
     def _format_fixed_width_table(
         self,
@@ -3166,9 +3208,9 @@ class NVClientPool:
         inner_width = len(header)
         data_lines = []
         for row_index, (_, row) in enumerate(df_display.iterrows()):
-            band_text = section_headers.get(row_index)
-            if band_text:
-                data_lines.append(self._format_section_band(band_text, inner_width))
+            band = section_headers.get(row_index)
+            if band:
+                data_lines.append(self._format_section_band(*band, inner_width))
             row_parts = []
             row_util = str(row.get("util", "0"))
             row_util_color = get_utilization_color(row_util)

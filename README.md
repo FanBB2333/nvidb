@@ -177,10 +177,11 @@ When viewing GPU stats, use these keyboard shortcuts:
 
 The default per-node view keeps each server's summary and expandable detail
 table. The unified view places GPUs from every node in one table. By default
-rows are grouped into per-node blocks: a colored band names the node, its
-hostname/IP, GPU count, free GPUs, average utilization, and VRAM, and the rows
-below it drop the redundant `Node` / `Hostname/IP` columns so more width goes to
-the GPU metrics. Press `g` to turn grouping off (or sort by anything other than
+rows are grouped into per-node blocks: a band names the node in bold cyan
+followed by its hostname/IP, GPU count, free GPUs, average utilization, and
+VRAM, with a dim rule filling the rest of the line, and the rows below it drop
+the redundant `Node` / `Hostname/IP` columns so more width goes to the GPU
+metrics. Press `g` to turn grouping off (or sort by anything other than
 node order) and the flat table with `Node` and `Hostname/IP` columns comes back.
 Columns adapt to the terminal width, with core identity, utilization, model, and
 VRAM fields kept ahead of secondary metrics.
@@ -199,7 +200,9 @@ Unified pages are sized from the current terminal height. The title shows the
 visible GPU range, and `>` marks the selected GPU.
 Press `f` to cycle through all, available, busy, and error-only views. Busy
 means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
-nodes whose latest refresh failed.
+nodes whose latest refresh failed. Because the filter is restored from the
+config on the next run, a warning line above the table spells out how many GPUs
+it is hiding.
 Press `Enter` or `Space` on a unified GPU to show its process details: PID,
 user, type, VRAM, plus htop-style CPU%, MEM%, RSS, elapsed time, thread count,
 process state, and the full command line. Commands too long for the table cell
