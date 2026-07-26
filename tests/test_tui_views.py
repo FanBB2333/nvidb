@@ -64,6 +64,13 @@ def _pool():
     pool.unified_selected_process = 0
     pool.unified_selected_process_pid = None
     pool._unified_process_count = 0
+    pool.unified_process_filter = ""
+    pool.unified_process_filter_editing = False
+    pool.unified_process_sort_mode = "vram"
+    pool.unified_process_sort_descending = True
+    pool.unified_process_rows = 0
+    pool._unified_process_visible_rows = 1
+    pool._unified_process_total_count = 0
     pool.unified_command_scroll = 0
     pool._unified_command_line_count = 0
     pool._unified_command_page_size = 0
@@ -79,6 +86,7 @@ def _pool():
     pool._unified_gpu_history = {}
     pool._unified_process_history = {}
     pool._unified_history_lock = threading.Lock()
+    pool.tui_help_visible = False
     pool.selected_server = 0
     pool.expanded_servers = {0}
     pool._toggle_disabled_servers = set()
@@ -997,6 +1005,40 @@ def _focus_raw_stats(command):
     }
 
 
+def _multi_process_raw_stats():
+    raw_stats = _focus_raw_stats("python train.py --model llama")
+    processes = raw_stats["_nvidb"]["process_details_by_client"][1]["0"]
+    processes.extend(
+        [
+            {
+                **processes[0],
+                "pid": 5252,
+                "username": "bob",
+                "used_memory": "4000 MiB",
+                "command": "torchrun eval.py --suite math",
+                "cpu_percent": 250.0,
+                "mem_percent": 8.0,
+                "rss_kb": 3000000,
+                "elapsed": "1-02:03:04",
+                "state": "S",
+            },
+            {
+                **processes[0],
+                "pid": 6262,
+                "username": "carol",
+                "used_memory": "8000 MiB",
+                "command": "python qwen serve.py",
+                "cpu_percent": 10.0,
+                "mem_percent": 1.0,
+                "rss_kb": 500000,
+                "elapsed": "02:00",
+                "state": "R",
+            },
+        ]
+    )
+    return raw_stats
+
+
 def test_detailed_process_pane_shows_the_whole_command_wrapped(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
@@ -1191,6 +1233,219 @@ def test_detailed_process_layout_stays_inside_terminal_bounds(monkeypatch):
                 ("command_scroll", -1),
                 ("command_scroll", 1),
             }
+
+
+def test_process_filter_is_live_and_keeps_shortcuts_out_of_the_query(
+    monkeypatch,
+):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool._unified_gpu_count = 2
+    raw_stats = _multi_process_raw_stats()
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda: os.terminal_size((100, 40)),
+    )
+
+    assert pool._handle_keypress("/") is True
+    assert pool.unified_active_pane == "process"
+    assert pool.unified_process_filter_editing is True
+
+    for character in "bob":
+        assert pool._handle_keypress(character) is True
+    assert pool._handle_keypress("q") is True
+    assert not pool.quit_flag.is_set()
+    assert pool.unified_process_filter == "bobq"
+    assert pool._handle_keypress(
+        SimpleNamespace(name="KEY_BACKSPACE")
+    ) is True
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 1))
+    )
+    assert "Processes | 1/3 match" in rendered
+    assert "Processes | 1/3 match | /bob_" in rendered
+    assert "torchrun eval.py --suite math" in rendered
+    assert pool._unified_process_count == 1
+    assert pool._unified_process_total_count == 3
+
+    assert pool._handle_keypress("\n") is True
+    assert pool.unified_process_filter_editing is False
+    assert pool.unified_process_filter == "bob"
+    assert pool._handle_keypress(SimpleNamespace(name="KEY_ESCAPE")) is True
+    assert pool.unified_process_filter == ""
+
+    pool._render_unified_gpu_lines(raw_stats, 2)
+    assert pool._unified_process_count == 3
+
+
+def test_process_sort_supports_keyboard_and_clickable_headers(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_active_pane = "process"
+    pool._unified_gpu_count = 2
+    raw_stats = _multi_process_raw_stats()
+    selected_row = pool._build_unified_gpu_table(raw_stats).iloc[0]
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda: os.terminal_size((120, 44)),
+    )
+
+    def sorted_pids():
+        return [
+            process["pid"]
+            for process in pool._get_sorted_unified_processes(
+                raw_stats,
+                selected_row,
+            )
+        ]
+
+    assert sorted_pids() == [4242, 6262, 5252]
+    assert pool._handle_keypress("o") is True
+    assert pool.unified_process_sort_mode == "cpu"
+    assert pool.unified_process_sort_descending is True
+    assert sorted_pids() == [5252, 4242, 6262]
+
+    assert pool._handle_keypress("O") is True
+    assert pool.unified_process_sort_descending is False
+    assert sorted_pids() == [6262, 4242, 5252]
+
+    pool._render_unified_gpu_lines(raw_stats, 1)
+    rss_region = next(
+        region
+        for region in pool._body_click_regions
+        if region[3] == ("process_sort", "rss")
+    )
+    pool._click_regions = list(pool._body_click_regions)
+    row, start, _end, _target = rss_region
+    click = MouseEvent(
+        button=0,
+        column=start + 1,
+        row=row + 1,
+        pressed=True,
+    )
+    assert pool._handle_mouse_event(click) is True
+    assert pool.unified_process_sort_mode == "rss"
+    assert pool.unified_process_sort_descending is True
+    assert sorted_pids() == [5252, 4242, 6262]
+
+    assert pool._handle_mouse_event(click) is True
+    assert pool.unified_process_sort_descending is False
+    assert sorted_pids() == [6262, 4242, 5252]
+
+
+def test_process_row_count_can_be_resized_without_exceeding_the_screen(
+    monkeypatch,
+):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_active_pane = "process"
+    raw_stats = _multi_process_raw_stats()
+    processes = raw_stats["_nvidb"]["process_details_by_client"][1]["0"]
+    template = processes[0]
+    for index in range(9):
+        processes.append(
+            {
+                **template,
+                "pid": 7000 + index,
+                "username": f"worker{index}",
+                "used_memory": f"{3000 - index * 100} MiB",
+                "command": f"python worker.py --rank {index}",
+                "cpu_percent": 50.0 + index,
+            }
+        )
+    width, height = 120, 70
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda: os.terminal_size((width, height)),
+    )
+
+    initial = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 1))
+    )
+    initial_rows = pool._unified_process_visible_rows
+    assert initial_rows >= 2
+    assert pool._unified_process_count == 12
+
+    assert pool._handle_keypress("+") is True
+    expanded = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 2))
+    )
+    assert pool._unified_process_visible_rows == initial_rows + 1
+    assert len(expanded.splitlines()) <= height - 4
+
+    assert pool._handle_keypress("-") is True
+    pool._render_unified_gpu_lines(raw_stats, 3)
+    assert pool._unified_process_visible_rows == initial_rows
+
+    plus_region = next(
+        region
+        for region in pool._body_click_regions
+        if region[3] == ("process_rows", 1)
+    )
+    pool._click_regions = list(pool._body_click_regions)
+    row, start, _end, _target = plus_region
+    assert pool._handle_mouse_event(
+        MouseEvent(
+            button=0,
+            column=start + 1,
+            row=row + 1,
+            pressed=True,
+        )
+    ) is True
+    assert pool.unified_process_rows == initial_rows + 1
+    assert len(initial.splitlines()) <= height - 4
+
+
+def test_help_overlay_tracks_focus_and_closes_with_mouse(monkeypatch, capsys):
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.cached_stats = ["", ""]
+    pool.cached_raw_stats = _multi_process_raw_stats()
+    pool._last_update_time = 1
+    pool._last_fetch_duration = 0.1
+    pool._last_fetch_error = None
+    pool._cache_lock = threading.Lock()
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda: os.terminal_size((100, 36)),
+    )
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+    assert pool._handle_keypress("?") is True
+    pool.print_stats(use_cache=True)
+    gpu_help = _without_ansi(capsys.readouterr().out)
+    assert "Help · UNIFIED · GPU/NODE" in gpu_help
+    assert "Enter/→/l" in gpu_help
+    assert set(pool._click_targets.values()) == {("close_help", None)}
+
+    help_row = next(iter(pool._click_targets))
+    assert pool._handle_mouse_event(_click(help_row + 1)) is True
+    assert pool.tui_help_visible is False
+
+    assert pool._handle_keypress("\n") is True
+    assert pool.unified_active_pane == "process"
+    assert pool._handle_keypress("?") is True
+    pool.print_stats(use_cache=True)
+    process_help = _without_ansi(capsys.readouterr().out)
+    assert "Help · UNIFIED · PROCESS" in process_help
+    assert "FIND AND ORDER" in process_help
+    assert "Mouse header" in process_help
+    assert "+ / -" in process_help
+
+    assert pool._handle_keypress("q") is True
+    assert pool.tui_help_visible is False
+    assert not pool.quit_flag.is_set()
 
 
 def test_arrow_keys_switch_gpu_and_process_panes_without_leaving_detailed_view():

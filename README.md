@@ -176,9 +176,14 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `k` / `↑`         | Move the active-pane selection up |
 | `PgUp` / `PgDn`   | Move the active-pane selection by a page |
 | `[` / `]`         | Page through a long wrapped command |
+| `/`               | Edit a live process filter |
+| `o` / `F6`        | Cycle process sorting |
+| `O`               | Reverse the current process sort |
+| `+` / `-`         | Show more/fewer process rows |
 | `i` / `T` / `K`   | Arm SIGINT / SIGTERM / SIGKILL for the selected process |
-| `Esc`             | Cancel an armed process signal |
-| Mouse             | Select GPUs/processes, click actions, or scroll either pane |
+| `Esc`             | Cancel a signal or clear the process filter |
+| `?`               | Open context-sensitive help |
+| Mouse             | Select rows, sort headers, click actions, or scroll either pane |
 | `Enter` (signal armed) | Confirm the pending process signal |
 | `Enter` / `Space` (per-node view) | Toggle the selected server details |
 | `a`               | Expand all servers            |
@@ -228,6 +233,15 @@ selected process gets an htop-style low-contrast grey background, and its block
 below the table spells out both percentage of the whole GPU and percentage of
 currently used GPU memory, threads, state, elapsed time, and the complete
 wrapped command line.
+Press `/` to filter the process list as you type. The query matches PID, user,
+type, state, process name, and the full command. `Enter` keeps the current
+filter and leaves edit mode; `Esc` clears it. Press `o` or `F6` to cycle through
+VRAM, CPU, host memory, RSS, elapsed time, PID, and command sorting. Uppercase
+`O` reverses the current order. The visible table headers are also clickable:
+click a field once to sort by it and again to reverse it.
+Use `+` and `-`, or the row controls in the action bar, to change how many
+processes stay visible. The request is capped at 12 rows and reduced
+automatically when the selected-process details need the space.
 When a wrapped command would push the action bar off-screen, it automatically
 uses height-aware pages (at most five command lines on terminals shorter than
 28 rows). Use `[`/`]`, the clickable command buttons, or the wheel over the
@@ -251,6 +265,10 @@ selected GPU and report permission or command failures in the pane. If
 GPU/node selection has focus, the first signal key only transfers focus to the
 process pane; press it again to arm the action.
 
+Press `?` for a help panel tailored to the current per-node, GPU, or process
+focus. Click anywhere inside the panel, or press `?`, `Esc`, or `q`, to close
+it. Closing help with `q` does not quit the monitor.
+
 Press `t` (or click History) to show utilization, VRAM, and temperature for the
 selected GPU plus CPU, GPU VRAM share, host memory, and RSS for the selected
 process. Both histories retain the latest 60 successful refresh samples in
@@ -262,7 +280,8 @@ Machines without NVIDIA GPUs (a macOS laptop, a CPU-only host) are not expanded
 by default in the per-node view and are collapsed into a single "hidden" line in
 the unified node status. Press `u` to show them.
 Layout toggles are written back to the `view` section of `~/.nvidb/config.yml`,
-so the next `nvidb` run starts with the same layout.
+so the next `nvidb` run starts with the same layout. Process filters, sorting,
+row counts, and help visibility are session-only.
 
 ### 2.7 GPU Monitor Decorator
 

@@ -1365,6 +1365,33 @@ class NVClientPool:
         "busy": "Busy",
         "errors": "Errors",
     }
+    UNIFIED_PROCESS_SORT_MODES = (
+        "vram",
+        "cpu",
+        "mem",
+        "rss",
+        "time",
+        "pid",
+        "command",
+    )
+    UNIFIED_PROCESS_SORT_LABELS = {
+        "vram": "VRAM",
+        "cpu": "CPU",
+        "mem": "MEM",
+        "rss": "RSS",
+        "time": "TIME",
+        "pid": "PID",
+        "command": "COMMAND",
+    }
+    UNIFIED_PROCESS_SORT_COLUMNS = {
+        "vram": "vram",
+        "cpu": "cpu",
+        "mem": "mem",
+        "rss": "rss",
+        "time": "time",
+        "pid": "pid",
+        "command": "command",
+    }
 
     def __init__(
         self,
@@ -1417,12 +1444,20 @@ class NVClientPool:
         self.unified_process_panel_hidden = False
         self.unified_selected_process = 0
         self.unified_selected_process_pid = None
+        self.unified_process_filter = ""
+        self.unified_process_filter_editing = False
+        self.unified_process_sort_mode = "vram"
+        self.unified_process_sort_descending = True
+        self.unified_process_rows = 0
+        self._unified_process_visible_rows = 1
+        self._unified_process_total_count = 0
         self._unified_process_count = 0
         self.unified_command_scroll = 0
         self._unified_command_line_count = 0
         self._unified_command_page_size = 0
         self._pending_process_signal = None
         self._process_action_notice = None
+        self.tui_help_visible = False
         self._click_targets = {}
         self._click_regions = []
         self._body_click_targets = {}
@@ -2158,16 +2193,101 @@ class NVClientPool:
         raw_stats_by_client,
         selected_row,
     ):
-        return sorted(
-            self._get_unified_process_details(
-                raw_stats_by_client,
-                selected_row,
-            ),
-            key=lambda process: (
-                self._extract_metric_number(process.get("used_memory")) or 0
-            ),
-            reverse=True,
+        processes = self._get_unified_process_details(
+            raw_stats_by_client,
+            selected_row,
         )
+        query = str(
+            getattr(self, "unified_process_filter", "") or ""
+        ).strip().casefold()
+        if query:
+            processes = [
+                process
+                for process in processes
+                if query
+                in " ".join(
+                    str(process.get(field) or "")
+                    for field in (
+                        "pid",
+                        "username",
+                        "type",
+                        "state",
+                        "process_name",
+                        "command",
+                    )
+                ).casefold()
+            ]
+
+        mode = self._get_unified_process_sort_mode()
+        descending = bool(
+            getattr(
+                self,
+                "unified_process_sort_descending",
+                mode != "command",
+            )
+        )
+        present = []
+        missing = []
+        for process in processes:
+            value = self._unified_process_sort_value(process, mode)
+            if value is None:
+                missing.append(process)
+            else:
+                present.append((value, process))
+        present.sort(key=lambda item: item[0], reverse=descending)
+        return [process for _value, process in present] + missing
+
+    def _get_unified_process_sort_mode(self):
+        mode = getattr(self, "unified_process_sort_mode", "vram")
+        if mode in self.UNIFIED_PROCESS_SORT_MODES:
+            return mode
+        return "vram"
+
+    @staticmethod
+    def _process_elapsed_seconds(value):
+        """Convert ps etime text ([[dd-]hh:]mm:ss) into seconds."""
+        text = str(value or "").strip()
+        if not text:
+            return None
+        days = 0
+        if "-" in text:
+            days_text, text = text.split("-", 1)
+            try:
+                days = int(days_text)
+            except ValueError:
+                return None
+        try:
+            parts = [int(part) for part in text.split(":")]
+        except ValueError:
+            return None
+        if not 1 <= len(parts) <= 3:
+            return None
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + part
+        return days * 86400 + seconds
+
+    def _unified_process_sort_value(self, process, mode):
+        if mode == "vram":
+            return self._extract_metric_number(process.get("used_memory"))
+        if mode == "cpu":
+            return self._extract_metric_number(process.get("cpu_percent"))
+        if mode == "mem":
+            return self._extract_metric_number(process.get("mem_percent"))
+        if mode == "rss":
+            return self._extract_metric_number(process.get("rss_kb"))
+        if mode == "time":
+            return self._process_elapsed_seconds(process.get("elapsed"))
+        if mode == "pid":
+            return self._extract_metric_number(process.get("pid"))
+        if mode == "command":
+            command = (
+                process.get("command")
+                or process.get("process_name")
+                or ""
+            )
+            return str(command).casefold() or None
+        return None
 
     @staticmethod
     def _format_memory_kb(value):
@@ -2349,7 +2469,9 @@ class NVClientPool:
     ):
         """Format the selectable htop-style process pane below GPU cards."""
         if selected_row is None:
+            self._unified_process_total_count = 0
             self._unified_process_count = 0
+            self._unified_process_visible_rows = 0
             self._unified_command_line_count = 0
             self._unified_command_page_size = 0
             return "Process details: no GPU selected"
@@ -2472,10 +2594,15 @@ class NVClientPool:
                 rows.append((plain, styled))
             return rows
 
+        all_processes = self._get_unified_process_details(
+            raw_stats_by_client,
+            selected_row,
+        )
         processes = self._get_sorted_unified_processes(
             raw_stats_by_client,
             selected_row,
         )
+        self._unified_process_total_count = len(all_processes)
         self._unified_process_count = len(processes)
         selected_index = int(
             getattr(self, "unified_selected_process", 0) or 0
@@ -2513,10 +2640,41 @@ class NVClientPool:
         node = selected_row.get("Node", "N/A")
         hostname = selected_row.get("Hostname", "N/A")
         gpu_index = selected_row.get("GPU", "N/A")
+        filter_query = str(
+            getattr(self, "unified_process_filter", "") or ""
+        )
+        filter_editing = bool(
+            getattr(self, "unified_process_filter_editing", False)
+        )
+        if filter_query or filter_editing:
+            count_label = f"{len(processes)}/{len(all_processes)} match"
+            filter_label = (
+                f"/{filter_query}{'_' if filter_editing else ''}"
+            )
+        else:
+            count_label = f"{len(processes)} active"
+            filter_label = ""
+        process_sort_mode = self._get_unified_process_sort_mode()
+        process_sort_label = self.UNIFIED_PROCESS_SORT_LABELS[
+            process_sort_mode
+        ]
+        process_sort_arrow = (
+            "▼"
+            if bool(
+                getattr(
+                    self,
+                    "unified_process_sort_descending",
+                    process_sort_mode != "command",
+                )
+            )
+            else "▲"
+        )
         focus_label = "ACTIVE" if pane_focused else "inactive · Enter/→"
+        filter_title = f" | {filter_label}" if filter_label else ""
         title = (
-            f"Processes | {len(processes)} active | {node} ({hostname}) | "
-            f"GPU {gpu_index} | {focus_label}"
+            f"Processes | {count_label}{filter_title} | "
+            f"{node} ({hostname}) | GPU {gpu_index} | "
+            f"sort {process_sort_label}{process_sort_arrow} | {focus_label}"
         )
         top_label = trim(
             f"{border_horizontal} {title} ",
@@ -2547,7 +2705,13 @@ class NVClientPool:
                 f" ({total_process_vram / total_gpu_mib * 100:.1f}% of GPU VRAM)"
             )
         visible_summary = (
-            f"{len(processes)} active | process VRAM {vram_summary}"
+            (
+                f"{len(processes)}/{len(all_processes)} match"
+                if filter_query or filter_editing
+                else f"{len(processes)} active"
+            )
+            + f" | {'matched' if filter_query else 'process'} VRAM "
+            f"{vram_summary}"
             + (
                 f" | {'selected' if pane_focused else 'details'} "
                 f"{selected_index + 1}/{len(processes)}"
@@ -2568,7 +2732,11 @@ class NVClientPool:
             self._unified_command_page_size = 0
             self.unified_command_scroll = 0
             lines.append(panel_rule("PROCESS LIST"))
-            empty = "No active GPU processes"
+            empty = (
+                f"No processes match /{filter_query}"
+                if filter_query
+                else "No active GPU processes"
+            )
             lines.append(panel_line(empty, colored(empty, "dark_grey")))
             lines.append(panel_rule("ACTIONS"))
             history_label = (
@@ -2616,20 +2784,59 @@ class NVClientPool:
             lines.append(panel_rule("", bottom=True))
             return "\n".join(lines)
 
+        active_sort_column = self.UNIFIED_PROCESS_SORT_COLUMNS[
+            process_sort_mode
+        ]
+
+        def sortable_label(key, label):
+            if key == active_sort_column:
+                return f"{label}{process_sort_arrow}"
+            return label
+
         column_specs = [
             {"key": "sel", "label": "", "minimum": 1, "align": "left"},
-            {"key": "pid", "label": "PID", "minimum": 7, "align": "right"},
+            {
+                "key": "pid",
+                "label": sortable_label("pid", "PID"),
+                "minimum": 7,
+                "align": "right",
+            },
             {"key": "user", "label": "USER", "minimum": 9, "align": "left"},
-            {"key": "vram", "label": "VRAM", "minimum": 10, "align": "right"},
+            {
+                "key": "vram",
+                "label": sortable_label("vram", "VRAM"),
+                "minimum": 10,
+                "align": "right",
+            },
             {"key": "gpu", "label": "VRAM%", "minimum": 6, "align": "right"},
-            {"key": "cpu", "label": "CPU%", "minimum": 6, "align": "right"},
-            {"key": "mem", "label": "MEM%", "minimum": 6, "align": "right"},
-            {"key": "rss", "label": "RSS", "minimum": 7, "align": "right"},
-            {"key": "time", "label": "TIME", "minimum": 9, "align": "right"},
+            {
+                "key": "cpu",
+                "label": sortable_label("cpu", "CPU%"),
+                "minimum": 6,
+                "align": "right",
+            },
+            {
+                "key": "mem",
+                "label": sortable_label("mem", "MEM%"),
+                "minimum": 6,
+                "align": "right",
+            },
+            {
+                "key": "rss",
+                "label": sortable_label("rss", "RSS"),
+                "minimum": 7,
+                "align": "right",
+            },
+            {
+                "key": "time",
+                "label": sortable_label("time", "TIME"),
+                "minimum": 9,
+                "align": "right",
+            },
             {"key": "state", "label": "S", "minimum": 3, "align": "left"},
             {
                 "key": "command",
-                "label": "COMMAND",
+                "label": sortable_label("command", "COMMAND"),
                 "minimum": 12,
                 "align": "left",
             },
@@ -2745,22 +2952,58 @@ class NVClientPool:
             }
             return values, colors
 
-        header_plain = " ".join(
+        header_cells = [
             padded_cell(column["label"], column) for column in columns
+        ]
+        header_plain = " ".join(header_cells)
+        header_styled = " ".join(
+            colored(
+                cell,
+                "cyan" if column["key"] == active_sort_column else "dark_grey",
+                attrs=(
+                    ["bold"]
+                    if column["key"] == active_sort_column
+                    else None
+                ),
+            )
+            for cell, column in zip(header_cells, columns)
         )
-        header_styled = colored(header_plain, "dark_grey")
+        header_line_index = None
         if not ultra_compact:
             if compact_layout:
+                header_line_index = len(lines)
                 lines.append(panel_line(header_plain, header_styled))
             else:
-                lines.extend(
-                    [
-                        panel_rule("PROCESS LIST"),
-                        panel_line(header_plain, header_styled),
-                    ]
-                )
+                lines.append(panel_rule("PROCESS LIST"))
+                header_line_index = len(lines)
+                lines.append(panel_line(header_plain, header_styled))
 
-        max_visible = (
+        if header_line_index is not None:
+            sort_targets = {
+                "pid": "pid",
+                "vram": "vram",
+                "gpu": "vram",
+                "cpu": "cpu",
+                "mem": "mem",
+                "rss": "rss",
+                "time": "time",
+                "command": "command",
+            }
+            column_start = 0
+            for column in columns:
+                sort_target = sort_targets.get(column["key"])
+                if sort_target:
+                    action_regions.append(
+                        (
+                            header_line_index,
+                            2 + column_start,
+                            2 + column_start + column["width"] - 1,
+                            ("process_sort", sort_target),
+                        )
+                    )
+                column_start += column["width"] + 1
+
+        automatic_visible = (
             1
             if compact_process_list
             else max(
@@ -2768,6 +3011,31 @@ class NVClientPool:
                 min(6, terminal_height // 8, max(1, height_budget // 5)),
             )
         )
+        tail_reserve = (
+            14
+            + (3 if inner_width < 70 else 0)
+            + (
+                6
+                if bool(getattr(self, "unified_show_trends", False))
+                else 0
+            )
+        )
+        safe_visible = max(
+            1,
+            min(
+                12,
+                height_budget - len(lines) - tail_reserve,
+            ),
+        )
+        requested_visible = max(
+            0,
+            int(getattr(self, "unified_process_rows", 0) or 0),
+        )
+        max_visible = min(
+            safe_visible,
+            requested_visible or automatic_visible,
+        )
+        self._unified_process_visible_rows = max_visible
         start = max(
             0,
             min(
@@ -3189,6 +3457,32 @@ class NVClientPool:
                         ),
                     ]
                 )
+        action_segments.extend(
+            [
+                (
+                    (
+                        "-"
+                        if tiny_actions
+                        else "-r"
+                        if compact_actions
+                        else "[-] Rows"
+                    ),
+                    action_color("cyan"),
+                    ("process_rows", -1),
+                ),
+                (
+                    (
+                        "+"
+                        if tiny_actions
+                        else "+r"
+                        if compact_actions
+                        else "[+] Rows"
+                    ),
+                    action_color("cyan"),
+                    ("process_rows", 1),
+                ),
+            ]
+        )
         action_plain = action_separator.join(
             text for text, _color, _target in action_segments
         )
@@ -3902,6 +4196,148 @@ class NVClientPool:
         self._unified_gpu_count = len(table)
         return table.iloc[selected]
 
+    def _format_tui_help_lines(self, width, height):
+        """Render a compact, context-sensitive keyboard and mouse reference."""
+        width = max(20, int(width))
+        height = max(4, int(height))
+        inner_width = max(1, width - 4)
+        display_mode = getattr(
+            self,
+            "display_mode",
+            self.DISPLAY_MODE_NODES,
+        )
+        unified = display_mode == self.DISPLAY_MODE_UNIFIED
+        pane = getattr(self, "unified_active_pane", "gpu")
+
+        if not unified:
+            context = "PER-NODE"
+            entries = [
+                ("section", "NAVIGATION", ""),
+                ("key", "j/k · ↑/↓", "Select a node"),
+                ("key", "Enter/Space", "Expand or collapse node details"),
+                ("key", "a / c", "Expand all / collapse all"),
+                ("section", "VIEWS", ""),
+                ("key", "v", "Open the unified GPU view"),
+                ("key", "?", "Close this help"),
+                ("key", "q", "Close help; q again quits"),
+            ]
+        elif pane == "process" and self._process_panel_visible():
+            context = "UNIFIED · PROCESS"
+            mode = self._get_unified_process_sort_mode()
+            arrow = (
+                "▼"
+                if bool(
+                    getattr(
+                        self,
+                        "unified_process_sort_descending",
+                        mode != "command",
+                    )
+                )
+                else "▲"
+            )
+            query = str(
+                getattr(self, "unified_process_filter", "") or ""
+            )
+            rows = int(
+                getattr(self, "_unified_process_visible_rows", 1) or 1
+            )
+            state = (
+                f"sort {self.UNIFIED_PROCESS_SORT_LABELS[mode]}{arrow}"
+                f" · filter /{query or '-'} · rows {rows}"
+            )
+            entries = [
+                ("state", "Current", state),
+                ("section", "NAVIGATION", ""),
+                ("key", "j/k · ↑/↓", "Select a process"),
+                ("key", "PgUp/PgDn", "Move by five processes"),
+                ("key", "← / h", "Return to GPU/node selection"),
+                ("key", "Tab", "Switch the active pane"),
+                ("key", "p", "Show or hide the process pane"),
+                ("section", "FIND AND ORDER", ""),
+                ("key", "/", "Edit a live PID/user/command filter"),
+                ("key", "Enter/Esc", "Apply / clear the filter"),
+                ("key", "o / F6", "Cycle the process sort field"),
+                ("key", "O", "Reverse the current sort"),
+                ("key", "Mouse header", "Sort or reverse that column"),
+                ("key", "+ / -", "Show more / fewer process rows"),
+                ("section", "DETAILS AND ACTIONS", ""),
+                ("key", "[ / ]", "Page through the full command"),
+                ("key", "t", "Toggle GPU and process history"),
+                ("key", "i / T / K", "Arm INT / TERM / KILL"),
+                ("key", "? / q", "Close this help"),
+            ]
+        else:
+            context = "UNIFIED · GPU/NODE"
+            entries = [
+                ("section", "NAVIGATION", ""),
+                ("key", "j/k · ↑/↓", "Select a GPU"),
+                ("key", "PgUp/PgDn", "Move by a GPU page"),
+                ("key", "Enter/→/l", "Enter the selected GPU processes"),
+                ("key", "Tab", "Switch to a visible process pane"),
+                ("key", "p", "Show or hide the process pane"),
+                ("section", "VIEW OPTIONS", ""),
+                ("key", "d", "Switch Detailed / Single-line"),
+                ("key", "s", "Cycle GPU sorting"),
+                ("key", "f", "Cycle GPU filters"),
+                ("key", "g", "Toggle per-node grouping"),
+                ("key", "u", "Show or hide unsupported nodes"),
+                ("key", "t", "Toggle GPU history"),
+                ("key", "v", "Return to the per-node view"),
+                ("key", "? / q", "Close this help"),
+            ]
+
+        def trim(text, limit):
+            text = str(text)
+            if len(text) <= limit:
+                return text
+            if limit <= 1:
+                return text[:limit]
+            return text[: limit - 1] + "…"
+
+        title = trim(
+            f"─ Help · {context} · ?/Esc/q close ",
+            width - 2,
+        )
+        lines = [
+            colored("┌", "dark_grey")
+            + colored(title, "cyan", attrs=["bold"])
+            + colored("─" * max(0, width - 2 - len(title)) + "┐", "dark_grey")
+        ]
+
+        max_entries = max(1, height - 2)
+        clipped = len(entries) > max_entries
+        if clipped:
+            entries = entries[: max(1, max_entries - 1)]
+            entries.append(("state", "More", "Enlarge the terminal for all keys"))
+
+        key_width = min(16, max(7, inner_width // 3))
+        description_width = max(0, inner_width - key_width - 1)
+        for kind, key, description in entries:
+            if kind == "section":
+                plain = trim(f"── {key} ", inner_width)
+                plain += "─" * max(0, inner_width - len(plain))
+                styled = colored(plain, "dark_grey")
+            else:
+                key_text = trim(key, key_width).ljust(key_width)
+                description_text = trim(
+                    description,
+                    description_width,
+                ).ljust(description_width)
+                plain = f"{key_text} {description_text}"
+                styled = colored(
+                    key_text,
+                    "cyan" if kind == "key" else "yellow",
+                    attrs=["bold"] if kind == "key" else None,
+                ) + " " + colored(description_text, "light_grey")
+            lines.append(
+                colored("│ ", "dark_grey")
+                + styled
+                + colored(" │", "dark_grey")
+            )
+
+        lines.append(colored("└" + "─" * (width - 2) + "┘", "dark_grey"))
+        return lines
+
     def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
         """Render the unified TUI body from cached per-node GPU data."""
         self._body_click_targets = {}
@@ -4120,7 +4556,9 @@ class NVClientPool:
             )
             lines.append(process_panel)
         else:
+            self._unified_process_total_count = 0
             self._unified_process_count = 0
+            self._unified_process_visible_rows = 0
             self._unified_command_line_count = 0
             self._unified_command_page_size = 0
             self.unified_command_scroll = 0
@@ -5008,17 +5446,56 @@ class NVClientPool:
             unsupported_label = (
                 "Show" if getattr(self, "hide_unsupported", True) else "Hide"
             )
-            controls = (
-                f"[v]N [d]{detail_action} [Enter/→]Proc [p]{process_action} "
-                f"[Tab/←]Pane [j/k]Select [i/T/K]Signal [t]History [q] "
-                f"[s]{sort_label} [f]{filter_label} [g]{group_label} "
-                f"[u]{unsupported_label}"
+            process_focused = (
+                getattr(self, "unified_active_pane", "gpu") == "process"
+                and self._process_panel_visible()
             )
+            if process_focused:
+                process_sort_mode = self._get_unified_process_sort_mode()
+                process_sort_label = self.UNIFIED_PROCESS_SORT_LABELS[
+                    process_sort_mode
+                ]
+                process_sort_arrow = (
+                    "▼"
+                    if bool(
+                        getattr(
+                            self,
+                            "unified_process_sort_descending",
+                            process_sort_mode != "command",
+                        )
+                    )
+                    else "▲"
+                )
+                process_filter = str(
+                    getattr(self, "unified_process_filter", "") or ""
+                )
+                find_label = (
+                    f"Find:{process_filter[:12]}"
+                    if process_filter
+                    else "Find"
+                )
+                controls = (
+                    f"[?]Help [/]{find_label} "
+                    f"[o]{process_sort_label}{process_sort_arrow} "
+                    f"[+/-]Rows [←]GPU [j/k]Select [i/T/K]Signal "
+                    f"[t]History [p]{process_action} [q]"
+                )
+            else:
+                controls = (
+                    f"[?]Help [Enter/→]Proc [j/k]GPU [p]{process_action} "
+                    f"[d]{detail_action} [s]{sort_label} [f]{filter_label} "
+                    f"[q] [g]{group_label} [u]{unsupported_label} [v]Nodes"
+                )
             if len(controls) > terminal_width:
                 controls = controls[: max(0, terminal_width - 3)] + "..."
         else:
             view_label = "Per-node"
-            controls = "[v] Unified view  [j/k] Select  [Enter] Toggle  [a/c] Expand/Collapse  [q] Quit"
+            controls = (
+                "[?] Help  [v] Unified view  [j/k] Select  "
+                "[Enter] Toggle  [a/c] Expand/Collapse  [q] Quit"
+            )
+        if bool(getattr(self, "tui_help_visible", False)):
+            controls = "[? / Esc / q] Close help"
         output_lines.append(
             f"Time: {current_time} | Updated: {update_display}{fetch_display} | "
             f"{server_label}: {server_count} | View: {view_label}{warn_display}"
@@ -5030,6 +5507,23 @@ class NVClientPool:
         else:
             separator_width = max(20, terminal_width)
         output_lines.append("-" * separator_width)
+
+        if bool(getattr(self, "tui_help_visible", False)):
+            help_offset = self._screen_line_count(output_lines)
+            help_lines = self._format_tui_help_lines(
+                terminal_width,
+                max(4, terminal_height - help_offset),
+            )
+            output_lines.extend(help_lines)
+            self._click_targets = {
+                help_offset + index: ("close_help", None)
+                for index in range(len(help_lines))
+            }
+            self._click_regions = []
+            self._body_click_targets = {}
+            self._body_click_regions = []
+            self._write_tui_lines(output_lines)
+            return
 
         meta = {}
         if isinstance(raw_stats_by_client, dict):
@@ -5268,6 +5762,159 @@ class NVClientPool:
         self.unified_selected_process = selected
         self.unified_selected_process_pid = None
         self.unified_command_scroll = 0
+        self._pending_process_signal = None
+        self._request_ui_refresh()
+        return True
+
+    def _set_unified_process_sort(self, mode, *, toggle=False):
+        if mode not in self.UNIFIED_PROCESS_SORT_MODES:
+            return False
+        current = self._get_unified_process_sort_mode()
+        current_descending = bool(
+            getattr(
+                self,
+                "unified_process_sort_descending",
+                current != "command",
+            )
+        )
+        if mode == current and toggle:
+            descending = not current_descending
+        elif mode == current:
+            return False
+        else:
+            descending = mode != "command"
+
+        self.unified_process_sort_mode = mode
+        self.unified_process_sort_descending = descending
+        self._pending_process_signal = None
+        self._request_ui_refresh()
+        return True
+
+    def _cycle_unified_process_sort(self):
+        current = self._get_unified_process_sort_mode()
+        next_index = (
+            self.UNIFIED_PROCESS_SORT_MODES.index(current) + 1
+        ) % len(self.UNIFIED_PROCESS_SORT_MODES)
+        return self._set_unified_process_sort(
+            self.UNIFIED_PROCESS_SORT_MODES[next_index]
+        )
+
+    def _adjust_unified_process_rows(self, delta):
+        if not self._process_panel_visible():
+            return False
+        current = int(getattr(self, "unified_process_rows", 0) or 0)
+        if current <= 0:
+            current = max(
+                1,
+                int(
+                    getattr(
+                        self,
+                        "_unified_process_visible_rows",
+                        1,
+                    )
+                    or 1
+                ),
+            )
+        selected = max(1, min(12, current + int(delta)))
+        if selected == current:
+            return False
+        self.unified_process_rows = selected
+        self._request_ui_refresh()
+        return True
+
+    def _reset_unified_process_filter_selection(self):
+        self.unified_selected_process = 0
+        self.unified_selected_process_pid = None
+        self.unified_command_scroll = 0
+        self._pending_process_signal = None
+
+    def _start_unified_process_filter(self):
+        if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
+            return False
+        entered = self._enter_unified_process_pane()
+        changed = not bool(
+            getattr(self, "unified_process_filter_editing", False)
+        )
+        self.unified_process_filter_editing = True
+        self._pending_process_signal = None
+        if changed and not entered:
+            self._request_ui_refresh()
+        return changed or entered
+
+    def _handle_unified_process_filter_key(self, key_text, key_name):
+        """Edit the live process filter while keeping global shortcuts inactive."""
+        if not bool(
+            getattr(self, "unified_process_filter_editing", False)
+        ):
+            return False
+
+        enter_pressed = (
+            key_name == "KEY_ENTER"
+            or key_text in {"\n", "\r"}
+        )
+        if enter_pressed:
+            self.unified_process_filter_editing = False
+            self._request_ui_refresh()
+            return True
+
+        if key_name == "KEY_ESCAPE" or key_text == "\x1b":
+            self.unified_process_filter = ""
+            self.unified_process_filter_editing = False
+            self._reset_unified_process_filter_selection()
+            self._request_ui_refresh()
+            return True
+
+        if (
+            key_name in {"KEY_BACKSPACE", "KEY_DELETE"}
+            or key_text in {"\b", "\x7f"}
+        ):
+            query = str(
+                getattr(self, "unified_process_filter", "") or ""
+            )
+            if query:
+                self.unified_process_filter = query[:-1]
+                self._reset_unified_process_filter_selection()
+                self._request_ui_refresh()
+            return True
+
+        if key_text == "\x15":  # Ctrl+U
+            self.unified_process_filter = ""
+            self._reset_unified_process_filter_selection()
+            self._request_ui_refresh()
+            return True
+
+        if (
+            key_text
+            and not str(key_name).startswith("KEY_")
+            and all(character.isprintable() for character in key_text)
+        ):
+            query = str(
+                getattr(self, "unified_process_filter", "") or ""
+            )
+            self.unified_process_filter = (query + key_text)[:80]
+            self._reset_unified_process_filter_selection()
+            self._request_ui_refresh()
+            return True
+        return False
+
+    def _clear_unified_process_filter(self):
+        query = str(getattr(self, "unified_process_filter", "") or "")
+        editing = bool(
+            getattr(self, "unified_process_filter_editing", False)
+        )
+        if not query and not editing:
+            return False
+        self.unified_process_filter = ""
+        self.unified_process_filter_editing = False
+        self._reset_unified_process_filter_selection()
+        self._request_ui_refresh()
+        return True
+
+    def _toggle_tui_help(self):
+        self.tui_help_visible = not bool(
+            getattr(self, "tui_help_visible", False)
+        )
+        self.unified_process_filter_editing = False
         self._pending_process_signal = None
         self._request_ui_refresh()
         return True
@@ -5614,6 +6261,15 @@ class NVClientPool:
         if target is None:
             target = (getattr(self, "_click_targets", {}) or {}).get(row)
 
+        if bool(getattr(self, "tui_help_visible", False)):
+            if (
+                event.is_left_press
+                and target is not None
+                and target[0] == "close_help"
+            ):
+                return self._toggle_tui_help()
+            return False
+
         if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) != self.DISPLAY_MODE_UNIFIED:
             if event.is_wheel_up or event.is_wheel_down:
                 delta = -1 if event.is_wheel_up else 1
@@ -5647,7 +6303,13 @@ class NVClientPool:
             if kind in {"command", "command_scroll"}:
                 self.unified_active_pane = "process"
                 return self._scroll_unified_command(delta)
-            if kind in {"process", "signal", "toggle_trends"}:
+            if kind in {
+                "process",
+                "process_rows",
+                "process_sort",
+                "signal",
+                "toggle_trends",
+            }:
                 self.unified_active_pane = "process"
                 return self._move_unified_process_selection(delta)
             if getattr(self, "unified_active_pane", "gpu") == "process":
@@ -5659,6 +6321,12 @@ class NVClientPool:
         if target is None:
             return False
         kind, value = target
+        if kind == "process_sort":
+            self.unified_active_pane = "process"
+            return self._set_unified_process_sort(value, toggle=True)
+        if kind == "process_rows":
+            self.unified_active_pane = "process"
+            return self._adjust_unified_process_rows(value)
         if kind == "command_scroll":
             self.unified_active_pane = "process"
             return self._scroll_unified_command(value)
@@ -5728,6 +6396,26 @@ class NVClientPool:
         key_name = key.name if hasattr(key, "name") and key.name else key_text
         key_lower = key_text.lower()
 
+        if bool(getattr(self, "tui_help_visible", False)):
+            if (
+                key_text in {"?", "q", "Q", "\n", "\r", " "}
+                or key_name in {"KEY_ESCAPE", "KEY_ENTER"}
+                or key_text == "\x1b"
+            ):
+                return self._toggle_tui_help()
+            return False
+
+        if bool(
+            getattr(self, "unified_process_filter_editing", False)
+        ):
+            return self._handle_unified_process_filter_key(
+                key_text,
+                key_name,
+            )
+
+        if key_text == "?":
+            return self._toggle_tui_help()
+
         if key_lower == "q":
             self.quit_flag.set()
             return True
@@ -5737,6 +6425,8 @@ class NVClientPool:
                 self._pending_process_signal = None
                 self._set_process_action_notice("Signal cancelled", "yellow")
                 self._request_ui_refresh()
+                return True
+            if self._clear_unified_process_filter():
                 return True
             return False
 
@@ -5789,6 +6479,24 @@ class NVClientPool:
             self._cycle_unified_filter_mode()
             return True
         if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED:
+            if key_text == "/":
+                return self._start_unified_process_filter()
+            if key_text == "O":
+                entered = self._enter_unified_process_pane()
+                changed = self._set_unified_process_sort(
+                    self._get_unified_process_sort_mode(),
+                    toggle=True,
+                )
+                return changed or entered
+            if key_lower == "o" or key_name == "KEY_F6":
+                entered = self._enter_unified_process_pane()
+                return self._cycle_unified_process_sort() or entered
+            if key_text in {"+", "="}:
+                entered = self._enter_unified_process_pane()
+                return self._adjust_unified_process_rows(1) or entered
+            if key_text == "-":
+                entered = self._enter_unified_process_pane()
+                return self._adjust_unified_process_rows(-1) or entered
             if key_lower == "p":
                 return self._toggle_unified_process_panel()
             if key_text == "i" or key_name == "KEY_F7":
@@ -5964,6 +6672,10 @@ class NVClientPool:
         print("   Enter/Right    : Enter processes; Enter confirms signals")
         print("   p              : Show/hide the unified process pane")
         print("   Space          : Enter processes or toggle per-node details")
+        print("   /              : Filter processes by PID, user, or command")
+        print("   o / F6 / O     : Cycle process sort / reverse direction")
+        print("   + / -          : Show more/fewer process rows")
+        print("   ?              : Context-sensitive help")
         print("   a              : Expand all")
         print("   c              : Collapse all")
         print("   v              : Switch unified/per-node view")
