@@ -1411,6 +1411,10 @@ class NVClientPool:
         # Detailed unified mode has two selectable panes.  The GPU cards stay
         # on screen while the lower pane shows and controls their processes.
         self.unified_active_pane = "gpu"
+        # Detailed mode shows the process pane by default. `p` can hide it for
+        # the current session without changing the persisted single-line
+        # process-pane preference.
+        self.unified_process_panel_hidden = False
         self.unified_selected_process = 0
         self.unified_selected_process_pid = None
         self._unified_process_count = 0
@@ -1514,15 +1518,8 @@ class NVClientPool:
         global_user_memory = {}
         process_details_by_client = {}
         # The htop-style process panel needs one extra `ps` call per host, so it
-        # is only collected while that panel is on screen. Detailed mode always
-        # includes the panel; single-line mode keeps the explicit toggle.
-        want_process_details = (
-            getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED
-            and (
-                bool(getattr(self, "unified_detailed", False))
-                or bool(getattr(self, "unified_show_processes", False))
-            )
-        )
+        # is only collected while that panel is on screen.
+        want_process_details = self._process_panel_visible()
         for idx, client in enumerate(self.pool):
             result = client.get_full_gpu_info()
             
@@ -2048,9 +2045,7 @@ class NVClientPool:
         except OSError:
             terminal_height = 24
 
-        show_processes = bool(
-            detailed or getattr(self, "unified_show_processes", False)
-        )
+        show_processes = self._process_panel_visible()
         show_trends = bool(getattr(self, "unified_show_trends", False))
         extra_lines = (
             (18 if show_processes else 0)
@@ -2518,7 +2513,7 @@ class NVClientPool:
         node = selected_row.get("Node", "N/A")
         hostname = selected_row.get("Hostname", "N/A")
         gpu_index = selected_row.get("GPU", "N/A")
-        focus_label = "ACTIVE" if pane_focused else "inactive · Tab/→"
+        focus_label = "ACTIVE" if pane_focused else "inactive · Enter/→"
         title = (
             f"Processes | {len(processes)} active | {node} ({hostname}) | "
             f"GPU {gpu_index} | {focus_label}"
@@ -3930,9 +3925,7 @@ class NVClientPool:
             terminal_width = 80
             terminal_height = 24
         filter_mode = self._get_unified_filter_mode()
-        show_process_panel = (
-            detailed or getattr(self, "unified_show_processes", False)
-        ) and filter_mode != "errors"
+        show_process_panel = self._process_panel_visible()
         compact_history = (
             show_process_panel
             and terminal_height < 36
@@ -4998,6 +4991,9 @@ class NVClientPool:
             detailed = getattr(self, "unified_detailed", False)
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
             detail_action = "Single-line" if detailed else "Detailed"
+            process_action = (
+                "HideProc" if self._process_panel_visible() else "ShowProc"
+            )
             sort_mode = self._get_unified_sort_mode()
             sort_label = {
                 "node": "Node",
@@ -5013,9 +5009,10 @@ class NVClientPool:
                 "Show" if getattr(self, "hide_unsupported", True) else "Hide"
             )
             controls = (
-                f"[v]N [d]{detail_action} [s]{sort_label} [f]{filter_label} "
-                f"[g]{group_label} [u]{unsupported_label} [Tab/←→]Pane "
-                f"[j/k]Select [i/T/K]Signal [t]History [q]"
+                f"[v]N [d]{detail_action} [Enter/→]Proc [p]{process_action} "
+                f"[Tab/←]Pane [j/k]Select [i/T/K]Signal [t]History [q] "
+                f"[s]{sort_label} [f]{filter_label} [g]{group_label} "
+                f"[u]{unsupported_label}"
             )
             if len(controls) > terminal_width:
                 controls = controls[: max(0, terminal_width - 3)] + "..."
@@ -5208,6 +5205,7 @@ class NVClientPool:
         else:
             self.display_mode = self.DISPLAY_MODE_UNIFIED
         self.unified_active_pane = "gpu"
+        self.unified_process_panel_hidden = False
         self.unified_selected_process_pid = None
         self.unified_command_scroll = 0
         self._pending_process_signal = None
@@ -5303,6 +5301,8 @@ class NVClientPool:
         return True
 
     def _process_panel_visible(self):
+        if bool(getattr(self, "unified_process_panel_hidden", False)):
+            return False
         return (
             getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
             == self.DISPLAY_MODE_UNIFIED
@@ -5312,6 +5312,77 @@ class NVClientPool:
             )
             and self._get_unified_filter_mode() != "errors"
         )
+
+    def _enter_unified_process_pane(self):
+        """Show the selected GPU's processes and move focus into that pane."""
+        if (
+            getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
+            != self.DISPLAY_MODE_UNIFIED
+            or self._get_unified_filter_mode() == "errors"
+            or max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0
+        ):
+            return False
+
+        visibility_changed = False
+        persist_visibility = False
+        if bool(getattr(self, "unified_detailed", False)):
+            if bool(
+                getattr(self, "unified_process_panel_hidden", False)
+            ):
+                self.unified_process_panel_hidden = False
+                visibility_changed = True
+        elif not bool(getattr(self, "unified_show_processes", False)):
+            self.unified_show_processes = True
+            visibility_changed = True
+            persist_visibility = True
+
+        if not self._process_panel_visible():
+            return False
+        focus_changed = (
+            getattr(self, "unified_active_pane", "gpu") != "process"
+        )
+        if not visibility_changed and not focus_changed:
+            return False
+
+        self.unified_active_pane = "process"
+        self._pending_process_signal = None
+        if persist_visibility:
+            self._apply_view_change()
+        else:
+            self._request_ui_refresh()
+        return True
+
+    def _toggle_unified_process_panel(self):
+        """Show or hide the process pane without treating Enter as a toggle."""
+        if (
+            getattr(self, "display_mode", self.DISPLAY_MODE_NODES)
+            != self.DISPLAY_MODE_UNIFIED
+            or self._get_unified_filter_mode() == "errors"
+            or max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0
+        ):
+            return False
+
+        detailed = bool(getattr(self, "unified_detailed", False))
+        if detailed:
+            self.unified_process_panel_hidden = not bool(
+                getattr(self, "unified_process_panel_hidden", False)
+            )
+            panel_visible = not self.unified_process_panel_hidden
+        else:
+            self.unified_process_panel_hidden = False
+            panel_visible = not bool(
+                getattr(self, "unified_show_processes", False)
+            )
+            self.unified_show_processes = panel_visible
+
+        if not panel_visible:
+            self.unified_active_pane = "gpu"
+            self._pending_process_signal = None
+        if detailed:
+            self._request_ui_refresh()
+        else:
+            self._apply_view_change()
+        return True
 
     def _set_unified_active_pane(self, pane):
         if pane not in {"gpu", "process"}:
@@ -5684,6 +5755,7 @@ class NVClientPool:
                 return False
             self.unified_detailed = not getattr(self, "unified_detailed", False)
             self.unified_active_pane = "gpu"
+            self.unified_process_panel_hidden = False
             self.unified_selected_process = 0
             self.unified_selected_process_pid = None
             self.unified_command_scroll = 0
@@ -5717,6 +5789,8 @@ class NVClientPool:
             self._cycle_unified_filter_mode()
             return True
         if getattr(self, "display_mode", self.DISPLAY_MODE_NODES) == self.DISPLAY_MODE_UNIFIED:
+            if key_lower == "p":
+                return self._toggle_unified_process_panel()
             if key_text == "i" or key_name == "KEY_F7":
                 return self._request_process_signal("INT")
             if key_text == "T" or key_name == "KEY_F8":
@@ -5736,15 +5810,15 @@ class NVClientPool:
             if key_name in {"KEY_TAB", "KEY_BTAB"} or key_text == "\t":
                 return self._toggle_unified_active_pane()
             if key_name == "KEY_RIGHT" or key_lower == "l":
-                return self._set_unified_active_pane("process")
+                return self._enter_unified_process_pane()
             if key_name == "KEY_LEFT" or key_lower == "h":
                 return self._set_unified_active_pane("gpu")
             if key_text == "[":
-                self.unified_active_pane = "process"
-                return self._scroll_unified_command(-1)
+                entered = self._enter_unified_process_pane()
+                return self._scroll_unified_command(-1) or entered
             if key_text == "]":
-                self.unified_active_pane = "process"
-                return self._scroll_unified_command(1)
+                entered = self._enter_unified_process_pane()
+                return self._scroll_unified_command(1) or entered
 
             process_pane = (
                 getattr(self, "unified_active_pane", "gpu") == "process"
@@ -5771,23 +5845,7 @@ class NVClientPool:
                     -max(1, int(getattr(self, "_unified_page_size", 1) or 1))
                 )
             if enter_pressed or key_text == " ":
-                if max(0, int(getattr(self, "_unified_gpu_count", 0) or 0)) == 0:
-                    return False
-                if getattr(self, "unified_detailed", False):
-                    return self._toggle_unified_active_pane()
-                self.unified_show_processes = not getattr(
-                    self,
-                    "unified_show_processes",
-                    False,
-                )
-                self.unified_active_pane = (
-                    "process" if self.unified_show_processes else "gpu"
-                )
-                self.unified_selected_process = 0
-                self.unified_selected_process_pid = None
-                self.unified_command_scroll = 0
-                self._apply_view_change()
-                return True
+                return self._enter_unified_process_pane()
             return False
 
         if key_lower == "j" or key_name == "KEY_DOWN":
@@ -5903,7 +5961,9 @@ class NVClientPool:
         print("Controls:")
         print("   j/k or Up/Down : Move the active selection")
         print("   PgUp/PgDn      : Change unified GPU page")
-        print("   Enter/Space    : Toggle details/pane or confirm a signal")
+        print("   Enter/Right    : Enter processes; Enter confirms signals")
+        print("   p              : Show/hide the unified process pane")
+        print("   Space          : Enter processes or toggle per-node details")
         print("   a              : Expand all")
         print("   c              : Collapse all")
         print("   v              : Switch unified/per-node view")
@@ -5913,7 +5973,7 @@ class NVClientPool:
         print("   g              : Toggle unified per-node grouping")
         print("   u              : Show/hide nodes without GPU support")
         print("   t              : Toggle GPU and selected-process history")
-        print("   Tab/Left/Right : Switch between GPU and process panes")
+        print("   Tab/Left       : Switch panes or return to GPU selection")
         print("   [ / ]          : Page through a long wrapped command")
         print("   i / T / K      : Confirmed SIGINT / SIGTERM / SIGKILL")
         print("   Mouse          : Select GPUs/processes, use actions, wheel to scroll")

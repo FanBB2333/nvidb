@@ -23,8 +23,9 @@ view:
   detailed: false        # unified card layout      ([d])
   sort: node             # node | available | utilization ([s])
   filter: all            # all | available | busy | errors ([f])
-  # Optional in single-line mode; Detailed mode always shows this pane.
-  processes: false       # process panel for the selected GPU ([Enter])
+  # Startup visibility in single-line mode. Detailed mode starts with the pane
+  # visible; [p] can temporarily hide it.
+  processes: false       # process panel for the selected GPU ([p])
   trends: false          # GPU + selected-process history     ([t])
   group_by_node: true    # node bands in the unified view      ([g])
   hide_unsupported: true # skip nodes without NVIDIA GPUs       ([u])

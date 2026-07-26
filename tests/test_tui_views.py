@@ -60,6 +60,7 @@ def _pool():
     pool.hide_unsupported = True
     pool.mouse_enabled = True
     pool.unified_active_pane = "gpu"
+    pool.unified_process_panel_hidden = False
     pool.unified_selected_process = 0
     pool.unified_selected_process_pid = None
     pool._unified_process_count = 0
@@ -606,12 +607,15 @@ def test_process_details_are_only_collected_while_the_panel_is_open():
     pool.get_client_gpus_info(return_raw=True)
     pool.unified_detailed = True
     pool.get_client_gpus_info(return_raw=True)
+    pool.unified_process_panel_hidden = True
+    pool.get_client_gpus_info(return_raw=True)
+    pool.unified_process_panel_hidden = False
     pool.unified_detailed = False
     pool.unified_show_processes = True
     pool.get_client_gpus_info(return_raw=True)
 
     # The extra `ps` call per host is only worth paying for while the panel is up.
-    assert calls == [False, False, True, True]
+    assert calls == [False, False, True, False, True]
 
 
 def test_process_selection_stays_on_the_same_pid_when_vram_sorting_changes(
@@ -1200,6 +1204,9 @@ def test_arrow_keys_switch_gpu_and_process_panes_without_leaving_detailed_view()
     assert pool._handle_keypress(right) is True
     assert pool.unified_active_pane == "process"
     assert pool.unified_detailed is True
+    assert pool._handle_keypress(right) is False
+    assert pool._handle_keypress("\n") is False
+    assert pool.unified_active_pane == "process"
 
     assert pool._handle_keypress("j") is True
     assert pool.unified_selected_process == 1
@@ -1211,6 +1218,97 @@ def test_arrow_keys_switch_gpu_and_process_panes_without_leaving_detailed_view()
     assert pool._handle_keypress("j") is True
     assert pool.unified_selected_gpu == 1
     assert pool._handle_keypress("h") is False
+
+
+def test_enter_opens_processes_and_p_is_the_only_visibility_toggle():
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool._unified_gpu_count = 2
+    pool._unified_process_count = 3
+
+    assert pool._process_panel_visible() is True
+    assert pool._handle_keypress("\n") is True
+    assert pool.unified_active_pane == "process"
+
+    pool.refresh_needed.clear()
+    assert pool._handle_keypress("\n") is False
+    assert pool._process_panel_visible() is True
+    assert pool.unified_active_pane == "process"
+    assert not pool.refresh_needed.is_set()
+
+    assert pool._handle_keypress("p") is True
+    assert pool.unified_process_panel_hidden is True
+    assert pool._process_panel_visible() is False
+    assert pool.unified_active_pane == "gpu"
+
+    # Enter and Right both reveal the pane and enter its task list.
+    assert pool._handle_keypress("\n") is True
+    assert pool.unified_process_panel_hidden is False
+    assert pool._process_panel_visible() is True
+    assert pool.unified_active_pane == "process"
+
+    assert pool._handle_keypress("p") is True
+    assert pool._handle_keypress(SimpleNamespace(name="KEY_RIGHT")) is True
+    assert pool.unified_process_panel_hidden is False
+    assert pool.unified_active_pane == "process"
+
+
+def test_single_line_enter_opens_processes_while_p_shows_and_hides_them():
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool._unified_gpu_count = 1
+    pool._unified_process_count = 1
+
+    assert pool._process_panel_visible() is False
+    assert pool._handle_keypress("\n") is True
+    assert pool.unified_show_processes is True
+    assert pool.unified_active_pane == "process"
+    assert pool._handle_keypress("\n") is False
+    assert pool.unified_show_processes is True
+
+    assert pool._handle_keypress("p") is True
+    assert pool.unified_show_processes is False
+    assert pool.unified_active_pane == "gpu"
+    assert pool._process_panel_visible() is False
+
+    # Showing the panel does not implicitly enter it; Enter performs that step.
+    assert pool._handle_keypress("p") is True
+    assert pool.unified_show_processes is True
+    assert pool.unified_active_pane == "gpu"
+    assert pool._handle_keypress(" ") is True
+    assert pool.unified_active_pane == "process"
+
+
+def test_hidden_detailed_process_panel_is_restored_by_enter(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    raw_stats = _focus_raw_stats("python train.py")
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda: os.terminal_size((100, 32)),
+    )
+
+    visible = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+    assert "Processes | 1 active" in visible
+
+    assert pool._handle_keypress("p") is True
+    hidden = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+    assert "Processes | 1 active" not in hidden
+    assert pool._unified_process_count == 0
+
+    assert pool._handle_keypress("\n") is True
+    restored = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+    assert restored.startswith("Focus process")
+    assert "Processes | 1 active" in restored
 
 
 def test_mouse_selects_gpus_processes_and_signal_actions(monkeypatch, capsys):
@@ -1411,9 +1509,20 @@ def test_view_changes_are_persisted_to_config(monkeypatch):
         "hide_unsupported": True,
         "mouse": True,
     }
+    pool._unified_gpu_count = 4
+    saved.clear()
+    assert pool._handle_keypress("p") is True
+    assert pool.unified_process_panel_hidden is True
+    assert saved == []
+
+    assert pool._handle_keypress("p") is True
+    pool.unified_detailed = False
+    assert pool._handle_keypress("p") is True
+    assert pool.unified_show_processes is True
+    assert saved[-1]["processes"] is True
+
     # Moving the selection is not a layout change and must not rewrite the file.
     saved.clear()
-    pool._unified_gpu_count = 4
     assert pool._handle_keypress("j") is True
     assert saved == []
 

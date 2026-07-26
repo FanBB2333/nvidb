@@ -69,9 +69,10 @@ servers:
 
 > **Warning**: Storing passwords in plaintext in the configuration file is **NOT RECOMMENDED** for security reasons. Consider using SSH key-based authentication (`auth: key`) instead.
 
-The same file also holds a `view` section that nvidb maintains itself: every TUI
-layout key (`v`, `d`, `s`, `f`, `g`, `u`, `t`, `Enter`) writes the new state back
-so the next run opens with the same view. See
+The same file also holds a `view` section that nvidb maintains itself. Persistent
+layout keys (`v`, `d`, `s`, `f`, `g`, `u`, `t`, and `p` in single-line mode)
+write the new state back so the next run opens with the same view. Pane focus and
+the temporary Detailed-mode process collapse are not persisted. See
 [2.6 Interactive TUI Navigation](#26-interactive-tui-navigation) for what each
 setting does.
 
@@ -167,7 +168,10 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `g`               | Toggle unified per-node grouping |
 | `u`               | Show/hide nodes without GPU support |
 | `t`               | Toggle GPU and selected-process history |
-| `Tab` / `h` / `l` / `←` / `→` | Switch between GPU and process panes |
+| `Enter` / `Space` / `l` / `→` | Show and enter the selected GPU's process pane |
+| `h` / `←`         | Return focus to the GPU/node pane |
+| `Tab`             | Switch between visible GPU and process panes |
+| `p`               | Show/hide the selected GPU's process pane |
 | `j` / `↓`         | Move the active-pane selection down |
 | `k` / `↑`         | Move the active-pane selection up |
 | `PgUp` / `PgDn`   | Move the active-pane selection by a page |
@@ -175,7 +179,8 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `i` / `T` / `K`   | Arm SIGINT / SIGTERM / SIGKILL for the selected process |
 | `Esc`             | Cancel an armed process signal |
 | Mouse             | Select GPUs/processes, click actions, or scroll either pane |
-| `Enter` / `Space` | Toggle server/process details or confirm a signal |
+| `Enter` (signal armed) | Confirm the pending process signal |
+| `Enter` / `Space` (per-node view) | Toggle the selected server details |
 | `a`               | Expand all servers            |
 | `c`               | Collapse all servers          |
 | `q`               | Quit                          |
@@ -211,28 +216,33 @@ means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
 nodes whose latest refresh failed. Because the filter is restored from the
 config on the next run, a warning line above the table spells out how many GPUs
 it is hiding.
-Detailed mode always places the selected GPU's process pane directly below the
-cards; there is no separate drill-down screen. In single-line mode, `Enter` or
-`Space` toggles the same pane. Its table shows PID, user, process VRAM, percentage
-of total GPU VRAM, CPU%, host MEM%, RSS, elapsed time, state, and command. Narrow
-terminals discard secondary columns first. The selected process gets an
-htop-style low-contrast grey background, and its block below the table spells
-out both percentage of the whole GPU and percentage of currently used GPU
-memory, threads, state, elapsed time, and the complete wrapped command line.
+Detailed mode places the selected GPU's process pane directly below the cards;
+there is no separate drill-down screen. `Enter`, `Space`, `→`, or `l` shows the
+pane when necessary and moves focus into its task list. Repeating one of these
+keys keeps process focus instead of collapsing the pane. Press `p` to hide or
+show it explicitly; `←` or `h` returns to GPU/node selection without hiding it.
+The same navigation applies in single-line mode. The process table shows PID,
+user, process VRAM, percentage of total GPU VRAM, CPU%, host MEM%, RSS, elapsed
+time, state, and command. Narrow terminals discard secondary columns first. The
+selected process gets an htop-style low-contrast grey background, and its block
+below the table spells out both percentage of the whole GPU and percentage of
+currently used GPU memory, threads, state, elapsed time, and the complete
+wrapped command line.
 When a wrapped command would push the action bar off-screen, it automatically
 uses height-aware pages (at most five command lines on terminals shorter than
 28 rows). Use `[`/`]`, the clickable command buttons, or the wheel over the
 command to see every line.
 
-Use `Tab`, `←`/`→`, or `h`/`l` to switch pane focus, then `j`/`k` or the arrow
-keys to move the highlighted row. The active pane uses solid borders; the
-inactive pane uses dashed borders. Only the active pane displays a selected-row
-background, so process rows are not highlighted while GPU/node selection has
-focus. Mouse reporting is on by default: click any GPU card or process row to
-select it, use the wheel over either pane to scroll that pane, and click the
-action buttons directly. Most terminals need `Shift` (or `Option`) held down
-for their own drag-to-select while mouse reporting is active; set
-`mouse: false` under `view` to disable TUI mouse handling.
+Use `Enter`, `→`, or `l` to enter process focus, `←` or `h` to return to
+GPU/node focus, and `Tab` to switch between visible panes. Then use `j`/`k` or
+the arrow keys to move the highlighted row. The active pane uses solid borders;
+the inactive pane uses dashed borders. Only the active pane displays a
+selected-row background, so process rows are not highlighted while GPU/node
+selection has focus. Mouse reporting is on by default: click any GPU card or
+process row to select it, use the wheel over either pane to scroll that pane,
+and click the action buttons directly. Most terminals need `Shift` (or
+`Option`) held down for their own drag-to-select while mouse reporting is
+active; set `mouse: false` under `view` to disable TUI mouse handling.
 
 The process action bar exposes `SIGINT`, `SIGTERM`, and `SIGKILL` as `i`, `T`,
 and `K`. Every signal requires a second identical click/key press or `Enter`
