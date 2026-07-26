@@ -404,7 +404,7 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
     )
 
     assert "Rows 1-1/3" in first_page
-    assert "> training-node GPU 0 [IDLE]" in first_page
+    assert "› training-node GPU 0 [IDLE]" in first_page
     assert "Model GPU A" in first_page
     assert "Model GPU B" not in first_page
     assert pool._unified_page_size == 1
@@ -415,7 +415,7 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
     )
 
     assert "Rows 2-2/3" in second_page
-    assert "> training-node GPU 1 [ACTIVE]" in second_page
+    assert "› training-node GPU 1 [ACTIVE]" in second_page
     assert "Model GPU B" in second_page
 
     page_down = SimpleNamespace(name="KEY_NPAGE")
@@ -424,7 +424,7 @@ def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):
         pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     )
     assert "Rows 3-3/3" in third_page
-    assert "> training-node GPU 2 [HIGH]" in third_page
+    assert "› training-node GPU 2 [HIGH]" in third_page
 
 
 def test_unified_selected_gpu_process_details(monkeypatch):
@@ -474,7 +474,10 @@ def test_unified_selected_gpu_process_details(monkeypatch):
 
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
 
-    assert "Processes | training-node (100.64.0.42) | GPU 0" in rendered
+    assert (
+        "Processes | 2 active | training-node (100.64.0.42) | GPU 0"
+        in rendered
+    )
     assert "PID" in rendered
     assert "USER" in rendered
     assert "VRAM" in rendered
@@ -491,6 +494,7 @@ def test_unified_process_panel_shows_htop_fields_and_full_command(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
     pool.unified_show_processes = True
+    pool.unified_active_pane = "process"
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("ANSI_COLORS_DISABLED", raising=False)
     monkeypatch.setenv("FORCE_COLOR", "1")
@@ -541,13 +545,14 @@ def test_unified_process_panel_shows_htop_fields_and_full_command(monkeypatch):
     # Truncated inside the table row, wrapped in full in the selected block.
     for fragment in command.split():
         assert fragment in rendered
-    assert "\x1b[46m" in styled  # htop-style cyan selected row
+    assert "\x1b[100m" in styled  # low-contrast grey selected row
     assert "\x1b[31m" in styled  # high CPU value
-    assert "\x1b[35m" in styled  # user / host-memory fields
+    assert "\x1b[35m" not in styled  # no magenta PID/user accents
+    assert "\x1b[34m" not in styled  # no blue PID/command accents
     assert all(
         len(line) == 120
         for line in rendered.splitlines()
-        if line.startswith(("┌", "├", "└", "│"))
+        if line.startswith(("┌", "├", "└", "│", "┊"))
     )
 
 
@@ -740,9 +745,13 @@ def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
     table = pool._build_unified_gpu_table(raw_stats)
     detailed_lines = pool._format_unified_detailed_table(table).splitlines()
-    content_lines = [line for line in detailed_lines if line.startswith("|")]
+    content_lines = [
+        line
+        for line in detailed_lines
+        if _without_ansi(line).startswith(("│", "┊"))
+    ]
 
-    assert "Unified GPU table (Detailed) | GPUs: 3" in rendered
+    assert "Focus GPU/node | Detailed | GPUs: 3" in rendered
     assert len(content_lines) == 12
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
     assert "training-node (100.64.0.42) -- 2 GPUs" not in _without_ansi(rendered)
@@ -802,6 +811,70 @@ def test_detailed_view_colors_status_without_breaking_alignment(monkeypatch):
     assert "GPU 0 [HIGH]" in plain_rendered
     assert "GPU 1 [IDLE]" in plain_rendered
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
+
+
+def test_detailed_focus_uses_quiet_highlight_and_solid_dashed_borders(
+    monkeypatch,
+):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    raw_stats = _focus_raw_stats("python train.py")
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda: os.terminal_size((100, 32)),
+    )
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("ANSI_COLORS_DISABLED", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+
+    pool.unified_active_pane = "gpu"
+    gpu_styled = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+    gpu_plain = _without_ansi(gpu_styled)
+    gpu_highlights = [
+        _without_ansi(line)
+        for line in gpu_styled.splitlines()
+        if "\x1b[100m" in line
+    ]
+
+    assert gpu_plain.startswith("Focus GPU/node")
+    assert any(line.startswith("┌─") for line in gpu_plain.splitlines())
+    assert any(
+        line.startswith("┌┄ Processes")
+        for line in gpu_plain.splitlines()
+    )
+    assert len(gpu_highlights) == 1
+    assert "GPU  › training-node GPU 0" in gpu_highlights[0]
+    assert "›    4242" not in gpu_plain
+
+    pool.unified_active_pane = "process"
+    process_styled = "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
+    process_plain = _without_ansi(process_styled)
+    process_highlights = [
+        _without_ansi(line)
+        for line in process_styled.splitlines()
+        if "\x1b[100m" in line
+    ]
+
+    assert process_plain.startswith("Focus process")
+    assert any(
+        line.startswith("┌┄┄")
+        for line in process_plain.splitlines()
+    )
+    assert any(
+        line.startswith("┌─ Processes")
+        for line in process_plain.splitlines()
+    )
+    assert len(process_highlights) == 1
+    assert "›    4242" in process_highlights[0]
+    assert "› training-node GPU 0" not in process_plain
+    assert "\x1b[34m" not in process_styled
+    assert "\x1b[35m" not in process_styled
 
 
 def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkeypatch):
@@ -936,7 +1009,10 @@ def test_detailed_process_pane_shows_the_whole_command_wrapped(monkeypatch):
     )
 
     assert "training-node GPU 0 [HIGH]" in rendered
-    assert "Processes | training-node (100.64.0.42) | GPU 0" in rendered
+    assert (
+        "Processes | 1 active | training-node (100.64.0.42) | GPU 0"
+        in rendered
+    )
     assert "VRAM 23,000 MiB" in rendered
     assert "CPU 99.4%" in rendered and "Threads 33" in rendered
     assert "GPU focus" not in rendered
@@ -1275,8 +1351,14 @@ def test_process_signals_require_confirmation_and_target_the_selected_host():
     pool._unified_gpu_count = 2
     pool._unified_process_count = 1
 
+    # A signal key first transfers focus from GPU selection to processes.
     assert pool._handle_keypress("T") is True
+    assert pool.unified_active_pane == "process"
     assert commands == []
+    assert pool._pending_process_signal is None
+    assert "press TERM again to arm" in pool._process_action_notice["message"]
+
+    assert pool._handle_keypress("T") is True
     assert pool._pending_process_signal["signal"] == "TERM"
     assert pool._pending_process_signal["pid"] == 4242
 

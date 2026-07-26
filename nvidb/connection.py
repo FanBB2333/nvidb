@@ -32,7 +32,7 @@ from .mouse import (
     MouseSequenceParser,
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
-from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color, get_memory_ratio_color
+from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color
 
 
 def parse_leading_float(value):
@@ -2190,7 +2190,7 @@ class NVClientPool:
         return f"{kib:.0f}K"
 
     @staticmethod
-    def _process_metric_color(value, warning, critical, default="green"):
+    def _process_metric_color(value, warning, critical, default="cyan"):
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -2200,15 +2200,6 @@ class NVClientPool:
         if number >= warning:
             return "yellow"
         return default
-
-    @staticmethod
-    def _process_accent_color(process):
-        palette = ("cyan", "green", "magenta", "blue", "yellow")
-        try:
-            index = int(process.get("pid", 0)) % len(palette)
-        except (TypeError, ValueError):
-            index = 0
-        return palette[index]
 
     def _format_unified_process_history(
         self,
@@ -2232,9 +2223,9 @@ class NVClientPool:
         )
         if not history and not gpu_history:
             plain = f"{title} | waiting for samples"[:width]
-            return [(plain, colored(plain, "magenta"))]
+            return [(plain, colored(plain, "cyan"))]
 
-        rows = [(title, colored(title, "magenta", attrs=["bold"]))]
+        rows = [(title, colored(title, "cyan", attrs=["bold"]))]
 
         def metric_row(
             label,
@@ -2285,7 +2276,7 @@ class NVClientPool:
                         "utilization",
                         lambda value: f"{value:.0f}%",
                         100,
-                        "green",
+                        "cyan",
                         gpu_history,
                     ),
                     metric_row(
@@ -2293,7 +2284,7 @@ class NVClientPool:
                         "memory",
                         lambda value: f"{value:.0f}%",
                         100,
-                        "yellow",
+                        "cyan",
                         gpu_history,
                     ),
                     metric_row(
@@ -2301,7 +2292,7 @@ class NVClientPool:
                         "temperature",
                         lambda value: f"{value:.0f}C",
                         100,
-                        "red",
+                        "cyan",
                         gpu_history,
                         minimum=20,
                     ),
@@ -2320,7 +2311,7 @@ class NVClientPool:
                     "cpu_percent",
                     lambda value: f"{value:.1f}%",
                     100,
-                    "green",
+                    "cyan",
                     history,
                 ),
                 metric_row(
@@ -2328,7 +2319,7 @@ class NVClientPool:
                     "gpu_vram_percent",
                     lambda value: f"{value:.1f}%",
                     100,
-                    "yellow",
+                    "cyan",
                     history,
                 ),
                 metric_row(
@@ -2336,7 +2327,7 @@ class NVClientPool:
                     "mem_percent",
                     lambda value: f"{value:.1f}%",
                     100,
-                    "magenta",
+                    "cyan",
                     history,
                 ),
                 metric_row(
@@ -2394,6 +2385,12 @@ class NVClientPool:
             terminal_height < 36
             and bool(getattr(self, "unified_show_trends", False))
         )
+        pane_focused = (
+            getattr(self, "unified_active_pane", "gpu") == "process"
+        )
+        border_horizontal = "─" if pane_focused else "┄"
+        border_vertical = "│" if pane_focused else "┊"
+        label_color = "cyan" if pane_focused else "dark_grey"
         process_line_map = process_line_map if process_line_map is not None else {}
         command_line_map = command_line_map if command_line_map is not None else {}
         action_regions = action_regions if action_regions is not None else []
@@ -2409,11 +2406,23 @@ class NVClientPool:
         def panel_rule(label, *, bottom=False):
             left, right = ("└", "┘") if bottom else ("├", "┤")
             if not label:
-                plain = left + "─" * max(0, width - 2) + right
-                return colored(plain, "cyan", attrs=["dark"])
-            label = trim(f"─ {label} ", max(0, width - 2))
-            plain = left + label + "─" * max(0, width - 2 - len(label)) + right
-            return colored(plain, "cyan", attrs=["dark"])
+                plain = (
+                    left
+                    + border_horizontal * max(0, width - 2)
+                    + right
+                )
+                return colored(plain, "dark_grey")
+            label = trim(
+                f"{border_horizontal} {label} ",
+                max(0, width - 2),
+            )
+            plain = (
+                left
+                + label
+                + border_horizontal * max(0, width - 2 - len(label))
+                + right
+            )
+            return colored(plain, "dark_grey")
 
         def panel_line(plain, styled=None):
             original_plain = str(plain)
@@ -2422,10 +2431,10 @@ class NVClientPool:
                 styled = plain
             padding = " " * max(0, inner_width - len(plain))
             return (
-                colored("│ ", "cyan", attrs=["dark"])
+                colored(f"{border_vertical} ", "dark_grey")
                 + (styled if styled is not None else plain)
                 + padding
-                + colored(" │", "cyan", attrs=["dark"])
+                + colored(f" {border_vertical}", "dark_grey")
             )
 
         def pack_fields(label, fields):
@@ -2457,10 +2466,10 @@ class NVClientPool:
                 )
                 styled = colored(
                     row_prefix,
-                    "cyan",
+                    label_color,
                     attrs=["bold"] if row_prefix.strip() else None,
                 ) + " | ".join(
-                    colored(text, color, attrs=["bold"])
+                    colored(text, color)
                     if color
                     else text
                     for text, color in row_fields
@@ -2509,20 +2518,28 @@ class NVClientPool:
         node = selected_row.get("Node", "N/A")
         hostname = selected_row.get("Hostname", "N/A")
         gpu_index = selected_row.get("GPU", "N/A")
-        pane_focused = getattr(self, "unified_active_pane", "gpu") == "process"
-        focus_label = "[FOCUS]" if pane_focused else "[Tab focus]"
+        focus_label = "ACTIVE" if pane_focused else "inactive · Tab/→"
         title = (
-            f"Processes | {node} ({hostname}) | GPU {gpu_index} | "
-            f"{focus_label} | {len(processes)} active"
+            f"Processes | {len(processes)} active | {node} ({hostname}) | "
+            f"GPU {gpu_index} | {focus_label}"
         )
-        top_label = trim(f"─ {title} ", max(0, width - 2))
-        top = (
-            "┌"
-            + top_label
-            + "─" * max(0, width - 2 - len(top_label))
+        top_label = trim(
+            f"{border_horizontal} {title} ",
+            max(0, width - 2),
+        )
+        top_tail = (
+            border_horizontal * max(0, width - 2 - len(top_label))
             + "┐"
         )
-        lines = [colored(top, "cyan", attrs=["bold"] if pane_focused else None)]
+        lines = [
+            colored("┌", "dark_grey")
+            + colored(
+                top_label,
+                label_color,
+                attrs=["bold"] if pane_focused else None,
+            )
+            + colored(top_tail, "dark_grey")
+        ]
 
         total_process_vram = sum(
             self._extract_metric_number(process.get("used_memory")) or 0
@@ -2537,7 +2554,8 @@ class NVClientPool:
         visible_summary = (
             f"{len(processes)} active | process VRAM {vram_summary}"
             + (
-                f" | selected {selected_index + 1}/{len(processes)}"
+                f" | {'selected' if pane_focused else 'details'} "
+                f"{selected_index + 1}/{len(processes)}"
                 if processes
                 else ""
             )
@@ -2546,7 +2564,7 @@ class NVClientPool:
             lines.append(
                 panel_line(
                     visible_summary,
-                    colored(visible_summary, "cyan", attrs=["bold"]),
+                    colored(visible_summary, "light_grey"),
                 )
             )
 
@@ -2556,7 +2574,7 @@ class NVClientPool:
             self.unified_command_scroll = 0
             lines.append(panel_rule("PROCESS LIST"))
             empty = "No active GPU processes"
-            lines.append(panel_line(empty, colored(empty, "green")))
+            lines.append(panel_line(empty, colored(empty, "dark_grey")))
             lines.append(panel_rule("ACTIONS"))
             history_label = (
                 "[t] History ON"
@@ -2577,7 +2595,12 @@ class NVClientPool:
             lines.append(
                 panel_line(
                     action_plain,
-                    "Actions  " + colored(history_label, "magenta", attrs=["bold"]),
+                    "Actions  "
+                    + colored(
+                        history_label,
+                        label_color,
+                        attrs=["bold"] if pane_focused else None,
+                    ),
                 )
             )
             notice = getattr(self, "_process_action_notice", None)
@@ -2674,7 +2697,11 @@ class NVClientPool:
                 or "N/A"
             )
             values = {
-                "sel": ">" if index == selected_index else " ",
+                "sel": (
+                    "›"
+                    if pane_focused and index == selected_index
+                    else " "
+                ),
                 "pid": str(process.get("pid", "N/A")),
                 "user": str(process.get("username", "N/A")),
                 "vram": (
@@ -2696,37 +2723,37 @@ class NVClientPool:
             }
             colors = {
                 "sel": "cyan",
-                "pid": self._process_accent_color(process),
-                "user": "magenta",
+                "pid": "light_grey",
+                "user": "light_grey",
                 "vram": self._process_metric_color(
-                    gpu_percent, 20, 50, default="green"
+                    gpu_percent, 50, 80
                 ),
                 "gpu": self._process_metric_color(
-                    gpu_percent, 20, 50, default="green"
+                    gpu_percent, 50, 80
                 ),
                 "cpu": self._process_metric_color(
-                    cpu_percent, 50, 100, default="green"
+                    cpu_percent, 70, 100
                 ),
                 "mem": self._process_metric_color(
-                    mem_percent, 10, 25, default="green"
+                    mem_percent, 20, 40
                 ),
-                "rss": "cyan",
-                "time": "blue",
+                "rss": "dark_grey",
+                "time": "dark_grey",
                 "state": (
                     "green"
                     if state.startswith("R")
                     else "red"
                     if state.startswith(("D", "Z", "X"))
-                    else "blue"
+                    else "dark_grey"
                 ),
-                "command": self._process_accent_color(process),
+                "command": "light_grey",
             }
             return values, colors
 
         header_plain = " ".join(
             padded_cell(column["label"], column) for column in columns
         )
-        header_styled = colored(header_plain, "white", attrs=["bold", "dark"])
+        header_styled = colored(header_plain, "dark_grey")
         if not ultra_compact:
             if compact_layout:
                 lines.append(panel_line(header_plain, header_styled))
@@ -2759,21 +2786,17 @@ class NVClientPool:
             values, colors = process_cells(process, index)
             cells = [padded_cell(values[column["key"]], column) for column in columns]
             plain = " ".join(cells)
-            if index == selected_index:
+            if pane_focused and index == selected_index:
                 styled = colored(
                     plain,
-                    "black",
-                    "on_cyan",
-                    attrs=["bold"],
+                    "light_grey",
+                    "on_dark_grey",
                 )
             else:
                 styled = " ".join(
                     colored(
                         cell,
                         colors.get(column["key"]),
-                        attrs=["bold"]
-                        if column["key"] in {"pid", "command"}
-                        else None,
                     )
                     if colors.get(column["key"])
                     else cell
@@ -2784,12 +2807,20 @@ class NVClientPool:
 
         if terminal_height >= 28 and (start > 0 or end < len(processes)):
             scroll_status = f"Rows {start + 1}-{end}/{len(processes)} | wheel or j/k"
-            lines.append(panel_line(scroll_status, colored(scroll_status, "blue")))
+            lines.append(
+                panel_line(
+                    scroll_status,
+                    colored(scroll_status, "dark_grey"),
+                )
+            )
 
         process = processes[selected_index]
         selected_pid = process.get("pid", "N/A")
         if not compact_history:
-            selected_label = f"SELECTED PROCESS | PID {selected_pid}"
+            selected_label = (
+                f"{'SELECTED PROCESS' if pane_focused else 'PROCESS DETAILS'}"
+                f" | PID {selected_pid}"
+            )
             if compact_layout:
                 selected_label += (
                     f" | {process.get('username', 'N/A')}"
@@ -2818,7 +2849,7 @@ class NVClientPool:
                     if vram_mib is not None
                     else "VRAM N/A"
                 ),
-                self._process_metric_color(gpu_percent, 20, 50, "green"),
+                self._process_metric_color(gpu_percent, 50, 80),
             ),
             (
                 (
@@ -2826,7 +2857,7 @@ class NVClientPool:
                     if gpu_percent is not None
                     else "% of GPU VRAM N/A"
                 ),
-                "yellow",
+                "cyan",
             ),
             (
                 (
@@ -2834,7 +2865,7 @@ class NVClientPool:
                     if used_share is not None
                     else "% of used VRAM N/A"
                 ),
-                "yellow",
+                "cyan",
             ),
             (
                 (
@@ -2842,7 +2873,7 @@ class NVClientPool:
                     if cpu_percent is not None
                     else "CPU N/A"
                 ),
-                self._process_metric_color(cpu_percent, 50, 100, "green"),
+                self._process_metric_color(cpu_percent, 70, 100),
             ),
             (
                 (
@@ -2850,11 +2881,11 @@ class NVClientPool:
                     if mem_percent is not None
                     else "Host MEM N/A"
                 ),
-                self._process_metric_color(mem_percent, 10, 25, "green"),
+                self._process_metric_color(mem_percent, 20, 40),
             ),
             (
                 f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
-                "cyan",
+                "dark_grey",
             ),
         ]
         if compact_layout:
@@ -2867,16 +2898,15 @@ class NVClientPool:
                     compact_vram,
                     self._process_metric_color(
                         gpu_percent,
-                        20,
                         50,
-                        "green",
+                        80,
                     ),
                 ),
             ]
             if gpu_percent is not None:
-                usage_fields.append((f"{gpu_percent:.1f}% total", "yellow"))
+                usage_fields.append((f"{gpu_percent:.1f}% total", "cyan"))
             if used_share is not None:
-                usage_fields.append((f"{used_share:.1f}% used", "yellow"))
+                usage_fields.append((f"{used_share:.1f}% used", "cyan"))
             usage_fields.extend(
                 [
                     (
@@ -2887,9 +2917,8 @@ class NVClientPool:
                         ),
                         self._process_metric_color(
                             cpu_percent,
-                            50,
+                            70,
                             100,
-                            "green",
                         ),
                     ),
                     (
@@ -2900,14 +2929,13 @@ class NVClientPool:
                         ),
                         self._process_metric_color(
                             mem_percent,
-                            10,
-                            25,
-                            "green",
+                            20,
+                            40,
                         ),
                     ),
                     (
                         f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
-                        "cyan",
+                        "dark_grey",
                     ),
                 ]
             )
@@ -2920,12 +2948,20 @@ class NVClientPool:
             )
         except (TypeError, ValueError):
             threads_display = str(threads or "-")
+        state = str(process.get("state") or "-")
+        state_color = (
+            "green"
+            if state.startswith("R")
+            else "red"
+            if state.startswith(("D", "Z", "X"))
+            else "dark_grey"
+        )
         detail_fields = [
-            (f"User {process.get('username', 'N/A')}", "magenta"),
-            (f"Type {process.get('type', 'N/A')}", "blue"),
-            (f"State {process.get('state') or '-'}", "green"),
-            (f"Threads {threads_display}", "cyan"),
-            (f"Elapsed {process.get('elapsed') or '-'}", "blue"),
+            (f"User {process.get('username', 'N/A')}", "light_grey"),
+            (f"Type {process.get('type', 'N/A')}", "dark_grey"),
+            (f"State {state}", state_color),
+            (f"Threads {threads_display}", "dark_grey"),
+            (f"Elapsed {process.get('elapsed') or '-'}", "dark_grey"),
         ]
         if not compact_history:
             for plain, styled in pack_fields("Usage", usage_fields):
@@ -3026,13 +3062,12 @@ class NVClientPool:
                 styled = (
                     colored(
                         prefix,
-                        "cyan",
+                        label_color,
                         attrs=["bold"] if command_index == 0 else None,
                     )
                     + colored(
                         command_part,
-                        self._process_accent_color(process),
-                        attrs=["bold"] if command_index == 0 else None,
+                        "light_grey",
                     )
                 )
                 process_line_map[len(lines)] = selected_index
@@ -3055,6 +3090,10 @@ class NVClientPool:
         compact_actions = inner_width < 70
         tiny_actions = inner_width < 56
         action_separator = " " if compact_actions else "  "
+
+        def action_color(color):
+            return color if pane_focused else "dark_grey"
+
         history_action_label = (
             f"t:{1 if history_enabled else 0}"
             if tiny_actions
@@ -3079,7 +3118,7 @@ class NVClientPool:
                         if compact_actions
                         else "[i] INT"
                     ),
-                    "cyan",
+                    action_color("cyan"),
                     ("signal", "INT"),
                 ),
                 (
@@ -3090,7 +3129,7 @@ class NVClientPool:
                         if compact_actions
                         else "[T] TERM"
                     ),
-                    "yellow",
+                    action_color("yellow"),
                     ("signal", "TERM"),
                 ),
                 (
@@ -3101,7 +3140,7 @@ class NVClientPool:
                         if compact_actions
                         else "[K] KILL"
                     ),
-                    "red",
+                    action_color("red"),
                     ("signal", "KILL"),
                 ),
             ]
@@ -3109,7 +3148,7 @@ class NVClientPool:
         action_segments.append(
             (
                 history_action_label,
-                "magenta",
+                action_color("cyan"),
                 ("toggle_trends", None),
             )
         )
@@ -3117,33 +3156,49 @@ class NVClientPool:
             if tiny_actions:
                 action_segments.extend(
                     [
-                        ("<", "blue", ("command_scroll", -1)),
+                        (
+                            "<",
+                            action_color("cyan"),
+                            ("command_scroll", -1),
+                        ),
                         (
                             f"{command_start + 1}/{len(all_command_parts)}",
-                            "blue",
+                            "dark_grey",
                             None,
                         ),
-                        (">", "blue", ("command_scroll", 1)),
+                        (
+                            ">",
+                            action_color("cyan"),
+                            ("command_scroll", 1),
+                        ),
                     ]
                 )
             else:
                 action_segments.extend(
                     [
-                        ("[<]Cmd", "blue", ("command_scroll", -1)),
+                        (
+                            "[<]Cmd",
+                            action_color("cyan"),
+                            ("command_scroll", -1),
+                        ),
                         (
                             f"{command_start + 1}-{command_end}/"
                             f"{len(all_command_parts)}",
-                            "blue",
+                            "dark_grey",
                             None,
                         ),
-                        ("[>]Cmd", "blue", ("command_scroll", 1)),
+                        (
+                            "[>]Cmd",
+                            action_color("cyan"),
+                            ("command_scroll", 1),
+                        ),
                     ]
                 )
         action_plain = action_separator.join(
             text for text, _color, _target in action_segments
         )
         action_styled = action_separator.join(
-            colored(text, color, attrs=["bold"]) if color else text
+            colored(text, color) if color else text
             for text, color, _target in action_segments
         )
         action_line_index = len(lines)
@@ -3416,6 +3471,9 @@ class NVClientPool:
             terminal_width = 80
         table_width = max(20, terminal_width)
         content_width = max(1, table_width - 4)
+        pane_focused = getattr(self, "unified_active_pane", "gpu") == "gpu"
+        border_horizontal = "─" if pane_focused else "┄"
+        border_vertical = "│" if pane_focused else "┊"
 
         def clean(value):
             if value is None:
@@ -3453,17 +3511,30 @@ class NVClientPool:
             if percent >= 50:
                 return "BUSY", "yellow"
             if percent >= 5:
-                return "ACTIVE", "green"
-            return "IDLE", "cyan"
+                return "ACTIVE", "cyan"
+            return "IDLE", "dark_grey"
 
         def memory_color(value):
             value = clean(value)
             if "/" not in value:
                 return None
             used, total = value.split("/", 1)
-            return get_memory_ratio_color(used, total)
+            used_value = self._extract_metric_number(used)
+            total_value = self._extract_metric_number(total)
+            if (
+                used_value is None
+                or total_value is None
+                or total_value <= 0
+            ):
+                return None
+            percent = used_value / total_value * 100
+            if percent >= 90:
+                return "red"
+            if percent >= 75:
+                return "yellow"
+            return "cyan"
 
-        def threshold_color(value, warning, critical, default="green"):
+        def threshold_color(value, warning, critical, default="cyan"):
             number = self._extract_metric_number(value)
             if number is None:
                 return None
@@ -3482,7 +3553,13 @@ class NVClientPool:
                 "bold": bold,
             }
 
-        def fit_fields(fields, *, drop_order=(), shrink_order=()):
+        def fit_fields(
+            fields,
+            *,
+            drop_order=(),
+            shrink_order=(),
+            highlight=False,
+        ):
             active = [dict(field) for field in fields]
             separator = "  "
 
@@ -3538,6 +3615,14 @@ class NVClientPool:
                 sum(len(part) for part in plain_parts)
                 + len(separator) * (len(plain_parts) - 1)
             )
+            padding = " " * max(0, content_width - plain_length)
+            plain_line = separator.join(plain_parts) + padding
+            if highlight:
+                return colored(
+                    plain_line,
+                    "light_grey",
+                    "on_dark_grey",
+                )
             styled_parts = []
             for field, part in zip(active, plain_parts):
                 color = field.get("color")
@@ -3547,7 +3632,7 @@ class NVClientPool:
                 )
 
             line = separator.join(styled_parts)
-            return line + " " * max(0, content_width - plain_length)
+            return line + padding
 
         def progress_bar(percent, width=10):
             """Render a compact block bar; empty when the metric is unknown."""
@@ -3562,24 +3647,47 @@ class NVClientPool:
                 filled = 1
             return " [" + "█" * filled + "░" * (width - filled) + "]"
 
-        border = "+" + "-" * (table_width - 2) + "+"
+        def card_rule(left, right):
+            return colored(
+                left
+                + border_horizontal * (table_width - 2)
+                + right,
+                "dark_grey",
+            )
+
+        top_border = card_rule("┌", "┐")
+        middle_border = card_rule("├", "┤")
+        bottom_border = card_rule("└", "┘")
+
+        def card_line(content):
+            return (
+                colored(f"{border_vertical} ", "dark_grey")
+                + content
+                + colored(f" {border_vertical}", "dark_grey")
+            )
         section_headers = section_headers or {}
-        lines = [border]
+        lines = [top_border]
         for row_index, (_, row) in enumerate(table.iterrows()):
             band = section_headers.get(row_index)
             if band:
-                if lines and lines[-1] == border:
-                    lines.pop()
                 lines.extend(
                     [
-                        border,
-                        f"| {self._format_section_band(*band, table_width - 4)} |",
-                        border,
+                        card_line(
+                            self._format_section_band(
+                                *band,
+                                table_width - 4,
+                            )
+                        ),
+                        middle_border,
                     ]
                 )
             utilization = clean(row.get("util")).replace(" ", "")
             status, utilization_color = utilization_status(utilization)
-            marker = "> " if row_index == selected_row else "  "
+            marker = (
+                "› "
+                if pane_focused and row_index == selected_row
+                else "  "
+            )
             # Node name first: the node is what users scan for before the GPU index.
             gpu_badge = (
                 f"{marker}{clean(row.get('Node'))} "
@@ -3598,13 +3706,13 @@ class NVClientPool:
                     "model",
                     f"Model {clean(row.get('name'))}",
                     18,
-                    color="white",
+                    color="light_grey",
                 ),
                 make_field(
                     "host",
                     clean(row.get("Hostname")),
                     13,
-                    color="blue",
+                    color="dark_grey",
                 ),
             ]
 
@@ -3623,7 +3731,7 @@ class NVClientPool:
                     "power",
                     f"Power {add_unit(row.get('power'), 'W')}",
                     18,
-                    color="magenta",
+                    color="light_grey",
                 ),
             ]
             memory_fields = [
@@ -3646,7 +3754,7 @@ class NVClientPool:
                     "fan",
                     f"Fan {clean(row.get('fan'))}",
                     8,
-                    color="blue",
+                    color="dark_grey",
                 ),
             ]
             auxiliary_fields = [
@@ -3655,19 +3763,19 @@ class NVClientPool:
                     "rx",
                     f"RX {clean(row.get('rx'))}",
                     11,
-                    color="blue",
+                    color="dark_grey",
                 ),
                 make_field(
                     "tx",
                     f"TX {clean(row.get('tx'))}",
                     11,
-                    color="blue",
+                    color="dark_grey",
                 ),
                 make_field(
                     "proc",
                     f"Proc {clean(row.get('processes'))}",
                     14,
-                    color="magenta",
+                    color="light_grey",
                 ),
             ]
 
@@ -3675,6 +3783,7 @@ class NVClientPool:
                 identity_fields,
                 drop_order=("host",),
                 shrink_order=("model", "host", "gpu"),
+                highlight=(pane_focused and row_index == selected_row),
             )
             load_line = fit_fields(
                 load_fields,
@@ -3696,11 +3805,15 @@ class NVClientPool:
                     row_line_map[len(lines) + offset] = row_index
             lines.extend(
                 [
-                    f"| {identity_line} |",
-                    f"| {load_line} |",
-                    f"| {memory_line} |",
-                    f"| {auxiliary_line} |",
-                    border,
+                    card_line(identity_line),
+                    card_line(load_line),
+                    card_line(memory_line),
+                    card_line(auxiliary_line),
+                    (
+                        bottom_border
+                        if row_index == len(table) - 1
+                        else middle_border
+                    ),
                 ]
             )
         return "\n".join(lines)
@@ -3886,15 +3999,47 @@ class NVClientPool:
         gpu_count_display = str(len(source_table))
         if filter_mode != "all":
             gpu_count_display = f"{len(filtered_table)}/{len(source_table)}"
-        title_line = (
-            f"{title} | GPUs: {gpu_count_display} | "
-            f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}"
+        gpu_pane_focused = (
+            getattr(self, "unified_active_pane", "gpu") == "gpu"
         )
+        focus_prefix = (
+            "Focus GPU/node"
+            if gpu_pane_focused
+            else "Focus process"
+        )
+        if detailed and terminal_width < 60:
+            focus_prefix = "F:GPU" if gpu_pane_focused else "F:PROC"
+            compact_page = page_status.removeprefix("Rows ")
+            title_line = (
+                f"{focus_prefix} | D | G:{gpu_count_display} | "
+                f"N:{node_count}/{len(self.pool)}"
+                + (f" | {compact_page}" if compact_page else "")
+            )
+        elif detailed and terminal_width < 100:
+            title_line = (
+                f"{focus_prefix} | Detailed | GPUs: {gpu_count_display} | "
+                f"Nodes: {node_count}/{len(self.pool)}{page_suffix}"
+            )
+        else:
+            title_with_focus = (
+                f"{focus_prefix} | {title}"
+                if detailed
+                else title
+            )
+            title_line = (
+                f"{title_with_focus} | GPUs: {gpu_count_display} | "
+                f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}"
+            )
         if len(title_line) > terminal_width:
             title_line = (
                 title_line[: max(0, terminal_width - 2)] + ".."
                 if terminal_width >= 2
                 else title_line[:terminal_width]
+            )
+        if detailed and title_line.startswith(focus_prefix):
+            title_line = (
+                colored(focus_prefix, "cyan", attrs=["bold"])
+                + title_line[len(focus_prefix):]
             )
         lines = [title_line]
         if not compact_history:
@@ -5233,6 +5378,15 @@ class NVClientPool:
             return False
         if not self._process_panel_visible():
             return False
+        if getattr(self, "unified_active_pane", "gpu") != "process":
+            self.unified_active_pane = "process"
+            self._pending_process_signal = None
+            self._set_process_action_notice(
+                f"Process focus enabled; press {signal_name} again to arm",
+                "cyan",
+            )
+            self._request_ui_refresh()
+            return True
         context = self._selected_process_context()
         if context is None:
             self._pending_process_signal = None

@@ -195,16 +195,17 @@ VRAM fields kept ahead of secondary metrics.
 In the unified view, press `d` to switch between the single-line table and
 Detailed cards. Each card is divided into four labelled rows: `GPU` identity,
 `LOAD`, `MEM/TEMP`, and `I/O`. Utilization and VRAM gain block bars on terminals
-at least 100 columns wide. Labels, model/host identity, utilization, VRAM,
-temperature, power, network traffic, and process summaries use distinct colors;
-threshold-sensitive values change from green to yellow and red. The node name
-comes before the GPU index so the machine is the first thing you read.
+at least 100 columns wide. The palette stays deliberately quiet: grey for
+structure and secondary values, cyan for the active focus and normal metrics,
+and yellow/red for warnings. Green is reserved for a running/healthy state.
+The node name comes before the GPU index so the machine is the first thing you
+read.
 The capacity line summarizes available and busy GPUs, average utilization, and
 used/total/free VRAM. Press `s` to cycle between node order, available GPUs
 first, and highest utilization first. A GPU is considered available when its
 utilization is below 5% and its VRAM usage is below 10%.
 Unified pages are sized from the current terminal height. The title shows the
-visible GPU range, and `>` marks the selected GPU.
+current focus and visible GPU range, and `›` marks the active selection.
 Press `f` to cycle through all, available, busy, and error-only views. Busy
 means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
 nodes whose latest refresh failed. Because the filter is restored from the
@@ -215,25 +216,30 @@ cards; there is no separate drill-down screen. In single-line mode, `Enter` or
 `Space` toggles the same pane. Its table shows PID, user, process VRAM, percentage
 of total GPU VRAM, CPU%, host MEM%, RSS, elapsed time, state, and command. Narrow
 terminals discard secondary columns first. The selected process gets an
-htop-style cyan highlight, and its block below the table spells out both
-percentage of the whole GPU and percentage of currently used GPU memory,
-threads, state, elapsed time, and the complete wrapped command line.
+htop-style low-contrast grey background, and its block below the table spells
+out both percentage of the whole GPU and percentage of currently used GPU
+memory, threads, state, elapsed time, and the complete wrapped command line.
 When a wrapped command would push the action bar off-screen, it automatically
 uses height-aware pages (at most five command lines on terminals shorter than
 28 rows). Use `[`/`]`, the clickable command buttons, or the wheel over the
 command to see every line.
 
 Use `Tab`, `←`/`→`, or `h`/`l` to switch pane focus, then `j`/`k` or the arrow
-keys to move the highlighted row. Mouse reporting is on by default: click any
-GPU card or process row to select it, use the wheel over either pane to scroll
-that pane, and click the action buttons directly. Most terminals need `Shift`
-(or `Option`) held down for their own drag-to-select while mouse reporting is
-active; set `mouse: false` under `view` to disable TUI mouse handling.
+keys to move the highlighted row. The active pane uses solid borders; the
+inactive pane uses dashed borders. Only the active pane displays a selected-row
+background, so process rows are not highlighted while GPU/node selection has
+focus. Mouse reporting is on by default: click any GPU card or process row to
+select it, use the wheel over either pane to scroll that pane, and click the
+action buttons directly. Most terminals need `Shift` (or `Option`) held down
+for their own drag-to-select while mouse reporting is active; set
+`mouse: false` under `view` to disable TUI mouse handling.
 
 The process action bar exposes `SIGINT`, `SIGTERM`, and `SIGKILL` as `i`, `T`,
 and `K`. Every signal requires a second identical click/key press or `Enter`
 within five seconds; `Esc` cancels it. Signals run on the node that owns the
-selected GPU and report permission or command failures in the pane.
+selected GPU and report permission or command failures in the pane. If
+GPU/node selection has focus, the first signal key only transfers focus to the
+process pane; press it again to arm the action.
 
 Press `t` (or click History) to show utilization, VRAM, and temperature for the
 selected GPU plus CPU, GPU VRAM share, host memory, and RSS for the selected
