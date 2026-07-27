@@ -213,6 +213,12 @@ class _Worker(threading.Thread):
                 dbm.set_node_enabled(scheduler.conn, action[1], True)
                 scheduler.tick(force=True)
                 self.set_notice(f"{action[1]} resumed", "green")
+            elif name == "ack":
+                count = dbm.acknowledge_alerts(scheduler.conn, all_open=True)
+                self.set_notice(
+                    f"acknowledged {count} alert(s)" if count else "no open alerts",
+                    "green" if count else "bright_black",
+                )
             elif name == "auto":
                 self.auto_tick = bool(action[1])
                 self.set_notice(
@@ -335,6 +341,46 @@ class QueueTUI:
             ),
             self._compose(segments, width),
         ]
+
+    def _alert_lines(self, snapshot: Dict[str, Any], width: int) -> List[str]:
+        """A banner for failures nobody has acknowledged yet.
+
+        Alerts sit above everything else because they are the one thing on this
+        screen that needs a decision rather than a glance.
+        """
+        alerts = snapshot.get("alerts") or []
+        open_alerts = [alert for alert in alerts if not alert.get("acknowledged_at")]
+        if not open_alerts:
+            return []
+        shown = open_alerts[-3:]
+        lines = [
+            self._compose(
+                [
+                    (f" ⚠ {len(open_alerts)} alert(s) ", "red"),
+                    ("— press A to acknowledge, L to read the job's log", "bright_black"),
+                ],
+                width,
+            )
+        ]
+        for alert in shown:
+            style = "red" if alert.get("severity") == "error" else "yellow"
+            lines.append(
+                self._compose(
+                    [
+                        (f"   {alert['id']:>4} ", "bright_black"),
+                        (f"{alert['kind']:<18}", style),
+                        (" ".join(str(alert["title"]).split()), None),
+                    ],
+                    width,
+                )
+            )
+        if len(open_alerts) > len(shown):
+            lines.append(
+                self._style(
+                    f"   … {len(open_alerts) - len(shown)} more", "bright_black"
+                )
+            )
+        return lines
 
     def _node_lines(self, width: int) -> List[str]:
         lines = [self._style("─ NODES " + "─" * max(0, width - 8), "bright_black")]
@@ -559,7 +605,7 @@ class QueueTUI:
             )
         keys = (
             "j/k move  Tab pane  Enter detail  L log  c cancel  r requeue  "
-            "t tick  a auto  f filter  d drain  ? help  q quit"
+            "A ack  t tick  a auto  f filter  d drain  ? help  q quit"
         )
         lines.append(self._style(self._fit(" " + keys, width), "bright_black"))
         return lines
@@ -577,6 +623,7 @@ class QueueTUI:
             ("a", "Toggle automatic ticking"),
             ("f", "Cycle the job filter"),
             ("d", "Drain or resume the selected node"),
+            ("A", "Acknowledge every open alert"),
             ("q", "Quit"),
         ]
         lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
@@ -600,6 +647,7 @@ class QueueTUI:
         # screen and shear the frame.
         usable = height - 1
         lines: List[str] = list(self._header_lines(state, width))
+        lines.extend(self._alert_lines(snapshot, width))
 
         if self.show_help:
             lines.extend(self._help_lines(width))
@@ -712,6 +760,8 @@ class QueueTUI:
                 self.worker.post(
                     "resume" if not node["enabled"] else "drain", node["name"]
                 )
+        elif text == "A":
+            self.worker.post("ack")
         return True
 
     # --- main loop --------------------------------------------------------

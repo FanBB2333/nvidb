@@ -36,6 +36,11 @@ from .transport import LocalTransport, SSHTransport, Transport, TransportError
 
 TICK_LOCK = "scheduler"
 
+# How much of a failed job's stderr to keep locally. Enough to see a traceback's
+# last frames without turning the queue database into a log store.
+FAILURE_LOG_LINES = 25
+FAILURE_DETAIL_CHARS = 4000
+
 DEFAULT_SETTINGS = {
     # VRAM left untouched on every GPU so a scheduled job never starves the
     # driver or a co-tenant that grows slightly.
@@ -380,6 +385,7 @@ class Scheduler:
             "finished": [],
             "dispatched": [],
             "errors": [],
+            "alerts": [],
         }
 
         if not force:
@@ -407,10 +413,12 @@ class Scheduler:
                     up = self._refresh_node(node, summary)
                 except TransportError as error:
                     up = False
-                    self._mark_node_down(node, str(error))
+                    self._mark_node_down(node, str(error), summary)
                 except Exception as error:  # a broken node must not stall the queue
                     up = False
-                    self._mark_node_down(node, f"{type(error).__name__}: {error}")
+                    self._mark_node_down(
+                        node, f"{type(error).__name__}: {error}", summary
+                    )
                     summary["errors"].append({"node": node.name, "error": str(error)})
                 summary["nodes_up" if up else "nodes_down"] += 1
 
@@ -457,14 +465,26 @@ class Scheduler:
             )
         return True
 
-    def _mark_node_down(self, node: Node, error: str) -> None:
+    def _mark_node_down(
+        self, node: Node, error: str, summary: Optional[Dict[str, Any]] = None
+    ) -> None:
         previous = dbm.set_node_state(self.conn, node.name, "down", error=error[:300])
         # Stale capacity would let dispatch place jobs on a machine that is gone.
         dbm.replace_node_gpus(self.conn, node.name, [])
-        if previous != "down":
-            dbm.add_event(
-                self.conn, "node_down", node=node.name, message=error[:200]
-            )
+        if previous == "down":
+            return  # already reported; do not alert once per tick
+        dbm.add_event(self.conn, "node_down", node=node.name, message=error[:200])
+        stranded = dbm.live_jobs(self.conn, node.name)
+        title = f"{node.name} is unreachable"
+        if stranded:
+            title += f"; {len(stranded)} running job(s) cannot be checked"
+        self._raise_alert(
+            "node_down",
+            title,
+            node=node.name,
+            detail=error[:FAILURE_DETAIL_CHARS],
+            summary=summary,
+        )
 
     # --- pass 2: reconcile ------------------------------------------------
 
@@ -498,6 +518,18 @@ class Scheduler:
                     result = backend.executor.read_result(job.run_dir)
                 except TransportError:
                     pass
+
+                detail = None
+                last_error = None
+                if state == "failed":
+                    detail = self._failure_detail(backend, job)
+                    # The first line of the reason belongs on the job row; the
+                    # whole tail goes to the alert.
+                    reason = (detail or "").strip().splitlines()
+                    last_error = f"exit code {exit_code}"
+                    if reason:
+                        last_error += f": {reason[-1][:200]}"
+
                 dbm.update_job(
                     self.conn,
                     job.id,
@@ -505,9 +537,18 @@ class Scheduler:
                     exit_code=exit_code,
                     finished_at=_epoch_to_iso(observed.finished_epoch) or utcnow(),
                     result=result,
-                    last_error=None if state == "completed" else f"exit code {exit_code}",
+                    last_error=last_error,
                     **progress_updates,
                 )
+                if state == "failed":
+                    self._raise_alert(
+                        "job_failed",
+                        f"{job.name or 'job'} failed with exit code {exit_code}",
+                        job_id=job.id,
+                        node=node.name,
+                        detail=detail,
+                        summary=summary,
+                    )
                 dbm.add_event(
                     self.conn,
                     "job_finished",
@@ -556,6 +597,16 @@ class Scheduler:
                     node=node.name,
                     message="process vanished; retrying",
                 )
+                self._raise_alert(
+                    "job_retried",
+                    f"{job.name or 'job'} vanished on {node.name}; retrying "
+                    f"(attempt {job.attempt + 1} of {job.max_retries + 1})",
+                    severity="warning",
+                    job_id=job.id,
+                    node=node.name,
+                    detail=self._failure_detail(backend, job),
+                    summary=summary,
+                )
             else:
                 dbm.update_job(
                     self.conn,
@@ -574,6 +625,14 @@ class Scheduler:
                     node=node.name,
                     message="process vanished without an exit code",
                 )
+                self._raise_alert(
+                    "job_lost",
+                    f"{job.name or 'job'} vanished on {node.name} without an exit code",
+                    job_id=job.id,
+                    node=node.name,
+                    detail=self._failure_detail(backend, job),
+                    summary=summary,
+                )
                 summary["finished"].append({"id": job.id, "state": "lost"})
 
     def _enforce_timeouts(self, summary: Dict[str, Any]) -> None:
@@ -584,9 +643,12 @@ class Scheduler:
             if elapsed is None or elapsed <= job.max_runtime_s:
                 continue
             node = dbm.get_node(self.conn, job.node) if job.node else None
+            detail = None
             if node is not None:
+                backend = self.backend(node)
                 try:
-                    self._terminate(self.backend(node), job)
+                    detail = self._failure_detail(backend, job)
+                    self._terminate(backend, job)
                 except TransportError:
                     pass
             dbm.update_job(
@@ -603,7 +665,61 @@ class Scheduler:
                 node=job.node,
                 message=f"killed after {int(elapsed)}s",
             )
+            self._raise_alert(
+                "job_timeout",
+                f"{job.name or 'job'} killed after {int(elapsed)}s "
+                f"(limit {job.max_runtime_s}s)",
+                job_id=job.id,
+                node=job.node,
+                detail=detail,
+                summary=summary,
+            )
             summary["finished"].append({"id": job.id, "state": "timeout"})
+
+    def _failure_detail(self, backend: NodeBackend, job: Job) -> Optional[str]:
+        """Fetch why a job died, so the reason is readable without a second trip.
+
+        stderr is where a crash normally lands; a job that logs everything to
+        stdout still gets an explanation rather than an empty alert.
+        """
+        if not job.run_dir:
+            return None
+        for stream in ("stderr", "stdout"):
+            try:
+                text = backend.executor.read_log(
+                    job.run_dir, stream=stream, lines=FAILURE_LOG_LINES
+                )
+            except TransportError:
+                return None
+            text = (text or "").strip()
+            if text:
+                return text[-FAILURE_DETAIL_CHARS:]
+        return None
+
+    def _raise_alert(
+        self,
+        kind: str,
+        title: str,
+        *,
+        severity: str = "error",
+        job_id: Optional[int] = None,
+        node: Optional[str] = None,
+        detail: Optional[str] = None,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        alert_id = dbm.add_alert(
+            self.conn,
+            kind,
+            title,
+            severity=severity,
+            job_id=job_id,
+            node=node,
+            detail=detail,
+        )
+        if summary is not None:
+            summary.setdefault("alerts", []).append(
+                {"id": alert_id, "kind": kind, "title": title, "job_id": job_id}
+            )
 
     def _terminate(self, backend: NodeBackend, job: Job, grace: int = 5) -> None:
         """Ask the process group to stop, escalating to SIGKILL in the background."""
@@ -742,6 +858,12 @@ class Scheduler:
                 dbm.add_event(
                     self.conn, "job_failed", job_id=job.id, message=problem
                 )
+                self._raise_alert(
+                    "dependency_failed",
+                    f"{job.name or 'job'} will never run: {problem}",
+                    job_id=job.id,
+                    summary=summary,
+                )
                 continue
             if not ready:
                 continue
@@ -766,6 +888,17 @@ class Scheduler:
                     job_id=job.id,
                     node=node_name,
                     message=f"launch failed: {error}"[:200],
+                )
+                # The job stays pending and will be retried, so this is a
+                # warning rather than a final failure.
+                self._raise_alert(
+                    "launch_failed",
+                    f"could not start {job.name or 'job'} on {node_name}",
+                    severity="warning",
+                    job_id=job.id,
+                    node=node_name,
+                    detail=str(error)[:FAILURE_DETAIL_CHARS],
+                    summary=summary,
                 )
                 summary["errors"].append({"job": job.id, "error": str(error)})
                 continue
@@ -908,7 +1041,23 @@ class Scheduler:
             "nodes": [node.to_dict(headroom) for node in nodes],
             "jobs": [job.to_dict() for job in jobs],
             "recent": [job.to_dict() for job in recent_terminal],
+            "alerts": dbm.list_alerts(self.conn, open_only=True, limit=20),
+            "open_alerts": dbm.open_alert_count(self.conn),
         }
+
+    def deliver_alerts(self, notifier) -> int:
+        """Push any undelivered alerts through a notifier. Used by the daemon.
+
+        Alerts are stamped as delivered whether or not a channel accepted them,
+        so a misconfigured hook cannot make the daemon replay the same failure
+        on every pass.
+        """
+        pending = dbm.undelivered_alerts(self.conn)
+        if not pending:
+            return 0
+        delivered = notifier.deliver(pending)
+        dbm.mark_alerts_delivered(self.conn, delivered)
+        return len(delivered)
 
     def job_logs(self, job_id: int, *, stream: str = "stdout", lines: int = 200) -> str:
         job = dbm.get_job(self.conn, job_id)

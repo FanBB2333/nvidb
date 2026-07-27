@@ -48,6 +48,16 @@ queue:
   job_root: ".nvidb/jobs"  # per-job directory on each node (relative to $HOME)
   include_local: false   # also schedule onto this machine
 
+  # Where `nvidb queue daemon` pushes failures. Alerts are always recorded in
+  # the queue database regardless of these settings; this section only controls
+  # delivery, so a misconfigured channel can never lose a failure.
+  notify:
+    enabled: true
+    desktop: true        # macOS notification centre / notify-send on Linux
+    log: true            # append JSON lines to $NVIDB_HOME/alerts.log
+    command: null        # optional: a shell command fed the alert as JSON on stdin
+    min_severity: warning  # warning | error
+
 servers:
   # Example server with SSH key authentication (recommended)
   - hostname: "server1.example.com"

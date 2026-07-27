@@ -118,6 +118,24 @@ CREATE TABLE IF NOT EXISTS locks (
     acquired_at TEXT,
     expires_at  TEXT
 );
+
+-- Something went wrong on a node and a person should know. Alerts outlive the
+-- process that noticed them: whichever client happens to run the scheduler pass
+-- records the alert, and it stays until someone acknowledges it.
+CREATE TABLE IF NOT EXISTS alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    severity        TEXT NOT NULL DEFAULT 'error',
+    job_id          INTEGER,
+    node            TEXT,
+    title           TEXT NOT NULL,
+    detail          TEXT,
+    acknowledged_at TEXT,
+    notified_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_open ON alerts(acknowledged_at);
 """
 
 _local = threading.local()
@@ -328,6 +346,99 @@ def list_events(
                 pass
         out.append(item)
     return out
+
+
+# --- alerts ----------------------------------------------------------------
+
+def add_alert(
+    conn: sqlite3.Connection,
+    kind: str,
+    title: str,
+    *,
+    severity: str = "error",
+    job_id: Optional[int] = None,
+    node: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> int:
+    with transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO alerts(ts, kind, severity, job_id, node, title, detail) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (utcnow(), kind, severity, job_id, node, title, detail),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_alerts(
+    conn: sqlite3.Connection,
+    *,
+    open_only: bool = True,
+    limit: int = 100,
+) -> List[dict]:
+    where = "WHERE acknowledged_at IS NULL" if open_only else ""
+    rows = conn.execute(
+        f"SELECT * FROM alerts {where} ORDER BY id DESC LIMIT ?", (int(limit),)
+    ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def open_alert_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM alerts WHERE acknowledged_at IS NULL"
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def acknowledge_alerts(
+    conn: sqlite3.Connection,
+    ids: Optional[Sequence[int]] = None,
+    *,
+    all_open: bool = False,
+) -> int:
+    now = utcnow()
+    with transaction(conn):
+        if all_open:
+            cursor = conn.execute(
+                "UPDATE alerts SET acknowledged_at = ? WHERE acknowledged_at IS NULL",
+                (now,),
+            )
+        elif ids:
+            placeholders = ", ".join("?" for _ in ids)
+            cursor = conn.execute(
+                f"UPDATE alerts SET acknowledged_at = ? WHERE acknowledged_at IS NULL "
+                f"AND id IN ({placeholders})",
+                (now, *[int(i) for i in ids]),
+            )
+        else:
+            return 0
+        return int(cursor.rowcount or 0)
+
+
+def undelivered_alerts(conn: sqlite3.Connection, limit: int = 50) -> List[dict]:
+    """Alerts nobody has pushed to a notification channel yet."""
+    rows = conn.execute(
+        "SELECT * FROM alerts WHERE notified_at IS NULL ORDER BY id LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_alerts_delivered(conn: sqlite3.Connection, ids: Sequence[int]) -> None:
+    if not ids:
+        return
+    placeholders = ", ".join("?" for _ in ids)
+    with transaction(conn):
+        conn.execute(
+            f"UPDATE alerts SET notified_at = ? WHERE id IN ({placeholders})",
+            (utcnow(), *[int(i) for i in ids]),
+        )
+
+
+def purge_alerts(conn: sqlite3.Connection, *, acknowledged_only: bool = True) -> int:
+    where = "WHERE acknowledged_at IS NOT NULL" if acknowledged_only else ""
+    with transaction(conn):
+        cursor = conn.execute(f"DELETE FROM alerts {where}")
+        return int(cursor.rowcount or 0)
 
 
 # --- nodes and GPUs --------------------------------------------------------

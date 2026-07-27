@@ -236,7 +236,14 @@ def _render_status(snapshot: Dict[str, Any]) -> str:
     )
     if lock.get("owner"):
         header += f"  (tick held by {lock['owner']})"
-    parts = [header, "", _render_nodes(snapshot), "", f"JOBS  {summary}"]
+    parts = [header]
+    if snapshot.get("open_alerts"):
+        # The first thing to say about a queue with failures in it is that it
+        # has failures in it.
+        parts.append("")
+        parts.append(f"ALERTS  {snapshot['open_alerts']} open (nvidb queue alerts)")
+        parts.append(_render_alerts(snapshot.get("alerts") or []))
+    parts += ["", _render_nodes(snapshot), "", f"JOBS  {summary}"]
     parts.append(_job_table(snapshot["jobs"]))
     if snapshot["recent"]:
         parts.append("")
@@ -325,6 +332,107 @@ def cmd_tick(args) -> int:
             if not args.watch:
                 return 0
             time.sleep(max(1, int(args.watch)))
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        scheduler.close()
+
+
+def _render_alerts(alerts: Sequence[Dict[str, Any]], *, detail: bool = False) -> str:
+    if not alerts:
+        return "no open alerts"
+    rows = [
+        [
+            str(alert["id"]),
+            (alert["ts"] or "")[:19].replace("T", " "),
+            alert["severity"],
+            alert["kind"],
+            str(alert["job_id"] or "-"),
+            alert["node"] or "-",
+            _short(alert["title"], 60),
+        ]
+        for alert in alerts
+    ]
+    out = [_table(rows, ["ID", "TIME", "LEVEL", "KIND", "JOB", "NODE", "WHAT"], indent="")]
+    if detail:
+        for alert in alerts:
+            if not alert.get("detail"):
+                continue
+            out.append("")
+            out.append(f"--- alert {alert['id']}: {alert['title']}")
+            out.extend(f"    {line}" for line in str(alert["detail"]).splitlines())
+    return "\n".join(out)
+
+
+def cmd_alerts(args) -> int:
+    scheduler = _open(args)
+    try:
+        _refresh(scheduler, args)
+        alerts = dbm.list_alerts(
+            scheduler.conn, open_only=not args.all, limit=args.number
+        )
+        if args.json:
+            _print_json(
+                {"alerts": alerts, "open": dbm.open_alert_count(scheduler.conn)}
+            )
+        else:
+            print(_render_alerts(alerts, detail=args.detail))
+        # A non-zero status lets a shell or agent branch on "anything wrong?".
+        return 1 if any(a["acknowledged_at"] is None for a in alerts) else 0
+    finally:
+        scheduler.close()
+
+
+def cmd_ack(args) -> int:
+    scheduler = _open(args)
+    try:
+        ids = _resolve_ids(scheduler, args.ids) if args.ids else None
+        count = dbm.acknowledge_alerts(scheduler.conn, ids, all_open=args.all)
+        if args.json:
+            _print_json({"ok": True, "acknowledged": count})
+        else:
+            print(f"acknowledged {count} alert(s)")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_daemon(args) -> int:
+    """Keep the queue moving and push failures out as they happen."""
+    from .notify import Notifier
+
+    scheduler = _open(args)
+    notifier = Notifier(scheduler.settings)
+    interval = max(2, int(args.interval))
+    if not args.json:
+        channels = [
+            name
+            for name, on in (
+                ("desktop", notifier.settings["desktop"] and notifier._desktop_command),
+                ("log", notifier.settings["log"]),
+                ("command", bool(notifier.settings["command"])),
+            )
+            if on
+        ]
+        print(
+            f"nvidb queue daemon: every {interval}s, "
+            f"notifying via {', '.join(channels) or 'nothing (disabled)'}",
+            file=sys.stderr,
+        )
+        print("Press Ctrl+C to stop.", file=sys.stderr)
+    try:
+        while True:
+            summary = scheduler.tick(force=True)
+            sent = 0 if args.no_notify else scheduler.deliver_alerts(notifier)
+            if args.json:
+                _print_json({"tick": summary, "notified": sent})
+                sys.stdout.flush()
+            else:
+                for item in summary.get("alerts") or []:
+                    print(f"  ! {item['kind']}: {item['title']}", file=sys.stderr)
+            if args.once:
+                return 0
+            time.sleep(interval)
     except KeyboardInterrupt:
         return 0
     finally:
@@ -756,6 +864,42 @@ def register_parsers(subparsers) -> None:
     tick.add_argument("--watch", type=int, default=0, metavar="SECONDS",
                       help="Keep ticking every N seconds until interrupted")
     tick.set_defaults(func=cmd_tick)
+
+    alerts = queue_sub.add_parser(
+        "alerts",
+        help="Show failures that still need attention",
+        description=(
+            "Lists what went wrong on the nodes. Exits non-zero while any alert "
+            "is unacknowledged, so a shell or an agent can branch on it."
+        ),
+    )
+    _add_common(alerts)
+    _add_refresh_flags(alerts)
+    alerts.add_argument("--all", action="store_true", help="Include acknowledged alerts")
+    alerts.add_argument("--detail", action="store_true", help="Show the captured output")
+    alerts.add_argument("-n", "--number", type=int, default=50)
+    alerts.set_defaults(func=cmd_alerts)
+
+    ack = queue_sub.add_parser("ack", help="Acknowledge alerts")
+    _add_common(ack)
+    ack.add_argument("ids", nargs="*", help="Alert ids to acknowledge")
+    ack.add_argument("--all", action="store_true", help="Acknowledge every open alert")
+    ack.set_defaults(func=cmd_ack)
+
+    daemon = queue_sub.add_parser(
+        "daemon",
+        help="Run the scheduler continuously and deliver alerts",
+        description=(
+            "Optional: the queue works without it, because every command runs a "
+            "scheduler pass. Run the daemon when you want failures pushed to you "
+            "instead of waiting to be asked."
+        ),
+    )
+    _add_common(daemon)
+    daemon.add_argument("--interval", type=int, default=15, metavar="SECONDS")
+    daemon.add_argument("--no-notify", action="store_true", help="Tick but stay quiet")
+    daemon.add_argument("--once", action="store_true", help="Run a single pass and exit")
+    daemon.set_defaults(func=cmd_daemon)
 
     events = queue_sub.add_parser("events", help="Replay the queue event log")
     _add_common(events)

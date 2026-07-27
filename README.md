@@ -448,7 +448,57 @@ Both fields appear in `job ls`, `queue status`, `job show`, the TUI and every
 which is often the quickest explanation of how far a lost or failed job got. A
 retry clears the stale status line but keeps your note.
 
-### 3.4 Driving the queue from other programs
+### 3.4 Failures, alerts and the optional daemon
+
+When something goes wrong on a node, the queue records an **alert** locally,
+classified by what actually happened:
+
+| Kind                | Raised when                                          | Severity |
+| ------------------- | ---------------------------------------------------- | -------- |
+| `job_failed`        | the command exited non-zero                          | error    |
+| `job_lost`          | the process vanished with no exit status             | error    |
+| `job_timeout`       | the job passed `--timeout` and was killed            | error    |
+| `dependency_failed` | a job can never run because a dependency failed      | error    |
+| `job_retried`       | the process vanished but a retry remains             | warning  |
+| `launch_failed`     | the job could not be started (disk full, permissions)| warning  |
+| `node_down`         | a node stopped answering                             | error    |
+
+For a failed job the queue pulls the tail of its stderr (falling back to stdout)
+onto the alert, so the reason is readable locally without another round trip:
+
+```bash
+nvidb queue alerts            # what needs attention
+nvidb queue alerts --detail   # ... with the captured output
+nvidb queue ack 3             # acknowledge one
+nvidb queue ack --all         # acknowledge everything
+```
+
+`nvidb queue alerts` exits non-zero while anything is unacknowledged, so a shell
+or an agent can branch on it. Alerts stay until acknowledged; they are never
+re-raised for the same failure, and `nvidb queue status` and the TUI both lead
+with them.
+
+Recording an alert and delivering it are separate. Recording happens on whatever
+scheduler pass notices the failure, so nothing is lost when nobody is watching.
+Delivery is the daemon's job:
+
+```bash
+nvidb queue daemon                      # tick every 15s and push failures
+nvidb queue daemon --interval 5
+nvidb queue daemon --once --json        # a single pass, for cron
+```
+
+The daemon is **optional** — the queue works exactly as before without it, since
+every command runs a scheduler pass. Run it when you want failures pushed to you
+rather than waiting to be asked, and for prompt timeout enforcement: without it,
+a job that overruns is only killed the next time some command happens to tick.
+
+Each alert is delivered once, whether or not the daemon restarts. Channels are
+configured under `queue.notify`: a desktop notification, a JSON-lines file at
+`$NVIDB_HOME/alerts.log`, and a `command` hook that receives the alert as JSON
+on stdin — which is how you route failures to anything else.
+
+### 3.5 Driving the queue from other programs
 
 Every command accepts `--json` and prints one JSON document on stdout, which is
 the intended way for tools — Claude Code sessions in particular — to use the
@@ -473,7 +523,7 @@ processes that never talk directly:
 - **Events.** `nvidb queue events --since <id>` replays every state change, so a
   client that was not running can catch up on exactly what it missed.
 
-### 3.5 The queue TUI
+### 3.6 The queue TUI
 
 ```bash
 nvidb queue                 # or: nvidb queue tui
@@ -496,10 +546,11 @@ slows the numbers down but never freezes the interface.
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
 | `d`                | Drain or resume the selected node             |
+| `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
 
-### 3.6 What runs on the nodes
+### 3.7 What runs on the nodes
 
 Nothing is installed. A generated `run.sh` is delivered over SSH and started
 with `setsid`, so the job outlives the client that launched it. Each job keeps a

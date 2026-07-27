@@ -192,6 +192,104 @@ def test_result_can_be_written_and_read_back(parser, queue_db, capsys):
     assert json.loads(capsys.readouterr().out)["result"] == {"accuracy": 0.93}
 
 
+def _raise_alert(queue_db, **fields):
+    conn = dbm.open_db(queue_db)
+    try:
+        return dbm.add_alert(
+            conn,
+            fields.pop("kind", "job_failed"),
+            fields.pop("title", "train failed with exit code 1"),
+            **fields,
+        )
+    finally:
+        conn.close()
+
+
+def test_alerts_exit_non_zero_while_anything_is_unacknowledged(parser, queue_db, capsys):
+    assert _run(parser, ["queue", "alerts"], queue_db) == 0
+    assert "no open alerts" in capsys.readouterr().out
+
+    _raise_alert(queue_db, job_id=1, node="big-node", detail="CUDA out of memory")
+    # Non-zero is what lets a shell or an agent branch on "anything wrong?".
+    assert _run(parser, ["queue", "alerts"], queue_db) == 1
+    output = capsys.readouterr().out
+    assert "job_failed" in output and "exit code 1" in output
+    assert "CUDA out of memory" not in output  # only with --detail
+
+    assert _run(parser, ["queue", "alerts", "--detail"], queue_db) == 1
+    assert "CUDA out of memory" in capsys.readouterr().out
+
+
+def test_acknowledging_clears_the_alert_exit_status(parser, queue_db, capsys):
+    _raise_alert(queue_db)
+    _raise_alert(queue_db, kind="node_lost", title="node down")
+    capsys.readouterr()
+
+    assert _run(parser, ["queue", "ack", "--all"], queue_db) == 0
+    assert "acknowledged 2" in capsys.readouterr().out
+    assert _run(parser, ["queue", "alerts"], queue_db) == 0
+    capsys.readouterr()
+
+    # Acknowledged alerts are kept, just not shown by default.
+    assert _run(parser, ["queue", "alerts", "--all", "--json"], queue_db) == 0
+    assert len(json.loads(capsys.readouterr().out)["alerts"]) == 2
+
+
+def test_acknowledging_one_alert_leaves_the_others(parser, queue_db, capsys):
+    first = _raise_alert(queue_db, title="first")
+    _raise_alert(queue_db, title="second")
+    capsys.readouterr()
+
+    assert _run(parser, ["queue", "ack", str(first)], queue_db) == 0
+    capsys.readouterr()
+    assert _run(parser, ["queue", "alerts", "--json"], queue_db) == 1
+    open_alerts = json.loads(capsys.readouterr().out)["alerts"]
+    assert [alert["title"] for alert in open_alerts] == ["second"]
+
+
+def test_status_leads_with_open_alerts(parser, queue_db, capsys):
+    _raise_alert(queue_db, title="train failed with exit code 1")
+    assert _run(parser, ["queue", "status"], queue_db) == 0
+    output = capsys.readouterr().out
+    assert "ALERTS  1 open" in output
+    assert output.index("ALERTS") < output.index("NODES")
+
+
+def test_the_daemon_ticks_and_delivers_in_one_pass(parser, queue_db, capsys, tmp_path):
+    log_path = tmp_path / "alerts.log"
+    import nvidb.sched.notify as notify_module
+
+    original = notify_module.alert_log_path
+    notify_module.alert_log_path = lambda: log_path
+    try:
+        _raise_alert(queue_db, title="train failed with exit code 1")
+        assert _run(
+            parser,
+            ["queue", "daemon", "--once", "--interval", "2", "--json"],
+            queue_db,
+        ) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["notified"] == 1
+        assert payload["tick"]["ran"] is True
+        assert "train failed" in log_path.read_text()
+    finally:
+        notify_module.alert_log_path = original
+
+
+def test_the_daemon_can_tick_without_notifying(parser, queue_db, capsys):
+    _raise_alert(queue_db)
+    assert _run(
+        parser, ["queue", "daemon", "--once", "--no-notify", "--json"], queue_db
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["notified"] == 0
+
+    conn = dbm.open_db(queue_db)
+    try:
+        assert dbm.undelivered_alerts(conn)  # still waiting for a real pass
+    finally:
+        conn.close()
+
+
 def test_submitting_against_an_unknown_node_is_refused(parser, queue_db, capsys):
     assert _run(parser, ["job", "submit", "--node", "nowhere", "--", "true"],
                 queue_db) == 1
