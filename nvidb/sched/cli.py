@@ -655,11 +655,23 @@ def cmd_result(args) -> int:
 def cmd_note(args) -> int:
     scheduler = _open(args)
     try:
-        text = " ".join(args.text) if args.text else None
-        if args.clear:
-            text = None
-        elif text is None:
-            # No text at all is a read, not an accidental erase.
+        replacement = " ".join(args.text) if args.text else None
+        given = [
+            name
+            for name, value in (
+                ("text", replacement),
+                ("--append", args.append),
+                ("--clear", args.clear or None),
+            )
+            if value
+        ]
+        if len(given) > 1:
+            return _error(
+                f"pick one of {', '.join(given)}", as_json=args.json
+            )
+
+        if not given:
+            # No argument at all is a read, not an accidental erase.
             job = dbm.get_job(scheduler.conn, args.id)
             if job is None:
                 return _error(f"job {args.id} not found", as_json=args.json)
@@ -668,8 +680,10 @@ def cmd_note(args) -> int:
             else:
                 print(job.notes or "(no note)")
             return 0
+
+        text = None if args.clear else (args.append or replacement)
         try:
-            value = scheduler.set_notes(args.id, text, append=args.append)
+            value = scheduler.set_notes(args.id, text, append=bool(args.append))
         except ValueError as error:
             return _error(str(error), as_json=args.json)
         if args.json:
@@ -875,8 +889,11 @@ def register_parsers(subparsers) -> None:
     )
     _add_common(note)
     note.add_argument("id", type=int)
-    note.add_argument("text", nargs="*", help="New note text")
-    note.add_argument("--append", action="store_true", help="Add to the existing note")
+    note.add_argument("text", nargs="*", help="Replace the note with this text")
+    # `--append` carries its own value: argparse cannot reliably split a bare
+    # flag from a following variable-length positional.
+    note.add_argument("--append", default=None, metavar="TEXT",
+                      help="Add this to the existing note")
     note.add_argument("--clear", action="store_true", help="Remove the note")
     note.set_defaults(func=cmd_note)
 
