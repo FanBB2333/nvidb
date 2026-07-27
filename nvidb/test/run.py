@@ -975,7 +975,13 @@ def main():
     web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
     clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
+    # Cluster job queue (`nvidb queue`, `nvidb job ...`)
+    from ..sched import cli as sched_cli
+    sched_cli.register_parsers(subparsers)
     args = parser.parse_args()
+
+    if getattr(args, 'queue_cli', False):
+        raise SystemExit(sched_cli.dispatch(args))
 
     cfg = _load_config_yaml()
     compact = bool(args.compact or _get_basic_compact(cfg))

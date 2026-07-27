@@ -1,0 +1,582 @@
+"""SQLite storage for the nvidb job queue.
+
+This file *is* the coordination channel. Several unrelated processes open the
+same database concurrently, so every mutation runs inside an explicit
+`BEGIN IMMEDIATE` transaction and the connection is opened in WAL mode with a
+generous busy timeout. Readers never block writers and a writer that loses the
+race retries instead of failing.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+from .. import config
+from .model import TERMINAL_JOB_STATES, GpuState, Job, Node, utcnow
+
+SCHEMA_VERSION = 1
+DEFAULT_BUSY_TIMEOUT_MS = 15000
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS nodes (
+    name       TEXT PRIMARY KEY,
+    hostname   TEXT,
+    port       INTEGER DEFAULT 22,
+    username   TEXT,
+    state      TEXT NOT NULL DEFAULT 'unknown',
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    last_seen  TEXT,
+    last_error TEXT,
+    gpu_count  INTEGER DEFAULT 0,
+    probed_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gpus (
+    node            TEXT NOT NULL,
+    gpu_index       INTEGER NOT NULL,
+    name            TEXT,
+    mem_total_mb    INTEGER DEFAULT 0,
+    mem_used_mb     INTEGER DEFAULT 0,
+    util_percent    INTEGER,
+    temperature_c   INTEGER,
+    external_mem_mb INTEGER DEFAULT 0,
+    external_procs  INTEGER DEFAULT 0,
+    reserved_mb     INTEGER DEFAULT 0,
+    queue_jobs      INTEGER DEFAULT 0,
+    attribution     TEXT DEFAULT 'processes',
+    updated_at      TEXT,
+    PRIMARY KEY (node, gpu_index)
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT,
+    command         TEXT NOT NULL,
+    workdir         TEXT,
+    env             TEXT,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    priority        INTEGER NOT NULL DEFAULT 0,
+    gpus            INTEGER NOT NULL DEFAULT 1,
+    vram_mb         INTEGER NOT NULL DEFAULT 0,
+    node_constraint TEXT,
+    depends_on      TEXT,
+    max_runtime_s   INTEGER,
+    submitter       TEXT,
+    tags            TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    started_at      TEXT,
+    finished_at     TEXT,
+    node            TEXT,
+    gpu_ids         TEXT,
+    remote_pid      INTEGER,
+    remote_pgid     INTEGER,
+    run_dir         TEXT,
+    exit_code       INTEGER,
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    max_retries     INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    heartbeat_at    TEXT,
+    gpu_mem_mb      INTEGER,
+    result          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE INDEX IF NOT EXISTS idx_jobs_node ON jobs(node);
+
+CREATE TABLE IF NOT EXISTS events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    job_id  INTEGER,
+    node    TEXT,
+    message TEXT,
+    data    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
+
+CREATE TABLE IF NOT EXISTS locks (
+    name        TEXT PRIMARY KEY,
+    owner       TEXT,
+    acquired_at TEXT,
+    expires_at  TEXT
+);
+"""
+
+_local = threading.local()
+
+
+def default_db_path() -> Path:
+    """Queue database path, overridable with NVIDB_QUEUE_DB for tests/sandboxes."""
+    override = os.environ.get("NVIDB_QUEUE_DB")
+    if override:
+        return Path(override).expanduser()
+    return Path(config.WORKING_DIR).expanduser() / "queue.db"
+
+
+def open_db(path=None) -> sqlite3.Connection:
+    """Open (and if needed create) the queue database."""
+    db_path = Path(path or default_db_path()).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000.0,
+        isolation_level=None,  # explicit transactions only
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
+    init_schema(conn)
+    return conn
+
+
+# Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` will
+# not add them to a database that already exists, so they are applied here.
+_ADDED_COLUMNS = {
+    "gpus": {"attribution": "TEXT DEFAULT 'processes'"},
+}
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    """Create tables when missing, add new columns, and stamp the version."""
+    # executescript() commits whatever is open before it runs, so it must stay
+    # outside the transaction helper.
+    conn.executescript(_SCHEMA)
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    """Run a block inside `BEGIN IMMEDIATE`, so writers serialize cleanly.
+
+    Nesting is tracked per connection and per thread: an inner `with` block
+    joins the transaction the outermost caller already owns, which lets the
+    scheduler compose the small single-purpose helpers below into one atomic
+    step without any of them knowing about the others.
+    """
+    depths = getattr(_local, "depths", None)
+    if depths is None:
+        depths = _local.depths = {}
+    key = id(conn)
+
+    if depths.get(key):
+        depths[key] += 1
+        try:
+            yield conn
+        finally:
+            depths[key] -= 1
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    depths[key] = 1
+    try:
+        yield conn
+    except Exception:
+        depths[key] = 0
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        depths[key] = 0
+        conn.execute("COMMIT")
+
+
+# --- meta ------------------------------------------------------------------
+
+def get_meta(conn: sqlite3.Connection, key: str, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value) -> None:
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+
+
+# --- locks -----------------------------------------------------------------
+
+def acquire_lock(conn: sqlite3.Connection, name: str, owner: str, ttl_seconds: int) -> bool:
+    """Take a lease-style lock, stealing it only once the holder's TTL expired.
+
+    A crashed client cannot wedge the queue: its lease simply ages out.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+    now_text = now.isoformat(timespec="seconds")
+    with transaction(conn):
+        row = conn.execute("SELECT * FROM locks WHERE name = ?", (name,)).fetchone()
+        if row is not None and row["owner"] and row["owner"] != owner:
+            if (row["expires_at"] or "") > now_text:
+                return False
+        conn.execute(
+            "INSERT INTO locks(name, owner, acquired_at, expires_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET owner=excluded.owner, "
+            "acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
+            (name, owner, now_text, expires),
+        )
+        return True
+
+
+def release_lock(conn: sqlite3.Connection, name: str, owner: str) -> None:
+    with transaction(conn):
+        conn.execute(
+            "UPDATE locks SET owner=NULL, expires_at=NULL WHERE name = ? AND owner = ?",
+            (name, owner),
+        )
+
+
+def lock_holder(conn: sqlite3.Connection, name: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM locks WHERE name = ?", (name,)).fetchone()
+
+
+# --- events ----------------------------------------------------------------
+
+def add_event(
+    conn: sqlite3.Connection,
+    kind: str,
+    *,
+    job_id: Optional[int] = None,
+    node: Optional[str] = None,
+    message: Optional[str] = None,
+    data: Optional[dict] = None,
+) -> int:
+    with transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO events(ts, kind, job_id, node, message, data) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                utcnow(),
+                kind,
+                job_id,
+                node,
+                message,
+                json.dumps(data, ensure_ascii=False) if data else None,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_events(
+    conn: sqlite3.Connection,
+    *,
+    since_id: Optional[int] = None,
+    job_id: Optional[int] = None,
+    limit: int = 100,
+) -> List[dict]:
+    clauses = []
+    params: List[Any] = []
+    if since_id is not None:
+        clauses.append("id > ?")
+        params.append(int(since_id))
+    if job_id is not None:
+        clauses.append("job_id = ?")
+        params.append(int(job_id))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    # Newest rows are the interesting ones, but callers want them oldest-first.
+    rows = conn.execute(
+        f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?",
+        (*params, int(limit)),
+    ).fetchall()
+    out = []
+    for row in reversed(rows):
+        item = dict(row)
+        if item.get("data"):
+            try:
+                item["data"] = json.loads(item["data"])
+            except ValueError:
+                pass
+        out.append(item)
+    return out
+
+
+# --- nodes and GPUs --------------------------------------------------------
+
+def upsert_node(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    hostname: Optional[str] = None,
+    port: Optional[int] = None,
+    username: Optional[str] = None,
+) -> None:
+    """Register a node from config.yml without disturbing its runtime state."""
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO nodes(name, hostname, port, username) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET hostname=excluded.hostname, "
+            "port=excluded.port, username=excluded.username",
+            (name, hostname, port or 22, username),
+        )
+
+
+def set_node_state(
+    conn: sqlite3.Connection,
+    name: str,
+    state: str,
+    *,
+    error: Optional[str] = None,
+    gpu_count: Optional[int] = None,
+) -> Optional[str]:
+    """Update a node's reachability and return the state it had before."""
+    with transaction(conn):
+        row = conn.execute("SELECT state FROM nodes WHERE name = ?", (name,)).fetchone()
+        previous = row["state"] if row else None
+        now = utcnow()
+        fields = ["state = ?", "probed_at = ?", "last_error = ?"]
+        params: List[Any] = [state, now, error]
+        if state == "up":
+            fields.append("last_seen = ?")
+            params.append(now)
+        if gpu_count is not None:
+            fields.append("gpu_count = ?")
+            params.append(int(gpu_count))
+        params.append(name)
+        conn.execute(f"UPDATE nodes SET {', '.join(fields)} WHERE name = ?", params)
+        return previous
+
+
+def set_node_enabled(conn: sqlite3.Connection, name: str, enabled: bool) -> None:
+    with transaction(conn):
+        conn.execute(
+            "UPDATE nodes SET enabled = ?, state = CASE WHEN ? THEN state ELSE 'drain' END "
+            "WHERE name = ?",
+            (1 if enabled else 0, 1 if enabled else 0, name),
+        )
+
+
+def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict]) -> None:
+    """Overwrite the cached GPU rows for one node."""
+    now = utcnow()
+    with transaction(conn):
+        conn.execute("DELETE FROM gpus WHERE node = ?", (node,))
+        conn.executemany(
+            "INSERT INTO gpus(node, gpu_index, name, mem_total_mb, mem_used_mb, "
+            "util_percent, temperature_c, external_mem_mb, external_procs, "
+            "reserved_mb, queue_jobs, attribution, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    node,
+                    int(gpu.get("index", 0)),
+                    gpu.get("name"),
+                    int(gpu.get("mem_total_mb") or 0),
+                    int(gpu.get("mem_used_mb") or 0),
+                    gpu.get("util_percent"),
+                    gpu.get("temperature_c"),
+                    int(gpu.get("external_mem_mb") or 0),
+                    int(gpu.get("external_procs") or 0),
+                    int(gpu.get("reserved_mb") or 0),
+                    int(gpu.get("queue_jobs") or 0),
+                    gpu.get("attribution") or "processes",
+                    now,
+                )
+                for gpu in gpus
+            ],
+        )
+
+
+def get_nodes(conn: sqlite3.Connection, *, with_gpus: bool = True) -> List[Node]:
+    nodes = [Node.from_row(row) for row in conn.execute(
+        "SELECT * FROM nodes ORDER BY name"
+    ).fetchall()]
+    if with_gpus:
+        by_name = {node.name: node for node in nodes}
+        for row in conn.execute("SELECT * FROM gpus ORDER BY node, gpu_index"):
+            node = by_name.get(row["node"])
+            if node is not None:
+                node.gpus.append(GpuState.from_row(row))
+    return nodes
+
+
+def get_node(conn: sqlite3.Connection, name: str) -> Optional[Node]:
+    row = conn.execute("SELECT * FROM nodes WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        return None
+    node = Node.from_row(row)
+    node.gpus = [
+        GpuState.from_row(gpu)
+        for gpu in conn.execute(
+            "SELECT * FROM gpus WHERE node = ? ORDER BY gpu_index", (name,)
+        )
+    ]
+    return node
+
+
+def resolve_node_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
+    """Match a node by exact name, then case-insensitively, then by substring.
+
+    Lets a client say `--node gem12` instead of `Gem12-wsl-tailscale`.
+    """
+    if not query:
+        return None
+    names = [row["name"] for row in conn.execute("SELECT name FROM nodes ORDER BY name")]
+    if query in names:
+        return query
+    lowered = query.lower()
+    exact = [name for name in names if name.lower() == lowered]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [name for name in names if lowered in name.lower()]
+    if len(partial) == 1:
+        return partial[0]
+    return None
+
+
+# --- jobs ------------------------------------------------------------------
+
+def insert_job(conn: sqlite3.Connection, **fields) -> int:
+    now = utcnow()
+    payload = {
+        "name": fields.get("name") or "",
+        "command": fields["command"],
+        "workdir": fields.get("workdir"),
+        "env": json.dumps(fields.get("env") or {}, ensure_ascii=False),
+        "state": "pending",
+        "priority": int(fields.get("priority") or 0),
+        "gpus": int(fields.get("gpus", 1)),
+        "vram_mb": int(fields.get("vram_mb") or 0),
+        "node_constraint": fields.get("node_constraint"),
+        "depends_on": ",".join(str(x) for x in (fields.get("depends_on") or [])) or None,
+        "max_runtime_s": fields.get("max_runtime_s"),
+        "submitter": fields.get("submitter"),
+        "tags": json.dumps(fields.get("tags") or [], ensure_ascii=False),
+        "created_at": now,
+        "updated_at": now,
+        "max_retries": int(fields.get("max_retries") or 0),
+    }
+    columns = ", ".join(payload)
+    placeholders = ", ".join("?" for _ in payload)
+    with transaction(conn):
+        cursor = conn.execute(
+            f"INSERT INTO jobs({columns}) VALUES({placeholders})",
+            tuple(payload.values()),
+        )
+        return int(cursor.lastrowid)
+
+
+def update_job(conn: sqlite3.Connection, job_id: int, **fields) -> None:
+    if not fields:
+        return
+    if "gpu_ids" in fields and isinstance(fields["gpu_ids"], (list, tuple)):
+        fields["gpu_ids"] = ",".join(str(x) for x in fields["gpu_ids"])
+    if "result" in fields and not isinstance(fields["result"], (str, type(None))):
+        fields["result"] = json.dumps(fields["result"], ensure_ascii=False)
+    if "env" in fields and isinstance(fields["env"], dict):
+        fields["env"] = json.dumps(fields["env"], ensure_ascii=False)
+    fields["updated_at"] = utcnow()
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    with transaction(conn):
+        conn.execute(
+            f"UPDATE jobs SET {assignments} WHERE id = ?",
+            (*fields.values(), int(job_id)),
+        )
+
+
+def get_job(conn: sqlite3.Connection, job_id: int) -> Optional[Job]:
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+    return Job.from_row(row) if row else None
+
+
+def list_jobs(
+    conn: sqlite3.Connection,
+    *,
+    states: Optional[Iterable[str]] = None,
+    node: Optional[str] = None,
+    limit: Optional[int] = None,
+    newest_first: bool = False,
+) -> List[Job]:
+    clauses = []
+    params: List[Any] = []
+    if states:
+        states = list(states)
+        clauses.append(f"state IN ({', '.join('?' for _ in states)})")
+        params.extend(states)
+    if node:
+        clauses.append("node = ?")
+        params.append(node)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    order = "DESC" if newest_first else "ASC"
+    sql = f"SELECT * FROM jobs {where} ORDER BY id {order}"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return [Job.from_row(row) for row in conn.execute(sql, params)]
+
+
+def pending_jobs(conn: sqlite3.Connection) -> List[Job]:
+    """Pending jobs in dispatch order: highest priority first, then FIFO."""
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE state = 'pending' ORDER BY priority DESC, id ASC"
+    ).fetchall()
+    return [Job.from_row(row) for row in rows]
+
+
+def live_jobs(conn: sqlite3.Connection, node: Optional[str] = None) -> List[Job]:
+    """Jobs currently occupying resources (running)."""
+    if node:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE state = 'running' AND node = ? ORDER BY id",
+            (node,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE state = 'running' ORDER BY id"
+        ).fetchall()
+    return [Job.from_row(row) for row in rows]
+
+
+def job_counts(conn: sqlite3.Connection) -> Dict[str, int]:
+    rows = conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
+    return {row["state"]: int(row["n"]) for row in rows}
+
+
+def purge_jobs(
+    conn: sqlite3.Connection,
+    *,
+    states: Optional[Iterable[str]] = None,
+    before_id: Optional[int] = None,
+) -> int:
+    """Delete terminal jobs. Active jobs are never removed."""
+    states = list(states) if states else sorted(TERMINAL_JOB_STATES)
+    states = [state for state in states if state in TERMINAL_JOB_STATES]
+    if not states:
+        return 0
+    clauses = [f"state IN ({', '.join('?' for _ in states)})"]
+    params: List[Any] = list(states)
+    if before_id is not None:
+        clauses.append("id < ?")
+        params.append(int(before_id))
+    where = " AND ".join(clauses)
+    with transaction(conn):
+        cursor = conn.execute(f"DELETE FROM jobs WHERE {where}", params)
+        return int(cursor.rowcount or 0)

@@ -1,0 +1,344 @@
+"""Tests for the queue TUI's rendering and key handling.
+
+The worker thread is never started here: the interface is driven from a plain
+snapshot dictionary, which is exactly the contract it renders from.
+"""
+import os
+import re
+
+import pytest
+from blessed.keyboard import Keystroke
+
+from nvidb.sched.tui import QueueTUI
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_MISSING = object()
+
+
+def _plain(text):
+    return ANSI.sub("", text)
+
+
+@pytest.fixture(autouse=True)
+def wide_terminal():
+    """blessed reads COLUMNS/LINES when it has no tty, which is the case here."""
+    previous = {key: os.environ.get(key) for key in ("COLUMNS", "LINES")}
+    os.environ["COLUMNS"] = "150"
+    os.environ["LINES"] = "42"
+    yield
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _gpu(index=0, name="RTX 3090 Ti", total=24564, used=0, external=0, reserved=0,
+         free=None, jobs=0, attribution="processes", procs=0):
+    return {
+        "index": index,
+        "name": name,
+        "mem_total_mb": total,
+        "mem_used_mb": used,
+        "external_mem_mb": external,
+        "external_procs": procs,
+        "attribution": attribution,
+        "reserved_mb": reserved,
+        "queue_jobs": jobs,
+        "free_mb": total - external - reserved - 512 if free is None else free,
+        "util_percent": 30,
+        "temperature_c": 50,
+        "updated_at": None,
+    }
+
+
+def _job(job_id, state="running", name="train", node="small-node", **overrides):
+    job = {
+        "id": job_id,
+        "name": name,
+        "state": state,
+        "command": "python train.py --epochs 10",
+        "workdir": "/data",
+        "env": {},
+        "priority": 0,
+        "gpus": 1,
+        "vram_mb": 20480,
+        "node_constraint": None,
+        "depends_on": [],
+        "max_runtime_s": None,
+        "submitter": "client-a",
+        "tags": [],
+        "created_at": "2026-07-27T10:00:00+00:00",
+        "started_at": "2026-07-27T10:00:01+00:00",
+        "finished_at": None,
+        "elapsed_s": 125.0,
+        "node": node,
+        "gpu_ids": [0],
+        "remote_pid": 4321,
+        "run_dir": "/home/u/.nvidb/jobs/1",
+        "exit_code": None,
+        "attempt": 1,
+        "max_retries": 0,
+        "last_error": None,
+        "heartbeat_at": None,
+        "gpu_mem_mb": None,
+        "result": None,
+    }
+    job.update(overrides)
+    return job
+
+
+def _snapshot(jobs=None, recent=None, nodes=None, counts=_MISSING):
+    return {
+        "generated_at": "2026-07-27T10:02:00+00:00",
+        "db_path": "/tmp/queue.db",
+        "last_tick_at": "2026-07-27T10:01:58+00:00",
+        "tick_lock": None,
+        "settings": {"headroom_mb": 512, "max_jobs_per_gpu": 4, "placement": "spread"},
+        "counts": {"running": 1, "pending": 1} if counts is _MISSING else counts,
+        "nodes": nodes
+        if nodes is not None
+        else [
+            {
+                "name": "big-node",
+                "hostname": "10.0.0.1",
+                "port": 22,
+                "username": "u",
+                "state": "up",
+                "enabled": True,
+                "last_seen": "2026-07-27T10:01:58+00:00",
+                "last_error": None,
+                "gpu_count": 1,
+                "probed_at": None,
+                "gpus": [_gpu(name="RTX PRO 5000", total=73415, used=69000, external=69000, procs=2)],
+            },
+            {
+                "name": "small-node",
+                "hostname": "10.0.0.2",
+                "port": 2222,
+                "username": "u",
+                "state": "up",
+                "enabled": True,
+                "last_seen": "2026-07-27T10:01:58+00:00",
+                "last_error": None,
+                "gpu_count": 1,
+                "probed_at": None,
+                "gpus": [_gpu()],
+            },
+        ],
+        "jobs": jobs if jobs is not None else [_job(1), _job(2, state="pending", name="eval")],
+        "recent": recent or [],
+    }
+
+
+def _state(snapshot=_MISSING, **overrides):
+    state = {
+        "snapshot": _snapshot() if snapshot is _MISSING else snapshot,
+        "notice": None,
+        "log_text": "",
+        "log_job": None,
+        "busy": False,
+        "auto_tick": True,
+        "error": None,
+    }
+    state.update(overrides)
+    return state
+
+
+def _tui(width=150):
+    os.environ["COLUMNS"] = str(width)
+    return QueueTUI()
+
+
+def _render(tui, state=None):
+    return _plain(tui.render(state or _state()))
+
+
+# --- rendering -------------------------------------------------------------
+
+def test_the_screen_shows_nodes_capacity_and_jobs():
+    output = _render(_tui())
+    assert "big-node" in output and "small-node" in output
+    assert "RTX PRO 5000" in output
+    assert "free" in output and "ext" in output
+    assert "python train.py" in output
+    # The keybinding footer is always reachable.
+    assert "q quit" in output
+
+
+def test_capacity_reflects_foreign_usage():
+    output = _render(_tui())
+    # 73415 total - 69000 foreign - 512 headroom, rendered compactly.
+    assert "3.8G" in output
+
+
+def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
+    snapshot = _snapshot()
+    snapshot["nodes"][1]["gpus"] = [_gpu(used=8000, external=0, reserved=8192,
+                                         attribution="blind", jobs=1)]
+    output = _render(_tui(), _state(snapshot))
+    assert "(blind)" in output
+
+
+def test_an_unreachable_node_shows_its_error():
+    snapshot = _snapshot()
+    snapshot["nodes"][0].update(state="down", last_error="timed out", gpus=[])
+    output = _render(_tui(), _state(snapshot))
+    assert "down" in output
+    assert "timed out" in output
+
+
+def test_every_line_fits_the_terminal_width():
+    snapshot = _snapshot(jobs=[_job(1, name="a-very-long-job-name-that-overflows")])
+    tui = _tui(width=80)
+    for line in _plain(tui.render(_state(snapshot))).splitlines():
+        assert len(line) <= 80, line
+
+
+def test_the_screen_survives_an_empty_queue():
+    output = _render(_tui(), _state(_snapshot(jobs=[], counts={})))
+    assert "queue empty" in output
+    assert "no jobs match this filter" in output
+
+
+def test_before_the_first_refresh_the_screen_explains_itself():
+    output = _plain(_tui().render(_state(snapshot=None)))
+    assert "connecting to nodes" in output
+
+
+def test_a_worker_error_is_shown_rather_than_swallowed():
+    output = _render(_tui(), _state(error="TransportError: host unreachable"))
+    assert "host unreachable" in output
+
+
+# --- selection and filtering ----------------------------------------------
+
+def _press(tui, char, name=None):
+    key = Keystroke(ucs=char if name is None else "", code=None, name=name)
+    return tui.handle_key(key)
+
+
+def test_j_and_k_move_the_job_selection():
+    tui = _tui()
+    _render(tui)
+    assert tui.job_index == 0
+    _press(tui, "j")
+    assert tui.job_index == 1
+    _press(tui, "j")  # already at the end
+    assert tui.job_index == 1
+    _press(tui, "k")
+    assert tui.job_index == 0
+
+
+def test_tab_switches_which_pane_has_focus():
+    tui = _tui()
+    _render(tui)
+    assert tui.focus == "jobs"
+    _press(tui, "", name="KEY_TAB")
+    assert tui.focus == "nodes"
+    _press(tui, "j")
+    assert tui.node_index == 1
+    assert tui.job_index == 0  # the job pane did not move
+
+
+def test_the_filter_cycles_through_the_useful_views():
+    tui = _tui()
+    snapshot = _snapshot(
+        jobs=[_job(1), _job(2, state="pending")],
+        recent=[_job(3, state="completed", exit_code=0)],
+    )
+    _render(tui, _state(snapshot))
+    assert {job["id"] for job in tui.jobs} == {1, 2}
+
+    _press(tui, "f")  # all
+    _render(tui, _state(snapshot))
+    assert {job["id"] for job in tui.jobs} == {1, 2, 3}
+
+    _press(tui, "f")  # running
+    _render(tui, _state(snapshot))
+    assert {job["id"] for job in tui.jobs} == {1}
+
+    _press(tui, "f")  # pending
+    _render(tui, _state(snapshot))
+    assert {job["id"] for job in tui.jobs} == {2}
+
+    _press(tui, "f")  # finished
+    _render(tui, _state(snapshot))
+    assert {job["id"] for job in tui.jobs} == {3}
+
+
+def test_q_quits_and_other_keys_do_not():
+    tui = _tui()
+    _render(tui)
+    assert _press(tui, "j") is True
+    assert _press(tui, "q") is False
+
+
+def test_help_opens_and_closes_without_quitting():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "?")
+    assert "Force a scheduler tick now" in _render(tui)
+    # `q` inside help closes the panel rather than exiting the program.
+    assert _press(tui, "q") is True
+    assert tui.show_help is False
+
+
+# --- actions ---------------------------------------------------------------
+
+def test_cancelling_needs_a_second_keypress():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "c")
+    assert tui.worker.actions.empty()
+    assert tui.pending_confirm is not None
+    assert "press c again" in _render(tui)
+
+    _press(tui, "c")
+    assert tui.worker.actions.get_nowait() == ("cancel", 1)
+
+
+def test_escape_abandons_a_pending_confirmation():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "c")
+    _press(tui, "", name="KEY_ESCAPE")
+    assert tui.pending_confirm is None
+    _press(tui, "c")
+    assert tui.worker.actions.empty()  # the counter restarted
+
+
+def test_requeue_and_tick_are_posted_to_the_worker():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "r")
+    assert tui.worker.actions.get_nowait() == ("requeue", 1)
+    _press(tui, "t")
+    assert tui.worker.actions.get_nowait() == ("tick",)
+
+
+def test_d_drains_the_selected_node_and_resumes_a_drained_one():
+    tui = _tui()
+    snapshot = _snapshot()
+    _render(tui, _state(snapshot))
+    _press(tui, "", name="KEY_TAB")
+    _press(tui, "d")
+    assert tui.worker.actions.get_nowait() == ("drain", "big-node")
+
+    snapshot["nodes"][0]["enabled"] = False
+    _render(tui, _state(snapshot))
+    _press(tui, "d")
+    assert tui.worker.actions.get_nowait() == ("resume", "big-node")
+
+
+def test_the_log_view_asks_the_worker_for_the_selected_job():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "L")
+    assert tui.worker.log_request == (1, "stdout")
+    output = _render(tui, _state(log_text="step 1\nstep 2\n", log_job=1))
+    assert "LOG job 1" in output
+    assert "step 2" in output
+
+    _press(tui, "L")
+    assert tui.worker.log_request is None

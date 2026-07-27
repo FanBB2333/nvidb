@@ -1,0 +1,166 @@
+"""Integration tests for the job executor against real local processes.
+
+These exercise the mechanism the queue relies on everywhere: a detached process
+group, a pid file, an atomically written exit code, captured output, and a
+`result.json` handed back to whoever asked for the job.
+"""
+import time
+
+import pytest
+
+from nvidb.sched.executor import JobExecutor
+from nvidb.sched.transport import LocalTransport
+
+
+def _wait_for_exit(executor, job_id, run_dir, timeout=15.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = executor.probe([(job_id, run_dir)]).jobs.get(job_id)
+        if probe is not None and probe.finished:
+            return probe
+        time.sleep(0.1)
+    pytest.fail(f"job {job_id} did not finish within {timeout}s")
+
+
+@pytest.fixture
+def executor(tmp_path):
+    return JobExecutor(LocalTransport("test-local"), job_root=str(tmp_path / "jobs"))
+
+
+def test_a_job_runs_detached_and_reports_its_exit_code(executor):
+    launched = executor.launch(
+        job_id=1,
+        job_name="hello",
+        command="echo out-line; echo err-line >&2; exit 0",
+        node_name="test-local",
+    )
+    assert launched.pid
+
+    probe = _wait_for_exit(executor, 1, launched.run_dir)
+    assert probe.exit_code == 0
+    assert probe.alive is False
+    assert "out-line" in executor.read_log(launched.run_dir)
+    assert "err-line" in executor.read_log(launched.run_dir, stream="stderr")
+
+
+def test_a_failing_command_propagates_its_status(executor):
+    launched = executor.launch(
+        job_id=2, job_name="boom", command="exit 42", node_name="test-local"
+    )
+    probe = _wait_for_exit(executor, 2, launched.run_dir)
+    assert probe.exit_code == 42
+    # The job stamps its own finish time, so elapsed does not depend on how
+    # soon anyone happens to look.
+    assert probe.finished_epoch is not None
+    assert abs(probe.finished_epoch - time.time()) < 60
+
+
+def test_a_job_can_hand_back_a_result_payload(executor):
+    command = (
+        'printf \'{"accuracy": 0.91, "note": "done"}\' > "$NVIDB_JOB_DIR/result.json"'
+    )
+    launched = executor.launch(
+        job_id=3, job_name="eval", command=command, node_name="test-local"
+    )
+    _wait_for_exit(executor, 3, launched.run_dir)
+    assert executor.read_result(launched.run_dir) == {"accuracy": 0.91, "note": "done"}
+
+
+def test_the_job_environment_describes_the_placement(executor):
+    command = 'env | grep -E "^(NVIDB_|CUDA_VISIBLE_DEVICES)" | sort'
+    launched = executor.launch(
+        job_id=4,
+        job_name="envcheck",
+        command=command,
+        gpu_ids=[0, 1],
+        env={"MY_SETTING": "value with spaces"},
+        node_name="node-x",
+    )
+    _wait_for_exit(executor, 4, launched.run_dir)
+    log = executor.read_log(launched.run_dir)
+    assert "CUDA_VISIBLE_DEVICES=0,1" in log
+    assert "NVIDB_JOB_ID=4" in log
+    assert "NVIDB_NODE=node-x" in log
+
+
+def test_a_command_with_awkward_quoting_survives_the_trip(executor):
+    command = """python3 -c 'print("quotes \\" and $dollar and \\'\\''single\\'\\''")'"""
+    launched = executor.launch(
+        job_id=5, job_name="quoting", command=command, node_name="test-local"
+    )
+    probe = _wait_for_exit(executor, 5, launched.run_dir)
+    assert probe.exit_code == 0
+    assert 'quotes " and $dollar and' in executor.read_log(launched.run_dir)
+
+
+def test_a_multi_line_command_runs_as_a_script(executor):
+    command = "\n".join(
+        [
+            "total=0",
+            "for i in 1 2 3; do",
+            "  total=$((total + i))",
+            "done",
+            'echo "total=$total"',
+        ]
+    )
+    launched = executor.launch(
+        job_id=6, job_name="script", command=command, node_name="test-local"
+    )
+    _wait_for_exit(executor, 6, launched.run_dir)
+    assert "total=6" in executor.read_log(launched.run_dir)
+
+
+def test_a_missing_workdir_fails_the_job_instead_of_hanging(executor):
+    launched = executor.launch(
+        job_id=7,
+        job_name="badcwd",
+        command="echo never",
+        workdir="/definitely/not/here",
+        node_name="test-local",
+    )
+    assert _wait_for_exit(executor, 7, launched.run_dir).exit_code == 127
+
+
+def test_a_running_job_can_be_killed(executor):
+    launched = executor.launch(
+        job_id=8, job_name="sleeper", command="sleep 120", node_name="test-local"
+    )
+    time.sleep(0.5)
+    assert executor.probe([(8, launched.run_dir)]).jobs[8].alive is True
+
+    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="TERM")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not executor.probe([(8, launched.run_dir)]).jobs[8].alive:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("the job was still alive after SIGTERM")
+
+
+def test_the_probe_reports_the_process_group_table(executor):
+    launched = executor.launch(
+        job_id=9, job_name="sleeper", command="sleep 5", node_name="test-local"
+    )
+    time.sleep(0.4)
+    probe = executor.probe([(9, launched.run_dir)])
+    assert probe.process_groups
+    # The job's own pid must appear, which is what lets GPU processes be
+    # attributed to the job that owns them.
+    assert launched.pid in probe.process_groups
+    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="KILL")
+
+
+def test_probing_an_unknown_job_reports_nothing_rather_than_failing(executor, tmp_path):
+    probe = executor.probe([(99, str(tmp_path / "missing"))])
+    assert probe.jobs[99].alive is False
+    assert probe.jobs[99].exit_code is None
+
+
+def test_the_run_directory_can_be_removed(executor):
+    launched = executor.launch(
+        job_id=10, job_name="tidy", command="echo bye", node_name="test-local"
+    )
+    _wait_for_exit(executor, 10, launched.run_dir)
+    executor.remove_run_dir(launched.run_dir)
+    assert executor.read_log(launched.run_dir) == ""

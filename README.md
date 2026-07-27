@@ -335,6 +335,145 @@ After function execution, it outputs:
 
 ---
 
+## 3. Cluster Job Queue
+
+`nvidb queue` adds a small slurm-like scheduler on top of the servers already in
+`config.yml`. Jobs are submitted from any machine that can SSH to the nodes, wait
+until a GPU has room for them, run detached on the node, and report back.
+
+The queue's only shared state is one SQLite file (`~/.nvidb/queue.db`). Several
+independent clients — several Claude Code sessions, a script, an open TUI —
+coordinate purely by reading and writing that file, so none of them has to stay
+running for the queue to work.
+
+### 3.1 How it schedules
+
+There is no daemon. Any command that touches the queue performs a **tick**:
+probe every node, settle finished jobs, then place whatever now fits. Ticks are
+rate-limited and guarded by a lease, so a burst of concurrent clients results in
+one round of SSH traffic rather than one per client. The open TUI ticks on a
+timer, and `nvidb queue tick --watch 10` gives you a background ticker if you
+want one.
+
+GPUs are allocated by **VRAM budget**, not whole cards:
+
+```
+free = total − memory used by non-queue processes − reservations of queue jobs − headroom
+```
+
+Counting foreign processes is what lets the queue share machines with work you
+started by hand: a card that someone else has filled simply reports no capacity,
+and jobs go elsewhere until it frees up. A job is charged the larger of what it
+reserved and what it actually uses, so understating `--vram` cannot oversubscribe
+a card.
+
+On nodes where the driver exposes no process list — WSL, where the GPU is driven
+from Windows — the split between foreign work and the queue's own jobs cannot be
+measured. Those GPUs are marked `blind` and their own jobs are credited up to
+their reservation, which keeps the queue from charging a job twice.
+
+### 3.2 Submitting and watching jobs
+
+```bash
+# Put the command last, after `--`, or pass it as one quoted string
+nvidb job submit --name train --vram 20G -- python train.py --epochs 10
+nvidb job submit --node gem12 --vram 8G --workdir ~/proj -- python eval.py
+nvidb job submit --gpus 0 -- python prepare_data.py        # CPU-only
+nvidb job submit --after 12 --vram 4G -- python report.py  # runs after job 12
+nvidb job submit --script run.sh --vram 12G                # a local file's contents
+
+nvidb job ls                    # everything, newest state
+nvidb job ls --active           # only pending and running
+nvidb job show 12 --logs 40     # detail plus the tail of stdout
+nvidb job logs 12 -f            # follow the output
+nvidb job wait 12 13            # block until both finish (exit 1 if any failed)
+nvidb job cancel 12             # kill the remote process group
+nvidb job requeue 12            # run a finished job again
+nvidb job purge                 # forget finished job records
+
+nvidb queue status              # nodes, capacity and jobs in one view
+nvidb queue nodes               # capacity only
+nvidb queue events --since 42   # replay what happened while you were away
+nvidb queue drain 406           # stop scheduling onto a node (`resume` undoes it)
+nvidb queue tick                # force one scheduler pass
+```
+
+Useful `submit` options: `--priority N` (higher goes first), `--timeout SECONDS`
+(kill an overrunning job), `--retries N` (restart if the process vanishes),
+`--env KEY=VALUE`, `--tag`, and `--wait` to block until the job finishes.
+
+Read commands refresh the queue themselves before printing, so `nvidb job show`
+never reports stale state. Pass `--no-tick` for a pure database read, or
+`--tick` to force a refresh.
+
+Every job runs with `CUDA_VISIBLE_DEVICES` set to its allocation, plus
+`NVIDB_JOB_ID`, `NVIDB_JOB_NAME`, `NVIDB_NODE`, and `NVIDB_JOB_DIR`.
+
+### 3.3 Driving the queue from other programs
+
+Every command accepts `--json` and prints one JSON document on stdout, which is
+the intended way for tools — Claude Code sessions in particular — to use the
+queue:
+
+```bash
+nvidb queue status --json     # nodes, per-GPU budgets, job table, counts
+nvidb job submit --json --vram 20G -- python train.py
+nvidb job wait 12 --json --logs 40
+nvidb queue events --json --since 42
+```
+
+Three things make the database usable as a coordination channel between
+processes that never talk directly:
+
+- **Dependencies.** `--after 12,13` records the ordering in the queue, so a
+  client can lay out a pipeline and exit; the jobs still run in order.
+- **Results.** A job that writes `$NVIDB_JOB_DIR/result.json` has that payload
+  collected on completion and served by `nvidb job result <id>`. Clients can
+  also write one directly with `nvidb job result <id> --set '{"note":"..."}'`,
+  which passes structured data between them without a shared filesystem.
+- **Events.** `nvidb queue events --since <id>` replays every state change, so a
+  client that was not running can catch up on exactly what it missed.
+
+### 3.4 The queue TUI
+
+```bash
+nvidb queue                 # or: nvidb queue tui
+```
+
+The screen stacks node capacity, the job table, and a detail or log pane for the
+selected job. All SSH work happens on a worker thread, so an unreachable node
+slows the numbers down but never freezes the interface.
+
+| Key                | Action                                        |
+| ------------------ | --------------------------------------------- |
+| `j` / `k` / arrows | Move the selection in the focused pane        |
+| `PgUp` / `PgDn`    | Move a page at a time                         |
+| `Tab`              | Switch focus between the node and job panes   |
+| `Enter`            | Show or hide the detail pane                  |
+| `L`                | Toggle a live tail of the selected job's log  |
+| `c`                | Cancel the selected job (press twice)         |
+| `r`                | Re-queue the selected finished job            |
+| `t`                | Force a scheduler tick now                    |
+| `a`                | Toggle automatic ticking                      |
+| `f`                | Cycle the job filter                          |
+| `d`                | Drain or resume the selected node             |
+| `?`                | Help                                          |
+| `q`                | Quit                                          |
+
+### 3.5 What runs on the nodes
+
+Nothing is installed. A generated `run.sh` is delivered over SSH and started
+with `setsid`, so the job outlives the client that launched it. Each job keeps a
+directory on its node (`~/.nvidb/jobs/<id>/` by default) holding the script,
+`stdout.log`, `stderr.log`, its pid, and the exit status with the time it
+finished. Every later interaction — checking liveness, reading output, killing a
+job — is a single shell round trip.
+
+Tuning lives under `queue:` in `config.yml`; see
+[config.example.yml](config.example.yml) for the full set of keys.
+
+---
+
 ## 4. System Requirements
 
 - NVIDIA driver with NVML (`libnvidia-ml.so.1`)

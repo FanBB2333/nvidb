@@ -34,6 +34,20 @@ view:
   # most terminals need Shift to drag-select).
   mouse: true
 
+# Cluster job queue (`nvidb queue`, `nvidb job ...`). Every key is optional;
+# the values shown here are the defaults.
+queue:
+  headroom_mb: 512       # VRAM never handed out, so a job cannot starve the driver
+  max_jobs_per_gpu: 4    # concurrent queue jobs allowed on one card
+  placement: spread      # spread: emptiest GPU first | pack: fullest GPU that fits
+  default_vram: "0"      # assumed reservation when `--vram` is omitted
+  tick_min_interval: 3   # seconds between automatic scheduler passes
+  lock_ttl: 180          # seconds a client may hold the scheduler lease
+  probe_timeout: 25      # seconds allowed for one node probe
+  launch_timeout: 60     # seconds allowed to start a job
+  job_root: ".nvidb/jobs"  # per-job directory on each node (relative to $HOME)
+  include_local: false   # also schedule onto this machine
+
 servers:
   # Example server with SSH key authentication (recommended)
   - hostname: "server1.example.com"
