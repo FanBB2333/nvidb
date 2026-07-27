@@ -523,6 +523,18 @@ processes that never talk directly:
 - **Events.** `nvidb queue events --since <id>` replays every state change, so a
   client that was not running can catch up on exactly what it missed.
 
+#### Agent skill
+
+[`skills/nvidb-queue/`](skills/nvidb-queue/SKILL.md) is an Agent Skill that
+teaches Claude Code, Codex and other skill-aware tools to route GPU work through
+the queue instead of starting it over raw SSH. Install it by symlinking, so both
+agents track the repository:
+
+```bash
+ln -s "$PWD/skills/nvidb-queue" ~/.claude/skills/nvidb-queue
+ln -s "$PWD/skills/nvidb-queue" ~/.codex/skills/nvidb-queue
+```
+
 ### 3.6 The queue TUI
 
 ```bash
