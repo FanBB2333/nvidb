@@ -83,6 +83,9 @@ def _job(job_id, state="running", name="train", node="small-node", **overrides):
         "heartbeat_at": None,
         "gpu_mem_mb": None,
         "result": None,
+        "notes": None,
+        "progress": None,
+        "progress_at": None,
     }
     job.update(overrides)
     return job
@@ -180,6 +183,30 @@ def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
     assert "(blind)" in output
 
 
+def test_progress_replaces_the_command_in_the_job_row():
+    snapshot = _snapshot(jobs=[_job(1, progress="epoch 3/10 loss 0.42")])
+    output = _render(_tui(), _state(snapshot))
+    assert "PROGRESS / COMMAND" in output
+    assert "▸ epoch 3/10 loss 0.42" in output
+    # The command is still reachable in the detail pane.
+    assert "python train.py" in output
+
+
+def test_a_job_without_progress_still_shows_its_command():
+    output = _render(_tui())
+    assert "PROGRESS" not in output
+    assert "python train.py --epochs 10" in output
+
+
+def test_the_detail_pane_shows_both_the_note_and_the_live_status():
+    snapshot = _snapshot(
+        jobs=[_job(1, progress="epoch 3/10", notes="baseline A, lr=1e-4")]
+    )
+    output = _render(_tui(), _state(snapshot))
+    assert "note baseline A, lr=1e-4" in output
+    assert "live " in output
+
+
 def test_an_unreachable_node_shows_its_error():
     snapshot = _snapshot()
     snapshot["nodes"][0].update(state="down", last_error="timed out", gpus=[])
@@ -193,6 +220,25 @@ def test_every_line_fits_the_terminal_width():
     tui = _tui(width=80)
     for line in _plain(tui.render(_state(snapshot))).splitlines():
         assert len(line) <= 80, line
+
+
+def test_wide_characters_do_not_push_lines_past_the_edge():
+    from nvidb.sched.model import display_width
+
+    snapshot = _snapshot(
+        jobs=[
+            _job(
+                1,
+                name="基线实验对照组",
+                notes="复现 issue #12，学习率 1e-4",
+                progress="第 3 轮 / 共 10 轮，损失 0.42",
+            )
+        ]
+    )
+    snapshot["nodes"][0]["name"] = "训练节点一号"
+    tui = _tui(width=100)
+    for line in _plain(tui.render(_state(snapshot))).splitlines():
+        assert display_width(line) <= 100, line
 
 
 def test_the_screen_survives_an_empty_queue():

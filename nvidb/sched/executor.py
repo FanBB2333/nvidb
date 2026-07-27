@@ -40,6 +40,7 @@ class JobProbe:
     exit_code: Optional[int] = None
     alive: bool = False
     finished_epoch: Optional[int] = None
+    progress: Optional[str] = None
 
     @property
     def finished(self) -> bool:
@@ -97,6 +98,9 @@ def build_run_script(
         f"export NVIDB_JOB_NAME={shlex.quote(job_name or '')}",
         'export NVIDB_JOB_DIR="$NVIDB_JOB_DIR"',
         f"export NVIDB_NODE={shlex.quote(node_name or '')}",
+        # A job reports its own progress by writing this file; the queue picks
+        # up the last line on every probe.
+        'export NVIDB_STATUS_FILE="$NVIDB_JOB_DIR/status"',
     ]
 
     visible = ",".join(str(index) for index in (gpu_ids or []))
@@ -260,6 +264,10 @@ class JobExecutor:
             "  _alive=0",
             '  if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then _alive=1; fi',
             '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive"',
+            # The status line is free-form text, so it travels on its own line
+            # where only the first two fields need splitting.
+            '  _st=$(tail -n 1 "$_d/status" 2>/dev/null | tr -d "\\n\\r")',
+            '  if [ -n "$_st" ]; then echo "STAT|$_id|$_st"; fi',
             "}",
             f"echo {PROBE_MARKER}",
         ]
@@ -336,7 +344,19 @@ def parse_probe_output(text: str) -> NodeProbe:
         if line == PS_MARKER:
             section = "ps"
             continue
-        if section == "jobs" and line.startswith("JOB|"):
+        if section == "jobs" and line.startswith("STAT|"):
+            # Only the id is delimited; the rest is the status text verbatim.
+            parts = line.split("|", 2)
+            if len(parts) < 3:
+                continue
+            job_id = _maybe_int(parts[1])
+            if job_id is None:
+                continue
+            existing = probe.jobs.get(job_id)
+            if existing is None:
+                existing = probe.jobs[job_id] = JobProbe(job_id=job_id)
+            existing.progress = parts[2].strip() or None
+        elif section == "jobs" and line.startswith("JOB|"):
             parts = line.split("|")
             if len(parts) < 6:
                 continue
@@ -347,6 +367,7 @@ def parse_probe_output(text: str) -> NodeProbe:
             # The exit-code field is "<status> <epoch seconds>"; older jobs and
             # partially written files may carry only the status.
             status_parts = parts[4].split()
+            existing = probe.jobs.get(job_id)
             probe.jobs[job_id] = JobProbe(
                 job_id=job_id,
                 pid=_maybe_int(parts[2]),
@@ -354,6 +375,9 @@ def parse_probe_output(text: str) -> NodeProbe:
                 exit_code=_maybe_int(status_parts[0]) if status_parts else None,
                 alive=parts[5] == "1",
                 finished_epoch=_maybe_int(status_parts[1]) if len(status_parts) > 1 else None,
+                # Section order puts JOB before STAT, but do not lose a status
+                # line if that ever changes.
+                progress=existing.progress if existing else None,
             )
         elif section == "ps":
             parts = line.split()

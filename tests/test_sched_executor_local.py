@@ -66,6 +66,45 @@ def test_a_job_can_hand_back_a_result_payload(executor):
     assert executor.read_result(launched.run_dir) == {"accuracy": 0.91, "note": "done"}
 
 
+def test_a_job_publishes_progress_through_its_status_file(executor):
+    command = "\n".join(
+        [
+            'echo "epoch 1/3" > "$NVIDB_STATUS_FILE"',
+            "sleep 1",
+            'echo "epoch 2/3 loss 0.42" > "$NVIDB_STATUS_FILE"',
+            "sleep 4",
+        ]
+    )
+    launched = executor.launch(
+        job_id=11, job_name="trainer", command=command, node_name="test-local"
+    )
+    time.sleep(0.5)
+    assert executor.probe([(11, launched.run_dir)]).jobs[11].progress == "epoch 1/3"
+
+    time.sleep(1.2)
+    probe = executor.probe([(11, launched.run_dir)]).jobs[11]
+    assert probe.progress == "epoch 2/3 loss 0.42"
+    assert probe.alive is True
+    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="KILL")
+
+
+def test_only_the_last_status_line_is_reported(executor):
+    command = 'printf "old line\\nnewest line\\n" > "$NVIDB_STATUS_FILE"'
+    launched = executor.launch(
+        job_id=12, job_name="appender", command=command, node_name="test-local"
+    )
+    _wait_for_exit(executor, 12, launched.run_dir)
+    assert executor.probe([(12, launched.run_dir)]).jobs[12].progress == "newest line"
+
+
+def test_a_job_that_reports_nothing_has_no_progress(executor):
+    launched = executor.launch(
+        job_id=13, job_name="quiet", command="echo hi", node_name="test-local"
+    )
+    _wait_for_exit(executor, 13, launched.run_dir)
+    assert executor.probe([(13, launched.run_dir)]).jobs[13].progress is None
+
+
 def test_the_job_environment_describes_the_placement(executor):
     command = 'env | grep -E "^(NVIDB_|CUDA_VISIBLE_DEVICES)" | sort'
     launched = executor.launch(
@@ -81,6 +120,8 @@ def test_the_job_environment_describes_the_placement(executor):
     assert "CUDA_VISIBLE_DEVICES=0,1" in log
     assert "NVIDB_JOB_ID=4" in log
     assert "NVIDB_NODE=node-x" in log
+    # The status file is how a job reports progress, so it must be advertised.
+    assert "NVIDB_STATUS_FILE=" in log
 
 
 def test_a_command_with_awkward_quoting_survives_the_trip(executor):

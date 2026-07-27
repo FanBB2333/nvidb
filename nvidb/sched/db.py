@@ -88,7 +88,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_error      TEXT,
     heartbeat_at    TEXT,
     gpu_mem_mb      INTEGER,
-    result          TEXT
+    result          TEXT,
+    -- `notes` is what a person or a client says about the job; `progress` is
+    -- what the job says about itself. Keeping them apart means a job's own
+    -- status line can never overwrite a human's annotation.
+    notes           TEXT,
+    progress        TEXT,
+    progress_at     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
@@ -147,6 +153,11 @@ def open_db(path=None) -> sqlite3.Connection:
 # not add them to a database that already exists, so they are applied here.
 _ADDED_COLUMNS = {
     "gpus": {"attribution": "TEXT DEFAULT 'processes'"},
+    "jobs": {
+        "notes": "TEXT",
+        "progress": "TEXT",
+        "progress_at": "TEXT",
+    },
 }
 
 
@@ -473,6 +484,7 @@ def insert_job(conn: sqlite3.Connection, **fields) -> int:
         "created_at": now,
         "updated_at": now,
         "max_retries": int(fields.get("max_retries") or 0),
+        "notes": fields.get("notes") or None,
     }
     columns = ", ".join(payload)
     placeholders = ", ".join("?" for _ in payload)

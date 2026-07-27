@@ -400,16 +400,55 @@ nvidb queue tick                # force one scheduler pass
 
 Useful `submit` options: `--priority N` (higher goes first), `--timeout SECONDS`
 (kill an overrunning job), `--retries N` (restart if the process vanishes),
-`--env KEY=VALUE`, `--tag`, and `--wait` to block until the job finishes.
+`--env KEY=VALUE`, `--tag`, `--note`, and `--wait` to block until the job
+finishes.
 
 Read commands refresh the queue themselves before printing, so `nvidb job show`
 never reports stale state. Pass `--no-tick` for a pure database read, or
 `--tick` to force a refresh.
 
 Every job runs with `CUDA_VISIBLE_DEVICES` set to its allocation, plus
-`NVIDB_JOB_ID`, `NVIDB_JOB_NAME`, `NVIDB_NODE`, and `NVIDB_JOB_DIR`.
+`NVIDB_JOB_ID`, `NVIDB_JOB_NAME`, `NVIDB_NODE`, `NVIDB_JOB_DIR`, and
+`NVIDB_STATUS_FILE`.
 
-### 3.3 Driving the queue from other programs
+### 3.3 Notes and live progress
+
+A job carries two independent pieces of free text, kept apart because they have
+different authors and neither should be able to overwrite the other:
+
+**`note`** — what you or a client says *about* the job. Set it at submit time and
+edit it whenever, including long after the job has finished:
+
+```bash
+nvidb job submit --note "baseline A, lr=1e-4" -- python train.py
+nvidb job note 12                              # read it
+nvidb job note 12 --append "loss plateaued at epoch 30"
+nvidb job note 12 "superseded by job 19"       # replace
+nvidb job note 12 --clear
+```
+
+**`progress`** — what the job says about *itself*. The job writes one line to
+`$NVIDB_STATUS_FILE` and the scheduler collects it on every probe, so you can
+watch a long run without tailing its log:
+
+```python
+# inside a training script
+import os
+with open(os.environ["NVIDB_STATUS_FILE"], "w") as handle:
+    handle.write(f"epoch {epoch}/{total} loss {loss:.3f}")
+```
+
+```bash
+echo "epoch $i/$n loss $loss" > "$NVIDB_STATUS_FILE"   # or from shell
+```
+
+Only the last line of the file is read, so overwriting is the normal pattern.
+Both fields appear in `job ls`, `queue status`, `job show`, the TUI and every
+`--json` payload. The last thing a job reported is kept on its finished record,
+which is often the quickest explanation of how far a lost or failed job got. A
+retry clears the stale status line but keeps your note.
+
+### 3.4 Driving the queue from other programs
 
 Every command accepts `--json` and prints one JSON document on stdout, which is
 the intended way for tools — Claude Code sessions in particular — to use the
@@ -434,7 +473,7 @@ processes that never talk directly:
 - **Events.** `nvidb queue events --since <id>` replays every state change, so a
   client that was not running can catch up on exactly what it missed.
 
-### 3.4 The queue TUI
+### 3.5 The queue TUI
 
 ```bash
 nvidb queue                 # or: nvidb queue tui
@@ -460,7 +499,7 @@ slows the numbers down but never freezes the interface.
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
 
-### 3.5 What runs on the nodes
+### 3.6 What runs on the nodes
 
 Nothing is installed. A generated `run.sh` is delivered over SSH and started
 with `setsid`, so the job outlives the client that launched it. Each job keeps a

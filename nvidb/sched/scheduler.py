@@ -243,6 +243,7 @@ class Scheduler:
         submitter: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
         max_retries: int = 0,
+        notes: Optional[str] = None,
     ) -> int:
         """Add a job to the queue and return its id."""
         if not command or not command.strip():
@@ -277,6 +278,7 @@ class Scheduler:
             submitter=submitter,
             tags=list(tags or []),
             max_retries=int(max_retries),
+            notes=notes,
         )
         dbm.add_event(
             self.conn,
@@ -291,6 +293,26 @@ class Scheduler:
             },
         )
         return job_id
+
+    def set_notes(
+        self, job_id: int, text: Optional[str], *, append: bool = False
+    ) -> Optional[str]:
+        """Write, extend or clear a job's annotation; returns the new value.
+
+        Notes stay editable for the whole life of a job, including after it
+        finishes, so a client can record what it concluded from the result.
+        """
+        job = dbm.get_job(self.conn, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+        if text is None:
+            value = None
+        elif append and job.notes:
+            value = f"{job.notes} | {text}"
+        else:
+            value = text
+        dbm.update_job(self.conn, job_id, notes=value)
+        return value
 
     def cancel(self, job_id: int, *, reason: str = "cancelled by user") -> bool:
         """Cancel a job, killing its process group when it is already running."""
@@ -336,6 +358,10 @@ class Scheduler:
             gpu_mem_mb=None,
             last_error=None,
             attempt=job.attempt,
+            # The annotation survives a re-run; the previous attempt's status
+            # line does not.
+            progress=None,
+            progress_at=None,
         )
         dbm.add_event(self.conn, "job_requeued", job_id=job_id, message="requeued")
         return True
@@ -455,6 +481,15 @@ class Scheduler:
             if observed is None:
                 continue  # nothing learned this round; leave the job alone
 
+            # The job's own status line is picked up whatever else happened, so
+            # the last thing a job said survives into its finished record.
+            progress_updates: Dict[str, Any] = {}
+            if observed.progress and observed.progress != job.progress:
+                progress_updates = {
+                    "progress": observed.progress,
+                    "progress_at": utcnow(),
+                }
+
             if observed.finished:
                 exit_code = observed.exit_code
                 state = "completed" if exit_code == 0 else "failed"
@@ -471,6 +506,7 @@ class Scheduler:
                     finished_at=_epoch_to_iso(observed.finished_epoch) or utcnow(),
                     result=result,
                     last_error=None if state == "completed" else f"exit code {exit_code}",
+                    **progress_updates,
                 )
                 dbm.add_event(
                     self.conn,
@@ -486,7 +522,7 @@ class Scheduler:
                 continue
 
             if observed.alive:
-                updates: Dict[str, Any] = {"heartbeat_at": utcnow()}
+                updates: Dict[str, Any] = {"heartbeat_at": utcnow(), **progress_updates}
                 if observed.pid and observed.pid != job.remote_pid:
                     updates["remote_pid"] = observed.pid
                 if observed.pgid and observed.pgid != job.remote_pgid:
@@ -508,6 +544,10 @@ class Scheduler:
                     started_at=None,
                     heartbeat_at=None,
                     last_error="process vanished; retrying",
+                    # The next attempt starts fresh, so the old status line
+                    # must not linger as if it were current.
+                    progress=None,
+                    progress_at=None,
                 )
                 dbm.add_event(
                     self.conn,
@@ -523,6 +563,9 @@ class Scheduler:
                     state="lost",
                     finished_at=utcnow(),
                     last_error="process vanished without an exit code",
+                    # Whatever the job last reported is the best clue about how
+                    # far it got, so it is kept on the record.
+                    **progress_updates,
                 )
                 dbm.add_event(
                     self.conn,

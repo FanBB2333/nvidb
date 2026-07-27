@@ -18,7 +18,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from blessed import Terminal
 
 from . import db as dbm
-from .model import age_seconds, format_duration, format_mb
+from .model import (
+    age_seconds,
+    display_width,
+    fit_display,
+    format_duration,
+    format_mb,
+    pad_display,
+)
 from .scheduler import Scheduler
 
 FILTERS = ("active", "all", "running", "pending", "finished")
@@ -265,17 +272,14 @@ class QueueTUI:
         return formatter(text) if callable(formatter) else text
 
     def _fit(self, text: str, width: int) -> str:
-        if len(text) <= width:
-            return text
-        if width <= 1:
-            return text[:width]
-        return text[: width - 1] + "…"
+        return fit_display(text, width)
 
     def _compose(self, segments, width: int, *, reverse: bool = False) -> str:
         """Join `(text, style)` pairs, truncating on plain text before styling.
 
-        Styling after truncation is what keeps escape sequences from being
-        counted as visible columns.
+        Truncating first is what keeps escape sequences from being counted as
+        visible columns, and every measurement is in terminal columns so a
+        Chinese note cannot push the line past the right edge.
         """
         plain_parts = []
         remaining = width
@@ -283,10 +287,10 @@ class QueueTUI:
             if remaining <= 0:
                 plain_parts.append("")
                 continue
-            plain_parts.append(self._fit(text, remaining))
-            remaining -= len(plain_parts[-1])
+            plain_parts.append(fit_display(text, remaining))
+            remaining -= display_width(plain_parts[-1])
         if reverse:
-            return self.term.reverse("".join(plain_parts).ljust(width))
+            return self.term.reverse(pad_display("".join(plain_parts), width))
         return "".join(
             self._style(part, style)
             for part, (_text, style) in zip(plain_parts, segments)
@@ -348,7 +352,10 @@ class QueueTUI:
                 state_style = "yellow"
             head = f"{marker} {label}"
             tail = f"{detail}  "
-            gap = max(1, width - len(head) - len(tail) - len(state) - 1)
+            gap = max(
+                1,
+                width - display_width(head) - display_width(tail) - len(state) - 1,
+            )
             lines.append(
                 self._compose(
                     [
@@ -421,7 +428,11 @@ class QueueTUI:
             columns = [column for column in columns if column[0] not in ("USED", "NODE")]
         used = sum(size + 1 for _, size in columns)
         command_width = max(10, width - used - 2)
-        header = " " + "".join(name.ljust(size + 1) for name, size in columns) + "COMMAND"
+        # A job that reports its own progress is being watched for exactly that,
+        # so the last column names whichever of the two it will show.
+        any_progress = any(job.get("progress") for job in self.jobs)
+        last_column = "PROGRESS / COMMAND" if any_progress else "COMMAND"
+        header = " " + "".join(name.ljust(size + 1) for name, size in columns) + last_column
         lines.append(self._style(self._fit(header, width), "bright_black"))
 
         if not self.jobs:
@@ -447,9 +458,16 @@ class QueueTUI:
                 "RC": "-" if job["exit_code"] is None else str(job["exit_code"]),
             }
             body = "".join(
-                self._fit(values[name], size).ljust(size + 1) for name, size in columns
+                pad_display(fit_display(values[name], size), size + 1)
+                for name, size in columns
             )
-            command = self._fit(" ".join(job["command"].split()), command_width)
+            # What the job says about itself beats the command line it was
+            # started with; `▸` marks which one is on screen.
+            progress = job.get("progress")
+            if progress:
+                tail, tail_style = f"▸ {' '.join(progress.split())}", "cyan"
+            else:
+                tail, tail_style = " ".join(job["command"].split()), None
             selected = self.focus == "jobs" and position == self.job_index
             marker = "›" if selected else " "
             lines.append(
@@ -457,7 +475,7 @@ class QueueTUI:
                     [
                         (marker, "bright_black"),
                         (body, STATE_STYLE.get(job["state"])),
-                        (command, None),
+                        (self._fit(tail, command_width), tail_style),
                     ],
                     width,
                     reverse=selected,
@@ -498,6 +516,15 @@ class QueueTUI:
         lines.append(self._fit(f"  cmd  {' '.join(job['command'].split())}", width))
         if job.get("workdir"):
             lines.append(self._fit(f"  cwd  {job['workdir']}", width))
+        if job.get("progress"):
+            lines.append(
+                self._compose(
+                    [("  live ", "bright_black"), (" ".join(job["progress"].split()), "cyan")],
+                    width,
+                )
+            )
+        if job.get("notes"):
+            lines.append(self._fit(f"  note {job['notes']}", width))
         if job.get("last_error"):
             lines.append(self._style(self._fit(f"  err  {job['last_error']}", width), "red"))
         if job.get("result") is not None:
@@ -582,7 +609,7 @@ class QueueTUI:
             footer = self._footer_lines(state, width)
             detail_height = 0
             if self.show_detail and self.jobs:
-                detail_height = 8 if self.show_log else 6
+                detail_height = 8
             body_height = usable - len(footer)
             job_height = body_height - len(lines) - detail_height
             lines.extend(self._job_lines(width, max(4, job_height)))

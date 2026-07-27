@@ -62,6 +62,10 @@ class FakeNode:
         record = self.jobs[job_id]
         self.gpus[gpu_index].processes[record["gpu_pid"]] = mb
 
+    def report_progress(self, job_id: int, text: str) -> None:
+        """Simulate the job writing its own status line to $NVIDB_STATUS_FILE."""
+        self.jobs[job_id]["progress"] = text
+
     def finish_job(self, job_id: int, exit_code: int = 0, result=None) -> None:
         record = self.jobs[job_id]
         record["exit_code"] = exit_code
@@ -169,6 +173,7 @@ class FakeExecutor:
             "run_dir": run_dir,
             "gpu_ids": list(gpu_ids or []),
             "command": command,
+            "progress": None,
         }
         self.node.logs[run_dir] = f"$ {command}\n"
         return LaunchResult(pid=pid, pgid=pid, run_dir=run_dir)
@@ -187,6 +192,7 @@ class FakeExecutor:
                 pgid=record["pgid"],
                 exit_code=record["exit_code"],
                 alive=record["alive"],
+                progress=record.get("progress"),
             )
         if want_process_table:
             probe.process_groups = self.node.process_groups()

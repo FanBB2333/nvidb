@@ -24,8 +24,11 @@ from .model import (
     TERMINAL_JOB_STATES,
     Job,
     age_seconds,
+    display_width,
+    fit_display,
     format_duration,
     format_mb,
+    pad_display,
 )
 from .scheduler import Scheduler
 
@@ -61,27 +64,31 @@ def _error(message: str, *, as_json: bool = False) -> int:
 
 
 def _table(rows: List[Sequence[str]], headers: Sequence[str], indent: str = "  ") -> str:
-    """Render a fixed-width table; column widths follow the widest cell."""
+    """Render a fixed-width table; column widths follow the widest cell.
+
+    Widths are measured in terminal columns rather than characters, so a
+    Chinese job name or note does not shear the alignment.
+    """
     if not rows:
         return f"{indent}(none)"
     columns = len(headers)
-    widths = [len(str(header)) for header in headers]
+    widths = [display_width(header) for header in headers]
     for row in rows:
         for index in range(columns):
-            widths[index] = max(widths[index], len(str(row[index])))
-    lines = [indent + "  ".join(str(headers[i]).ljust(widths[i]) for i in range(columns)).rstrip()]
+            widths[index] = max(widths[index], display_width(row[index]))
+    lines = [
+        indent + "  ".join(pad_display(headers[i], widths[i]) for i in range(columns)).rstrip()
+    ]
     for row in rows:
         lines.append(
-            indent + "  ".join(str(row[i]).ljust(widths[i]) for i in range(columns)).rstrip()
+            indent + "  ".join(pad_display(row[i], widths[i]) for i in range(columns)).rstrip()
         )
     return "\n".join(lines)
 
 
 def _short(text: Optional[str], limit: int = 60) -> str:
     text = " ".join((text or "").split())
-    if len(text) <= limit:
-        return text or "-"
-    return text[: limit - 1] + "…"
+    return fit_display(text, limit) if text else "-"
 
 
 def _age(value: Optional[str]) -> str:
@@ -173,23 +180,6 @@ def _render_nodes(snapshot: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _job_row(job: Dict[str, Any]) -> List[str]:
-    gpu = ",".join(str(index) for index in job["gpu_ids"]) or "-"
-    used = format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-"
-    return [
-        str(job["id"]),
-        job["state"],
-        _short(job["name"] or "-", 20),
-        job["node"] or (job["node_constraint"] or "-"),
-        gpu,
-        format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
-        used,
-        format_duration(job["elapsed_s"]) if job.get("elapsed_s") is not None else "-",
-        "-" if job["exit_code"] is None else str(job["exit_code"]),
-        _short(job["command"], 44),
-    ]
-
-
 JOB_HEADERS = [
     "ID",
     "STATE",
@@ -204,6 +194,37 @@ JOB_HEADERS = [
 ]
 
 
+def _job_row(job: Dict[str, Any], *, extra: Sequence[str] = ()) -> List[str]:
+    gpu = ",".join(str(index) for index in job["gpu_ids"]) or "-"
+    used = format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-"
+    row = [
+        str(job["id"]),
+        job["state"],
+        _short(job["name"] or "-", 20),
+        job["node"] or (job["node_constraint"] or "-"),
+        gpu,
+        format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
+        used,
+        format_duration(job["elapsed_s"]) if job.get("elapsed_s") is not None else "-",
+        "-" if job["exit_code"] is None else str(job["exit_code"]),
+        _short(job["command"], 44),
+    ]
+    row.extend(_short(job.get(key), 40) for key in extra)
+    return row
+
+
+def _job_table(jobs: Sequence[Dict[str, Any]], indent: str = "  ") -> str:
+    """Render jobs, adding PROGRESS and NOTE columns only when they carry data.
+
+    Most rows have neither, and always reserving the width would squeeze the
+    command out of a normal terminal.
+    """
+    optional = {"progress": "PROGRESS", "notes": "NOTE"}
+    extra = [key for key in optional if any(job.get(key) for job in jobs)]
+    headers = JOB_HEADERS + [optional[key] for key in extra]
+    return _table([_job_row(job, extra=extra) for job in jobs], headers, indent=indent)
+
+
 def _render_status(snapshot: Dict[str, Any]) -> str:
     counts = snapshot["counts"]
     summary = " · ".join(
@@ -216,12 +237,11 @@ def _render_status(snapshot: Dict[str, Any]) -> str:
     if lock.get("owner"):
         header += f"  (tick held by {lock['owner']})"
     parts = [header, "", _render_nodes(snapshot), "", f"JOBS  {summary}"]
-    rows = [_job_row(job) for job in snapshot["jobs"]]
-    parts.append(_table(rows, JOB_HEADERS))
+    parts.append(_job_table(snapshot["jobs"]))
     if snapshot["recent"]:
         parts.append("")
         parts.append("RECENTLY FINISHED")
-        parts.append(_table([_job_row(job) for job in snapshot["recent"]], JOB_HEADERS))
+        parts.append(_job_table(snapshot["recent"]))
     return "\n".join(parts)
 
 
@@ -243,6 +263,10 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
         f"  submitter   {job.submitter or '-'}",
         f"  run_dir     {job.run_dir or '-'}",
     ]
+    if job.progress:
+        lines.append(f"  progress    {job.progress}   (reported {_age(job.progress_at)})")
+    if job.notes:
+        lines.append(f"  note        {job.notes}")
     if job.depends_on:
         lines.append(f"  depends_on  {','.join(str(i) for i in job.depends_on)}")
     if job.tags:
@@ -406,6 +430,7 @@ def cmd_submit(args) -> int:
                 submitter=args.submitter or _default_submitter(),
                 tags=args.tag or [],
                 max_retries=args.retries,
+                notes=args.note,
             )
         except ValueError as error:
             return _error(str(error), as_json=args.json)
@@ -448,7 +473,7 @@ def cmd_list(args) -> int:
         if args.json:
             _print_json({"jobs": [job.to_dict() for job in jobs]})
         else:
-            print(_table([_job_row(job.to_dict()) for job in jobs], JOB_HEADERS, indent=""))
+            print(_job_table([job.to_dict() for job in jobs], indent=""))
         return 0
     finally:
         scheduler.close()
@@ -559,7 +584,7 @@ def cmd_wait(args) -> int:
         if args.json:
             _print_json(payload)
         else:
-            print(_table([_job_row(entry) for entry in payload["jobs"]], JOB_HEADERS, indent=""))
+            print(_job_table(payload["jobs"], indent=""))
         return 0 if payload["all_succeeded"] else 1
     finally:
         scheduler.close()
@@ -622,6 +647,35 @@ def cmd_result(args) -> int:
             _print_json({"id": job.id, "state": job.state, "result": job.result})
         else:
             print(json.dumps(job.result, ensure_ascii=False, indent=2) if job.result is not None else "(no result)")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_note(args) -> int:
+    scheduler = _open(args)
+    try:
+        text = " ".join(args.text) if args.text else None
+        if args.clear:
+            text = None
+        elif text is None:
+            # No text at all is a read, not an accidental erase.
+            job = dbm.get_job(scheduler.conn, args.id)
+            if job is None:
+                return _error(f"job {args.id} not found", as_json=args.json)
+            if args.json:
+                _print_json({"id": job.id, "notes": job.notes, "progress": job.progress})
+            else:
+                print(job.notes or "(no note)")
+            return 0
+        try:
+            value = scheduler.set_notes(args.id, text, append=args.append)
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
+        if args.json:
+            _print_json({"ok": True, "id": args.id, "notes": value})
+        else:
+            print(f"job {args.id} note: {value or '(cleared)'}")
         return 0
     finally:
         scheduler.close()
@@ -746,6 +800,7 @@ def register_parsers(subparsers) -> None:
     submit.add_argument("--retries", type=int, default=0, help="Retries if the process vanishes")
     submit.add_argument("--tag", action="append", default=[], help="Free-form tag")
     submit.add_argument("--submitter", default=None, help="Identify the submitting client")
+    submit.add_argument("--note", default=None, help="Free-form annotation for this job")
     submit.add_argument("--script", default=None, metavar="FILE",
                         help="Use a local file's contents as the command body")
     submit.add_argument("--wait", action="store_true", help="Block until the job finishes")
@@ -809,6 +864,21 @@ def register_parsers(subparsers) -> None:
     result.add_argument("id", type=int)
     result.add_argument("--set", default=None, metavar="JSON", help="Store this payload")
     result.set_defaults(func=cmd_result)
+
+    note = job_sub.add_parser(
+        "note",
+        help="Read or write a job's annotation",
+        description=(
+            "With no text the current note is printed. Notes stay editable "
+            "after a job finishes, so a client can record what it concluded."
+        ),
+    )
+    _add_common(note)
+    note.add_argument("id", type=int)
+    note.add_argument("text", nargs="*", help="New note text")
+    note.add_argument("--append", action="store_true", help="Add to the existing note")
+    note.add_argument("--clear", action="store_true", help="Remove the note")
+    note.set_defaults(func=cmd_note)
 
     purge = job_sub.add_parser("purge", help="Delete finished job records")
     _add_common(purge)

@@ -12,8 +12,11 @@ from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
 from nvidb.sched import db as dbm  # noqa: E402
 from nvidb.sched.executor import build_run_script, parse_probe_output  # noqa: E402
 from nvidb.sched.model import (  # noqa: E402
+    display_width,
+    fit_display,
     format_duration,
     format_mb,
+    pad_display,
     parse_size_mb,
 )
 from nvidb.sched.scheduler import Scheduler  # noqa: E402
@@ -74,6 +77,30 @@ def test_format_helpers():
     assert format_mb(20480) == "20.0G"
     assert format_duration(3725) == "01:02:05"
     assert format_duration(90061) == "1-01:01:01"
+
+
+def test_wide_characters_are_measured_in_terminal_columns():
+    """Notes and job names are often Chinese, where one character is two columns."""
+    assert display_width("abc") == 3
+    assert display_width("基线实验") == 8
+    assert display_width("lr=1e-4 复现") == 12
+    assert fit_display("基线实验对照", 6) == "基线…"
+    assert fit_display("abc", 10) == "abc"
+    assert display_width(pad_display("基线", 10)) == 10
+
+
+def test_a_chinese_note_keeps_a_table_aligned():
+    from nvidb.sched.cli import _table
+
+    rows = [["1", "基线实验 A"], ["2", "ascii only"], ["3", "x"]]
+    lines = _table(rows, ["ID", "NOTE"], indent="").splitlines()
+    # The NOTE column must start at the same terminal offset on every line,
+    # which is what a character-counting `ljust` gets wrong.
+    offsets = {
+        display_width(line.split(marker)[0])
+        for line, marker in zip(lines, ("NOTE", "基线", "ascii", "x"))
+    }
+    assert len(offsets) == 1
 
 
 def test_run_script_embeds_the_command_without_quoting_it():
@@ -406,6 +433,138 @@ def test_timeout_kills_an_overrunning_job(scheduler, cluster):
     job = dbm.get_job(scheduler.conn, job_id)
     assert job.state == "timeout"
     assert job_id in cluster["small-node"].killed
+
+
+# --- notes and progress ----------------------------------------------------
+
+def test_a_note_can_be_set_at_submit_time_and_edited_later(scheduler):
+    job_id = scheduler.submit("python train.py", notes="baseline A, lr=1e-4")
+    assert dbm.get_job(scheduler.conn, job_id).notes == "baseline A, lr=1e-4"
+
+    scheduler.set_notes(job_id, "loss plateaued", append=True)
+    assert dbm.get_job(scheduler.conn, job_id).notes == "baseline A, lr=1e-4 | loss plateaued"
+
+    scheduler.set_notes(job_id, "replaced")
+    assert dbm.get_job(scheduler.conn, job_id).notes == "replaced"
+
+    scheduler.set_notes(job_id, None)
+    assert dbm.get_job(scheduler.conn, job_id).notes is None
+
+
+def test_a_note_outlives_the_job_it_describes(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("run.sh", vram="1G", node="small-node", notes="run #3")
+    scheduler.tick(force=True)
+    cluster["small-node"].finish_job(job_id, exit_code=0)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "completed"
+    assert job.notes == "run #3"
+    # A client can still record what it concluded from the result.
+    scheduler.set_notes(job_id, "accepted as the new baseline", append=True)
+    assert "accepted" in dbm.get_job(scheduler.conn, job_id).notes
+
+
+def test_annotating_a_missing_job_is_an_error(scheduler):
+    with pytest.raises(ValueError):
+        scheduler.set_notes(999, "nope")
+
+
+def test_a_job_reports_its_own_progress(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train.sh", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).progress is None
+
+    cluster["small-node"].report_progress(job_id, "epoch 3/10 loss 0.42")
+    scheduler.tick(force=True)
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.progress == "epoch 3/10 loss 0.42"
+    assert job.progress_at is not None
+
+    cluster["small-node"].report_progress(job_id, "epoch 7/10 loss 0.21")
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).progress == "epoch 7/10 loss 0.21"
+
+
+def test_the_last_progress_survives_into_the_finished_record(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train.sh", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].report_progress(job_id, "epoch 10/10 done")
+    cluster["small-node"].finish_job(job_id, exit_code=0)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "completed"
+    assert job.progress == "epoch 10/10 done"
+
+
+def test_progress_explains_how_far_a_lost_job_got(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train.sh", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].report_progress(job_id, "epoch 4/10")
+    cluster["small-node"].vanish_job(job_id)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "lost"
+    assert job.progress == "epoch 4/10"
+
+
+def test_a_retry_starts_with_a_clean_progress_line(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit(
+        "train.sh", vram="1G", node="small-node", max_retries=1, notes="keep me"
+    )
+    scheduler.tick(force=True)
+    cluster["small-node"].report_progress(job_id, "epoch 4/10")
+    cluster["small-node"].vanish_job(job_id)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "running"
+    assert job.progress is None  # stale status must not look current
+    assert job.notes == "keep me"  # the annotation is not the job's to reset
+
+
+def test_requeue_keeps_the_note_and_drops_the_progress(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train.sh", vram="1G", node="small-node", notes="run #3")
+    scheduler.tick(force=True)
+    cluster["small-node"].report_progress(job_id, "epoch 9/10")
+    cluster["small-node"].finish_job(job_id, exit_code=1)
+    scheduler.tick(force=True)
+
+    scheduler.requeue(job_id)
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.notes == "run #3"
+    assert job.progress is None
+
+
+def test_a_status_line_containing_pipes_is_not_mangled():
+    probe = parse_probe_output(
+        "NVIDB_PROBE_V1\n"
+        "JOB|7|4321|4321||1\n"
+        "STAT|7|epoch 3/10 | loss 0.42 | lr 1e-4\n"
+    )
+    assert probe.jobs[7].progress == "epoch 3/10 | loss 0.42 | lr 1e-4"
+    assert probe.jobs[7].alive is True
+
+
+def test_notes_and_progress_are_in_the_machine_readable_view(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train.sh", vram="1G", node="small-node", notes="run #3")
+    scheduler.tick(force=True)
+    cluster["small-node"].report_progress(job_id, "epoch 3/10")
+    scheduler.tick(force=True)
+
+    job = next(job for job in scheduler.snapshot()["jobs"] if job["id"] == job_id)
+    assert job["notes"] == "run #3"
+    assert job["progress"] == "epoch 3/10"
+    assert job["progress_at"]
 
 
 # --- ordering and dependencies ---------------------------------------------
