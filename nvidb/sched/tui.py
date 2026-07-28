@@ -19,6 +19,7 @@ from blessed import Terminal
 
 from . import db as dbm
 from .model import (
+    GpuProcess,
     age_seconds,
     display_width,
     fit_display,
@@ -29,6 +30,10 @@ from .model import (
 from .scheduler import Scheduler
 
 FILTERS = ("active", "all", "running", "pending", "finished")
+# summary: only the processes the queue does not manage, which is what explains
+# a card being full; all: those plus this queue's own jobs; off: neither.
+PROC_VIEWS = ("summary", "all", "off")
+PROC_SUMMARY_LIMIT = 2
 FILTER_STATES = {
     "active": ("pending", "running"),
     "running": ("running",),
@@ -238,6 +243,7 @@ class QueueTUI:
         self.job_index = 0
         self.node_index = 0
         self.filter = "active"
+        self.proc_view = "summary"
         self.show_detail = True
         self.show_log = False
         self.show_help = False
@@ -333,7 +339,10 @@ class QueueTUI:
         mode = "auto" if state["auto_tick"] else "manual"
         status = "working" if state["busy"] else "idle"
         title = " nvidb queue "
-        meta = f"tick {tick_text} · {mode} · {status} · filter {self.filter} "
+        meta = (
+            f"tick {tick_text} · {mode} · {status} · filter {self.filter} "
+            f"· procs {self.proc_view} "
+        )
         gap = max(1, width - len(title) - len(meta))
         return [
             self._compose(
@@ -434,8 +443,10 @@ class QueueTUI:
                     else "yellow" if gpu["free_mb"] >= 1024
                     else "red"
                 )
+                name_width = 26 if width >= 100 else 16
                 left = (
-                    f"    GPU{gpu['index']} {self._fit(gpu['name'] or '-', 26):<26} "
+                    f"    GPU{gpu['index']} "
+                    f"{self._fit(gpu['name'] or '-', name_width):<{name_width}} "
                     f"util {util_text}  [{self._bar(committed, bar_width)}] "
                 )
                 free = f"free {format_mb(gpu['free_mb']):>6}"
@@ -444,8 +455,16 @@ class QueueTUI:
                     if gpu.get("attribution") == "blind"
                     else f"{gpu['external_procs']}p"
                 )
+                # Whole-card occupancy first: what is actually on the GPU matters
+                # even when none of it came from this queue.
+                occupancy = (
+                    f"  mem {format_mb(gpu['mem_used_mb'])}/{format_mb(gpu['mem_total_mb'])}"
+                    if width >= 120
+                    else ""
+                )
                 rest = (
-                    f"  ext {format_mb(gpu['external_mem_mb']):>6} ({source})"
+                    f"{occupancy}"
+                    f"  other {format_mb(gpu['external_mem_mb']):>6} ({source})"
                     f"  res {format_mb(gpu['reserved_mb']):>6}  jobs {gpu['queue_jobs']}"
                 )
                 lines.append(
@@ -454,6 +473,62 @@ class QueueTUI:
                         width,
                     )
                 )
+                lines.extend(self._gpu_process_lines(gpu, width))
+        return lines
+
+    def _gpu_process_lines(self, gpu: Dict[str, Any], width: int) -> List[str]:
+        """Name what is on the card, so a full GPU explains itself.
+
+        Unmanaged processes are the interesting ones - they are why a job is
+        waiting - so the compact view lists only those.
+        """
+        if self.proc_view == "off":
+            return []
+        processes = gpu.get("processes") or []
+        if gpu.get("attribution") == "blind":
+            lines = [
+                self._style(
+                    self._fit(
+                        f"        · ~{format_mb(gpu['external_mem_mb'])} of "
+                        f"{format_mb(gpu['mem_used_mb'])} in use, this driver "
+                        "reports no per-process memory",
+                        width,
+                    ),
+                    "yellow",
+                )
+            ]
+            for process in processes:
+                entry = GpuProcess.from_dict(process)
+                lines.append(
+                    self._compose(
+                        [
+                            (f"        · pid {entry.pid}  ", "bright_black"),
+                            (f"{fit_display(entry.name or '-', 26):<26}  ", None),
+                            (entry.owner if entry.managed else "unmanaged",
+                             "cyan" if entry.managed else "yellow"),
+                        ],
+                        width,
+                    )
+                )
+            return lines
+        if self.proc_view == "summary":
+            processes = [item for item in processes if not item.get("managed")]
+            processes = processes[:PROC_SUMMARY_LIMIT]
+        lines = []
+        for process in processes:
+            entry = GpuProcess.from_dict(process)
+            owner = entry.owner if entry.managed else "unmanaged"
+            lines.append(
+                self._compose(
+                    [
+                        (f"        · {format_mb(entry.mem_mb):>6}  ", "bright_black"),
+                        (f"{fit_display(entry.name or str(entry.pid), 26):<26}  ", None),
+                        (f"{fit_display(entry.username or '-', 10):<10}  ", "bright_black"),
+                        (owner, "cyan" if entry.managed else "yellow"),
+                    ],
+                    width,
+                )
+            )
         return lines
 
     def _job_lines(self, width: int, height: int) -> List[str]:
@@ -605,7 +680,7 @@ class QueueTUI:
             )
         keys = (
             "j/k move  Tab pane  Enter detail  L log  c cancel  r requeue  "
-            "A ack  t tick  a auto  f filter  d drain  ? help  q quit"
+            "A ack  t tick  a auto  f filter  p procs  d drain  ? help  q quit"
         )
         lines.append(self._style(self._fit(" " + keys, width), "bright_black"))
         return lines
@@ -622,6 +697,7 @@ class QueueTUI:
             ("t", "Force a scheduler tick now"),
             ("a", "Toggle automatic ticking"),
             ("f", "Cycle the job filter"),
+            ("p", "GPU processes: unmanaged only / all / none"),
             ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
             ("q", "Quit"),
@@ -653,7 +729,17 @@ class QueueTUI:
             lines.extend(self._help_lines(width))
             lines = lines[:usable]
         else:
-            lines.extend(self._node_lines(width))
+            # Process listings can make the node pane arbitrarily tall, and the
+            # job table is what this screen is for, so cap it at half the height.
+            node_lines = self._node_lines(width)
+            node_budget = max(6, usable // 2)
+            if len(node_lines) > node_budget:
+                hidden = len(node_lines) - node_budget + 1
+                node_lines = node_lines[: node_budget - 1]
+                node_lines.append(
+                    self._style(f"    … {hidden} more line(s), press p", "bright_black")
+                )
+            lines.extend(node_lines)
             footer = self._footer_lines(state, width)
             detail_height = 0
             if self.show_detail and self.jobs:
@@ -742,6 +828,10 @@ class QueueTUI:
         elif text == "f":
             self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
             self.job_index = 0
+        elif text == "p":
+            self.proc_view = PROC_VIEWS[
+                (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
+            ]
         elif text == "t":
             self.worker.post("tick")
         elif text == "a":

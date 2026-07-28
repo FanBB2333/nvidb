@@ -34,21 +34,40 @@ def wide_terminal():
 
 
 def _gpu(index=0, name="RTX 3090 Ti", total=24564, used=0, external=0, reserved=0,
-         free=None, jobs=0, attribution="processes", procs=0):
+         free=None, jobs=0, attribution="processes", procs=0, processes=None,
+         queue_mem=0):
     return {
         "index": index,
         "name": name,
         "mem_total_mb": total,
         "mem_used_mb": used,
+        "mem_used_percent": int(round(100 * used / total)) if total else None,
         "external_mem_mb": external,
         "external_procs": procs,
+        "queue_mem_mb": queue_mem,
         "attribution": attribution,
         "reserved_mb": reserved,
         "queue_jobs": jobs,
         "free_mb": total - external - reserved - 512 if free is None else free,
         "util_percent": 30,
+        "mem_util_percent": 12,
         "temperature_c": 50,
+        "processes": processes or [],
         "updated_at": None,
+    }
+
+
+def _proc(pid=999, mem=4096, name="python train.py", user="l1ght", job_id=None,
+          job_name=None):
+    return {
+        "pid": pid,
+        "mem_mb": mem,
+        "name": name,
+        "user": user,
+        "type": "C",
+        "job_id": job_id,
+        "job_name": job_name,
+        "managed": job_id is not None,
     }
 
 
@@ -163,7 +182,7 @@ def test_the_screen_shows_nodes_capacity_and_jobs():
     output = _render(_tui())
     assert "big-node" in output and "small-node" in output
     assert "RTX PRO 5000" in output
-    assert "free" in output and "ext" in output
+    assert "free" in output and "other" in output
     assert "python train.py" in output
     # The keybinding footer is always reachable.
     assert "q quit" in output

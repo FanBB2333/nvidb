@@ -345,6 +345,66 @@ class Job:
 
 
 @dataclass
+class GpuProcess:
+    """One process NVML reports on a card, whoever started it.
+
+    The queue schedules around work it did not start, so a machine's real
+    occupancy has to be visible: these rows carry the foreign processes too,
+    with `job_id` left None when the queue is not the one running them.
+    """
+
+    pid: int
+    mem_mb: int = 0
+    name: Optional[str] = None
+    username: Optional[str] = None
+    # NVML's process type: "C" compute, "G" graphics, "C+G" both.
+    kind: Optional[str] = None
+    job_id: Optional[int] = None
+    job_name: Optional[str] = None
+
+    @property
+    def managed(self) -> bool:
+        """True when this queue started the process, so it is already budgeted."""
+        return self.job_id is not None
+
+    @property
+    def owner(self) -> str:
+        if self.job_id is None:
+            return "external"
+        return f"job {self.job_id}" + (f" {self.job_name}" if self.job_name else "")
+
+    def describe(self) -> str:
+        """A one-line `name (user, 6.1G)` summary for compact views."""
+        label = self.name or f"pid {self.pid}"
+        details = [detail for detail in (self.username, format_mb(self.mem_mb)) if detail]
+        return f"{label} ({', '.join(details)})" if details else label
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GpuProcess":
+        return cls(
+            pid=int(data.get("pid") or 0),
+            mem_mb=int(data.get("mem_mb") or 0),
+            name=data.get("name"),
+            username=data.get("user") or data.get("username"),
+            kind=data.get("type") or data.get("kind"),
+            job_id=data.get("job_id"),
+            job_name=data.get("job_name"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "mem_mb": self.mem_mb,
+            "name": self.name,
+            "user": self.username,
+            "type": self.kind,
+            "job_id": self.job_id,
+            "job_name": self.job_name,
+            "managed": self.managed,
+        }
+
+
+@dataclass
 class GpuState:
     """One GPU as of the last successful node probe."""
 
@@ -354,15 +414,19 @@ class GpuState:
     mem_total_mb: int = 0
     mem_used_mb: int = 0
     util_percent: Optional[int] = None
+    mem_util_percent: Optional[int] = None
     temperature_c: Optional[int] = None
     external_mem_mb: int = 0
     external_procs: int = 0
+    queue_mem_mb: int = 0
     reserved_mb: int = 0
     queue_jobs: int = 0
     # "processes" when NVML named the processes on this card, "blind" when it
     # reported memory in use but no process list (WSL passes the GPU through
     # the Windows driver, so nothing on the Linux side is visible).
     attribution: str = "processes"
+    # Every process on the card, queue-owned and foreign alike, biggest first.
+    processes: List[GpuProcess] = field(default_factory=list)
     updated_at: Optional[str] = None
 
     @classmethod
@@ -375,14 +439,30 @@ class GpuState:
             mem_total_mb=int(data.get("mem_total_mb") or 0),
             mem_used_mb=int(data.get("mem_used_mb") or 0),
             util_percent=data.get("util_percent"),
+            mem_util_percent=data.get("mem_util_percent"),
             temperature_c=data.get("temperature_c"),
             external_mem_mb=int(data.get("external_mem_mb") or 0),
             external_procs=int(data.get("external_procs") or 0),
+            queue_mem_mb=int(data.get("queue_mem_mb") or 0),
             reserved_mb=int(data.get("reserved_mb") or 0),
             queue_jobs=int(data.get("queue_jobs") or 0),
             attribution=data.get("attribution") or "processes",
+            processes=[
+                GpuProcess.from_dict(item)
+                for item in _json_loads(data.get("processes_json"), []) or []
+            ],
             updated_at=data.get("updated_at"),
         )
+
+    @property
+    def external_processes(self) -> List["GpuProcess"]:
+        """The processes the queue does not manage - the ones it schedules around."""
+        return [process for process in self.processes if not process.managed]
+
+    def mem_used_percent(self) -> Optional[int]:
+        if not self.mem_total_mb:
+            return None
+        return int(round(100.0 * self.mem_used_mb / self.mem_total_mb))
 
     def free_mb(self, headroom_mb: int = 0) -> int:
         """Schedulable VRAM: total minus foreign usage, our reservations, headroom.
@@ -403,14 +483,20 @@ class GpuState:
             "name": self.name,
             "mem_total_mb": self.mem_total_mb,
             "mem_used_mb": self.mem_used_mb,
+            "mem_used_percent": self.mem_used_percent(),
+            # What is on the card that this queue did not put there, and what it
+            # did: a reader can tell real occupancy from queue bookkeeping.
             "external_mem_mb": self.external_mem_mb,
             "external_procs": self.external_procs,
+            "queue_mem_mb": self.queue_mem_mb,
             "attribution": self.attribution,
             "reserved_mb": self.reserved_mb,
             "queue_jobs": self.queue_jobs,
             "free_mb": self.free_mb(headroom_mb),
             "util_percent": self.util_percent,
+            "mem_util_percent": self.mem_util_percent,
             "temperature_c": self.temperature_c,
+            "processes": [process.to_dict() for process in self.processes],
             "updated_at": self.updated_at,
         }
 

@@ -367,12 +367,43 @@ and jobs go elsewhere until it frees up. A job is charged the larger of what it
 reserved and what it actually uses, so understating `--vram` cannot oversubscribe
 a card.
 
-On nodes where the driver exposes no process list — WSL, where the GPU is driven
-from Windows — the split between foreign work and the queue's own jobs cannot be
-measured. Those GPUs are marked `blind` and their own jobs are credited up to
-their reservation, which keeps the queue from charging a job twice.
+On nodes where the driver accounts for none of the memory in use — WSL, where
+the GPU is driven from Windows, and which either names no processes at all or
+names them without memory figures — the split between foreign work and the
+queue's own jobs cannot be measured. Those GPUs are marked `blind` and their own
+jobs are credited up to their reservation, which keeps the queue from charging a
+job twice.
 
-### 3.2 Submitting and watching jobs
+### 3.2 What is on the GPUs
+
+The queue's own bookkeeping is only half the picture: these are workstations,
+and most of what runs on them was started by hand. `nvidb queue nodes` reports
+the whole card.
+
+```bash
+nvidb queue nodes               # capacity, plus the unmanaged work behind it
+nvidb queue nodes --procs       # every process on every GPU, with its owner
+nvidb queue nodes --json        # the same as structured data
+```
+
+```
+  Gem12-wsl-tailscale  [up]  100.109.8.69  seen 00:00:00 ago
+    GPU   MODEL                       UTIL  MEM              UNMANAGED      QUEUE  RESERVED  JOBS  FREE
+    GPU0  NVIDIA GeForce RTX 3090 Ti  10%   23.2G/24.0G 97%  15.2G (blind)  0M     8.0G      1     316M
+      unmanaged  ~15.2G of 23.2G in use; this driver reports no per-process memory
+        pid 1608997  /python3.11  l1ght  job 32 openbook-grid
+```
+
+`UTIL` and `MEM` describe the card itself, whoever is using it. `UNMANAGED` is
+what the queue did not start — `(2p)` counts the processes behind it, `(blind)`
+means the figure is inferred rather than measured. `QUEUE` is what the queue's
+own jobs hold right now, against the `RESERVED` they were promised.
+
+In JSON each GPU carries `mem_used_mb`, `mem_total_mb`, `mem_used_percent`,
+`util_percent`, `external_mem_mb`, `queue_mem_mb`, `reserved_mb`, `free_mb`, and
+a `processes` list naming every process with `managed` and `job_id`.
+
+### 3.3 Submitting and watching jobs
 
 ```bash
 # Put the command last, after `--`, or pass it as one quoted string
@@ -392,7 +423,7 @@ nvidb job requeue 12            # run a finished job again
 nvidb job purge                 # forget finished job records
 
 nvidb queue status              # nodes, capacity and jobs in one view
-nvidb queue nodes               # capacity only
+nvidb queue status --procs      # the same, with every GPU process listed
 nvidb queue events --since 42   # replay what happened while you were away
 nvidb queue drain 406           # stop scheduling onto a node (`resume` undoes it)
 nvidb queue tick                # force one scheduler pass
@@ -411,7 +442,7 @@ Every job runs with `CUDA_VISIBLE_DEVICES` set to its allocation, plus
 `NVIDB_JOB_ID`, `NVIDB_JOB_NAME`, `NVIDB_NODE`, `NVIDB_JOB_DIR`, and
 `NVIDB_STATUS_FILE`.
 
-### 3.3 Notes and live progress
+### 3.4 Notes and live progress
 
 A job carries two independent pieces of free text, kept apart because they have
 different authors and neither should be able to overwrite the other:
@@ -448,7 +479,7 @@ Both fields appear in `job ls`, `queue status`, `job show`, the TUI and every
 which is often the quickest explanation of how far a lost or failed job got. A
 retry clears the stale status line but keeps your note.
 
-### 3.4 Failures, alerts and the optional daemon
+### 3.5 Failures, alerts and the optional daemon
 
 When something goes wrong on a node, the queue records an **alert** locally,
 classified by what actually happened:
@@ -498,7 +529,7 @@ configured under `queue.notify`: a desktop notification, a JSON-lines file at
 `$NVIDB_HOME/alerts.log`, and a `command` hook that receives the alert as JSON
 on stdin — which is how you route failures to anything else.
 
-### 3.5 Driving the queue from other programs
+### 3.6 Driving the queue from other programs
 
 Every command accepts `--json` and prints one JSON document on stdout, which is
 the intended way for tools — Claude Code sessions in particular — to use the
@@ -535,7 +566,7 @@ ln -s "$PWD/skills/nvidb-queue" ~/.claude/skills/nvidb-queue
 ln -s "$PWD/skills/nvidb-queue" ~/.codex/skills/nvidb-queue
 ```
 
-### 3.6 The queue TUI
+### 3.7 The queue TUI
 
 ```bash
 nvidb queue                 # or: nvidb queue tui
@@ -557,12 +588,13 @@ slows the numbers down but never freezes the interface.
 | `t`                | Force a scheduler tick now                    |
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
+| `p`                | GPU processes: unmanaged only / all / none    |
 | `d`                | Drain or resume the selected node             |
 | `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
 
-### 3.7 What runs on the nodes
+### 3.8 What runs on the nodes
 
 Nothing is installed. A generated `run.sh` is delivered over SSH and started
 with `setsid`, so the job outlives the client that launched it. Each job keeps a

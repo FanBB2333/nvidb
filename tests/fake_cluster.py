@@ -22,7 +22,10 @@ class FakeGpu:
         self.total_mb = total_mb
         # pid -> MiB, covering both foreign work and this queue's jobs
         self.processes: Dict[int, int] = {}
+        # pid -> (process name, username), as NVML would report them
+        self.identities: Dict[int, tuple] = {}
         self.util = 0
+        self.mem_util = 0
 
     def used_mb(self) -> int:
         return sum(self.processes.values())
@@ -37,8 +40,10 @@ class FakeNode:
         self.online = True
         self.nvml_ok = True
         # WSL passes the GPU through the Windows driver: NVML reports memory in
-        # use but names no processes at all.
+        # use but cannot attribute it. That shows up two ways on real machines -
+        # no process list at all, or a list whose memory figures are all zero.
         self.hide_processes = False
+        self.hide_process_memory = False
         self.launch_error: Optional[str] = None
         self.jobs: Dict[int, dict] = {}
         self.results: Dict[str, object] = {}
@@ -48,10 +53,18 @@ class FakeNode:
 
     # --- test-facing helpers ---------------------------------------------
 
-    def add_foreign_process(self, gpu_index: int, mb: int, pid: Optional[int] = None) -> int:
+    def add_foreign_process(
+        self,
+        gpu_index: int,
+        mb: int,
+        pid: Optional[int] = None,
+        name: str = "python",
+        username: str = "someone",
+    ) -> int:
         """Simulate work this queue did not start (a hand-launched training run)."""
         pid = pid if pid is not None else self._allocate_pid()
         self.gpus[gpu_index].processes[pid] = mb
+        self.gpus[gpu_index].identities[pid] = (name, username)
         return pid
 
     def clear_gpu(self, gpu_index: int) -> None:
@@ -61,6 +74,7 @@ class FakeNode:
         """Let a running job actually take VRAM on a card."""
         record = self.jobs[job_id]
         self.gpus[gpu_index].processes[record["gpu_pid"]] = mb
+        self.gpus[gpu_index].identities[record["gpu_pid"]] = ("python", "tester")
 
     def report_progress(self, job_id: int, text: str) -> None:
         """Simulate the job writing its own status line to $NVIDB_STATUS_FILE."""
@@ -103,11 +117,20 @@ class FakeNode:
                     "memory_total_bytes": gpu.total_mb * MB,
                     "memory_used_bytes": gpu.used_mb() * MB,
                     "gpu_util_percent": gpu.util,
+                    "memory_util_percent": gpu.mem_util,
                     "temperature_c": 45,
                     "processes": []
                     if self.hide_processes
                     else [
-                        {"pid": pid, "used_gpu_memory_bytes": mb * MB}
+                        {
+                            "pid": pid,
+                            "used_gpu_memory_bytes": None
+                            if self.hide_process_memory
+                            else mb * MB,
+                            "process_name": gpu.identities.get(pid, ("python", "someone"))[0],
+                            "username": gpu.identities.get(pid, ("python", "someone"))[1],
+                            "type": "C",
+                        }
                         for pid, mb in sorted(gpu.processes.items())
                     ],
                 }

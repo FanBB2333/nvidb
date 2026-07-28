@@ -48,12 +48,15 @@ CREATE TABLE IF NOT EXISTS gpus (
     mem_total_mb    INTEGER DEFAULT 0,
     mem_used_mb     INTEGER DEFAULT 0,
     util_percent    INTEGER,
+    mem_util_percent INTEGER,
     temperature_c   INTEGER,
     external_mem_mb INTEGER DEFAULT 0,
     external_procs  INTEGER DEFAULT 0,
+    queue_mem_mb    INTEGER DEFAULT 0,
     reserved_mb     INTEGER DEFAULT 0,
     queue_jobs      INTEGER DEFAULT 0,
     attribution     TEXT DEFAULT 'processes',
+    processes_json  TEXT,
     updated_at      TEXT,
     PRIMARY KEY (node, gpu_index)
 );
@@ -170,7 +173,12 @@ def open_db(path=None) -> sqlite3.Connection:
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` will
 # not add them to a database that already exists, so they are applied here.
 _ADDED_COLUMNS = {
-    "gpus": {"attribution": "TEXT DEFAULT 'processes'"},
+    "gpus": {
+        "attribution": "TEXT DEFAULT 'processes'",
+        "mem_util_percent": "INTEGER",
+        "queue_mem_mb": "INTEGER DEFAULT 0",
+        "processes_json": "TEXT",
+    },
     "jobs": {
         "notes": "TEXT",
         "progress": "TEXT",
@@ -503,9 +511,10 @@ def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict])
         conn.execute("DELETE FROM gpus WHERE node = ?", (node,))
         conn.executemany(
             "INSERT INTO gpus(node, gpu_index, name, mem_total_mb, mem_used_mb, "
-            "util_percent, temperature_c, external_mem_mb, external_procs, "
-            "reserved_mb, queue_jobs, attribution, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "util_percent, mem_util_percent, temperature_c, external_mem_mb, "
+            "external_procs, queue_mem_mb, reserved_mb, queue_jobs, attribution, "
+            "processes_json, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     node,
@@ -514,12 +523,15 @@ def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict])
                     int(gpu.get("mem_total_mb") or 0),
                     int(gpu.get("mem_used_mb") or 0),
                     gpu.get("util_percent"),
+                    gpu.get("mem_util_percent"),
                     gpu.get("temperature_c"),
                     int(gpu.get("external_mem_mb") or 0),
                     int(gpu.get("external_procs") or 0),
+                    int(gpu.get("queue_mem_mb") or 0),
                     int(gpu.get("reserved_mb") or 0),
                     int(gpu.get("queue_jobs") or 0),
                     gpu.get("attribution") or "processes",
+                    json.dumps(gpu.get("processes") or [], ensure_ascii=False),
                     now,
                 )
                 for gpu in gpus

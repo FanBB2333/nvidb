@@ -22,6 +22,7 @@ from . import db as dbm
 from .model import (
     JOB_STATES,
     TERMINAL_JOB_STATES,
+    GpuProcess,
     Job,
     age_seconds,
     display_width,
@@ -137,7 +138,65 @@ def _resolve_ids(scheduler: Scheduler, raw_ids: Sequence[str]) -> List[int]:
 
 # --- rendering -------------------------------------------------------------
 
-def _render_nodes(snapshot: Dict[str, Any]) -> str:
+SUMMARY_PROCESSES = 3
+
+
+def _gpu_process_lines(gpu: Dict[str, Any], *, detail: bool) -> List[str]:
+    """Name the work sitting on a card, whether or not the queue started it.
+
+    Capacity numbers alone cannot answer "why is this GPU full"; the answer is
+    usually a process nobody submitted through the queue.
+    """
+    processes = gpu.get("processes") or []
+    external = [process for process in processes if not process.get("managed")]
+
+    if gpu.get("attribution") == "blind":
+        # The driver accounts for none of the memory in use (WSL), so say that
+        # rather than implying the card is idle or that the split is measured.
+        lines = [
+            f"      unmanaged  ~{format_mb(gpu['external_mem_mb'])} of "
+            f"{format_mb(gpu['mem_used_mb'])} in use; this driver reports no "
+            "per-process memory"
+        ]
+        shown = processes if detail else processes[:SUMMARY_PROCESSES]
+        for process in shown:
+            entry = GpuProcess.from_dict(process)
+            lines.append(
+                f"        pid {entry.pid}  {_short(entry.name, 40)}  "
+                f"{entry.username or '-'}  {entry.owner}"
+            )
+        return lines
+    if not processes:
+        return []
+
+    if not detail:
+        if not external:
+            return []
+        shown = external[:SUMMARY_PROCESSES]
+        text = ", ".join(GpuProcess.from_dict(process).describe() for process in shown)
+        if len(external) > len(shown):
+            text += f", +{len(external) - len(shown)} more"
+        return [
+            f"      unmanaged  {format_mb(gpu['external_mem_mb'])} "
+            f"in {len(external)} process(es): {text}"
+        ]
+
+    rows = [
+        [
+            str(process.get("pid") or "-"),
+            _short(process.get("user"), 12),
+            format_mb(process.get("mem_mb")),
+            process.get("type") or "-",
+            GpuProcess.from_dict(process).owner,
+            _short(process.get("name"), 40),
+        ]
+        for process in processes
+    ]
+    table = _table(rows, ["PID", "USER", "MEM", "T", "OWNER", "PROCESS"], indent="        ")
+    return [f"      GPU{gpu['index']} processes"] + table.splitlines()
+
+
+def _render_nodes(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
     lines = ["NODES"]
     for node in snapshot["nodes"]:
         flags = [node["state"]]
@@ -158,13 +217,17 @@ def _render_nodes(snapshot: Dict[str, Any]) -> str:
                 if gpu.get("attribution") == "blind"
                 else f"{gpu['external_procs']}p"
             )
+            used = f"{format_mb(gpu['mem_used_mb'])}/{format_mb(gpu['mem_total_mb'])}"
+            if gpu.get("mem_used_percent") is not None:
+                used += f" {gpu['mem_used_percent']}%"
             rows.append(
                 [
                     f"GPU{gpu['index']}",
-                    _short(gpu["name"], 30),
+                    _short(gpu["name"], 26),
                     f"{gpu['util_percent'] if gpu['util_percent'] is not None else '-'}%",
-                    f"{format_mb(gpu['mem_used_mb'])}/{format_mb(gpu['mem_total_mb'])}",
+                    used,
                     f"{format_mb(gpu['external_mem_mb'])} ({source})",
+                    format_mb(gpu.get("queue_mem_mb") or 0),
                     format_mb(gpu["reserved_mb"]),
                     f"{gpu['queue_jobs']}",
                     format_mb(gpu["free_mb"]),
@@ -173,10 +236,24 @@ def _render_nodes(snapshot: Dict[str, Any]) -> str:
         lines.append(
             _table(
                 rows,
-                ["GPU", "MODEL", "UTIL", "MEM", "EXTERNAL", "RESERVED", "JOBS", "FREE"],
+                # UNMANAGED is everything on the card the queue did not start;
+                # QUEUE is what its own jobs actually hold right now.
+                [
+                    "GPU",
+                    "MODEL",
+                    "UTIL",
+                    "MEM",
+                    "UNMANAGED",
+                    "QUEUE",
+                    "RESERVED",
+                    "JOBS",
+                    "FREE",
+                ],
                 indent="    ",
             )
         )
+        for gpu in node["gpus"]:
+            lines.extend(_gpu_process_lines(gpu, detail=procs))
     return "\n".join(lines)
 
 
@@ -225,7 +302,7 @@ def _job_table(jobs: Sequence[Dict[str, Any]], indent: str = "  ") -> str:
     return _table([_job_row(job, extra=extra) for job in jobs], headers, indent=indent)
 
 
-def _render_status(snapshot: Dict[str, Any]) -> str:
+def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
     counts = snapshot["counts"]
     summary = " · ".join(
         f"{state} {counts[state]}" for state in STATE_ORDER if counts.get(state)
@@ -243,7 +320,12 @@ def _render_status(snapshot: Dict[str, Any]) -> str:
         parts.append("")
         parts.append(f"ALERTS  {snapshot['open_alerts']} open (nvidb queue alerts)")
         parts.append(_render_alerts(snapshot.get("alerts") or []))
-    parts += ["", _render_nodes(snapshot), "", f"JOBS  {summary}"]
+    parts += [
+        "",
+        _render_nodes(snapshot, procs=procs),
+        "",
+        f"JOBS  {summary}",
+    ]
     parts.append(_job_table(snapshot["jobs"]))
     if snapshot["recent"]:
         parts.append("")
@@ -301,7 +383,7 @@ def cmd_status(args) -> int:
         if args.json:
             _print_json(snapshot)
         else:
-            print(_render_status(snapshot))
+            print(_render_status(snapshot, procs=bool(getattr(args, "procs", False))))
         return 0
     finally:
         scheduler.close()
@@ -477,7 +559,7 @@ def cmd_nodes(args) -> int:
         if args.json:
             _print_json({"nodes": nodes})
         else:
-            print(_render_nodes({"nodes": nodes}))
+            print(_render_nodes({"nodes": nodes}, procs=bool(args.procs)))
         return 0
     finally:
         scheduler.close()
@@ -840,6 +922,14 @@ def _add_refresh_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_procs_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--procs",
+        action="store_true",
+        help="List every process on each GPU, queue-managed or not",
+    )
+
+
 def register_parsers(subparsers) -> None:
     """Attach the `queue` and `job` command trees to the main nvidb parser."""
     queue = subparsers.add_parser(
@@ -857,6 +947,7 @@ def register_parsers(subparsers) -> None:
     status = queue_sub.add_parser("status", help="Show nodes, capacity and jobs")
     _add_common(status)
     _add_refresh_flags(status)
+    _add_procs_flag(status)
     status.set_defaults(func=cmd_status)
 
     tick = queue_sub.add_parser("tick", help="Run one scheduler pass")
@@ -908,8 +999,12 @@ def register_parsers(subparsers) -> None:
     events.add_argument("-n", "--number", type=int, default=50, help="Maximum events")
     events.set_defaults(func=cmd_events)
 
-    nodes = queue_sub.add_parser("nodes", help="Show node capacity")
+    nodes = queue_sub.add_parser(
+        "nodes",
+        help="Show node capacity, including GPU work the queue does not manage",
+    )
     _add_common(nodes)
+    _add_procs_flag(nodes)
     _add_refresh_flags(nodes)
     nodes.set_defaults(func=cmd_nodes)
 

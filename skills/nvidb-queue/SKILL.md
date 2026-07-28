@@ -155,13 +155,34 @@ free = total − memory used by processes the queue did not start − reservatio
 ```
 
 Work the user started by hand counts fully against capacity, so the queue shares
-machines rather than fighting them. `nvidb queue nodes --json` shows the split.
-A job stuck in `pending` is almost always waiting for VRAM — check `free_mb` per
-GPU before assuming anything is broken.
+machines rather than fighting them. A job stuck in `pending` is almost always
+waiting for VRAM — check `free_mb` per GPU before assuming anything is broken.
 
-Some nodes report `"attribution": "blind"`: their driver exposes no process
-list (WSL), so the foreign/queue split there is inferred, not measured. Treat
-those numbers as conservative.
+## What is actually on the GPUs
+
+These are the user's own workstations and they run plenty of work nobody
+submitted through the queue. `nvidb queue nodes` reports the whole card, not
+just the queue's share:
+
+```bash
+nvidb queue nodes --json      # per-GPU memory, utilisation and every process
+nvidb queue nodes --procs     # same, as a table with a PID/USER/MEM/OWNER row each
+```
+
+Per GPU: `mem_used_mb` / `mem_total_mb` / `mem_used_percent` and `util_percent`
+describe the card itself; `external_mem_mb` (+ `external_procs`) is what the
+queue does not manage, `queue_mem_mb` is what its own jobs hold right now, and
+`reserved_mb` is what it has promised them. `processes[]` names them all, each
+with `managed` and, when the queue started it, `job_id`.
+
+**Read `util_percent` and `external_mem_mb` before telling the user a machine is
+free.** A GPU at 99% utilisation with no queue jobs on it is busy with the
+user's own work; scheduling onto it is legal but slow, and worth mentioning.
+
+Some GPUs report `"attribution": "blind"`: their driver (WSL) accounts for none
+of the memory in use, either naming no processes or naming them without memory
+figures. The foreign/queue split there is inferred from reservations, not
+measured, so treat it as approximate.
 
 ## Managing
 

@@ -26,6 +26,7 @@ from .. import config as nvidb_config
 from . import db as dbm
 from .executor import JobExecutor, NodeProbe
 from .model import (
+    GpuProcess,
     Job,
     Node,
     format_mb,
@@ -40,6 +41,10 @@ TICK_LOCK = "scheduler"
 # last frames without turning the queue database into a log store.
 FAILURE_LOG_LINES = 25
 FAILURE_DETAIL_CHARS = 4000
+
+# GPU processes kept per card, largest first. Enough to explain who is using a
+# busy GPU without storing every graphics context a desktop session opens.
+MAX_RECORDED_GPU_PROCESSES = 16
 
 DEFAULT_SETTINGS = {
     # VRAM left untouched on every GPU so a scheduled job never starves the
@@ -748,6 +753,7 @@ class Scheduler:
         """
         pgid_to_job = {job.remote_pgid: job.id for job in running if job.remote_pgid}
         pid_to_job = {job.remote_pid: job.id for job in running if job.remote_pid}
+        job_names = {job.id: job.name for job in running}
 
         measured: Dict[Tuple[int, int], int] = {}  # (job_id, gpu_index) -> MiB
         states: List[dict] = []
@@ -760,15 +766,35 @@ class Scheduler:
             processes = entry.get("processes") or []
             ours_mb = 0
             external_procs = 0
+            # How much of the card's usage NVML managed to attribute to anyone.
+            # WSL lists the processes but reports no memory for them, which is a
+            # different failure from listing nothing at all.
+            reported_mb = 0
+            # Foreign work is what the queue schedules around, so it is recorded
+            # rather than merely counted: a card that looks full should be able
+            # to say who filled it, queue job or not.
+            process_rows: List[dict] = []
             for process in processes:
                 pid = process.get("pid")
                 process_mb = _bytes_to_mb(process.get("used_gpu_memory_bytes"))
+                reported_mb += process_mb
                 # A job's GPU process is usually a child of its run.sh, so match
                 # on the process group first and fall back to the pid itself.
                 job_id = pid_to_job.get(pid)
                 if job_id is None:
                     pgid = probe.process_groups.get(pid)
                     job_id = pgid_to_job.get(pgid) if pgid is not None else None
+                process_rows.append(
+                    GpuProcess(
+                        pid=int(pid or 0),
+                        mem_mb=process_mb,
+                        name=process.get("process_name"),
+                        username=process.get("username"),
+                        kind=process.get("type"),
+                        job_id=job_id,
+                        job_name=job_names.get(job_id) if job_id else None,
+                    ).to_dict()
+                )
                 if job_id is None:
                     external_procs += 1
                     continue
@@ -776,19 +802,26 @@ class Scheduler:
                 key = (job_id, index)
                 measured[key] = measured.get(key, 0) + process_mb
 
+            # Biggest consumer first, and bounded: a busy display server can list
+            # dozens of tiny graphics contexts nobody needs stored.
+            process_rows.sort(key=lambda row: row["mem_mb"], reverse=True)
+            del process_rows[MAX_RECORDED_GPU_PROCESSES:]
+
             on_gpu = [job for job in running if index in job.gpu_ids]
             reserved_mb = sum(
                 max(job.vram_mb, measured.get((job.id, index), 0)) for job in on_gpu
             )
 
-            if processes or not on_gpu:
+            if reported_mb > 0 or not on_gpu:
                 attribution = "processes"
                 external_mb = max(0, used_mb - ours_mb)
             else:
-                # NVML named no processes at all yet memory is in use and this
-                # queue has jobs here - the WSL case, where the card is driven
-                # from Windows. Credit our jobs up to their reservation rather
-                # than charging them once as "external" and again as "reserved".
+                # Memory is in use, this queue has jobs here, and NVML attributed
+                # none of it - the WSL case, where the card is driven from
+                # Windows. It shows up two ways: no process list at all, or a
+                # process list whose memory figures are all zero. Either way,
+                # credit our jobs up to their reservation rather than charging
+                # them once as "external" and again as "reserved".
                 attribution = "blind"
                 external_mb = max(0, used_mb - reserved_mb)
 
@@ -799,12 +832,15 @@ class Scheduler:
                     "mem_total_mb": total_mb,
                     "mem_used_mb": used_mb,
                     "util_percent": entry.get("gpu_util_percent"),
+                    "mem_util_percent": entry.get("memory_util_percent"),
                     "temperature_c": entry.get("temperature_c"),
                     "external_mem_mb": external_mb,
                     "external_procs": external_procs,
+                    "queue_mem_mb": ours_mb,
                     "attribution": attribution,
                     "reserved_mb": reserved_mb,
                     "queue_jobs": len(on_gpu),
+                    "processes": process_rows,
                 }
             )
 
