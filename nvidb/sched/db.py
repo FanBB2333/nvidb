@@ -152,6 +152,47 @@ def default_db_path() -> Path:
     return Path(config.WORKING_DIR).expanduser() / "queue.db"
 
 
+def connection_path(conn: sqlite3.Connection) -> str:
+    """The file a connection is actually attached to.
+
+    Reads that say which database they came from have to ask the connection:
+    a caller may have opened one explicitly with `--db-path`, in which case the
+    default location is the wrong answer.
+    """
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if row["name"] == "main" and row["file"]:
+                return str(row["file"])
+    except sqlite3.Error:
+        pass
+    return str(default_db_path())
+
+
+def _retry_while_locked(action, *, attempts: int = 60, delay: float = 0.05):
+    """Run `action`, retrying while SQLite reports the database as locked.
+
+    The busy timeout covers ordinary statements, but not all of them: SQLite
+    refuses `PRAGMA journal_mode=WAL` immediately rather than consulting the
+    busy handler. Several clients opening a brand-new queue at the same moment
+    therefore all try to convert the journal and every loser fails outright -
+    which is exactly the moment this queue is designed for, since a burst of
+    independent agent sessions is how it gets used.
+    """
+    import random
+    import time
+
+    for attempt in range(attempts):
+        try:
+            return action()
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error) and "busy" not in str(error):
+                raise
+            if attempt == attempts - 1:
+                raise
+            # Jittered, so a herd of clients does not retry in lockstep.
+            time.sleep(delay * (1 + random.random()))
+
+
 def open_db(path=None) -> sqlite3.Connection:
     """Open (and if needed create) the queue database."""
     db_path = Path(path or default_db_path()).expanduser()
@@ -162,11 +203,13 @@ def open_db(path=None) -> sqlite3.Connection:
         isolation_level=None,  # explicit transactions only
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # Set the busy timeout before anything that can contend, so every statement
+    # after this point waits its turn instead of failing.
     conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+    _retry_while_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    init_schema(conn)
+    _retry_while_locked(lambda: init_schema(conn))
     return conn
 
 
@@ -197,8 +240,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
             row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
         }
         for name, definition in columns.items():
-            if name not in existing:
+            if name in existing:
+                continue
+            try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            except sqlite3.OperationalError as error:
+                # Another client added the column between the read above and
+                # this write. Its work is ours; anything else is a real fault.
+                if "duplicate column" not in str(error).lower():
+                    raise
     with transaction(conn):
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -339,13 +389,27 @@ def list_events(
         clauses.append("job_id = ?")
         params.append(int(job_id))
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    # Newest rows are the interesting ones, but callers want them oldest-first.
-    rows = conn.execute(
-        f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?",
-        (*params, int(limit)),
-    ).fetchall()
+    # Paging forward from a cursor must return the *oldest* unseen rows: a
+    # client that catches up with `--since <last id>` would otherwise jump to
+    # the newest few and silently skip everything in between. Without a cursor
+    # the newest rows are the interesting ones, but callers want them
+    # oldest-first either way.
+    if since_id is not None:
+        rows = conn.execute(
+            f"SELECT * FROM events {where} ORDER BY id ASC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+    else:
+        rows = list(
+            reversed(
+                conn.execute(
+                    f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?",
+                    (*params, int(limit)),
+                ).fetchall()
+            )
+        )
     out = []
-    for row in reversed(rows):
+    for row in rows:
         item = dict(row)
         if item.get("data"):
             try:
@@ -496,11 +560,17 @@ def set_node_state(
 
 
 def set_node_enabled(conn: sqlite3.Connection, name: str, enabled: bool) -> None:
+    """Drain or resume a node.
+
+    Only `enabled` moves: `state` means reachability, and a drained node is
+    still probed so its running jobs can be seen to finish. Writing 'drain' into
+    `state` here would also fake a state change, making the next probe look like
+    the node had just come back online.
+    """
     with transaction(conn):
         conn.execute(
-            "UPDATE nodes SET enabled = ?, state = CASE WHEN ? THEN state ELSE 'drain' END "
-            "WHERE name = ?",
-            (1 if enabled else 0, 1 if enabled else 0, name),
+            "UPDATE nodes SET enabled = ? WHERE name = ?",
+            (1 if enabled else 0, name),
         )
 
 

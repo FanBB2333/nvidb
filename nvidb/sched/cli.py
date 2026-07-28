@@ -453,14 +453,16 @@ def cmd_alerts(args) -> int:
         alerts = dbm.list_alerts(
             scheduler.conn, open_only=not args.all, limit=args.number
         )
+        open_count = dbm.open_alert_count(scheduler.conn)
         if args.json:
-            _print_json(
-                {"alerts": alerts, "open": dbm.open_alert_count(scheduler.conn)}
-            )
+            _print_json({"alerts": alerts, "open": open_count})
         else:
             print(_render_alerts(alerts, detail=args.detail))
         # A non-zero status lets a shell or agent branch on "anything wrong?".
-        return 1 if any(a["acknowledged_at"] is None for a in alerts) else 0
+        # It counts every open alert, not just the ones this listing happened to
+        # show: `--all -n 5` must not report a clean queue because the five
+        # newest alerts were acknowledged.
+        return 1 if open_count else 0
     finally:
         scheduler.close()
 
@@ -604,6 +606,15 @@ def cmd_submit(args) -> int:
                 return _error(f"--env expects KEY=VALUE, got {item!r}", as_json=args.json)
             key, value = item.split("=", 1)
             env[key.strip()] = value
+
+        # A zero or negative limit would be stored as "no limit at all", which is
+        # the opposite of what someone typing `--timeout 0` is asking for.
+        if args.timeout is not None and args.timeout <= 0:
+            return _error("--timeout must be a positive number of seconds", as_json=args.json)
+        if args.gpus < 0:
+            return _error("--gpus cannot be negative (use 0 for CPU-only work)", as_json=args.json)
+        if args.retries < 0:
+            return _error("--retries cannot be negative", as_json=args.json)
 
         try:
             job_id = scheduler.submit(

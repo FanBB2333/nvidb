@@ -151,6 +151,53 @@ def test_a_multi_line_command_runs_as_a_script(executor):
     assert "total=6" in executor.read_log(launched.run_dir)
 
 
+def test_relaunching_a_live_job_adopts_it_instead_of_running_it_twice(executor):
+    """The transport retries a command whose channel died mid-flight.
+
+    If that retry reached a node which had already started the job, the queue
+    would end up with two copies of the same training run and a record of only
+    one of them.
+    """
+    launched = executor.launch(
+        job_id=20,
+        job_name="long",
+        command='echo started; sleep 30',
+        node_name="test-local",
+    )
+    assert launched.adopted is False
+    time.sleep(0.4)
+
+    again = executor.launch(
+        job_id=20, job_name="long", command="echo started; sleep 30", node_name="test-local"
+    )
+    assert again.adopted is True
+    assert again.pid == launched.pid
+    assert again.run_dir == launched.run_dir
+
+    # One process, one "started" line: the second call started nothing.
+    log = executor.read_log(launched.run_dir)
+    assert log.count("started") == 1
+    assert executor.probe([(20, launched.run_dir)]).jobs[20].alive is True
+    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="KILL")
+
+
+def test_a_finished_job_can_still_be_launched_again(executor):
+    """Adoption must not block a re-queue: that job's process is gone."""
+    launched = executor.launch(
+        job_id=21, job_name="short", command="echo run-one", node_name="test-local"
+    )
+    _wait_for_exit(executor, 21, launched.run_dir)
+
+    again = executor.launch(
+        job_id=21, job_name="short", command="echo run-two", node_name="test-local"
+    )
+    assert again.adopted is False
+    assert again.pid != launched.pid
+    _wait_for_exit(executor, 21, again.run_dir)
+    log = executor.read_log(again.run_dir)
+    assert "run-two" in log and "run-one" not in log  # the log was reset
+
+
 def test_a_missing_workdir_fails_the_job_instead_of_hanging(executor):
     launched = executor.launch(
         job_id=7,

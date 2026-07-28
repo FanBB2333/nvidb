@@ -411,9 +411,10 @@ class Scheduler:
         try:
             summary["ran"] = True
             self.sync_nodes_from_config()
+            # Drained nodes are refreshed too. Draining stops *dispatch* onto a
+            # node, and a node is usually drained precisely so its running jobs
+            # can finish - which they can only be seen to do if it is probed.
             for node in dbm.get_nodes(self.conn, with_gpus=False):
-                if not node.enabled:
-                    continue
                 try:
                     up = self._refresh_node(node, summary)
                 except TransportError as error:
@@ -862,9 +863,12 @@ class Scheduler:
         if not pending:
             return
 
-        nodes = [node for node in dbm.get_nodes(self.conn) if node.is_schedulable]
-        if not nodes:
-            return
+        all_nodes = dbm.get_nodes(self.conn)
+        # Everything the queue knows a GPU about, drained or not. Used only to
+        # tell "waiting for room" apart from "will never fit anywhere"; a node
+        # that is down has no GPU rows, so it cannot make a job look doomed.
+        inventory = [node for node in all_nodes if node.gpus]
+        nodes = [node for node in all_nodes if node.is_schedulable]
 
         headroom = int(self.settings["headroom_mb"])
         max_jobs = int(self.settings["max_jobs_per_gpu"])
@@ -882,6 +886,26 @@ class Scheduler:
             ]
 
         for job in pending:
+            impossible = self._impossible_reason(job, inventory, headroom)
+            if impossible:
+                dbm.update_job(
+                    self.conn,
+                    job.id,
+                    state="failed",
+                    finished_at=utcnow(),
+                    last_error=impossible,
+                )
+                dbm.add_event(
+                    self.conn, "job_failed", job_id=job.id, message=impossible
+                )
+                self._raise_alert(
+                    "job_unschedulable",
+                    f"{job.name or 'job'} will never run: {impossible}",
+                    job_id=job.id,
+                    summary=summary,
+                )
+                continue
+
             ready, problem = self._dependencies_ready(job)
             if problem:
                 dbm.update_job(
@@ -946,6 +970,44 @@ class Scheduler:
             summary["dispatched"].append(
                 {"id": job.id, "node": node_name, "gpu_ids": gpu_ids}
             )
+
+    def _impossible_reason(
+        self, job: Job, inventory: List[Node], headroom_mb: int
+    ) -> Optional[str]:
+        """Why this job can never run, or None if it is merely waiting for room.
+
+        A job nothing can host would otherwise sit `pending` forever with no
+        explanation, and any client blocked in `job wait` would sit with it.
+        The judgement is made only against GPUs the queue has actually seen, so
+        a request that outgrows the machines which happen to be reachable right
+        now keeps waiting instead of being declared doomed.
+        """
+        if job.gpus <= 0:
+            return None  # CPU-only work needs no GPU to fit on
+        candidates = inventory
+        if job.node_constraint:
+            candidates = [node for node in inventory if node.name == job.node_constraint]
+        if not candidates:
+            return None
+
+        widest = max(len(node.gpus) for node in candidates)
+        if job.gpus > widest:
+            where = job.node_constraint or "the largest known node"
+            return f"needs {job.gpus} GPUs; {where} has {widest}"
+
+        biggest = max(gpu.mem_total_mb for node in candidates for gpu in node.gpus)
+        usable = max(0, biggest - headroom_mb)
+        if job.vram_mb > usable:
+            where = (
+                f"the largest GPU on {job.node_constraint}"
+                if job.node_constraint
+                else "the largest GPU the queue knows of"
+            )
+            return (
+                f"reserves {format_mb(job.vram_mb)}; {where} holds "
+                f"{format_mb(usable)} at most"
+            )
+        return None
 
     def _dependencies_ready(self, job: Job) -> Tuple[bool, Optional[str]]:
         """Return (ready, fatal_problem). A failed dependency fails the job."""
@@ -1065,7 +1127,7 @@ class Scheduler:
         holder = dbm.lock_holder(self.conn, TICK_LOCK)
         return {
             "generated_at": utcnow(),
-            "db_path": str(dbm.default_db_path()),
+            "db_path": dbm.connection_path(self.conn),
             "last_tick_at": dbm.get_meta(self.conn, "last_tick_at"),
             "tick_lock": dict(holder) if holder else None,
             "settings": {

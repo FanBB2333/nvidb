@@ -127,7 +127,8 @@ not.
 
 Failures become **alerts** in the queue, classified by what happened:
 `job_failed` (non-zero exit), `job_lost` (process vanished), `job_timeout`,
-`dependency_failed`, `launch_failed`, `node_down`, `job_retried`.
+`dependency_failed`, `job_unschedulable` (no GPU in the cluster could ever hold
+it), `launch_failed`, `node_down`, `job_retried`.
 
 ```bash
 nvidb queue alerts --json            # what needs attention
@@ -157,6 +158,11 @@ free = total − memory used by processes the queue did not start − reservatio
 Work the user started by hand counts fully against capacity, so the queue shares
 machines rather than fighting them. A job stuck in `pending` is almost always
 waiting for VRAM — check `free_mb` per GPU before assuming anything is broken.
+
+A request no GPU in the cluster could ever hold — more GPUs than any node has,
+or more VRAM than the largest card — fails immediately with `job_unschedulable`
+rather than waiting forever. If that happens, the reservation was wrong, not the
+cluster.
 
 ## What is actually on the GPUs
 

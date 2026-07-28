@@ -109,6 +109,24 @@ def test_submit_without_a_command_is_refused(parser, queue_db, capsys):
     assert "nothing to run" in capsys.readouterr().err
 
 
+def test_submit_refuses_limits_that_would_silently_mean_nothing(parser, queue_db, capsys):
+    """`--timeout 0` reads as "no limit" once stored, which is not what it says."""
+    assert _run(parser, ["job", "submit", "--timeout", "0", "--", "true"], queue_db) == 1
+    assert "--timeout must be a positive" in capsys.readouterr().err
+
+    assert _run(parser, ["job", "submit", "--gpus", "-1", "--", "true"], queue_db) == 1
+    assert "--gpus cannot be negative" in capsys.readouterr().err
+
+    assert _run(parser, ["job", "submit", "--retries", "-2", "--", "true"], queue_db) == 1
+    assert "--retries cannot be negative" in capsys.readouterr().err
+
+    conn = dbm.open_db(queue_db)
+    try:
+        assert dbm.list_jobs(conn) == []  # nothing was queued by a rejected call
+    finally:
+        conn.close()
+
+
 def test_note_reads_writes_appends_and_clears(parser, queue_db, capsys):
     _submit(parser, queue_db, "--note", "first", "--", "true")
     capsys.readouterr()
@@ -136,6 +154,42 @@ def test_note_refuses_contradictory_arguments(parser, queue_db, capsys):
 def test_note_on_a_missing_job_reports_an_error(parser, queue_db, capsys):
     assert _run(parser, ["job", "note", "404", "hello"], queue_db) == 1
     assert "not found" in capsys.readouterr().err
+
+
+def test_status_names_the_database_it_actually_read(parser, tmp_path, monkeypatch, capsys):
+    """Clients decide whether they are looking at the same queue by this path."""
+    monkeypatch.setattr("nvidb.config.load_config", lambda *a, **k: {"servers": []})
+    monkeypatch.delenv("NVIDB_QUEUE_DB", raising=False)
+    elsewhere = tmp_path / "elsewhere.db"
+    argv = ["queue", "status", "--json", "--no-tick", "--db-path", str(elsewhere)]
+    assert sched_cli.dispatch(parser.parse_args(argv)) == 0
+    assert json.loads(capsys.readouterr().out)["db_path"] == str(elsewhere)
+
+
+def test_alerts_exit_non_zero_for_any_open_alert_not_just_listed_ones(
+    parser, queue_db, capsys
+):
+    """Agents use this exit code as a health check before reporting success."""
+    conn = dbm.open_db(queue_db)
+    try:
+        old = dbm.add_alert(conn, "job_failed", "an old failure nobody handled")
+        for index in range(5):
+            dbm.acknowledge_alerts(
+                conn, [dbm.add_alert(conn, "job_failed", f"handled {index}")]
+            )
+    finally:
+        conn.close()
+
+    # The five newest alerts are all acknowledged; the open one is off the page.
+    assert _run(parser, ["queue", "alerts", "--all", "-n", "5", "--no-tick"], queue_db) == 1
+    capsys.readouterr()
+
+    conn = dbm.open_db(queue_db)
+    try:
+        dbm.acknowledge_alerts(conn, [old])
+    finally:
+        conn.close()
+    assert _run(parser, ["queue", "alerts", "--all", "-n", "5", "--no-tick"], queue_db) == 0
 
 
 def test_json_output_is_the_only_thing_on_stdout(parser, queue_db, capsys):

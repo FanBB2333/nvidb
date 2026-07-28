@@ -425,7 +425,8 @@ nvidb job purge                 # forget finished job records
 nvidb queue status              # nodes, capacity and jobs in one view
 nvidb queue status --procs      # the same, with every GPU process listed
 nvidb queue events --since 42   # replay what happened while you were away
-nvidb queue drain 406           # stop scheduling onto a node (`resume` undoes it)
+nvidb queue drain 406           # stop scheduling onto a node (`resume` undoes it);
+                                # jobs already on it keep running and still report back
 nvidb queue tick                # force one scheduler pass
 ```
 
@@ -490,6 +491,7 @@ classified by what actually happened:
 | `job_lost`          | the process vanished with no exit status             | error    |
 | `job_timeout`       | the job passed `--timeout` and was killed            | error    |
 | `dependency_failed` | a job can never run because a dependency failed      | error    |
+| `job_unschedulable` | no GPU in the cluster is big enough to ever hold it  | error    |
 | `job_retried`       | the process vanished but a retry remains             | warning  |
 | `launch_failed`     | the job could not be started (disk full, permissions)| warning  |
 | `node_down`         | a node stopped answering                             | error    |

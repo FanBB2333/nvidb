@@ -26,6 +26,9 @@ class LaunchResult:
     pgid: Optional[int]
     run_dir: str
     session_isolated: bool = True
+    # True when this launch found the job already running and took it over
+    # rather than starting a second copy. See `JobExecutor.launch`.
+    adopted: bool = False
     stdout: str = ""
     stderr: str = ""
 
@@ -189,31 +192,44 @@ class JobExecutor:
             [
                 f"d={quoted_dir}",
                 'mkdir -p "$d" || exit 1',
-                f"printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || exit 1",
-                'chmod +x "$d/run.sh"',
-                'rm -f "$d/exit_code" "$d/pid" "$d/pgid" "$d/result.json"',
-                ': > "$d/stdout.log"',
-                ': > "$d/stderr.log"',
+                # The transport retries a command whose channel died, which can
+                # happen after the remote shell already started the job. Adopt
+                # that process instead of starting a second copy: the pid must
+                # still be alive *and* still be running this job's run.sh, so a
+                # recycled pid cannot be mistaken for our own.
+                'nvidb_pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
+                'if [ -n "$nvidb_pid" ] && kill -0 "$nvidb_pid" 2>/dev/null && '
+                'ps -o command= -p "$nvidb_pid" 2>/dev/null | grep -q "$d/run.sh"; then',
+                '  echo "NVIDB_ADOPTED=1"',
+                "else",
+                f"  printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || exit 1",
+                '  chmod +x "$d/run.sh"',
+                '  rm -f "$d/exit_code" "$d/pid" "$d/pgid" "$d/result.json"',
+                '  : > "$d/stdout.log"',
+                '  : > "$d/stderr.log"',
                 # setsid puts the job in its own session, so it survives the
                 # SSH channel closing and can later be signalled as a group.
                 # macOS has no setsid; nohup still detaches, but the job then
                 # shares a process group with the login shell and must never be
-                # signalled by group id.
-                'if command -v setsid >/dev/null 2>&1; then',
-                '  ( setsid bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
+                # signalled by group id. Which one ran is recorded on the node,
+                # so an adopting retry reports the same answer.
+                '  if command -v setsid >/dev/null 2>&1; then',
+                '    echo 1 > "$d/session"',
+                '    ( setsid bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
                 " < /dev/null & )",
-                '  echo "NVIDB_SETSID=1"',
-                "else",
-                '  ( nohup bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
+                "  else",
+                '    echo 0 > "$d/session"',
+                '    ( nohup bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
                 " < /dev/null & )",
-                '  echo "NVIDB_SETSID=0"',
+                "  fi",
+                "  i=0",
+                '  while [ "$i" -lt 60 ]; do',
+                '    [ -s "$d/pid" ] && break',
+                "    sleep 0.05",
+                "    i=$((i+1))",
+                "  done",
                 "fi",
-                "i=0",
-                'while [ "$i" -lt 60 ]; do',
-                '  [ -s "$d/pid" ] && break',
-                "  sleep 0.05",
-                "  i=$((i+1))",
-                "done",
+                'echo "NVIDB_SETSID=$(cat "$d/session" 2>/dev/null | tr -d " \\n\\r")"',
                 'echo "NVIDB_PID=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")"',
                 'echo "NVIDB_PGID=$(cat "$d/pgid" 2>/dev/null | tr -d " \\n\\r")"',
             ]
@@ -222,6 +238,7 @@ class JobExecutor:
         pid = _parse_marker_int(result.stdout, "NVIDB_PID=")
         pgid = _parse_marker_int(result.stdout, "NVIDB_PGID=")
         isolated = _parse_marker_int(result.stdout, "NVIDB_SETSID=") == 1
+        adopted = _parse_marker_int(result.stdout, "NVIDB_ADOPTED=") == 1
         if pid is None:
             raise TransportError(
                 f"{self.transport.name}: job {job_id} did not report a pid: "
@@ -234,6 +251,7 @@ class JobExecutor:
             pgid=pgid if (isolated and pgid is not None) else None,
             run_dir=run_dir,
             session_isolated=isolated,
+            adopted=adopted,
             stdout=result.stdout,
             stderr=result.stderr,
         )
