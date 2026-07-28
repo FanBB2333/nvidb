@@ -9,6 +9,7 @@ several short-lived clients take turns driving the same queue.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional, Sequence
@@ -18,6 +19,9 @@ from .transport import CommandResult, Transport, TransportError
 PROBE_MARKER = "NVIDB_PROBE_V1"
 PS_MARKER = "PSTABLE"
 DEFAULT_JOB_ROOT = ".nvidb/jobs"
+
+# What a POSIX shell will accept on the left of `export NAME=value`.
+VALID_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -110,7 +114,10 @@ def build_run_script(
     lines.append(f"export CUDA_VISIBLE_DEVICES={shlex.quote(visible)}")
 
     for key, value in (env or {}).items():
-        if not key or not str(key).replace("_", "").isalnum():
+        # Anything a shell would refuse is dropped rather than emitted as a line
+        # that fails at runtime where nobody would see it. `nvidb job submit`
+        # rejects these up front, so reaching here means a hand-written record.
+        if not VALID_ENV_KEY.match(str(key or "")):
             continue
         lines.append(f"export {key}={shlex.quote(str(value))}")
 

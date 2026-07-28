@@ -98,7 +98,12 @@ class LocalTransport(Transport):
                 timeout=timeout or DEFAULT_COMMAND_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            return CommandResult(124, "", f"timed out after {timeout}s")
+            # A hung command is a transport fault, not a command that failed:
+            # returning a status here would have the scheduler read the empty
+            # output as fact - no pid, no processes - instead of as "unknown".
+            raise TransportError(
+                f"{self.name}: command timed out after {timeout or DEFAULT_COMMAND_TIMEOUT}s"
+            ) from None
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
 

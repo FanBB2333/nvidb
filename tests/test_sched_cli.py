@@ -120,6 +120,11 @@ def test_submit_refuses_limits_that_would_silently_mean_nothing(parser, queue_db
     assert _run(parser, ["job", "submit", "--retries", "-2", "--", "true"], queue_db) == 1
     assert "--retries cannot be negative" in capsys.readouterr().err
 
+    # A name no shell can export was silently dropped on the way to the node.
+    argv = ["job", "submit", "--env", "MY-VAR=1", "--", "true"]
+    assert _run(parser, argv, queue_db) == 1
+    assert "not a valid shell variable name" in capsys.readouterr().err
+
     conn = dbm.open_db(queue_db)
     try:
         assert dbm.list_jobs(conn) == []  # nothing was queued by a rejected call

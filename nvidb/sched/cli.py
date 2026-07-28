@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import db as dbm
+from .executor import VALID_ENV_KEY
 from .model import (
     JOB_STATES,
     TERMINAL_JOB_STATES,
@@ -605,7 +606,16 @@ def cmd_submit(args) -> int:
             if "=" not in item:
                 return _error(f"--env expects KEY=VALUE, got {item!r}", as_json=args.json)
             key, value = item.split("=", 1)
-            env[key.strip()] = value
+            key = key.strip()
+            # A name no shell can export would otherwise be dropped on the way
+            # to the node, and the job would run without it saying anything.
+            if not VALID_ENV_KEY.match(key):
+                return _error(
+                    f"--env name {key!r} is not a valid shell variable name "
+                    "(letters, digits and underscore; not starting with a digit)",
+                    as_json=args.json,
+                )
+            env[key] = value
 
         # A zero or negative limit would be stored as "no limit at all", which is
         # the opposite of what someone typing `--timeout 0` is asking for.
