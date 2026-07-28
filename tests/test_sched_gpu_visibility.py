@@ -67,7 +67,7 @@ def _gpu(scheduler, node="big-node", index=0):
 
 def test_foreign_processes_are_named_not_just_counted(scheduler, cluster):
     cluster["big-node"].add_foreign_process(
-        0, 69000, pid=4242, name="python train.py", username="l1ght"
+        0, 69000, pid=4242, name="python train.py", username="alice"
     )
     scheduler.tick(force=True)
 
@@ -77,7 +77,7 @@ def test_foreign_processes_are_named_not_just_counted(scheduler, cluster):
     process = gpu.processes[0]
     assert process.pid == 4242
     assert process.name == "python train.py"
-    assert process.username == "l1ght"
+    assert process.username == "alice"
     assert process.mem_mb == 69000
     assert process.managed is False
     assert process.owner == "external"
@@ -206,9 +206,9 @@ def test_process_rows_survive_the_database_round_trip(scheduler, cluster):
 
 def test_gpu_process_describes_itself_for_compact_views():
     process = GpuProcess.from_dict(
-        {"pid": 7, "mem_mb": 6242, "name": "python train.py", "user": "l1ght"}
+        {"pid": 7, "mem_mb": 6242, "name": "python train.py", "user": "alice"}
     )
-    assert process.describe() == "python train.py (l1ght, 6.1G)"
+    assert process.describe() == "python train.py (alice, 6.1G)"
     assert GpuProcess(pid=9).describe() == "pid 9 (0M)"
 
 
@@ -259,12 +259,12 @@ def cli(tmp_path, monkeypatch, cluster):
 
 def test_nodes_names_the_unmanaged_work_by_default(cli, cluster):
     cluster["big-node"].add_foreign_process(
-        0, 69000, name="python pretrain.py", username="l1ght"
+        0, 69000, name="python pretrain.py", username="alice"
     )
     code, output = cli(["queue", "nodes"])
     assert code == 0
     assert "UNMANAGED" in output
-    assert "python pretrain.py (l1ght, 67.4G)" in output
+    assert "python pretrain.py (alice, 67.4G)" in output
 
 
 def test_nodes_summarises_extra_unmanaged_processes(cli, cluster):
@@ -404,7 +404,7 @@ def _tui_state(processes, attribution="processes", external=6000, queue_mem=4000
     }
 
 
-def _proc(pid, mem, name, user="l1ght", job_id=None, job_name=None):
+def _proc(pid, mem, name, user="alice", job_id=None, job_name=None):
     return {
         "pid": pid,
         "mem_mb": mem,
@@ -466,12 +466,12 @@ def test_the_tui_says_when_a_cards_split_is_inferred(tui):
 
 def test_the_tui_names_the_job_behind_blind_memory(tui):
     state = _tui_state(
-        [_proc(12, 0, "/python3.11", job_id=32, job_name="openbook-grid")],
+        [_proc(12, 0, "/python3.11", job_id=32, job_name="sweep")],
         attribution="blind",
         external=8000,
     )
     output = _render(tui, state)
-    assert "job 32 openbook-grid" in output
+    assert "job 32 sweep" in output
 
 
 def test_a_long_process_list_cannot_push_the_jobs_off_the_screen(tui):

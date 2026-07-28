@@ -395,11 +395,11 @@ nvidb queue nodes --json        # the same as structured data
 ```
 
 ```
-  Gem12-wsl-tailscale  [up]  100.109.8.69  seen 00:00:00 ago
+  workstation  [up]  10.0.0.2  seen 00:00:00 ago
     GPU   MODEL                       UTIL  MEM              UNMANAGED      QUEUE  RESERVED  JOBS  FREE
     GPU0  NVIDIA GeForce RTX 3090 Ti  10%   23.2G/24.0G 97%  15.2G (blind)  0M     8.0G      1     316M
       unmanaged  ~15.2G of 23.2G in use; this driver reports no per-process memory
-        pid 1608997  /python3.11  l1ght  job 32 openbook-grid
+        pid 1608997  /python3.11  alice  job 12 sweep
 ```
 
 `UTIL` and `MEM` describe the card itself, whoever is using it. `UNMANAGED` is

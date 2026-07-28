@@ -57,7 +57,7 @@ def _gpu(index=0, name="RTX 3090 Ti", total=24564, used=0, external=0, reserved=
     }
 
 
-def _proc(pid=999, mem=4096, name="python train.py", user="l1ght", job_id=None,
+def _proc(pid=999, mem=4096, name="python train.py", user="alice", job_id=None,
           job_name=None):
     return {
         "pid": pid,

@@ -1044,9 +1044,9 @@ def test_detailed_process_pane_shows_the_whole_command_wrapped(monkeypatch):
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
     pool.unified_detailed = True
     command = (
-        "/home/l1ght/anaconda3/envs/c14/bin/python /home/l1ght/cc_scripts/"
-        "diag_math500_format.py --model /mnt/z/models/Qwen3-1.7B --math500 "
-        "/mnt/z/datasets/MATH-500/test.jsonl --out /mnt/z/results/qwen3.jsonl"
+        "/home/alice/anaconda3/envs/eval/bin/python /home/alice/scripts/"
+        "diag_math500_format.py --model /data/models/Qwen3-1.7B --math500 "
+        "/data/datasets/MATH-500/test.jsonl --out /data/results/qwen3.jsonl"
     )
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((90, 30)))
 

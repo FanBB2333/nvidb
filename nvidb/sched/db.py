@@ -657,7 +657,7 @@ def get_node(conn: sqlite3.Connection, name: str) -> Optional[Node]:
 def resolve_node_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
     """Match a node by exact name, then case-insensitively, then by substring.
 
-    Lets a client say `--node gem12` instead of `Gem12-wsl-tailscale`.
+    Lets a client say `--node lab2` instead of `lab2-workstation-tailscale`.
     """
     if not query:
         return None

@@ -23,7 +23,7 @@ def test_view_settings_round_trip_keeps_servers_and_basic(monkeypatch, tmp_path)
                 {
                     "hostname": "100.64.0.42",
                     "port": 2222,
-                    "username": "l1ght",
+                    "username": "alice",
                     "nickname": "training-node",
                     "auth": "key",
                 }
@@ -73,7 +73,7 @@ def test_saving_view_settings_preserves_comments_and_layout(monkeypatch, tmp_pat
         "servers:\n"
         '  - hostname: "100.64.0.42"\n'
         "    port: 2222              # WSL sshd, port 22 is the Windows host\n"
-        '    username: "l1ght"\n'
+        '    username: "alice"\n'
     )
     config_path.write_text(original)
 
