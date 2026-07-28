@@ -660,6 +660,11 @@ def cmd_submit(args) -> int:
                 print(f"  running on {job.node} GPU {','.join(str(i) for i in job.gpu_ids) or '-'}")
             elif job.state == "pending":
                 print("  waiting for capacity; it starts on the next tick that fits it")
+        if args.wait:
+            # Same three-way status as `job wait`, for the same reason.
+            if not job.is_terminal:
+                return 2
+            return 0 if job.state == "completed" else 1
         return 0 if job.state != "failed" else 1
     finally:
         scheduler.close()
@@ -792,10 +797,21 @@ def cmd_wait(args) -> int:
             payload["jobs"].append(entry)
         payload["all_done"] = all(job.is_terminal for job in jobs)
         payload["all_succeeded"] = all(job.state == "completed" for job in jobs)
+        payload["timed_out"] = not payload["all_done"]
         if args.json:
             _print_json(payload)
         else:
             print(_job_table(payload["jobs"], indent=""))
+            if payload["timed_out"]:
+                print(
+                    "wait timed out; the job(s) above are still going",
+                    file=sys.stderr,
+                )
+        # 0 succeeded, 1 finished badly, 2 still running. Giving the timeout its
+        # own status is what lets a caller tell "this failed" from "I stopped
+        # waiting", which are opposite things to do next.
+        if payload["timed_out"]:
+            return 2
         return 0 if payload["all_succeeded"] else 1
     finally:
         scheduler.close()

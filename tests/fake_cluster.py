@@ -49,6 +49,8 @@ class FakeNode:
         self.results: Dict[str, object] = {}
         self.logs: Dict[str, str] = {}
         self.killed: List[int] = []
+        # Jobs whose leftover process was cleaned up after the fact.
+        self.reaped: List[int] = []
         self._next_pid = 1000
 
     # --- test-facing helpers ---------------------------------------------
@@ -222,12 +224,30 @@ class FakeExecutor:
         return probe
 
     def kill(self, *, pid, pgid, signal="TERM"):
+        # An offline node cannot be signalled - the scheduler has to cope with
+        # closing a job's record while its process keeps running.
+        if not self.node.online:
+            raise TransportError(f"{self.node.name}: unreachable")
         for job_id, record in self.node.jobs.items():
             if record["pid"] == pid and record["alive"]:
                 record["alive"] = False
                 self.node._release_job_memory(record)
                 self.node.killed.append(job_id)
         return CommandResult(0, "", "")
+
+    def reap(self, *, run_dir, pid, pgid=None, grace=5):
+        if not self.node.online:
+            raise TransportError(f"{self.node.name}: unreachable")
+        for job_id, record in self.node.jobs.items():
+            if record["pid"] != pid or record["run_dir"] != run_dir:
+                continue
+            if not record["alive"]:
+                return False
+            record["alive"] = False
+            self.node._release_job_memory(record)
+            self.node.reaped.append(job_id)
+            return True
+        return False
 
     def read_result(self, run_dir):
         return self.node.results.get(run_dir)

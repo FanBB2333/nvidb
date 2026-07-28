@@ -198,6 +198,34 @@ def test_a_finished_job_can_still_be_launched_again(executor):
     assert "run-two" in log and "run-one" not in log  # the log was reset
 
 
+def test_reaping_kills_a_leftover_process_but_only_the_right_one(executor):
+    """The cleanup runs long after the fact, when the pid may belong to anyone."""
+    launched = executor.launch(
+        job_id=30, job_name="leftover", command="sleep 30", node_name="test-local"
+    )
+    time.sleep(0.3)
+
+    # A pid that is alive but is not this job: an unrelated process, which the
+    # node has every right to have started since.
+    import subprocess
+
+    stranger = subprocess.Popen(["sleep", "30"])
+    try:
+        assert executor.reap(run_dir=launched.run_dir, pid=stranger.pid) is False
+        assert stranger.poll() is None  # untouched
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+    assert executor.reap(
+        run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid
+    ) is True
+    probe = _wait_for_exit(executor, 30, launched.run_dir)
+    assert probe.alive is False
+    # Reaping something already gone is a no-op, not an error.
+    assert executor.reap(run_dir=launched.run_dir, pid=launched.pid) is False
+
+
 def test_a_missing_workdir_fails_the_job_instead_of_hanging(executor):
     launched = executor.launch(
         job_id=7,

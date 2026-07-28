@@ -161,6 +161,33 @@ def test_note_on_a_missing_job_reports_an_error(parser, queue_db, capsys):
     assert "not found" in capsys.readouterr().err
 
 
+def test_wait_reports_a_timeout_differently_from_a_failure(parser, queue_db, capsys):
+    """"It failed" and "I stopped waiting" call for opposite next steps."""
+    _submit(parser, queue_db, "--name", "slow", "--", "true")
+    capsys.readouterr()
+
+    # No nodes are configured, so the job cannot start: waiting must time out.
+    assert _run(parser, ["job", "wait", "1", "--timeout", "1", "--json"], queue_db) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["timed_out"] is True
+    assert payload["all_done"] is False
+
+    conn = dbm.open_db(queue_db)
+    try:
+        dbm.update_job(conn, 1, state="failed", exit_code=3)
+    finally:
+        conn.close()
+    assert _run(parser, ["job", "wait", "1", "--json"], queue_db) == 1
+    assert json.loads(capsys.readouterr().out)["timed_out"] is False
+
+    conn = dbm.open_db(queue_db)
+    try:
+        dbm.update_job(conn, 1, state="completed", exit_code=0)
+    finally:
+        conn.close()
+    assert _run(parser, ["job", "wait", "1", "--json"], queue_db) == 0
+
+
 def test_status_names_the_database_it_actually_read(parser, tmp_path, monkeypatch, capsys):
     """Clients decide whether they are looking at the same queue by this path."""
     monkeypatch.setattr("nvidb.config.load_config", lambda *a, **k: {"servers": []})

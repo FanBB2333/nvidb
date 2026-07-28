@@ -50,6 +50,8 @@ EVENT_KINDS = (
     "job_failed",
     "job_lost",
     "job_timeout",
+    # A process that outlived the job record - killed once its node answered.
+    "job_reaped",
     "node_up",
     "node_down",
     "tick",

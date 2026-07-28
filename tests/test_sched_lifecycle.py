@@ -7,6 +7,7 @@ and whoever called `nvidb job wait` waits forever.
 """
 import os
 import sys
+import time
 
 import pytest
 
@@ -20,6 +21,7 @@ from nvidb.sched.scheduler import Scheduler  # noqa: E402
 SETTINGS = {
     "headroom_mb": 512,
     "max_jobs_per_gpu": 4,
+    "max_cpu_jobs_per_node": 4,
     "probe_timeout": 5,
     "launch_timeout": 5,
     "tick_min_interval": 0,
@@ -215,6 +217,160 @@ def test_cpu_only_work_is_never_called_unschedulable(scheduler):
     job_id = scheduler.submit("prep", gpus=0, vram="500G")
     scheduler.tick(force=True)
     assert dbm.get_job(scheduler.conn, job_id).state == "running"
+
+
+# --- processes left behind by a closed job ----------------------------------
+
+def test_a_job_cancelled_during_an_outage_is_killed_when_the_node_returns(
+    scheduler, cluster
+):
+    """Cancelling cannot reach an offline node, but the process is still there.
+
+    Without this the GPU stays occupied for the length of the outage by work
+    the user already told the queue to stop, and nothing is left to clean up.
+    """
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train", vram="4G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].job_allocates(job_id, 0, 4000)
+
+    cluster["small-node"].online = False
+    assert scheduler.cancel(job_id) is True
+    assert dbm.get_job(scheduler.conn, job_id).state == "cancelled"
+    # The record is final, but the process is not: it is remembered instead.
+    assert cluster["small-node"].jobs[job_id]["alive"] is True
+    assert len(dbm.list_orphans(scheduler.conn)) == 1
+
+    cluster["small-node"].online = True
+    summary = scheduler.tick(force=True)
+
+    assert cluster["small-node"].reaped == [job_id]
+    assert cluster["small-node"].jobs[job_id]["alive"] is False
+    assert dbm.list_orphans(scheduler.conn) == []
+    assert summary["reaped"] == [
+        {"job": job_id, "node": "small-node", "pid": cluster["small-node"].jobs[job_id]["pid"]}
+    ]
+    kinds = [event["kind"] for event in dbm.list_events(scheduler.conn, limit=100)]
+    assert "job_reaped" in kinds
+
+    # NVML was sampled before the kill, so the card reads free on the next pass.
+    scheduler.tick(force=True)
+    assert dbm.get_node(scheduler.conn, "small-node").gpus[0].external_mem_mb == 0
+
+
+def test_a_timeout_that_could_not_kill_is_finished_off_later(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("slow", vram="1G", node="small-node", max_runtime_s=1)
+    scheduler.tick(force=True)
+    time.sleep(1.2)
+
+    cluster["small-node"].online = False
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "timeout"
+    assert cluster["small-node"].jobs[job_id]["alive"] is True
+
+    cluster["small-node"].online = True
+    scheduler.tick(force=True)
+    assert cluster["small-node"].reaped == [job_id]
+
+
+def test_a_process_that_died_on_its_own_is_simply_forgotten(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("x", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].online = False
+    scheduler.cancel(job_id)
+
+    # The machine rebooted, taking the process with it.
+    cluster["small-node"].vanish_job(job_id)
+    cluster["small-node"].online = True
+    summary = scheduler.tick(force=True)
+
+    assert dbm.list_orphans(scheduler.conn) == []
+    assert cluster["small-node"].reaped == []
+    assert summary.get("reaped") is None  # nothing to report
+
+
+def test_the_cleanup_survives_purging_the_job_record(scheduler, cluster):
+    """`job purge` deletes the row; the process it started still has to go."""
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("x", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].online = False
+    scheduler.cancel(job_id)
+    assert dbm.purge_jobs(scheduler.conn) == 1
+    assert dbm.get_job(scheduler.conn, job_id) is None
+
+    cluster["small-node"].online = True
+    scheduler.tick(force=True)
+    assert cluster["small-node"].reaped == [job_id]
+
+
+def test_an_unreachable_node_keeps_its_cleanup_queued(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("x", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].online = False
+    scheduler.cancel(job_id)
+
+    for _ in range(3):
+        scheduler.tick(force=True)
+    assert len(dbm.list_orphans(scheduler.conn)) == 1  # not dropped, not retried away
+    assert scheduler.snapshot()["pending_reaps"] == 1
+
+
+# --- CPU-only work ----------------------------------------------------------
+
+def test_cpu_only_jobs_are_capped_per_node(scheduler):
+    """They reserve no VRAM, so without a count nothing bounds them at all."""
+    scheduler.tick(force=True)
+    ids = [scheduler.submit(f"cpu{index}", gpus=0) for index in range(12)]
+    scheduler.tick(force=True)
+
+    states = [dbm.get_job(scheduler.conn, job_id).state for job_id in ids]
+    # Two nodes, four slots each.
+    assert states.count("running") == 8
+    assert states.count("pending") == 4
+
+    per_node: dict = {}
+    for job in dbm.live_jobs(scheduler.conn):
+        per_node[job.node] = per_node.get(job.node, 0) + 1
+    assert sorted(per_node.values()) == [4, 4]
+
+
+def test_a_finished_cpu_job_frees_its_slot(scheduler, cluster):
+    scheduler.tick(force=True)
+    ids = [scheduler.submit(f"cpu{index}", gpus=0, node="small-node") for index in range(6)]
+    scheduler.tick(force=True)
+    assert [dbm.get_job(scheduler.conn, i).state for i in ids].count("running") == 4
+
+    for job_id in ids[:2]:
+        cluster["small-node"].finish_job(job_id, exit_code=0)
+    scheduler.tick(force=True)
+
+    states = [dbm.get_job(scheduler.conn, job_id).state for job_id in ids]
+    assert states.count("completed") == 2
+    assert states.count("running") == 4  # the waiting two moved up
+
+
+def test_the_cpu_cap_can_be_switched_off(tmp_path, cluster):
+    conn = dbm.open_db(tmp_path / "uncapped.db")
+    settings = dict(SETTINGS)
+    settings["max_cpu_jobs_per_node"] = 0
+    sched = Scheduler(
+        conn, cfg=cluster.config(), settings=settings,
+        backend_factory=cluster.backend_factory, owner="test",
+    )
+    try:
+        sched.sync_nodes_from_config()
+        sched.tick(force=True)
+        ids = [sched.submit(f"cpu{index}", gpus=0) for index in range(10)]
+        sched.tick(force=True)
+        states = [dbm.get_job(conn, job_id).state for job_id in ids]
+        assert states.count("running") == 10
+    finally:
+        sched.close()
+        conn.close()
 
 
 # --- opening the database ---------------------------------------------------

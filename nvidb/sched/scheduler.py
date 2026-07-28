@@ -51,6 +51,9 @@ DEFAULT_SETTINGS = {
     # driver or a co-tenant that grows slightly.
     "headroom_mb": 512,
     "max_jobs_per_gpu": 4,
+    # CPU-only jobs (`--gpus 0`) reserve no VRAM, so nothing else bounds how
+    # many of them a node runs at once. This does.
+    "max_cpu_jobs_per_node": 4,
     "probe_timeout": 25,
     "launch_timeout": 60,
     "tick_min_interval": 3,
@@ -336,7 +339,11 @@ class Scheduler:
                     backend = self.backend(node)
                     self._terminate(backend, job)
                 except TransportError:
-                    pass  # The node is unreachable; the record still becomes final.
+                    # The node is unreachable, so the record becomes final now
+                    # and the process is killed when the node answers again -
+                    # otherwise a cancelled job keeps a GPU for as long as the
+                    # outage lasts, with nothing left that knows about it.
+                    self._remember_orphan(job, reason="cancelled while unreachable")
         dbm.update_job(
             self.conn,
             job_id,
@@ -453,6 +460,7 @@ class Scheduler:
         )
 
         self._reconcile_jobs(node, backend, running, probe, summary)
+        self._reap_orphans(node, backend, summary)
 
         still_running = dbm.live_jobs(self.conn, node.name)
         gpus = self._build_gpu_states(node, payload, probe, still_running)
@@ -641,6 +649,52 @@ class Scheduler:
                 )
                 summary["finished"].append({"id": job.id, "state": "lost"})
 
+    def _remember_orphan(self, job: Job, *, reason: str) -> None:
+        """Record a process this queue closed the books on but could not kill."""
+        if not job.node:
+            return
+        dbm.add_orphan(
+            self.conn,
+            node=job.node,
+            job_id=job.id,
+            run_dir=job.run_dir,
+            pid=job.remote_pid,
+            pgid=job.remote_pgid,
+            reason=reason,
+        )
+
+    def _reap_orphans(
+        self, node: Node, backend: NodeBackend, summary: Dict[str, Any]
+    ) -> None:
+        """Kill processes belonging to jobs whose records were already closed.
+
+        A job cancelled or timed out while its node was unreachable keeps its
+        GPU until someone notices. This is the "someone": the first probe that
+        gets through finishes the job the cancel could not.
+        """
+        for orphan in dbm.list_orphans(self.conn, node.name):
+            try:
+                killed = backend.executor.reap(
+                    run_dir=orphan["run_dir"],
+                    pid=orphan["pid"],
+                    pgid=orphan["pgid"],
+                )
+            except TransportError:
+                continue  # still unreachable; the row keeps it on the list
+            dbm.drop_orphan(self.conn, orphan["id"])
+            if not killed:
+                continue  # already gone on its own, which is the usual case
+            dbm.add_event(
+                self.conn,
+                "job_reaped",
+                job_id=orphan["job_id"],
+                node=node.name,
+                message=f"killed a leftover process ({orphan['reason']})",
+            )
+            summary.setdefault("reaped", []).append(
+                {"job": orphan["job_id"], "node": node.name, "pid": orphan["pid"]}
+            )
+
     def _enforce_timeouts(self, summary: Dict[str, Any]) -> None:
         for job in dbm.live_jobs(self.conn):
             if not job.max_runtime_s:
@@ -650,13 +704,16 @@ class Scheduler:
                 continue
             node = dbm.get_node(self.conn, job.node) if job.node else None
             detail = None
-            if node is not None:
+            if node is None:
+                self._remember_orphan(job, reason="timed out with its node gone")
+            else:
                 backend = self.backend(node)
                 try:
                     detail = self._failure_detail(backend, job)
                     self._terminate(backend, job)
                 except TransportError:
-                    pass
+                    # Unreachable: the kill is retried on the reap pass.
+                    self._remember_orphan(job, reason="timed out while unreachable")
             dbm.update_job(
                 self.conn,
                 job.id,
@@ -872,6 +929,18 @@ class Scheduler:
 
         headroom = int(self.settings["headroom_mb"])
         max_jobs = int(self.settings["max_jobs_per_gpu"])
+        # CPU-only jobs are held to a count per node, since they reserve no
+        # memory for anything else to schedule around.
+        max_cpu_jobs = int(self.settings.get("max_cpu_jobs_per_node") or 0)
+        cpu_slots: Dict[str, int] = {}
+        if max_cpu_jobs > 0:
+            running_cpu: Dict[str, int] = {}
+            for job in dbm.live_jobs(self.conn):
+                if job.gpus <= 0 and job.node:
+                    running_cpu[job.node] = running_cpu.get(job.node, 0) + 1
+            for node in nodes:
+                cpu_slots[node.name] = max(0, max_cpu_jobs - running_cpu.get(node.name, 0))
+
         budgets: Dict[str, List[GpuBudget]] = {}
         for node in nodes:
             budgets[node.name] = [
@@ -928,7 +997,9 @@ class Scheduler:
             if not ready:
                 continue
 
-            placement = self._find_placement(job, nodes, budgets, max_jobs)
+            placement = self._find_placement(
+                job, nodes, budgets, max_jobs, cpu_slots if max_cpu_jobs > 0 else None
+            )
             if placement is None:
                 continue
             node_name, gpu_ids = placement
@@ -963,6 +1034,8 @@ class Scheduler:
                 summary["errors"].append({"job": job.id, "error": str(error)})
                 continue
 
+            if job.gpus <= 0 and node_name in cpu_slots:
+                cpu_slots[node_name] = max(0, cpu_slots[node_name] - 1)
             for budget in budgets[node_name]:
                 if budget.index in gpu_ids:
                     budget.free_mb = max(0, budget.free_mb - job.vram_mb)
@@ -1028,6 +1101,7 @@ class Scheduler:
         nodes: List[Node],
         budgets: Dict[str, List[GpuBudget]],
         max_jobs: int,
+        cpu_slots: Optional[Dict[str, int]] = None,
     ) -> Optional[Tuple[str, List[int]]]:
         """Pick a node and GPU set for one job, or None when nothing fits."""
         candidates = nodes
@@ -1037,7 +1111,13 @@ class Scheduler:
             return None
 
         if job.gpus <= 0:
-            # CPU-only work: any live node, least loaded first.
+            # CPU-only work: any live node with a free slot, least loaded first.
+            if cpu_slots is not None:
+                candidates = [
+                    node for node in candidates if cpu_slots.get(node.name, 0) > 0
+                ]
+                if not candidates:
+                    return None
             best = min(
                 candidates,
                 key=lambda node: sum(b.jobs for b in budgets.get(node.name, [])),
@@ -1141,6 +1221,9 @@ class Scheduler:
             "recent": [job.to_dict() for job in recent_terminal],
             "alerts": dbm.list_alerts(self.conn, open_only=True, limit=20),
             "open_alerts": dbm.open_alert_count(self.conn),
+            # Processes still to be killed on nodes that were unreachable when
+            # their job was cancelled or timed out.
+            "pending_reaps": dbm.orphan_count(self.conn),
         }
 
     def deliver_alerts(self, notifier) -> int:

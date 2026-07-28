@@ -307,18 +307,67 @@ class JobExecutor:
 
     def kill(self, *, pid: Optional[int], pgid: Optional[int], signal: str = "TERM") -> CommandResult:
         """Signal the job's whole process group, falling back to the bare pid."""
+        if not pid and not pgid:
+            return CommandResult(1, "", "no pid recorded")
+        return self.transport.run(
+            self._signal_command(pid=pid, pgid=pgid, signal=signal), timeout=20
+        )
+
+    def reap(
+        self,
+        *,
+        run_dir: str,
+        pid: Optional[int],
+        pgid: Optional[int] = None,
+        grace: int = 5,
+    ) -> bool:
+        """Kill a process left behind by a job whose record is already final.
+
+        Returns True when something was found and signalled. The pid must still
+        be running *this* job's run.sh: a job cancelled hours ago on a machine
+        that was offline has a pid the node has long since handed to someone
+        else, and killing that would be far worse than leaking a process.
+        """
+        if not pid or not run_dir:
+            return False
+        quoted_dir = shlex.quote(run_dir)
+        script = "\n".join(
+            [
+                f"d={quoted_dir}",
+                f"pid={int(pid)}",
+                'if kill -0 "$pid" 2>/dev/null && '
+                'ps -o command= -p "$pid" 2>/dev/null | grep -q "$d/run.sh"; then',
+                f"  {self._signal_command(pid=pid, pgid=pgid, signal='TERM')}",
+                # The wrapper only runs its EXIT trap once the work it is
+                # waiting on returns, so the escalation has to reach the same
+                # set of processes rather than just the wrapper again.
+                f"  ( sleep {int(grace)}; "
+                f"{self._signal_command(pid=pid, pgid=pgid, signal='KILL')} ) "
+                ">/dev/null 2>&1 &",
+                '  echo "NVIDB_REAPED=1"',
+                "else",
+                '  echo "NVIDB_REAPED=0"',
+                "fi",
+            ]
+        )
+        result = self.transport.run(script, timeout=20)
+        return _parse_marker_int(result.stdout, "NVIDB_REAPED=") == 1
+
+    @staticmethod
+    def _signal_command(
+        *, pid: Optional[int], pgid: Optional[int], signal: str = "TERM"
+    ) -> str:
+        """Shell to signal a job: its group when it has one, its children when not."""
         parts = []
         if pgid:
             parts.append(f"kill -{signal} -{int(pgid)} 2>/dev/null")
         if pid:
             parts.append(f"kill -{signal} {int(pid)} 2>/dev/null")
             if not pgid:
-                # No private process group to signal, so reach the job's direct
-                # children explicitly instead of leaving them orphaned.
+                # No private process group, so reach the job's own children
+                # explicitly instead of leaving the real work running.
                 parts.append(f"pkill -{signal} -P {int(pid)} 2>/dev/null")
-        if not parts:
-            return CommandResult(1, "", "no pid recorded")
-        return self.transport.run(" ; ".join(parts) + " ; true", timeout=20)
+        return " ; ".join(parts) + " ; true" if parts else "true"
 
     def read_log(
         self, run_dir: str, *, stream: str = "stdout", lines: int = 200

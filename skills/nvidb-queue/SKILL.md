@@ -83,12 +83,17 @@ nvidb queue status --json     # nodes, per-GPU budgets, jobs, open alerts
 nvidb job ls --json --active  # pending and running only
 nvidb job show 12 --json      # one job in full, including its events
 nvidb job logs 12 -n 200      # its output
-nvidb job wait 12 13 --json   # block until both finish; non-zero if any failed
+nvidb job wait 12 13 --json   # block until both finish (see the exit codes below)
 ```
 
 Read commands refresh from the nodes themselves (rate-limited), so a plain
 `nvidb job show` is current. Add `--no-tick` for a pure database read when
 polling in a tight loop.
+
+`nvidb job wait` exits **0** when everything completed, **1** when a job ended
+badly, and **2** when `--timeout` ran out with work still going. Two is not a
+failure: the job is still running and can be waited on again. Do not report a
+timeout to the user as a failed job.
 
 ## Reporting progress from inside a job
 

@@ -139,6 +139,24 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_open ON alerts(acknowledged_at);
+
+-- A job's record was closed without proof its remote process died: cancelled or
+-- timed out while the node was unreachable. The pid is kept here rather than on
+-- the job row because it has to outlive both `job requeue` (which clears the
+-- placement) and `job purge` (which deletes the row entirely) - otherwise the
+-- process keeps its GPU with nothing left that knows about it.
+CREATE TABLE IF NOT EXISTS orphans (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     INTEGER,
+    node       TEXT NOT NULL,
+    run_dir    TEXT,
+    pid        INTEGER,
+    pgid       INTEGER,
+    reason     TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orphans_node ON orphans(node);
 """
 
 _local = threading.local()
@@ -744,6 +762,52 @@ def pending_jobs(conn: sqlite3.Connection) -> List[Job]:
         "SELECT * FROM jobs WHERE state = 'pending' ORDER BY priority DESC, id ASC"
     ).fetchall()
     return [Job.from_row(row) for row in rows]
+
+
+# --- orphaned processes ----------------------------------------------------
+
+def add_orphan(
+    conn: sqlite3.Connection,
+    *,
+    node: str,
+    job_id: Optional[int] = None,
+    run_dir: Optional[str] = None,
+    pid: Optional[int] = None,
+    pgid: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> Optional[int]:
+    """Remember a process that must be killed once its node answers again."""
+    if not pid or not run_dir:
+        return None  # nothing identifiable enough to kill safely later
+    with transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO orphans(job_id, node, run_dir, pid, pgid, reason, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (job_id, node, run_dir, int(pid), pgid, reason, utcnow()),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_orphans(
+    conn: sqlite3.Connection, node: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    if node:
+        rows = conn.execute(
+            "SELECT * FROM orphans WHERE node = ? ORDER BY id", (node,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM orphans ORDER BY id").fetchall()
+    return [dict(row) for row in rows]
+
+
+def drop_orphan(conn: sqlite3.Connection, orphan_id: int) -> None:
+    with transaction(conn):
+        conn.execute("DELETE FROM orphans WHERE id = ?", (int(orphan_id),))
+
+
+def orphan_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) AS n FROM orphans").fetchone()
+    return int(row["n"]) if row else 0
 
 
 def live_jobs(conn: sqlite3.Connection, node: Optional[str] = None) -> List[Job]:

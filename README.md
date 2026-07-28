@@ -365,7 +365,15 @@ Counting foreign processes is what lets the queue share machines with work you
 started by hand: a card that someone else has filled simply reports no capacity,
 and jobs go elsewhere until it frees up. A job is charged the larger of what it
 reserved and what it actually uses, so understating `--vram` cannot oversubscribe
-a card.
+a card. CPU-only jobs (`--gpus 0`) reserve nothing, so they are bounded by a
+count instead: `max_cpu_jobs_per_node`, four by default.
+
+A job cancelled or timed out while its node was unreachable keeps its record
+final but its process alive. The pid is remembered separately from the job — it
+has to outlive both `job requeue` and `job purge` — and the first probe that
+reaches that node again kills it, provided the pid is still running that job's
+`run.sh`. `nvidb queue status --json` reports how many such cleanups are
+outstanding as `pending_reaps`.
 
 On nodes where the driver accounts for none of the memory in use — WSL, where
 the GPU is driven from Windows, and which either names no processes at all or
@@ -417,7 +425,7 @@ nvidb job ls                    # everything, newest state
 nvidb job ls --active           # only pending and running
 nvidb job show 12 --logs 40     # detail plus the tail of stdout
 nvidb job logs 12 -f            # follow the output
-nvidb job wait 12 13            # block until both finish (exit 1 if any failed)
+nvidb job wait 12 13            # block until both finish (0 ok, 1 failed, 2 timed out)
 nvidb job cancel 12             # kill the remote process group
 nvidb job requeue 12            # run a finished job again
 nvidb job purge                 # forget finished job records
