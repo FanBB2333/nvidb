@@ -103,6 +103,10 @@ def format_servers_yaml(servers) -> str:
         if auth in ("auto", "key") and identityfile:
             lines.append(f"    identityfile: {_dq(identityfile)}")
 
+        proxyjump = server.get("proxyjump")
+        if proxyjump:
+            lines.append(f"    proxyjump: {_dq(proxyjump)}")
+
     return "\n".join(lines) + "\n"
 
 

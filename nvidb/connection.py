@@ -32,6 +32,7 @@ from .mouse import (
     MouseSequenceParser,
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
+from .ssh_proxy import open_proxyjump_socket
 from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color
 
 
@@ -1005,15 +1006,62 @@ class RemoteClient(BaseClient):
         self.description = server.description
         self.password = server.password
         self.identityfile = getattr(server, "identityfile", None)
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        if self.auth in ['auto', 'key']:
-            self.client.load_system_host_keys()
+        self.proxyjump = getattr(server, "proxyjump", None)
+        self._proxy = None
+        self.client = self._make_ssh_client()
         self._nvml_agent_lock = threading.RLock()
         self._nvml_agent_stdin = None
         self._nvml_agent_stdout = None
         self._nvml_agent_stderr = None
         self._nvml_agent_channel = None
+
+    def _make_ssh_client(self):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if self.auth in ["auto", "key"]:
+            client.load_system_host_keys()
+        return client
+
+    def _close_proxy(self):
+        if self._proxy is not None:
+            try:
+                self._proxy.close()
+            except Exception:
+                pass
+        self._proxy = None
+
+    def _connect_client(self, **kwargs):
+        """Connect a fresh Paramiko client, optionally through ProxyJump."""
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self._close_proxy()
+        self.client = self._make_ssh_client()
+
+        proxy = None
+        try:
+            proxy = open_proxyjump_socket(
+                self.proxyjump,
+                self.host,
+                self.port,
+                batch_mode=False,
+            )
+            if proxy is not None:
+                kwargs["sock"] = proxy
+            self.client.connect(**kwargs)
+        except Exception:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            if proxy is not None:
+                try:
+                    proxy.close()
+                except Exception:
+                    pass
+            raise
+        self._proxy = proxy
     
     def __del__(self):
         try:
@@ -1026,6 +1074,7 @@ class RemoteClient(BaseClient):
             logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
         except Exception:
             pass
+        self._close_proxy()
 
     def _close_nvml_agent_locked(self):
         channel = self._nvml_agent_channel
@@ -1126,7 +1175,7 @@ class RemoteClient(BaseClient):
                         print(f"  ⚠ Authentication failed. {remaining} attempt(s) remaining.")
                     password = getpass.getpass(prompt=f"Enter password for {self.username}@{self.host}:{self.port} -> ")
 
-                self.client.connect(
+                self._connect_client(
                     hostname=self.host,
                     port=self.port,
                     username=self.username,
@@ -1166,7 +1215,7 @@ class RemoteClient(BaseClient):
             if self.auth == "auto":
                 # Auto mode: try key-based auth first, then password
                 try:
-                    self.client.connect(
+                    self._connect_client(
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1184,7 +1233,7 @@ class RemoteClient(BaseClient):
                         logging.error(msg=f"Key requires passphrase on {self.description}, trying password...")
                         return self._authenticate_with_password()
                     passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
-                    self.client.connect(
+                    self._connect_client(
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1209,7 +1258,7 @@ class RemoteClient(BaseClient):
             elif self.auth == "key":
                 # Key-based authentication only (no password fallback)
                 try:
-                    self.client.connect(
+                    self._connect_client(
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1227,7 +1276,7 @@ class RemoteClient(BaseClient):
                         self._set_connect_error("Key requires passphrase; set `identityfile` or use `auth: password`", error_type="auth")
                         return False
                     passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
-                    self.client.connect(
+                    self._connect_client(
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1263,6 +1312,10 @@ class RemoteClient(BaseClient):
                 self._set_connect_error(f"Unsupported auth method: {self.auth}", error_type="error")
                 return False
         except OSError as e:
+            logging.error(msg=f"Connection failed: {e}")
+            self._set_connect_error(str(e), error_type="connect")
+            return False
+        except Exception as e:
             logging.error(msg=f"Connection failed: {e}")
             self._set_connect_error(str(e), error_type="connect")
             return False

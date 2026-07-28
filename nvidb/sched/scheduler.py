@@ -193,6 +193,7 @@ class Scheduler:
                 auth=server.get("auth", "auto"),
                 identityfile=server.get("identityfile"),
                 password=server.get("password"),
+                proxyjump=server.get("proxyjump"),
             )
         return NodeBackend(
             node.name,

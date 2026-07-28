@@ -14,6 +14,8 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from ..ssh_proxy import open_proxyjump_socket
+
 DEFAULT_CONNECT_TIMEOUT = 8.0
 DEFAULT_COMMAND_TIMEOUT = 30.0
 
@@ -120,6 +122,7 @@ class SSHTransport(Transport):
         auth: str = "auto",
         identityfile: Optional[str] = None,
         password: Optional[str] = None,
+        proxyjump: Optional[str] = None,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
     ):
         self.hostname = hostname
@@ -129,8 +132,10 @@ class SSHTransport(Transport):
         self.auth = auth or "auto"
         self.identityfile = identityfile
         self.password = password
+        self.proxyjump = proxyjump
         self.connect_timeout = connect_timeout
         self._client = None
+        self._proxy = None
         self._lock = threading.RLock()
 
     # --- connection -------------------------------------------------------
@@ -175,16 +180,32 @@ class SSHTransport(Transport):
             if self.password and self.auth == "auto":
                 kwargs["password"] = self.password
 
+        proxy = None
         try:
+            proxy = open_proxyjump_socket(
+                self.proxyjump,
+                self.hostname,
+                self.port,
+                connect_timeout=self.connect_timeout,
+                batch_mode=True,
+            )
+            if proxy is not None:
+                kwargs["sock"] = proxy
             client.connect(**kwargs)
         except Exception as error:
             try:
                 client.close()
             except Exception:
                 pass
+            if proxy is not None:
+                try:
+                    proxy.close()
+                except Exception:
+                    pass
             raise TransportError(f"{self.name}: {type(error).__name__}: {error}") from error
 
         self._client = client
+        self._proxy = proxy
         return client
 
     def _ensure_client(self):
@@ -203,6 +224,12 @@ class SSHTransport(Transport):
             except Exception:
                 pass
         self._client = None
+        if self._proxy is not None:
+            try:
+                self._proxy.close()
+            except Exception:
+                pass
+        self._proxy = None
 
     def close(self) -> None:
         with self._lock:

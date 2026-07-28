@@ -56,6 +56,7 @@ servers:
     nickname: "Production GPU"     # Human-readable nickname for display
     auth: "auto"                   # Authentication method: auto | key | password
     identityfile: "~/.ssh/id_ed25519"  # Optional, used only when auth is auto/key
+    proxyjump: "login.example.com" # Optional OpenSSH ProxyJump host or alias
 ```
 
 **Configuration Options:**
@@ -66,8 +67,31 @@ servers:
 - `auth`: Authentication method - `auto`, `key`, or `password` (optional, default: `auto`)
 - `identityfile`: SSH private key path (optional, only effective when `auth` is `auto` or `key`)
 - `password`: SSH password (optional, will prompt if needed)
+- `proxyjump`: OpenSSH jump host, alias, or comma-separated chain (optional; for
+  example `login` or `login-a,alice@login-b:2222`)
 
 > **Warning**: Storing passwords in plaintext in the configuration file is **NOT RECOMMENDED** for security reasons. Consider using SSH key-based authentication (`auth: key`) instead.
+
+`proxyjump` uses the local OpenSSH client, so aliases and credentials configured
+in `~/.ssh/config` are reused. Connect to the jump host once with `ssh login` to
+accept its host key and verify key/agent authentication before running the
+non-interactive job queue. `nvidb import` copies `ProxyJump` from OpenSSH config:
+
+```sshconfig
+Host login
+    HostName login.example.com
+    User jump-user
+
+Host training-a100
+    HostName 10.0.0.42
+    User gpu-user
+    ProxyJump login
+```
+
+```bash
+nvidb import
+nvidb --remote
+```
 
 The same file also holds a `view` section that nvidb maintains itself. Persistent
 layout keys (`v`, `d`, `s`, `f`, `g`, `u`, `t`, and `p` in single-line mode)
@@ -416,7 +440,7 @@ a `processes` list naming every process with `managed` and `job_id`.
 ```bash
 # Put the command last, after `--`, or pass it as one quoted string
 nvidb job submit --name train --vram 20G -- python train.py --epochs 10
-nvidb job submit --node gem12 --vram 8G --workdir ~/proj -- python eval.py
+nvidb job submit --node gpu-node --vram 8G --workdir ~/proj -- python eval.py
 nvidb job submit --gpus 0 -- python prepare_data.py        # CPU-only
 nvidb job submit --after 12 --vram 4G -- python report.py  # runs after job 12
 nvidb job submit --script run.sh --vram 12G                # a local file's contents
@@ -433,7 +457,7 @@ nvidb job purge                 # forget finished job records
 nvidb queue status              # nodes, capacity and jobs in one view
 nvidb queue status --procs      # the same, with every GPU process listed
 nvidb queue events --since 42   # replay what happened while you were away
-nvidb queue drain 406           # stop scheduling onto a node (`resume` undoes it);
+nvidb queue drain gpu-node           # stop scheduling onto a node (`resume` undoes it);
                                 # jobs already on it keep running and still report back
 nvidb queue tick                # force one scheduler pass
 ```
@@ -623,6 +647,7 @@ Tuning lives under `queue:` in `config.yml`; see
 - NVIDIA driver with NVML (`libnvidia-ml.so.1`)
 - Python 3.8+
 - Python 3.8+ and SSH access on remote servers
+- Local OpenSSH client when `proxyjump` is configured
 - `nvidia-smi` is optional and used only as an NVML failure fallback
 
 ## 5. Tips

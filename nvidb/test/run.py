@@ -56,9 +56,12 @@ def _format_import_candidate(candidate: dict) -> str:
     port = candidate.get("port")
     username = candidate.get("username")
     identityfile = candidate.get("identityfile")
+    proxyjump = candidate.get("proxyjump")
     label = f"{nickname} ({username}@{hostname}:{port})"
     if identityfile:
         label += f" [key: {identityfile}]"
+    if proxyjump:
+        label += f" [via: {proxyjump}]"
     return label
 
 
@@ -173,6 +176,7 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
                 identityfile = identityfiles[0]
         elif isinstance(identityfiles, str):
             identityfile = identityfiles
+        proxyjump = data.get("proxyjump")
 
         candidate = {
             "hostname": hostname,
@@ -183,6 +187,8 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
         }
         if identityfile:
             candidate["identityfile"] = identityfile
+        if proxyjump and str(proxyjump).strip().lower() != "none":
+            candidate["proxyjump"] = proxyjump
         candidates.append(candidate)
 
     selection = _prompt_import_selection(candidates)
@@ -324,6 +330,11 @@ def interactive_add_server(config_path=None):
         identityfile_input = input("IdentityFile (SSH private key path, optional): ").strip()
         if identityfile_input:
             identityfile = identityfile_input
+
+    proxyjump_input = input(
+        "ProxyJump (SSH host or comma-separated chain, optional): "
+    ).strip()
+    proxyjump = proxyjump_input or None
     
     # Password (optional)
     password = None
@@ -336,7 +347,8 @@ def interactive_add_server(config_path=None):
         description=nickname,
         identityfile=identityfile,
         password=password,
-        auth=auth
+        auth=auth,
+        proxyjump=proxyjump,
     )
     
     # Display summary
@@ -350,6 +362,7 @@ def interactive_add_server(config_path=None):
     print(f"  Auth:        {auth}")
     if auth in ("auto", "key"):
         print(f"  IdentityFile:{' (default)' if not identityfile else ' ' + identityfile}")
+    print(f"  ProxyJump:  {proxyjump or '(not set)'}")
     print(f"  Password:    {'***' if password else '(not set)'}")
     print("-" * 50)
     
@@ -379,6 +392,8 @@ def interactive_add_server(config_path=None):
         }
         if identityfile and auth in ("auto", "key"):
             server_dict['identityfile'] = identityfile
+        if proxyjump:
+            server_dict['proxyjump'] = proxyjump
         if password:
             server_dict['password'] = password
         
@@ -494,12 +509,14 @@ def show_servers(config_path=None, detail=False):
         
         if detail:
             auth = server.get('auth', 'auto')
+            proxyjump = server.get('proxyjump')
             has_password = 'Yes' if server.get('password') else 'No'
             
             print(f"\n  [{idx + 1}] {nickname}")
             print(f"      Host:     {host}:{port}")
             print(f"      User:     {username}")
             print(f"      Auth:     {auth}")
+            print(f"      Via:      {proxyjump or 'Direct'}")
             print(f"      Password: {has_password}")
         else:
             print(f"  [{idx + 1}] {nickname} ({host}:{port})")

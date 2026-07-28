@@ -70,6 +70,15 @@ servers:
     auth: "auto"  # auto | key | password
     identityfile: "~/.ssh/id_ed25519"  # Optional, used only when auth is auto/key
 
+  # Example server reached through a jump host from ~/.ssh/config.
+  # A comma-separated value such as "login-a,login-b" enables multiple hops.
+  - hostname: "10.0.0.42"
+    port: 22
+    username: "user2"
+    nickname: "GPU Server via Jump Host"
+    auth: "key"
+    proxyjump: "login"
+
   # Example server with password authentication
   - hostname: "192.168.1.100"
     port: 22

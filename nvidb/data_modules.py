@@ -100,6 +100,7 @@ class ServerInfo:
     identityfile: Optional[str] = None
     password: str = field(repr=False, default=None)
     auth: Literal['password', 'key', 'auto'] = 'auto'
+    proxyjump: Optional[str] = None
     
     def __post_init__(self):
         if self.description is None:
