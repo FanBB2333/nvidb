@@ -615,7 +615,8 @@ slows the numbers down but never freezes the interface.
 | `j` / `k` / arrows | Move the selection in the focused pane        |
 | `PgUp` / `PgDn`    | Move a page at a time                         |
 | `Tab`              | Switch focus between the node and job panes   |
-| `Enter`            | Show or hide the detail pane                  |
+| `Enter`            | Show or hide the selected job's detail pane   |
+| `[` / `]`          | Page through wrapped detail text              |
 | `L`                | Toggle a live tail of the selected job's log  |
 | `c`                | Cancel the selected job (press twice)         |
 | `r`                | Re-queue the selected finished job            |

@@ -247,6 +247,9 @@ class QueueTUI:
         self.show_detail = True
         self.show_log = False
         self.show_help = False
+        self.detail_page = 0
+        self.detail_pages = 1
+        self._detail_job_id: Optional[int] = None
         self.pending_confirm: Optional[Tuple[str, int, float]] = None
         self.jobs: List[Dict[str, Any]] = []
         self.nodes: List[Dict[str, Any]] = []
@@ -285,6 +288,62 @@ class QueueTUI:
 
     def _fit(self, text: str, width: int) -> str:
         return fit_display(text, width)
+
+    @staticmethod
+    def _wrap_plain(text: Any, width: int) -> List[str]:
+        """Wrap plain text by terminal columns, including wide characters."""
+        width = max(1, int(width))
+        wrapped: List[str] = []
+        logical_lines = str(text).splitlines() or [""]
+        for logical_line in logical_lines:
+            remaining = " ".join(logical_line.split())
+            if not remaining:
+                wrapped.append("")
+                continue
+            while display_width(remaining) > width:
+                used = 0
+                split_at = 0
+                for index, char in enumerate(remaining):
+                    char_width = display_width(char)
+                    if used + char_width > width:
+                        break
+                    used += char_width
+                    split_at = index + 1
+                if split_at == 0:
+                    split_at = 1
+                candidate = remaining[:split_at]
+                word_break = candidate.rfind(" ")
+                if word_break > 0:
+                    candidate = candidate[:word_break]
+                    split_at = word_break + 1
+                wrapped.append(candidate.rstrip())
+                remaining = remaining[split_at:].lstrip()
+            wrapped.append(remaining)
+        return wrapped
+
+    def _field_lines(
+        self,
+        label: str,
+        value: Any,
+        width: int,
+        *,
+        style: Optional[str] = None,
+    ) -> List[str]:
+        """Render a labeled detail field without truncating its value."""
+        prefix = f"  {label:<5}"
+        continuation = " " * display_width(prefix)
+        available = max(1, width - display_width(prefix))
+        values = self._wrap_plain(value, available)
+        return [
+            self._compose(
+                [
+                    (prefix if index == 0 else continuation, "bright_black"),
+                    (line, style),
+                ],
+                width,
+            )
+            for index, line in enumerate(values)
+        ]
 
     def _compose(self, segments, width: int, *, reverse: bool = False) -> str:
         """Join `(text, style)` pairs, truncating on plain text before styling.
@@ -560,7 +619,10 @@ class QueueTUI:
             lines.append(self._style("  (no jobs match this filter)", "bright_black"))
             return lines
 
-        rows = max(1, height - 2)
+        # Reserve a row for the hidden-count indicator when the table cannot
+        # show every job. This keeps the pane within its assigned height.
+        row_budget = max(1, height - 2)
+        rows = max(1, height - 3) if len(self.jobs) > row_budget else row_budget
         start = max(0, min(self.job_index - rows // 2, len(self.jobs) - rows))
         start = max(0, start)
         for position in range(start, min(len(self.jobs), start + rows)):
@@ -589,8 +651,9 @@ class QueueTUI:
                 tail, tail_style = f"▸ {' '.join(progress.split())}", "cyan"
             else:
                 tail, tail_style = " ".join(job["command"].split()), None
-            selected = self.focus == "jobs" and position == self.job_index
-            marker = "›" if selected else " "
+            current = position == self.job_index
+            selected = self.focus == "jobs" and current
+            marker = ("▾" if self.show_detail else "▸") if current else " "
             lines.append(
                 self._compose(
                     [
@@ -608,11 +671,31 @@ class QueueTUI:
             )
         return lines
 
+    def _sync_detail_selection(self) -> None:
+        job = self.selected_job()
+        job_id = job["id"] if job else None
+        if job_id != self._detail_job_id:
+            self._detail_job_id = job_id
+            self.detail_page = 0
+            self.detail_pages = 1
+
+    def _collapsed_detail_line(self, width: int) -> Optional[str]:
+        job = self.selected_job()
+        if job is None:
+            return None
+        title = f"─ ▸ JOB {job['id']} DETAIL HIDDEN — Enter to show "
+        return self._style(
+            title + "─" * max(0, width - display_width(title)),
+            "bright_black",
+        )
+
     def _detail_lines(self, state: Dict[str, Any], width: int, height: int) -> List[str]:
         job = self.selected_job()
         if job is None or height < 3:
             return []
         if self.show_log:
+            self.detail_page = 0
+            self.detail_pages = 1
             title = f"─ LOG job {job['id']} "
             lines = [self._style(title + "─" * max(0, width - len(title)), "bright_black")]
             text = state["log_text"] if state["log_job"] == job["id"] else ""
@@ -623,8 +706,7 @@ class QueueTUI:
             lines.extend("  " + self._fit(line, width - 2) for line in body)
             return lines
 
-        title = f"─ JOB {job['id']} "
-        lines = [self._style(title + "─" * max(0, width - len(title)), "bright_black")]
+        content: List[str] = []
         pieces = [
             f"name {job['name'] or '-'}",
             f"state {job['state']}",
@@ -633,30 +715,53 @@ class QueueTUI:
             f"pid {job['remote_pid'] or '-'}",
             f"submitter {job['submitter'] or '-'}",
         ]
-        lines.append(self._fit("  " + "   ".join(pieces), width))
-        lines.append(self._fit(f"  cmd  {' '.join(job['command'].split())}", width))
+        content.append(self._fit("  " + "   ".join(pieces), width))
+        content.append(self._fit(f"  cmd  {' '.join(job['command'].split())}", width))
         if job.get("workdir"):
-            lines.append(self._fit(f"  cwd  {job['workdir']}", width))
+            content.append(self._fit(f"  cwd  {job['workdir']}", width))
         if job.get("progress"):
-            lines.append(
-                self._compose(
-                    [("  live ", "bright_black"), (" ".join(job["progress"].split()), "cyan")],
+            content.extend(
+                self._field_lines(
+                    "live",
+                    " ".join(job["progress"].split()),
                     width,
+                    style="cyan",
                 )
             )
         if job.get("notes"):
-            lines.append(self._fit(f"  note {job['notes']}", width))
+            content.extend(self._field_lines("note", job["notes"], width))
         if job.get("last_error"):
-            lines.append(self._style(self._fit(f"  err  {job['last_error']}", width), "red"))
+            content.extend(
+                self._field_lines("err", job["last_error"], width, style="red")
+            )
         if job.get("result") is not None:
             import json as _json
 
-            lines.append(
-                self._fit(
-                    f"  out  {_json.dumps(job['result'], ensure_ascii=False)}", width
+            content.extend(
+                self._field_lines(
+                    "out",
+                    _json.dumps(job["result"], ensure_ascii=False),
+                    width,
                 )
             )
-        return lines[:height]
+
+        page_height = max(1, height - 1)
+        self.detail_pages = max(1, (len(content) + page_height - 1) // page_height)
+        self.detail_page = max(0, min(self.detail_page, self.detail_pages - 1))
+        page = self.detail_page + 1
+        title = f"─ ▾ JOB {job['id']} DETAIL"
+        if self.detail_pages > 1:
+            title += f" [{page}/{self.detail_pages} · [/] page]"
+        title += " "
+        lines = [
+            self._style(
+                title + "─" * max(0, width - display_width(title)),
+                "bright_black",
+            )
+        ]
+        start = self.detail_page * page_height
+        lines.extend(content[start : start + page_height])
+        return lines
 
     def _footer_lines(self, state: Dict[str, Any], width: int) -> List[str]:
         notice = state.get("notice")
@@ -678,8 +783,10 @@ class QueueTUI:
                     "yellow",
                 )
             )
+        detail_action = "hide detail" if self.show_detail else "show detail"
         keys = (
-            "j/k move  Tab pane  Enter detail  L log  c cancel  r requeue  "
+            f"j/k move  Tab pane  Enter {detail_action}  [/] page  "
+            "L log  c cancel  r requeue  "
             "A ack  t tick  a auto  f filter  p procs  d drain  ? help  q quit"
         )
         lines.append(self._style(self._fit(" " + keys, width), "bright_black"))
@@ -690,7 +797,8 @@ class QueueTUI:
             ("j / k / ↑ / ↓", "Move the selection in the focused pane"),
             ("PgUp / PgDn", "Move a page at a time"),
             ("Tab", "Switch focus between the node and job panes"),
-            ("Enter", "Show or hide the detail pane"),
+            ("Enter", "Show or hide the selected job's detail pane"),
+            ("[ / ]", "Page through wrapped detail text"),
             ("L", "Toggle the log tail for the selected job"),
             ("c", "Cancel the selected job (press twice)"),
             ("r", "Re-queue the selected finished job"),
@@ -718,6 +826,7 @@ class QueueTUI:
 
         self.nodes = snapshot["nodes"]
         self.jobs = self._visible_jobs(snapshot)
+        self._sync_detail_selection()
 
         # Leave the bottom row free so writing the last line cannot scroll the
         # screen and shear the frame.
@@ -741,14 +850,28 @@ class QueueTUI:
                 )
             lines.extend(node_lines)
             footer = self._footer_lines(state, width)
-            detail_height = 0
-            if self.show_detail and self.jobs:
-                detail_height = 8
             body_height = usable - len(footer)
-            job_height = body_height - len(lines) - detail_height
-            lines.extend(self._job_lines(width, max(4, job_height)))
-            if detail_height:
+            available = max(0, body_height - len(lines))
+            if self.show_detail and self.jobs:
+                minimum_detail = min(8, max(3, available - 4))
+                job_height = min(
+                    max(4, len(self.jobs) + 2),
+                    max(4, available - minimum_detail),
+                )
+                job_lines = self._job_lines(width, job_height)
+                # At least three rows are needed for a useful detail pane.
+                job_lines = job_lines[: max(0, available - 3)]
+                lines.extend(job_lines)
+                detail_height = max(0, body_height - len(lines))
                 lines.extend(self._detail_lines(state, width, detail_height))
+            else:
+                collapsed_height = 1 if self.jobs else 0
+                job_height = max(4, available - collapsed_height)
+                job_lines = self._job_lines(width, job_height)
+                lines.extend(job_lines[: max(0, available - collapsed_height)])
+                collapsed = self._collapsed_detail_line(width)
+                if collapsed:
+                    lines.append(collapsed)
             # The footer holds the keybindings, so it is reserved rather than
             # left to whatever space happens to remain.
             lines = lines[:body_height]
@@ -767,7 +890,10 @@ class QueueTUI:
             if self.nodes:
                 self.node_index = max(0, min(self.node_index + delta, len(self.nodes) - 1))
         elif self.jobs:
+            previous = self.job_index
             self.job_index = max(0, min(self.job_index + delta, len(self.jobs) - 1))
+            if self.job_index != previous:
+                self.detail_page = 0
 
     def _confirm(self, action: str, job_id: int) -> bool:
         """Two-step confirmation: the same key twice within a few seconds."""
@@ -812,12 +938,23 @@ class QueueTUI:
             self._move(-10)
         elif text == "g":
             self.job_index = 0
+            self.detail_page = 0
         elif text == "G":
             self.job_index = max(0, len(self.jobs) - 1)
+            self.detail_page = 0
         elif name == "KEY_TAB":
             self.focus = "nodes" if self.focus == "jobs" else "jobs"
-        elif name == "KEY_ENTER" or text in ("\n", "\r"):
-            self.show_detail = not self.show_detail
+        elif name in ("KEY_ENTER", "KEY_RETURN") or text in ("\n", "\r"):
+            if self.selected_job() is not None:
+                self.show_detail = not self.show_detail
+                if self.show_detail:
+                    self.detail_page = 0
+                elif self.show_log:
+                    self.worker.set_log_request(None)
+        elif text == "[" and self.show_detail and not self.show_log:
+            self.detail_page = max(0, self.detail_page - 1)
+        elif text == "]" and self.show_detail and not self.show_log:
+            self.detail_page = min(self.detail_pages - 1, self.detail_page + 1)
         elif text == "L":
             job = self.selected_job()
             self.show_log = not self.show_log
@@ -828,6 +965,7 @@ class QueueTUI:
         elif text == "f":
             self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
             self.job_index = 0
+            self.detail_page = 0
         elif text == "p":
             self.proc_view = PROC_VIEWS[
                 (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
@@ -863,7 +1001,7 @@ class QueueTUI:
             with term.fullscreen(), term.cbreak(), term.hidden_cursor():
                 while True:
                     state = self.worker.read_state()
-                    if self.show_log:
+                    if self.show_log and self.show_detail:
                         job = self.selected_job()
                         if job:
                             self.worker.set_log_request((job["id"], "stdout"))

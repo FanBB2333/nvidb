@@ -226,6 +226,52 @@ def test_the_detail_pane_shows_both_the_note_and_the_live_status():
     assert "live " in output
 
 
+def test_a_long_note_wraps_instead_of_being_truncated():
+    from nvidb.sched.model import display_width
+
+    os.environ["LINES"] = "32"
+    note = (
+        "开头标记：这个任务用于验证详情区域中的长说明能够根据终端宽度自动换行，"
+        "其中包含中文、English words 和参数 --learning-rate 1e-4。"
+        "继续添加内容以确保单行无法容纳，最后保留一个容易检查的结尾标记。"
+        "结尾标记：NOTE-COMPLETE"
+    )
+    snapshot = _snapshot(jobs=[_job(1, notes=note)], nodes=[])
+    tui = _tui(width=60)
+
+    output = _render(tui, _state(snapshot))
+
+    assert "开头标记" in output
+    assert "NOTE-COMPLETE" in output
+    assert tui.detail_pages == 1
+    for line in output.splitlines():
+        assert display_width(line) <= 60
+
+
+def test_a_very_long_note_can_be_paged_to_its_end():
+    os.environ["LINES"] = "20"
+    note = "\n".join(
+        [f"note line {index:02d}: retained detail text" for index in range(30)]
+        + ["END-OF-NOTE"]
+    )
+    snapshot = _snapshot(jobs=[_job(1, notes=note)], nodes=[])
+    state = _state(snapshot)
+    tui = _tui(width=70)
+
+    first_page = _render(tui, state)
+
+    assert tui.detail_pages > 1
+    assert "[1/" in first_page
+    assert "END-OF-NOTE" not in first_page
+
+    for _ in range(tui.detail_pages - 1):
+        _press(tui, "]")
+        last_page = _render(tui, state)
+
+    assert f"[{tui.detail_pages}/{tui.detail_pages}" in last_page
+    assert "END-OF-NOTE" in last_page
+
+
 def test_an_unreachable_node_shows_its_error():
     snapshot = _snapshot()
     snapshot["nodes"][0].update(state="down", last_error="timed out", gpus=[])
@@ -304,6 +350,29 @@ def test_tab_switches_which_pane_has_focus():
     _press(tui, "j")
     assert tui.node_index == 1
     assert tui.job_index == 0  # the job pane did not move
+
+
+def test_enter_has_visible_expand_and_collapse_states():
+    snapshot = _snapshot(jobs=[_job(1, notes="visible detail")], nodes=[])
+    state = _state(snapshot)
+    tui = _tui()
+
+    expanded = _render(tui, state)
+    assert "▾ JOB 1 DETAIL" in expanded
+    assert "Enter hide detail" in expanded
+    assert "note visible detail" in expanded
+
+    _press(tui, "", name="KEY_ENTER")
+    collapsed = _render(tui, state)
+    assert "▸ JOB 1 DETAIL HIDDEN" in collapsed
+    assert "Enter show detail" in collapsed
+    assert "note visible detail" not in collapsed
+
+    # Some terminal definitions report Return separately from KEY_ENTER.
+    _press(tui, "", name="KEY_RETURN")
+    reopened = _render(tui, state)
+    assert "▾ JOB 1 DETAIL" in reopened
+    assert "note visible detail" in reopened
 
 
 def test_the_filter_cycles_through_the_useful_views():
