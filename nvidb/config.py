@@ -46,19 +46,76 @@ def ensure_working_dir():
     WORKING_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_config(config_path=None) -> dict:
-    """Load config.yml, returning an empty dict when it is missing or invalid."""
+def get_queue_config_path():
+    """Path of the queue's own config file, overridable for tests and sandboxes."""
+    override = os.environ.get('NVIDB_QUEUE_CONFIG')
+    if override:
+        return Path(override).expanduser()
+    return WORKING_DIR / 'queue.yml'
+
+
+def _read_yaml(path) -> dict:
+    """Load a YAML mapping, returning an empty dict when it is missing or invalid."""
     import yaml
 
-    path = Path(config_path or get_config_path()).expanduser()
+    path = Path(path).expanduser()
     if not path.exists():
         return {}
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            cfg = yaml.load(handle, Loader=yaml.FullLoader) or {}
+            data = yaml.load(handle, Loader=yaml.FullLoader) or {}
     except Exception:
         return {}
-    return cfg if isinstance(cfg, dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config(config_path=None) -> dict:
+    """Load config.yml, returning an empty dict when it is missing or invalid."""
+    return _read_yaml(config_path or get_config_path())
+
+
+def load_queue_config(config_path=None) -> dict:
+    """Configuration governing the job queue: queue.yml when it exists, else config.yml.
+
+    The queue needs a different server list from the monitor. Every entry it can
+    see becomes a node it probes and may dispatch work onto, which is not what
+    someone who added a colleague's machine to `nvidb` was asking for. Giving the
+    queue its own file lets one `~/.nvidb` serve both; leaving the file out keeps
+    the original behaviour exactly.
+
+    The result has the same shape as config.yml, so everything downstream reads
+    `servers` and `queue` without knowing which file they came from.
+    """
+    main = load_config()
+    queue_cfg = _read_yaml(config_path or get_queue_config_path())
+    if not queue_cfg:
+        return main
+
+    merged = dict(queue_cfg)
+
+    # `nodes` reads better in a file that is only about the queue, but `servers`
+    # keeps blocks copy-pasteable from config.yml. Both are accepted.
+    servers = queue_cfg.get("servers")
+    if servers is None:
+        servers = queue_cfg.get("nodes")
+    if servers is None:
+        # No list of its own: the queue schedules onto whatever the monitor
+        # watches, which is what a single-machine setup wants.
+        servers = main.get("servers") or []
+    merged.pop("nodes", None)
+    merged["servers"] = servers
+
+    settings = dict((main.get("queue") or {}))
+    overrides = queue_cfg.get("queue") or {}
+    if isinstance(overrides, dict):
+        notify = {**(settings.get("notify") or {}), **(overrides.get("notify") or {})}
+        settings.update(overrides)
+        if notify:
+            # Merged one level deeper: a queue.yml that only turns off desktop
+            # notifications must not drop the command hook set in config.yml.
+            settings["notify"] = notify
+    merged["queue"] = settings
+    return merged
 
 
 def _dq(value) -> str:

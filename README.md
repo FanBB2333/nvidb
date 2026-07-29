@@ -641,6 +641,60 @@ job — is a single shell round trip.
 Tuning lives under `queue:` in `config.yml`; see
 [config.example.yml](config.example.yml) for the full set of keys.
 
+### 3.9 Keeping the queue on a machine that stays on
+
+Everything above assumes some client eventually runs a scheduler pass. That
+stops being enough when the point is to submit work and walk away: a job queued
+just before a laptop is closed stays `pending` until something looks again.
+Jobs already **running** are unaffected — they were detached from the SSH
+session that started them — so the only thing missing is somebody to dispatch.
+
+Move the queue onto a machine that stays on, and the laptop becomes a client of
+it. The queue's own configuration lives in its own file, so one `~/.nvidb` can
+hold both a monitor watching many machines and a queue scheduling onto a few:
+
+```yaml
+# ~/.nvidb/queue.yml on the queue host — see queue.example.yml
+servers:
+  - hostname: "gpu-node.example.com"
+    port: 2222
+    username: "user"
+    nickname: "gpu-node"
+queue:
+  include_local: true
+  local_node_name: "queue-host"
+```
+
+The **keeper** keeps that machine scheduling. It is a shell script written into
+`~/.nvidb`, which restarts `nvidb queue daemon` whenever it stops and detaches
+it from the session that installed it — no root, no cron entry, no service
+manager:
+
+```bash
+nvidb queue keeper install --start   # write ~/.nvidb/queue-keeper.sh and run it
+nvidb queue keeper status            # non-zero while nothing is keeping the queue moving
+nvidb queue keeper logs -n 50
+nvidb queue keeper stop
+```
+
+It does not survive a reboot, by design. Any client command starts it again,
+because a client configured with `remote:` opens no database of its own and
+forwards the whole command line to the queue host, running the keeper's `ensure`
+in the same round trip:
+
+```yaml
+# ~/.nvidb/queue.yml on the laptop
+remote:
+  host: "queue-host.example.com"
+  nvidb: "/home/user/.local/bin/nvidb"   # absolute: a non-interactive shell has a thin PATH
+```
+
+`nvidb job submit`, `job wait`, `logs --follow`, `queue status` and the TUI then
+behave exactly as they do locally — it is the same CLI, running over there — and
+the exit codes come back unchanged. `--local` runs one command against this
+machine's own queue instead, and `nvidb queue status` reports `keeper up` or
+`keeper DOWN` wherever a keeper is installed.
+
 ---
 
 ## 4. System Requirements

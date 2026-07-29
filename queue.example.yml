@@ -1,0 +1,50 @@
+# nvidb queue configuration example
+#
+# Copy this to ~/.nvidb/queue.yml. It is entirely optional: without it the queue
+# reads `servers` and `queue` from config.yml exactly as before.
+#
+# It exists for one reason. Every server the queue can see becomes a node it
+# probes and may dispatch work onto, which is rarely what you want from the list
+# of machines you happen to monitor. Giving the queue its own file lets one
+# ~/.nvidb serve both, and it is where a machine says whether it *hosts* the
+# queue or merely talks to one.
+
+# --- A. On the machine that hosts the queue -------------------------------
+# The nodes it schedules onto. `nodes:` is accepted as a synonym. Leave the
+# whole section out to inherit config.yml's servers.
+servers:
+  - hostname: "gpu-node.example.com"
+    port: 2222
+    username: "user"
+    nickname: "gpu-node"
+    auth: "auto"          # auto | key | password
+
+queue:
+  include_local: true     # also schedule onto this machine
+  local_node_name: "queue-host"  # what to call it; "local" reads oddly once there are two
+  # Everything under `queue:` in config.example.yml is accepted here and wins
+  # over the value there.
+  headroom_mb: 512
+  max_jobs_per_gpu: 4
+  notify:
+    desktop: false        # a headless queue host has nobody to show a pop-up to
+    log: true             # $NVIDB_HOME/alerts.log
+    command: null         # a shell command fed the alert as JSON on stdin
+
+# --- B. On a machine that only talks to that queue ------------------------
+# With `remote:` set, nvidb opens no database of its own: it hands the command
+# to the same nvidb over there and passes back its output and exit code. Submit
+# from a laptop, close it, and the queue keeps scheduling.
+#
+# remote:
+#   host: "queue-host.example.com"        # or an ~/.ssh/config alias
+#   port: 22                     # optional when the alias covers it
+#   username: "user"             # optional, likewise
+#   # Absolute path: `ssh host 'nvidb ...'` gets a non-interactive shell whose
+#   # PATH usually lacks the ~/.local/bin a `pip install --user` writes to.
+#   nvidb: "/home/user/.local/bin/nvidb"
+#   nvidb_home: null             # set only if the far side uses a custom NVIDB_HOME
+#   keeper: ensure               # ensure | off - start the keeper if it is not up
+#   ssh_options: []              # extra -o options, e.g. ["ConnectTimeout=8"]
+#
+# `nvidb <anything> --local` uses this machine's own queue for one command.

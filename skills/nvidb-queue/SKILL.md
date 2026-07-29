@@ -18,6 +18,12 @@ SQLite file (`~/.nvidb/queue.db`), which is the point: several agent sessions
 coordinate through that file alone, without talking to each other and without
 any of them needing to stay alive.
 
+That file may be on another machine. When `~/.nvidb/queue.yml` has a `remote:`
+section, every command below is forwarded to the queue host and behaves
+identically — same output, same exit codes — so nothing here changes. It does
+mean jobs keep being dispatched after this session ends, not merely the ones
+already running.
+
 **Never start GPU work with a bare `ssh ... python train.py &`.** A job started
 that way is invisible to every other session, holds no reservation, and is lost
 when its SSH connection drops. Submit it to the queue instead.
@@ -52,7 +58,7 @@ Key options:
   the GPU gets oversubscribed, too high and the job waits for room it will not
   use. Omitting it means "reserve nothing", which is only right for CPU work.
 - `--gpus N` — GPUs required, default 1. Use `--gpus 0` for CPU-only work.
-- `--node <name>` — pin to one machine; prefix matches, so `--node gem12` works.
+- `--node <name>` — pin to one machine; prefix matches, so `--node gpu-node` works.
   Leave it off unless the job genuinely needs that machine (its data is there,
   it needs that GPU's memory); the scheduler places it better than you can.
 - `--note "..."` — **write one.** Say what the job is for and what would make it
@@ -201,7 +207,7 @@ measured, so treat it as approximate.
 nvidb job cancel 12          # kill the remote process group
 nvidb job requeue 12         # run a finished job again
 nvidb job note 12 --append "loss plateaued at epoch 30"
-nvidb queue drain gem12      # stop scheduling onto a node (`resume` undoes it)
+nvidb queue drain gpu-node      # stop scheduling onto a node (`resume` undoes it)
 ```
 
 Cancelling is destructive and discards work in progress. **Confirm with the user
@@ -225,5 +231,6 @@ it.
 `nvidb queue --help`, `nvidb job submit --help`, and section 3 of the nvidb
 README cover the rest: the TUI (`nvidb queue`), the optional notification daemon
 (`nvidb queue daemon`), the event log (`nvidb queue events --since <id>`, for
-catching up on what happened while you were not running), and the `queue:`
-settings in `~/.nvidb/config.yml`.
+catching up on what happened while you were not running), the keeper that keeps
+a queue host scheduling (`nvidb queue keeper status`), and the `queue:` settings
+in `~/.nvidb/config.yml` or `~/.nvidb/queue.yml`.

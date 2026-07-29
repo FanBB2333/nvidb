@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import db as dbm
+from . import keeper as keeper_mod
+from . import remote as remote_mod
 from .executor import VALID_ENV_KEY
 from .model import (
     JOB_STATES,
@@ -314,6 +316,11 @@ def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
     )
     if lock.get("owner"):
         header += f"  (tick held by {lock['owner']})"
+    keeper_state = snapshot.get("keeper") or {}
+    # Only worth a word where a keeper is meant to exist: on a laptop driving a
+    # remote queue there is nothing here to report.
+    if keeper_state.get("installed") or keeper_state.get("running"):
+        header += f"  keeper {'up' if keeper_state.get('running') else 'DOWN'}"
     parts = [header]
     if snapshot.get("open_alerts"):
         # The first thing to say about a queue with failures in it is that it
@@ -522,6 +529,78 @@ def cmd_daemon(args) -> int:
         return 0
     finally:
         scheduler.close()
+
+
+def _render_keeper(state: Dict[str, Any]) -> str:
+    if state.get("running"):
+        return f"running (pid {state['pid']})"
+    return "stopped" if state.get("installed") else "not installed"
+
+
+def cmd_keeper(args) -> int:
+    """Install and drive the shell script that keeps this queue moving."""
+    action = getattr(args, "keeper_action", None) or "status"
+
+    if action == "install":
+        try:
+            info = keeper_mod.install(nvidb_bin=args.nvidb, interval=args.interval)
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
+        except OSError as error:
+            return _error(f"could not write the keeper: {error}", as_json=args.json)
+        started = None
+        if args.start:
+            result = keeper_mod.run("start")
+            started = result.returncode == 0
+        if args.json:
+            _print_json({"ok": True, **info, "started": started, "state": keeper_mod.status()})
+        else:
+            verb = "reinstalled" if info["replaced"] else "installed"
+            print(f"{verb} {info['script']}")
+            print(f"  runs   {info['nvidb']} queue daemon --interval {info['interval']}")
+            print(f"  log    {info['log']}")
+            if started is None:
+                print("  start it with: nvidb queue keeper start")
+            else:
+                print(f"  keeper {_render_keeper(keeper_mod.status())}")
+        return 0
+
+    if action == "status":
+        state = keeper_mod.status()
+        if args.json:
+            _print_json(state)
+        else:
+            print(f"keeper {_render_keeper(state)}")
+            print(f"  script {state['script']}")
+            print(f"  log    {state['log']}")
+        # Non-zero while nothing is keeping the queue moving, so a shell or an
+        # agent can branch on it the way it does on `queue alerts`.
+        return 0 if state["running"] else 1
+
+    extra = [args.number] if action == "logs" else []
+    try:
+        result = keeper_mod.run(action, *extra)
+    except FileNotFoundError as error:
+        return _error(
+            f"no keeper installed at {error} (run `nvidb queue keeper install`)",
+            as_json=args.json,
+        )
+    output = (result.stdout or "").rstrip("\n")
+    if args.json:
+        _print_json(
+            {
+                "ok": result.returncode == 0,
+                "action": action,
+                "output": output,
+                "state": keeper_mod.status(),
+            }
+        )
+    else:
+        if output:
+            print(output)
+        if result.stderr.strip():
+            print(result.stderr.rstrip("\n"), file=sys.stderr)
+    return result.returncode
 
 
 def cmd_events(args) -> int:
@@ -947,6 +1026,11 @@ def _add_common(parser: argparse.ArgumentParser, *, json_flag: bool = True) -> N
     if json_flag:
         parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     parser.add_argument("--db-path", default=None, help="Queue database path")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Use this machine's own queue even when a remote queue host is configured",
+    )
 
 
 def _add_refresh_flags(parser: argparse.ArgumentParser) -> None:
@@ -1028,6 +1112,43 @@ def register_parsers(subparsers) -> None:
     daemon.add_argument("--no-notify", action="store_true", help="Tick but stay quiet")
     daemon.add_argument("--once", action="store_true", help="Run a single pass and exit")
     daemon.set_defaults(func=cmd_daemon)
+
+    keeper = queue_sub.add_parser(
+        "keeper",
+        help="Install and control the shell script that keeps this queue moving",
+        description=(
+            "Writes a small `sh` script into the nvidb working directory that "
+            "restarts `nvidb queue daemon` whenever it stops, and detaches it "
+            "from the session that started it. Needs no root, no cron entry and "
+            "no service manager; it does not survive a reboot, and any client "
+            "command starts it again."
+        ),
+    )
+    _add_common(keeper)
+    keeper.add_argument(
+        "keeper_action",
+        nargs="?",
+        default="status",
+        choices=["install", "start", "ensure", "stop", "restart", "status", "logs"],
+    )
+    keeper.add_argument(
+        "--nvidb",
+        default=None,
+        metavar="PATH",
+        help="The nvidb executable to run (default: the one on PATH, resolved to an absolute path)",
+    )
+    keeper.add_argument(
+        "--interval",
+        type=int,
+        default=keeper_mod.DEFAULT_INTERVAL,
+        metavar="SECONDS",
+        help="Seconds between scheduler passes",
+    )
+    keeper.add_argument(
+        "--start", action="store_true", help="Start it straight after installing"
+    )
+    keeper.add_argument("-n", "--number", type=int, default=50, help="Log lines to show")
+    keeper.set_defaults(func=cmd_keeper)
 
     events = queue_sub.add_parser("events", help="Replay the queue event log")
     _add_common(events)
@@ -1192,12 +1313,40 @@ def quiet_transport_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def _forward_to_queue_host(target: Dict[str, Any], args) -> int:
+    """Hand this invocation to the machine that owns the queue."""
+    script_text = None
+    if getattr(args, "func", None) is cmd_submit and getattr(args, "script", None):
+        # `--script` names a file on *this* machine, so it is read here and the
+        # contents travel with the command.
+        script_path = Path(args.script).expanduser()
+        try:
+            script_text = script_path.read_text(encoding="utf-8")
+        except OSError as error:
+            return _error(f"could not read {script_path}: {error}", as_json=getattr(args, "json", False))
+    return remote_mod.forward(
+        target,
+        sys.argv[1:],
+        # The TUI needs a terminal on the far side; everything else is a pipe
+        # and must not be given one, or its output would grow carriage returns.
+        tty=getattr(args, "func", None) is cmd_tui and sys.stdin.isatty(),
+        script_text=script_text,
+    )
+
+
 def dispatch(args) -> int:
     """Run the handler argparse selected, or report a usable error."""
     quiet_transport_logging()
     handler = getattr(args, "func", None)
     if handler is None:
         return _error("no queue subcommand selected")
+    if not getattr(args, "local", False):
+        target = remote_mod.load_target()
+        if target is not None:
+            try:
+                return _forward_to_queue_host(target, args)
+            except KeyboardInterrupt:
+                return 130
     try:
         return handler(args)
     except KeyboardInterrupt:

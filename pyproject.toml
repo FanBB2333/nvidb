@@ -50,3 +50,8 @@ version = { attr = "nvidb.config.VERSION" }
 
 [tool.setuptools.packages.find]
 include = ["nvidb*"]
+
+[tool.setuptools.package-data]
+# The keeper is shipped as a shell script and copied into the working directory
+# by `nvidb queue keeper install`, so it has to survive packaging.
+nvidb = ["sched/keeper.sh"]

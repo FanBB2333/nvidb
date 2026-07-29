@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import config as nvidb_config
 from . import db as dbm
+from . import keeper as keeper_mod
 from .executor import JobExecutor, NodeProbe
 from .model import (
     GpuProcess,
@@ -64,13 +65,18 @@ DEFAULT_SETTINGS = {
     # pack:   prefer the fullest GPU that still fits (keeps big cards free)
     "placement": "spread",
     "include_local": False,
+    # What to call this machine when `include_local` puts it in the queue. Worth
+    # setting once the scheduler runs on a node rather than on a laptop, where
+    # "local" reads as "wherever I happen to be". Changing it later strands jobs
+    # recorded against the old name, so it is a set-it-once value.
+    "local_node_name": "local",
 }
 
 
 def load_settings(cfg: Optional[dict] = None) -> Dict[str, Any]:
-    """Merge the `queue:` section of config.yml over the defaults."""
+    """Merge the `queue:` section of the queue's configuration over the defaults."""
     if cfg is None:
-        cfg = nvidb_config.load_config()
+        cfg = nvidb_config.load_queue_config()
     raw = (cfg or {}).get("queue") or {}
     settings = dict(DEFAULT_SETTINGS)
     if isinstance(raw, dict):
@@ -164,7 +170,7 @@ class Scheduler:
         owner: Optional[str] = None,
     ):
         self.conn = conn
-        self.cfg = cfg if cfg is not None else nvidb_config.load_config()
+        self.cfg = cfg if cfg is not None else nvidb_config.load_queue_config()
         self.settings = settings or load_settings(self.cfg)
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}"
         self._backend_factory = backend_factory or self._default_backend_factory
@@ -220,7 +226,7 @@ class Scheduler:
     # --- configuration sync ----------------------------------------------
 
     def sync_nodes_from_config(self) -> List[str]:
-        """Mirror config.yml's server list into the `nodes` table."""
+        """Mirror the queue configuration's server list into the `nodes` table."""
         names = []
         for server in (self.cfg or {}).get("servers") or []:
             name = node_name_for_server(server)
@@ -233,10 +239,11 @@ class Scheduler:
             )
             names.append(name)
         if self.settings.get("include_local"):
+            local_name = str(self.settings.get("local_node_name") or "local")
             dbm.upsert_node(
-                self.conn, "local", hostname="localhost", port=0, username=None
+                self.conn, local_name, hostname="localhost", port=0, username=None
             )
-            names.append("local")
+            names.append(local_name)
         return names
 
     # --- submission -------------------------------------------------------
@@ -1211,6 +1218,10 @@ class Scheduler:
             "db_path": dbm.connection_path(self.conn),
             "last_tick_at": dbm.get_meta(self.conn, "last_tick_at"),
             "tick_lock": dict(holder) if holder else None,
+            # Whether this machine has something keeping the queue moving while
+            # no client is looking. Reported rather than acted on: a queue with
+            # a stopped keeper is not broken, only idle.
+            "keeper": keeper_mod.status(),
             "settings": {
                 "headroom_mb": headroom,
                 "max_jobs_per_gpu": int(self.settings["max_jobs_per_gpu"]),

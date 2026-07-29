@@ -397,9 +397,15 @@ class QueueTUI:
         tick_text = "never" if tick_age is None else f"{int(tick_age)}s ago"
         mode = "auto" if state["auto_tick"] else "manual"
         status = "working" if state["busy"] else "idle"
+        # Only where a keeper is meant to exist: its absence is the difference
+        # between "the queue is idle" and "nothing will start until I look".
+        keeper = snapshot.get("keeper") or {}
+        keeper_text = ""
+        if keeper.get("installed") or keeper.get("running"):
+            keeper_text = f"keeper {'up' if keeper.get('running') else 'DOWN'} · "
         title = " nvidb queue "
         meta = (
-            f"tick {tick_text} · {mode} · {status} · filter {self.filter} "
+            f"tick {tick_text} · {keeper_text}{mode} · {status} · filter {self.filter} "
             f"· procs {self.proc_view} "
         )
         gap = max(1, width - len(title) - len(meta))
