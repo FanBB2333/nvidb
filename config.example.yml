@@ -51,6 +51,14 @@ queue:
   job_root: ".nvidb/jobs"  # per-job directory on each node (relative to $HOME)
   include_local: false   # also schedule onto this machine
 
+  # Optional consistent SQLite backups made by `nvidb queue daemon`.
+  # Manual snapshots are always available through `nvidb queue backup`.
+  backup:
+    enabled: false
+    interval_hours: 24
+    keep: 7              # 0 keeps every generated backup
+    directory: null      # default: $NVIDB_HOME/backups
+
   # Where `nvidb queue daemon` pushes failures. Alerts are always recorded in
   # the queue database regardless of these settings; this section only controls
   # delivery, so a misconfigured channel can never lose a failure.

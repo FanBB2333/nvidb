@@ -232,5 +232,6 @@ it.
 README cover the rest: the TUI (`nvidb queue`), the optional notification daemon
 (`nvidb queue daemon`), the event log (`nvidb queue events --since <id>`, for
 catching up on what happened while you were not running), the keeper that keeps
-a queue host scheduling (`nvidb queue keeper status`), and the `queue:` settings
-in `~/.nvidb/config.yml` or `~/.nvidb/queue.yml`.
+a queue host scheduling (`nvidb queue keeper status`), consistent database
+snapshots (`nvidb queue backup --json`), and the `queue:` settings in
+`~/.nvidb/config.yml` or `~/.nvidb/queue.yml`.

@@ -26,6 +26,11 @@ queue:
   # over the value there.
   headroom_mb: 512
   max_jobs_per_gpu: 4
+  backup:
+    enabled: true
+    interval_hours: 24
+    keep: 7
+    directory: null        # $NVIDB_HOME/backups
   notify:
     desktop: false        # a headless queue host has nobody to show a pop-up to
     log: true             # $NVIDB_HOME/alerts.log
@@ -44,7 +49,7 @@ queue:
 #   # PATH usually lacks the ~/.local/bin a `pip install --user` writes to.
 #   nvidb: "/home/user/.local/bin/nvidb"
 #   nvidb_home: null             # set only if the far side uses a custom NVIDB_HOME
-#   keeper: ensure               # ensure | off - start the keeper if it is not up
+#   keeper: ensure               # ensure | off - start it or report why that failed
 #   ssh_options: []              # extra -o options, e.g. ["ConnectTimeout=8"]
 #
 # `nvidb <anything> --local` uses this machine's own queue for one command.

@@ -1,13 +1,11 @@
-"""Tests for the queue's own configuration file, the keeper, and remote forwarding.
-
-The keeper is a shell script, so the parts worth testing here are the ones that
-decide what ends up inside it and what the CLI does with it: nothing starts a
-real process.
-"""
+"""Tests for queue configuration, process supervision, and remote forwarding."""
 import os
+import shutil
 import stat
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -115,8 +113,11 @@ def test_install_bakes_in_an_absolute_nvidb_path(nvidb_home, tmp_path):
     assert info["nvidb"] == str(fake.resolve())
     assert str(fake.resolve()) in script
     assert "__NVIDB_BIN__" not in script and "__INTERVAL__" not in script
+    assert "__MANAGER__" not in script and "__KEEPER_TOKEN__" not in script
     assert str(nvidb_home) in script
     assert 'INTERVAL="${NVIDB_QUEUE_INTERVAL:-42}"' in script
+    assert info["manager"] == "shell"
+    assert (nvidb_home / keeper_mod.MANAGER_NAME).read_text().strip() == "shell"
     assert os.stat(nvidb_home / keeper_mod.SCRIPT_NAME).st_mode & stat.S_IXUSR
 
 
@@ -137,16 +138,19 @@ def test_status_reports_a_dead_pid_as_stopped(nvidb_home, tmp_path):
         "installed": True,
         "running": False,
         "pid": None,
+        "manager": "shell",
         "script": str(nvidb_home / keeper_mod.SCRIPT_NAME),
+        "unit": None,
         "log": str(nvidb_home / keeper_mod.LOG_NAME),
     }
 
     (nvidb_home / keeper_mod.PID_NAME).write_text("999999999", encoding="utf-8")
     assert keeper_mod.status()["running"] is False
 
+    # A live but unrelated pid must not be accepted from a stale pid file.
     (nvidb_home / keeper_mod.PID_NAME).write_text(str(os.getpid()), encoding="utf-8")
-    state = keeper_mod.status()
-    assert state["running"] is True and state["pid"] == os.getpid()
+    (nvidb_home / keeper_mod.TOKEN_NAME).write_text("stale-token", encoding="utf-8")
+    assert keeper_mod.status()["running"] is False
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
@@ -165,6 +169,99 @@ def test_the_generated_script_is_valid_shell_and_reports_status(nvidb_home, tmp_
 
     usage = subprocess.run(["sh", script, "nonsense"], capture_output=True, text=True)
     assert usage.returncode == 2 and "usage:" in usage.stderr
+
+
+def _write_fake_daemon(path: Path, parent_log: Path):
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$PPID\" >> {str(parent_log)!r}\n"
+        "trap 'exit 0' TERM INT\n"
+        "while :; do sleep 1; done\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _wait_until(predicate, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
+def test_keeper_really_detaches_and_concurrent_ensure_starts_one_loop(
+    nvidb_home, tmp_path
+):
+    """Several clients may reconnect together; only one supervisor may start."""
+    parent_log = tmp_path / "daemon-parents"
+    fake = tmp_path / "nvidb-bin"
+    _write_fake_daemon(fake, parent_log)
+    script = str(keeper_mod.install(nvidb_bin=str(fake), interval=2)["script"])
+
+    callers = [
+        subprocess.Popen(
+            ["sh", script, "ensure"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(6)
+    ]
+    try:
+        results = [caller.communicate(timeout=12) for caller in callers]
+        assert all(caller.returncode == 0 for caller in callers), results
+        assert _wait_until(lambda: keeper_mod.status()["running"])
+        assert _wait_until(parent_log.exists)
+        parents = {
+            line.strip()
+            for line in parent_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        assert len(parents) == 1
+        assert keeper_mod.status()["pid"] == int(next(iter(parents)))
+    finally:
+        keeper_mod.run("stop")
+        assert _wait_until(lambda: not keeper_mod.status()["running"])
+
+
+def test_systemd_install_writes_a_user_unit(nvidb_home, tmp_path, monkeypatch):
+    fake = tmp_path / "nvidb-bin"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake.chmod(0o755)
+    unit = tmp_path / "systemd" / keeper_mod.SYSTEMD_UNIT_NAME
+    calls = []
+
+    monkeypatch.setattr(keeper_mod, "systemd_unit_path", lambda: unit)
+    monkeypatch.setattr(keeper_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def systemctl(*args):
+        calls.append(args)
+        output = "4321\n" if args and args[0] == "show" else ""
+        return subprocess.CompletedProcess(args, 0, output, "")
+
+    monkeypatch.setattr(keeper_mod, "_systemctl", systemctl)
+    info = keeper_mod.install(
+        nvidb_bin=str(fake),
+        interval=17,
+        manager_name="systemd",
+    )
+
+    service = unit.read_text(encoding="utf-8")
+    script = (nvidb_home / keeper_mod.SCRIPT_NAME).read_text(encoding="utf-8")
+    assert info["manager"] == "systemd"
+    assert info["unit"] == str(unit)
+    assert "ExecStart=" in service and "queue daemon --interval 17" in service
+    assert "Restart=always" in service
+    assert "MANAGER=systemd" in script
+    assert calls == [("daemon-reload",)]
+
+    state = keeper_mod.status()
+    assert state["running"] is True
+    assert state["pid"] == 4321
+    assert state["manager"] == "systemd"
 
 
 # --- remote forwarding ----------------------------------------------------
@@ -227,9 +324,20 @@ def test_local_only_flags_are_stripped_but_the_job_command_is_not(target):
 
 def test_the_keeper_is_ensured_in_the_same_round_trip(target):
     command = remote_mod.build_command(target, ["queue", "status"])
-    assert command.splitlines()[0].startswith("sh $HOME/.nvidb/queue-keeper.sh ensure")
+    assert 'nvidb_keeper="$HOME/.nvidb/queue-keeper.sh"' in command
+    assert 'sh "$nvidb_keeper" ensure' in command
+    assert "warning: queue keeper is not installed" in command
     assert command.splitlines()[-1] == (
         "NVIDB_QUEUE_NO_REMOTE=1 /home/alice/.local/bin/nvidb queue status"
+    )
+
+
+def test_keeper_lifecycle_commands_do_not_auto_start_it(target):
+    command = remote_mod.build_command(target, ["queue", "keeper", "status"])
+    assert "nvidb_keeper=" not in command
+    assert command == (
+        "NVIDB_QUEUE_NO_REMOTE=1 /home/alice/.local/bin/nvidb "
+        "queue keeper status"
     )
 
 
@@ -241,8 +349,44 @@ def test_the_keeper_can_be_left_alone(target):
 def test_a_custom_home_reaches_both_the_keeper_and_the_command(target):
     target["nvidb_home"] = "/data/nvidb"
     command = remote_mod.build_command(target, ["queue", "status"])
-    assert "sh /data/nvidb/queue-keeper.sh ensure" in command
+    assert "nvidb_keeper=/data/nvidb/queue-keeper.sh" in command
+    assert 'sh "$nvidb_keeper" ensure' in command
     assert "NVIDB_HOME=/data/nvidb" in command
+
+
+def test_a_missing_remote_keeper_warns_without_corrupting_the_command(
+    target, tmp_path
+):
+    target["nvidb"] = shutil.which("true")
+    target["nvidb_home"] = str(tmp_path / "home with spaces")
+    command = remote_mod.build_command(target, ["queue", "status", "--json"])
+    result = subprocess.run(
+        ["sh", "-c", command],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "warning: queue keeper is not installed" in result.stderr
+    assert str(tmp_path / "home with spaces") in result.stderr
+
+
+def test_a_remote_keeper_start_failure_is_reported(target, tmp_path):
+    target["nvidb"] = shutil.which("true")
+    target["nvidb_home"] = str(tmp_path)
+    keeper = tmp_path / keeper_mod.SCRIPT_NAME
+    keeper.write_text(
+        "#!/bin/sh\necho 'systemd user bus unavailable' >&2\nexit 7\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["sh", "-c", remote_mod.build_command(target, ["queue", "status"])],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "warning: queue keeper could not be started" in result.stderr
+    assert "systemd user bus unavailable" in result.stderr
 
 
 def test_a_local_script_travels_with_the_command(target):

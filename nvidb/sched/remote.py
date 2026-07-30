@@ -122,11 +122,16 @@ def _quote(token: str) -> str:
 
 
 def keeper_script_path(target: Dict[str, Any]) -> str:
-    """Where the keeper lives on the far side, as a shell word."""
+    """Where the keeper lives on the far side."""
     home = target.get("nvidb_home")
     if home:
         return f"{str(home).rstrip('/')}/{keeper_mod.SCRIPT_NAME}"
     return f"$HOME/.nvidb/{keeper_mod.SCRIPT_NAME}"
+
+
+def _manages_keeper(head: Sequence[str]) -> bool:
+    """Keeper lifecycle commands must observe state without auto-starting it."""
+    return len(head) >= 2 and head[0] == "queue" and head[1] == "keeper"
 
 
 def build_command(
@@ -142,10 +147,32 @@ def build_command(
         head = _point_script_at_temp_file(head)
 
     lines: List[str] = []
-    if target.get("keeper") == "ensure":
+    if target.get("keeper") == "ensure" and not _manages_keeper(head):
         # Folded into the same command, so keeping the queue alive costs no
-        # extra round trip. A keeper that is already up exits immediately.
-        lines.append(f"sh {keeper_script_path(target)} ensure >/dev/null 2>&1 || true")
+        # extra round trip. Warnings stay on stderr so JSON stdout remains
+        # machine-readable, while a missing or broken keeper is no longer
+        # mistaken for a queue that will keep scheduling after disconnect.
+        if target.get("nvidb_home"):
+            lines.append(
+                f"nvidb_keeper={shlex.quote(keeper_script_path(target))}"
+            )
+        else:
+            lines.append(
+                f'nvidb_keeper="$HOME/.nvidb/{keeper_mod.SCRIPT_NAME}"'
+            )
+        lines.extend(
+            [
+                'if [ ! -f "$nvidb_keeper" ]; then',
+                '  printf \'%s\\n\' "warning: queue keeper is not installed at '
+                '$nvidb_keeper; run nvidb queue keeper install --start" >&2',
+                'elif ! nvidb_keeper_error=$(sh "$nvidb_keeper" ensure 2>&1); then',
+                '  printf \'%s\\n\' "warning: queue keeper could not be started: '
+                '$nvidb_keeper" >&2',
+                '  [ -z "$nvidb_keeper_error" ] || printf \'  %s\\n\' '
+                '"$nvidb_keeper_error" >&2',
+                "fi",
+            ]
+        )
 
     if script_text is not None:
         # The same base64 hop the executor uses to put a run script on a node:

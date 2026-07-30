@@ -13,11 +13,13 @@ import json
 import os
 import shlex
 import socket
+import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from . import backup as backup_mod
 from . import db as dbm
 from . import keeper as keeper_mod
 from . import remote as remote_mod
@@ -316,6 +318,8 @@ def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
     )
     if lock.get("owner"):
         header += f"  (tick held by {lock['owner']})"
+    if snapshot.get("last_backup_at"):
+        header += f"  backup {_age(snapshot['last_backup_at'])}"
     keeper_state = snapshot.get("keeper") or {}
     # Only worth a word where a keeper is meant to exist: on a laptop driving a
     # remote queue there is nothing here to report.
@@ -489,12 +493,42 @@ def cmd_ack(args) -> int:
         scheduler.close()
 
 
+def cmd_backup(args) -> int:
+    """Write a verified SQLite snapshot without stopping the queue."""
+    scheduler = _open(args)
+    try:
+        if args.keep < 0:
+            return _error("--keep cannot be negative", as_json=args.json)
+        try:
+            info = backup_mod.create(
+                scheduler.conn,
+                args.path,
+                keep=args.keep,
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            return _error(f"could not back up the queue: {error}", as_json=args.json)
+        if args.json:
+            _print_json({"ok": True, "backup": info})
+        else:
+            print(f"backed up {info['source']} to {info['path']}")
+            print("  verified  yes")
+            print(f"  size      {info['bytes']} bytes")
+            if info["pruned"]:
+                print(f"  pruned    {len(info['pruned'])} older backup(s)")
+        return 0
+    finally:
+        scheduler.close()
+
+
 def cmd_daemon(args) -> int:
     """Keep the queue moving and push failures out as they happen."""
     from .notify import Notifier
 
     scheduler = _open(args)
     notifier = Notifier(scheduler.settings)
+    queue_settings = ((scheduler.cfg or {}).get("queue") or {})
+    if not isinstance(queue_settings, dict):
+        queue_settings = {}
     interval = max(2, int(args.interval))
     if not args.json:
         channels = [
@@ -516,12 +550,34 @@ def cmd_daemon(args) -> int:
         while True:
             summary = scheduler.tick(force=True)
             sent = 0 if args.no_notify else scheduler.deliver_alerts(notifier)
+            backup = None
+            backup_error = None
+            if not args.no_backup:
+                try:
+                    backup = backup_mod.maybe_create(
+                        scheduler.conn, queue_settings
+                    )
+                except (OSError, ValueError, sqlite3.Error) as error:
+                    # A backup failure needs attention, but it must not stop
+                    # scheduling and timeout enforcement.
+                    backup_error = str(error)
             if args.json:
-                _print_json({"tick": summary, "notified": sent})
+                _print_json(
+                    {
+                        "tick": summary,
+                        "notified": sent,
+                        "backup": backup,
+                        "backup_error": backup_error,
+                    }
+                )
                 sys.stdout.flush()
             else:
                 for item in summary.get("alerts") or []:
                     print(f"  ! {item['kind']}: {item['title']}", file=sys.stderr)
+                if backup:
+                    print(f"  backup: {backup['path']}", file=sys.stderr)
+                if backup_error:
+                    print(f"  ! backup failed: {backup_error}", file=sys.stderr)
             if args.once:
                 return 0
             time.sleep(interval)
@@ -533,8 +589,11 @@ def cmd_daemon(args) -> int:
 
 def _render_keeper(state: Dict[str, Any]) -> str:
     if state.get("running"):
-        return f"running (pid {state['pid']})"
-    return "stopped" if state.get("installed") else "not installed"
+        pid = f", pid {state['pid']}" if state.get("pid") else ""
+        return f"running ({state.get('manager', 'shell')}{pid})"
+    if state.get("installed"):
+        return f"stopped ({state.get('manager', 'shell')})"
+    return "not installed"
 
 
 def cmd_keeper(args) -> int:
@@ -542,28 +601,51 @@ def cmd_keeper(args) -> int:
     action = getattr(args, "keeper_action", None) or "status"
 
     if action == "install":
+        manager_name = "systemd" if args.systemd else "shell"
         try:
-            info = keeper_mod.install(nvidb_bin=args.nvidb, interval=args.interval)
-        except ValueError as error:
+            info = keeper_mod.install(
+                nvidb_bin=args.nvidb,
+                interval=args.interval,
+                manager_name=manager_name,
+            )
+        except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
         except OSError as error:
             return _error(f"could not write the keeper: {error}", as_json=args.json)
         started = None
+        start_error = None
         if args.start:
-            result = keeper_mod.run("start")
+            result = keeper_mod.run("restart" if info["replaced"] else "start")
             started = result.returncode == 0
+            if not started:
+                start_error = (
+                    result.stderr or result.stdout or f"exit {result.returncode}"
+                ).strip()
         if args.json:
-            _print_json({"ok": True, **info, "started": started, "state": keeper_mod.status()})
+            _print_json(
+                {
+                    "ok": started is not False,
+                    **info,
+                    "started": started,
+                    "start_error": start_error,
+                    "state": keeper_mod.status(),
+                }
+            )
         else:
             verb = "reinstalled" if info["replaced"] else "installed"
             print(f"{verb} {info['script']}")
+            print(f"  manager {info['manager']}")
             print(f"  runs   {info['nvidb']} queue daemon --interval {info['interval']}")
             print(f"  log    {info['log']}")
+            if info.get("unit"):
+                print(f"  unit   {info['unit']}")
             if started is None:
                 print("  start it with: nvidb queue keeper start")
+            elif start_error:
+                print(f"error: keeper did not start: {start_error}", file=sys.stderr)
             else:
                 print(f"  keeper {_render_keeper(keeper_mod.status())}")
-        return 0
+        return 0 if started is not False else 1
 
     if action == "status":
         state = keeper_mod.status()
@@ -573,6 +655,8 @@ def cmd_keeper(args) -> int:
             print(f"keeper {_render_keeper(state)}")
             print(f"  script {state['script']}")
             print(f"  log    {state['log']}")
+            if state.get("unit"):
+                print(f"  unit   {state['unit']}")
         # Non-zero while nothing is keeping the queue moving, so a shell or an
         # agent can branch on it the way it does on `queue alerts`.
         return 0 if state["running"] else 1
@@ -1110,18 +1194,39 @@ def register_parsers(subparsers) -> None:
     _add_common(daemon)
     daemon.add_argument("--interval", type=int, default=15, metavar="SECONDS")
     daemon.add_argument("--no-notify", action="store_true", help="Tick but stay quiet")
+    daemon.add_argument(
+        "--no-backup", action="store_true", help="Skip configured periodic backups"
+    )
     daemon.add_argument("--once", action="store_true", help="Run a single pass and exit")
     daemon.set_defaults(func=cmd_daemon)
 
+    backup = queue_sub.add_parser(
+        "backup",
+        help="Create and verify a consistent snapshot of the queue database",
+    )
+    _add_common(backup)
+    backup.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Destination file or existing directory (default: $NVIDB_HOME/backups)",
+    )
+    backup.add_argument(
+        "--keep",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Keep the newest N generated backups (default: 0, keep all)",
+    )
+    backup.set_defaults(func=cmd_backup)
+
     keeper = queue_sub.add_parser(
         "keeper",
-        help="Install and control the shell script that keeps this queue moving",
+        help="Install and control the supervisor that keeps this queue moving",
         description=(
-            "Writes a small `sh` script into the nvidb working directory that "
-            "restarts `nvidb queue daemon` whenever it stops, and detaches it "
-            "from the session that started it. Needs no root, no cron entry and "
-            "no service manager; it does not survive a reboot, and any client "
-            "command starts it again."
+            "Uses a portable detached shell supervisor by default. Pass "
+            "--systemd while installing to create a user service instead; "
+            "--start enables it so the daemon can return after a host reboot."
         ),
     )
     _add_common(keeper)
@@ -1146,6 +1251,11 @@ def register_parsers(subparsers) -> None:
     )
     keeper.add_argument(
         "--start", action="store_true", help="Start it straight after installing"
+    )
+    keeper.add_argument(
+        "--systemd",
+        action="store_true",
+        help="Install a systemd user service instead of the detached shell supervisor",
     )
     keeper.add_argument("-n", "--number", type=int, default=50, help="Log lines to show")
     keeper.set_defaults(func=cmd_keeper)

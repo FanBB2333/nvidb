@@ -1217,6 +1217,7 @@ class Scheduler:
             "generated_at": utcnow(),
             "db_path": dbm.connection_path(self.conn),
             "last_tick_at": dbm.get_meta(self.conn, "last_tick_at"),
+            "last_backup_at": dbm.get_meta(self.conn, "last_backup_at"),
             "tick_lock": dict(holder) if holder else None,
             # Whether this machine has something keeping the queue moving while
             # no client is looking. Reported rather than acted on: a queue with

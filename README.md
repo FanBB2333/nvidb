@@ -665,9 +665,9 @@ queue:
   local_node_name: "queue-host"
 ```
 
-The **keeper** keeps that machine scheduling. It is a shell script written into
-`~/.nvidb`, which restarts `nvidb queue daemon` whenever it stops and detaches
-it from the session that installed it — no root, no cron entry, no service
+The **keeper** keeps that machine scheduling. Its default shell supervisor is
+written into `~/.nvidb`, restarts `nvidb queue daemon` whenever it stops, and
+detaches from the session that installed it — no root, cron entry, or service
 manager:
 
 ```bash
@@ -677,10 +677,27 @@ nvidb queue keeper logs -n 50
 nvidb queue keeper stop
 ```
 
-It does not survive a reboot, by design. Any client command starts it again,
-because a client configured with `remote:` opens no database of its own and
+On a Linux host with a working user systemd session, install a user service
+instead. `--start` enables and starts `nvidb-queue.service`; systemd then
+restarts the daemon after failures and starts it with the user's next session:
+
+```bash
+nvidb queue keeper install --systemd --start
+systemctl --user status nvidb-queue.service
+```
+
+Starting the user service during boot, before that user logs in, additionally
+requires lingering where the host permits it:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+The shell supervisor does not survive a reboot. Any later client command starts
+it again. A client configured with `remote:` opens no database of its own and
 forwards the whole command line to the queue host, running the keeper's `ensure`
-in the same round trip:
+in the same round trip. A missing or failed keeper is reported on stderr rather
+than silently leaving the queue idle:
 
 ```yaml
 # ~/.nvidb/queue.yml on the laptop
@@ -694,6 +711,28 @@ behave exactly as they do locally — it is the same CLI, running over there —
 the exit codes come back unchanged. `--local` runs one command against this
 machine's own queue instead, and `nvidb queue status` reports `keeper up` or
 `keeper DOWN` wherever a keeper is installed.
+
+Back up the queue with SQLite's online backup API, which includes committed WAL
+state without pausing the daemon:
+
+```bash
+nvidb queue backup                         # ~/.nvidb/backups/queue-<time>.db
+nvidb queue backup /secure/queue-copy.db  # explicit destination, never overwritten
+```
+
+The daemon can create and rotate backups automatically:
+
+```yaml
+queue:
+  backup:
+    enabled: true
+    interval_hours: 24
+    keep: 7
+    directory: null        # defaults to $NVIDB_HOME/backups
+```
+
+Each snapshot is checked with `PRAGMA quick_check` before it replaces its
+temporary file. `nvidb queue status --json` includes `last_backup_at`.
 
 ---
 

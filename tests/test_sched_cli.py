@@ -57,6 +57,7 @@ def test_the_queue_commands_are_all_recognised(parser):
         ["queue"],
         ["queue", "status"],
         ["queue", "tick"],
+        ["queue", "backup"],
         ["queue", "nodes"],
         ["queue", "events"],
         ["queue", "drain", "n1"],
@@ -374,6 +375,66 @@ def test_the_daemon_can_tick_without_notifying(parser, queue_db, capsys):
         assert dbm.undelivered_alerts(conn)  # still waiting for a real pass
     finally:
         conn.close()
+
+
+def test_backup_command_creates_a_readable_snapshot(
+    parser, queue_db, tmp_path, capsys
+):
+    _submit(parser, queue_db, "--name", "preserved", "--", "true")
+    capsys.readouterr()
+    destination = tmp_path / "queue-backup.db"
+
+    assert _run(
+        parser,
+        ["queue", "backup", str(destination), "--json"],
+        queue_db,
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backup"]["verified"] is True
+
+    backup_conn = dbm.open_db(destination)
+    try:
+        assert dbm.get_job(backup_conn, 1).name == "preserved"
+    finally:
+        backup_conn.close()
+
+    # An existing destination is protected from accidental replacement.
+    assert _run(
+        parser,
+        ["queue", "backup", str(destination), "--json"],
+        queue_db,
+    ) == 1
+    assert "already exists" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_daemon_creates_a_configured_periodic_backup(
+    parser, queue_db, tmp_path, monkeypatch, capsys
+):
+    directory = tmp_path / "automatic-backups"
+    monkeypatch.setattr(
+        "nvidb.config.load_config",
+        lambda *a, **k: {
+            "servers": [],
+            "queue": {
+                "backup": {
+                    "enabled": True,
+                    "interval_hours": 24,
+                    "directory": str(directory),
+                    "keep": 2,
+                }
+            },
+        },
+    )
+
+    assert _run(
+        parser,
+        ["queue", "daemon", "--once", "--no-notify", "--json"],
+        queue_db,
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backup"]["verified"] is True
+    assert payload["backup_error"] is None
+    assert len(list(directory.glob("queue-*.db"))) == 1
 
 
 def test_submitting_against_an_unknown_node_is_refused(parser, queue_db, capsys):

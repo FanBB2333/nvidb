@@ -1,66 +1,179 @@
 #!/bin/sh
 # nvidb queue keeper - keeps `nvidb queue daemon` running on this machine.
 #
-# Written here by `nvidb queue keeper install`. It is a plain file in the nvidb
-# working directory on purpose: read it, edit it, or run it by hand. Nothing
-# else on the machine has to know it exists - no cron entry, no service unit -
-# so it needs neither root nor a configured login session.
-#
-# A reboot is deliberately not survived. Whoever next talks to the queue runs
-# `keeper ensure`, which starts it again and does nothing when it is already up.
+# Shell mode is self-contained and needs no root or service manager. Systemd
+# mode delegates lifecycle operations to an optional user unit, which can start
+# at login (or at boot when lingering is enabled).
 set -u
 
-NVIDB_HOME="${NVIDB_HOME:-__NVIDB_HOME__}"
-# Baked in as an absolute path at install time: `ssh host 'nvidb ...'` gets a
-# non-interactive shell, and on most distributions that never reads the profile
-# lines which put a `pip install --user` binary on PATH.
-NVIDB="${NVIDB_BIN:-__NVIDB_BIN__}"
+DEFAULT_NVIDB_HOME=__NVIDB_HOME__
+DEFAULT_NVIDB=__NVIDB_BIN__
+NVIDB_HOME="${NVIDB_HOME:-$DEFAULT_NVIDB_HOME}"
+NVIDB="${NVIDB_BIN:-$DEFAULT_NVIDB}"
 INTERVAL="${NVIDB_QUEUE_INTERVAL:-__INTERVAL__}"
+MANAGER=__MANAGER__
+KEEPER_TOKEN=__KEEPER_TOKEN__
+UNIT=__SYSTEMD_UNIT__
 
 PIDFILE="$NVIDB_HOME/queue-keeper.pid"
+TOKENFILE="$NVIDB_HOME/queue-keeper.token"
 LOCKDIR="$NVIDB_HOME/queue-keeper.lock"
+LOCKOWNER="$LOCKDIR/owner"
 SESSION="$NVIDB_HOME/queue-keeper.session"
 LOG="$NVIDB_HOME/queue-keeper.log"
 
-alive() {
+read_pid() {
   [ -f "$PIDFILE" ] || return 1
-  kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+  nvidb_pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  case "$nvidb_pid" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  printf "%s" "$nvidb_pid"
 }
 
-case "${1:-start}" in
+alive() {
+  nvidb_pid=$(read_pid) || return 1
+  [ -f "$TOKENFILE" ] || return 1
+  nvidb_token=$(cat "$TOKENFILE" 2>/dev/null) || return 1
+  [ -n "$nvidb_token" ] || return 1
+  kill -0 "$nvidb_pid" 2>/dev/null || return 1
+  nvidb_command=$(ps -p "$nvidb_pid" -o command= 2>/dev/null) || return 1
+  case "$nvidb_command" in
+    *"_loop $nvidb_token"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+release_start_lock() {
+  rm -f "$LOCKOWNER"
+  rmdir "$LOCKDIR" 2>/dev/null
+}
+
+wait_for_keeper() {
+  nvidb_wait=0
+  while [ "$nvidb_wait" -lt 5 ]; do
+    alive && return 0
+    sleep 1
+    nvidb_wait=$((nvidb_wait + 1))
+  done
+  return 1
+}
+
+acquire_start_lock() {
+  nvidb_attempt=0
+  while [ "$nvidb_attempt" -lt 2 ]; do
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      echo $$ > "$LOCKOWNER"
+      return 0
+    fi
+
+    # Another caller may be between creating the lock and publishing its pid.
+    # Wait for that keeper instead of deleting a live startup lock.
+    wait_for_keeper && return 2
+
+    # No verified keeper appeared. Remove only the known owner file and the
+    # empty directory; a caller that still owns the lock prevents rmdir.
+    rm -f "$LOCKOWNER"
+    rmdir "$LOCKDIR" 2>/dev/null
+    nvidb_attempt=$((nvidb_attempt + 1))
+  done
+  return 1
+}
+
+systemd_action() {
+  case "$1" in
+    start)
+      systemctl --user enable --now "$UNIT" || return 1
+      systemctl --user is-active --quiet "$UNIT"
+      ;;
+    ensure)
+      systemctl --user start "$UNIT" || return 1
+      systemctl --user is-active --quiet "$UNIT"
+      ;;
+    stop)
+      systemctl --user disable --now "$UNIT"
+      ;;
+    restart)
+      systemctl --user enable "$UNIT" || return 1
+      systemctl --user restart "$UNIT"
+      ;;
+    status)
+      if systemctl --user is-active --quiet "$UNIT"; then
+        nvidb_pid=$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null)
+        echo "running under systemd (pid ${nvidb_pid:-unknown})"
+      else
+        echo "stopped (systemd user service)"
+        return 1
+      fi
+      ;;
+    logs)
+      journalctl --user -u "$UNIT" -n "${2:-50}" --no-pager
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+action="${1:-start}"
+if [ "$MANAGER" = "systemd" ]; then
+  systemd_action "$action" "${2:-}" && exit 0
+  rc=$?
+  [ "$rc" -eq 2 ] && echo "usage: $0 {start|ensure|stop|restart|status|logs [LINES]}" >&2
+  exit "$rc"
+fi
+
+case "$action" in
   start|ensure)
     alive && exit 0
     mkdir -p "$NVIDB_HOME" || exit 1
-    # A lock directory surviving without a live keeper is debris from a kill -9
-    # or a power cut, never a keeper that is still starting.
-    rmdir "$LOCKDIR" 2>/dev/null
-    # mkdir is atomic on POSIX, so when several clients race to start the keeper
-    # exactly one proceeds. The losers exit quietly - the winner is starting it.
-    mkdir "$LOCKDIR" 2>/dev/null || exit 0
-    if command -v setsid >/dev/null 2>&1; then
-      # Its own session, so the keeper outlives the SSH channel that started it
-      # and can later be signalled as a process group.
-      echo 1 > "$SESSION"
-      setsid "$0" _loop >> "$LOG" 2>&1 < /dev/null &
-    else
-      # macOS has no setsid. nohup still detaches, but the keeper then shares a
-      # process group with the calling shell and must never be signalled by
-      # group id - which would take the caller down with it.
-      echo 0 > "$SESSION"
-      nohup "$0" _loop >> "$LOG" 2>&1 < /dev/null &
+    acquire_start_lock
+    lock_rc=$?
+    [ "$lock_rc" -eq 2 ] && exit 0
+    if [ "$lock_rc" -ne 0 ]; then
+      echo "could not acquire the keeper startup lock at $LOCKDIR" >&2
+      exit 1
     fi
-    exit 0
+
+    echo "$KEEPER_TOKEN" > "$TOKENFILE"
+    if command -v setsid >/dev/null 2>&1; then
+      # Its own session lets the keeper outlive the SSH channel and gives stop
+      # a process group containing both the keeper and its daemon.
+      echo 1 > "$SESSION"
+      setsid "$0" _loop "$KEEPER_TOKEN" >> "$LOG" 2>&1 < /dev/null &
+    else
+      # macOS has no setsid. nohup detaches from the terminal, but the keeper
+      # still shares a process group with its caller and must be stopped by pid.
+      echo 0 > "$SESSION"
+      nohup "$0" _loop "$KEEPER_TOKEN" >> "$LOG" 2>&1 < /dev/null &
+    fi
+    starter_pid=$!
+
+    if wait_for_keeper; then
+      release_start_lock
+      exit 0
+    fi
+
+    kill -TERM "$starter_pid" 2>/dev/null
+    rm -f "$PIDFILE" "$TOKENFILE"
+    release_start_lock
+    echo "keeper did not become ready; see $LOG" >&2
+    exit 1
     ;;
   _loop)
+    loop_token="${2:-}"
+    if [ -z "$loop_token" ] || [ "$loop_token" != "$KEEPER_TOKEN" ]; then
+      echo "[keeper] refusing an internal start with an invalid token" >&2
+      exit 2
+    fi
+    echo "$loop_token" > "$TOKENFILE"
     echo $$ > "$PIDFILE"
-    rmdir "$LOCKDIR" 2>/dev/null
     daemon_pid=""
-    # The trap must end in `exit`: a handler that only cleans up returns into
-    # the loop below, which would start a fresh daemon seconds after being
-    # asked to stop. Taking the daemon with it explicitly matters too, since
-    # without setsid there is no process group that means "just these two".
+
     nvidb_shutdown() {
-      rm -f "$PIDFILE"
+      if [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$PIDFILE" "$TOKENFILE"
+      fi
       [ -n "$daemon_pid" ] && kill -TERM "$daemon_pid" 2>/dev/null
       echo "[keeper] $(date) stopped"
       exit 143
@@ -68,33 +181,27 @@ case "${1:-start}" in
     trap nvidb_shutdown TERM INT
     echo "[keeper] $(date) up, interval=${INTERVAL}s, nvidb=$NVIDB"
     while : ; do
-      # Backgrounded and waited on, rather than run in the foreground: a signal
-      # arriving during `wait` runs the trap at once, where one arriving while a
-      # foreground child runs would be held until that child exited on its own.
+      # Waiting on a background child lets the signal trap run immediately.
       "$NVIDB" queue daemon --interval "$INTERVAL" &
       daemon_pid=$!
       wait "$daemon_pid"
       rc=$?
       daemon_pid=""
-      # Restarting at full speed would spin when the daemon cannot start at all
-      # - a broken install, an unreadable config - and bury the reason in log.
-      # The pause makes that failure cheap to survive and easy to read.
       echo "[keeper] $(date) daemon exited ($rc), restarting in 5s"
       sleep 5
     done
     ;;
   stop)
     if alive; then
-      pid=$(cat "$PIDFILE")
+      pid=$(read_pid)
       if [ "$(cat "$SESSION" 2>/dev/null)" = "1" ]; then
-        # The whole group: the keeper and the daemon it supervises.
         kill -TERM "-$pid" 2>/dev/null
       else
         kill -TERM "$pid" 2>/dev/null
         pkill -TERM -P "$pid" 2>/dev/null
       fi
     fi
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$TOKENFILE" "$LOCKOWNER"
     rmdir "$LOCKDIR" 2>/dev/null
     echo "stopped"
     ;;
@@ -105,7 +212,7 @@ case "${1:-start}" in
     ;;
   status)
     if alive; then
-      echo "running (pid $(cat "$PIDFILE"))"
+      echo "running (pid $(read_pid))"
     else
       echo "stopped"
       exit 1
