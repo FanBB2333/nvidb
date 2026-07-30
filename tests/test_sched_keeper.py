@@ -152,6 +152,12 @@ def test_status_reports_a_dead_pid_as_stopped(nvidb_home, tmp_path):
     (nvidb_home / keeper_mod.TOKEN_NAME).write_text("stale-token", encoding="utf-8")
     assert keeper_mod.status()["running"] is False
 
+    (nvidb_home / keeper_mod.PID_NAME).write_text("9" * 1000, encoding="utf-8")
+    assert keeper_mod.status()["running"] is False
+
+    (nvidb_home / keeper_mod.PID_NAME).write_text("-1", encoding="utf-8")
+    assert keeper_mod.status()["running"] is False
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
 def test_the_generated_script_is_valid_shell_and_reports_status(nvidb_home, tmp_path):
@@ -192,6 +198,60 @@ def _wait_until(predicate, timeout=8):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
+def test_reinstall_recognizes_and_restarts_a_tokenless_legacy_keeper(
+    nvidb_home, tmp_path
+):
+    script = nvidb_home / keeper_mod.SCRIPT_NAME
+    pid_file = nvidb_home / keeper_mod.PID_NAME
+    script.write_text(
+        "#!/bin/sh\n"
+        f"PIDFILE={str(pid_file)!r}\n"
+        'if [ "${1:-}" = "_loop" ]; then\n'
+        '  echo $$ > "$PIDFILE"\n'
+        "  trap 'rm -f \"$PIDFILE\"; exit 0' TERM INT\n"
+        "  while :; do sleep 1; done\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    legacy = subprocess.Popen(
+        ["sh", str(script), "_loop"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    fake = tmp_path / "nvidb-bin"
+    parent_log = tmp_path / "daemon-parents"
+    _write_fake_daemon(fake, parent_log)
+
+    try:
+        assert _wait_until(pid_file.exists)
+        assert int(pid_file.read_text()) == legacy.pid
+
+        keeper_mod.install(nvidb_bin=str(fake), interval=2)
+        # The newly written controller must still identify the old tokenless
+        # process, otherwise `install --start` would leave two supervisors.
+        assert keeper_mod.run("status").returncode == 0
+        assert keeper_mod.status()["pid"] == legacy.pid
+
+        restarted = keeper_mod.run("restart")
+        assert restarted.returncode == 0, restarted.stderr
+        assert _wait_until(lambda: legacy.poll() is not None)
+        assert keeper_mod.status()["running"] is True
+        assert keeper_mod.status()["pid"] != legacy.pid
+        assert _wait_until(parent_log.exists)
+    finally:
+        if keeper_mod.status()["running"]:
+            keeper_mod.run("stop")
+        if legacy.poll() is None:
+            legacy.terminate()
+        try:
+            legacy.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            legacy.kill()
+            legacy.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
 def test_keeper_really_detaches_and_concurrent_ensure_starts_one_loop(
     nvidb_home, tmp_path
 ):
@@ -227,6 +287,78 @@ def test_keeper_really_detaches_and_concurrent_ensure_starts_one_loop(
         assert _wait_until(lambda: not keeper_mod.status()["running"])
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
+def test_a_live_start_lock_owner_is_never_removed(nvidb_home, tmp_path):
+    fake = tmp_path / "nvidb-bin"
+    parent_log = tmp_path / "daemon-parents"
+    _write_fake_daemon(fake, parent_log)
+    script = str(keeper_mod.install(nvidb_bin=str(fake), interval=2)["script"])
+    lock_dir = nvidb_home / keeper_mod.LOCK_NAME
+    lock_dir.mkdir()
+    owner_file = lock_dir / "owner"
+    owner = subprocess.Popen(
+        [
+            "sh",
+            "-c",
+            "trap 'exit 0' TERM INT; while :; do sleep 1; done",
+            script,
+            "ensure",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    owner_file.write_text(str(owner.pid), encoding="utf-8")
+
+    try:
+        result = subprocess.run(
+            ["sh", script, "ensure"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        assert "could not acquire" in result.stderr
+        assert owner_file.read_text().strip() == str(owner.pid)
+        assert keeper_mod.status()["running"] is False
+        assert not parent_log.exists()
+    finally:
+        owner.terminate()
+        try:
+            owner.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            owner.kill()
+            owner.wait(timeout=5)
+        if keeper_mod.status()["running"]:
+            keeper_mod.run("stop")
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell script")
+def test_a_reused_unrelated_start_lock_pid_is_reclaimed(nvidb_home, tmp_path):
+    fake = tmp_path / "nvidb-bin"
+    parent_log = tmp_path / "daemon-parents"
+    _write_fake_daemon(fake, parent_log)
+    script = str(keeper_mod.install(nvidb_bin=str(fake), interval=2)["script"])
+    lock_dir = nvidb_home / keeper_mod.LOCK_NAME
+    lock_dir.mkdir()
+    (lock_dir / "owner").write_text(str(os.getpid()), encoding="utf-8")
+
+    try:
+        result = subprocess.run(
+            ["sh", script, "ensure"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert _wait_until(lambda: keeper_mod.status()["running"])
+        assert _wait_until(parent_log.exists)
+    finally:
+        if keeper_mod.status()["running"]:
+            keeper_mod.run("stop")
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
 def test_systemd_install_writes_a_user_unit(nvidb_home, tmp_path, monkeypatch):
     fake = tmp_path / "nvidb-bin"
     fake.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -255,6 +387,7 @@ def test_systemd_install_writes_a_user_unit(nvidb_home, tmp_path, monkeypatch):
     assert info["unit"] == str(unit)
     assert "ExecStart=" in service and "queue daemon --interval 17" in service
     assert "Restart=always" in service
+    assert "network-online.target" not in service
     assert "MANAGER=systemd" in script
     assert calls == [("daemon-reload",)]
 

@@ -731,8 +731,9 @@ queue:
     directory: null        # defaults to $NVIDB_HOME/backups
 ```
 
-Each snapshot is checked with `PRAGMA quick_check` before it replaces its
-temporary file. `nvidb queue status --json` includes `last_backup_at`.
+Each snapshot is checked with `PRAGMA quick_check` before its complete temporary
+database is atomically published without replacing an existing path.
+`nvidb queue status --json` includes `last_backup_at`.
 
 ---
 

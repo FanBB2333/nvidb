@@ -19,6 +19,7 @@ PIDFILE="$NVIDB_HOME/queue-keeper.pid"
 TOKENFILE="$NVIDB_HOME/queue-keeper.token"
 LOCKDIR="$NVIDB_HOME/queue-keeper.lock"
 LOCKOWNER="$LOCKDIR/owner"
+SCRIPT="$NVIDB_HOME/queue-keeper.sh"
 SESSION="$NVIDB_HOME/queue-keeper.session"
 LOG="$NVIDB_HOME/queue-keeper.log"
 
@@ -33,18 +34,26 @@ read_pid() {
 
 alive() {
   nvidb_pid=$(read_pid) || return 1
-  [ -f "$TOKENFILE" ] || return 1
-  nvidb_token=$(cat "$TOKENFILE" 2>/dev/null) || return 1
-  [ -n "$nvidb_token" ] || return 1
   kill -0 "$nvidb_pid" 2>/dev/null || return 1
   nvidb_command=$(ps -p "$nvidb_pid" -o command= 2>/dev/null) || return 1
+  nvidb_token=$(cat "$TOKENFILE" 2>/dev/null) || nvidb_token=""
+  if [ -n "$nvidb_token" ]; then
+    case "$nvidb_command" in
+      *"_loop $nvidb_token"*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  # A keeper installed before identity tokens existed still uses this exact
+  # script path. Recognizing it prevents an upgrade from starting a duplicate.
   case "$nvidb_command" in
-    *"_loop $nvidb_token"*) return 0 ;;
+    *"$SCRIPT _loop"*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 release_start_lock() {
+  nvidb_lock_owner=$(cat "$LOCKOWNER" 2>/dev/null) || return 0
+  [ "$nvidb_lock_owner" = "$$" ] || return 0
   rm -f "$LOCKOWNER"
   rmdir "$LOCKDIR" 2>/dev/null
 }
@@ -59,11 +68,68 @@ wait_for_keeper() {
   return 1
 }
 
+start_owner_alive() {
+  nvidb_owner_pid="$1"
+  case "$nvidb_owner_pid" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  [ "$nvidb_owner_pid" -gt 0 ] 2>/dev/null || return 1
+  kill -0 "$nvidb_owner_pid" 2>/dev/null || return 1
+  nvidb_owner_command=$(ps -p "$nvidb_owner_pid" -o command= 2>/dev/null) || return 1
+  case "$nvidb_owner_command" in
+    *"$SCRIPT start"*|*"$SCRIPT ensure"*|*"$SCRIPT") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+clear_stale_start_lock() {
+  # An empty directory can only be the tiny gap between mkdir and publishing
+  # the owner, or debris from a process killed in that gap. rmdir is safe: it
+  # fails atomically if the live starter publishes its owner first.
+  if [ ! -f "$LOCKOWNER" ]; then
+    rmdir "$LOCKDIR" 2>/dev/null
+    return $?
+  fi
+
+  nvidb_lock_owner=$(cat "$LOCKOWNER" 2>/dev/null) || return 1
+  start_owner_alive "$nvidb_lock_owner" && return 1
+
+  # Moving the owner file is the cleanup claim. Only one contender can win it;
+  # the others cannot remove a new owner's file after the directory is reused.
+  nvidb_claim="$NVIDB_HOME/.queue-keeper.lock.stale.$$"
+  rm -f "$nvidb_claim"
+  mv "$LOCKOWNER" "$nvidb_claim" 2>/dev/null || return 1
+  nvidb_claimed_owner=$(cat "$nvidb_claim" 2>/dev/null) || nvidb_claimed_owner=""
+
+  if start_owner_alive "$nvidb_claimed_owner"; then
+    if [ -d "$LOCKDIR" ] && [ ! -f "$LOCKOWNER" ]; then
+      mv "$nvidb_claim" "$LOCKOWNER" 2>/dev/null
+    else
+      rm -f "$nvidb_claim"
+    fi
+    return 1
+  fi
+
+  if rmdir "$LOCKDIR" 2>/dev/null; then
+    rm -f "$nvidb_claim"
+    return 0
+  fi
+  if [ -d "$LOCKDIR" ] && [ ! -f "$LOCKOWNER" ]; then
+    mv "$nvidb_claim" "$LOCKOWNER" 2>/dev/null
+  else
+    rm -f "$nvidb_claim"
+  fi
+  return 1
+}
+
 acquire_start_lock() {
   nvidb_attempt=0
-  while [ "$nvidb_attempt" -lt 2 ]; do
+  while [ "$nvidb_attempt" -lt 3 ]; do
     if mkdir "$LOCKDIR" 2>/dev/null; then
-      echo $$ > "$LOCKOWNER"
+      if ! echo $$ > "$LOCKOWNER"; then
+        rmdir "$LOCKDIR" 2>/dev/null
+        return 1
+      fi
       return 0
     fi
 
@@ -71,10 +137,9 @@ acquire_start_lock() {
     # Wait for that keeper instead of deleting a live startup lock.
     wait_for_keeper && return 2
 
-    # No verified keeper appeared. Remove only the known owner file and the
-    # empty directory; a caller that still owns the lock prevents rmdir.
-    rm -f "$LOCKOWNER"
-    rmdir "$LOCKDIR" 2>/dev/null
+    # A live starter may legitimately need longer than the readiness window.
+    # Only a dead or malformed owner can be claimed and removed.
+    clear_stale_start_lock || return 1
     nvidb_attempt=$((nvidb_attempt + 1))
   done
   return 1

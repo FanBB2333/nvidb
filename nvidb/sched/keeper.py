@@ -155,8 +155,6 @@ def render_systemd_unit(*, nvidb_bin: str, interval: int) -> str:
         [
             "[Unit]",
             "Description=nvidb queue scheduler",
-            "After=network-online.target",
-            "Wants=network-online.target",
             "",
             "[Service]",
             "Type=simple",
@@ -277,9 +275,10 @@ def _pid() -> Optional[int]:
     except OSError:
         return None
     try:
-        return int(raw)
+        pid = int(raw)
     except ValueError:
         return None
+    return pid if pid > 0 else None
 
 
 def _token() -> Optional[str]:
@@ -293,7 +292,7 @@ def _token() -> Optional[str]:
 def _shell_process_matches(pid: int, token: Optional[str]) -> bool:
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
+    except (ProcessLookupError, PermissionError, OSError, OverflowError):
         return False
     try:
         result = subprocess.run(

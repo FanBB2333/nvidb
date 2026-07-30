@@ -1,5 +1,7 @@
 """Queue database backups stay coherent while the WAL-backed queue is live."""
+import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -53,6 +55,99 @@ def test_backup_never_overwrites_an_existing_file_or_the_source(tmp_path):
             backup_mod.create(conn, str(source))
     finally:
         conn.close()
+
+
+def test_backup_is_published_only_after_the_temporary_database_is_valid(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "queue.db"
+    destination = tmp_path / "snapshot.db"
+    conn = dbm.open_db(source)
+    real_link = backup_mod.os.link
+    observed = []
+
+    def checked_link(temporary, target):
+        temporary = Path(temporary)
+        target = Path(target)
+        assert not target.exists()
+        probe = sqlite3.connect(str(temporary))
+        try:
+            assert probe.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert probe.execute("SELECT name FROM jobs").fetchone()[0] == "train"
+        finally:
+            probe.close()
+        observed.append(target)
+        return real_link(str(temporary), str(target))
+
+    monkeypatch.setattr(backup_mod.os, "link", checked_link)
+    try:
+        _seed(conn)
+        info = backup_mod.create(conn, str(destination))
+    finally:
+        conn.close()
+
+    assert observed == [destination]
+    assert info["path"] == str(destination)
+    assert destination.stat().st_size > 0
+
+
+def test_generated_backup_retries_a_publish_name_collision(tmp_path, monkeypatch):
+    source = tmp_path / "queue.db"
+    directory = tmp_path / "backups"
+    created = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    conn = dbm.open_db(source)
+    real_link = backup_mod.os.link
+    occupied = []
+
+    def racing_link(temporary, target):
+        target = Path(target)
+        if not occupied:
+            target.write_bytes(b"another backup won this name")
+            occupied.append(target)
+        return real_link(str(temporary), str(target))
+
+    monkeypatch.setattr(backup_mod.os, "link", racing_link)
+    try:
+        _seed(conn)
+        info = backup_mod.create(conn, directory=str(directory), now=created)
+    finally:
+        conn.close()
+
+    assert occupied[0].read_bytes() == b"another backup won this name"
+    assert Path(info["path"]) != occupied[0]
+    assert Path(info["path"]).is_file()
+
+
+def test_restored_backup_has_no_live_leases_and_records_its_creation(tmp_path):
+    source = tmp_path / "queue.db"
+    destination = tmp_path / "snapshot.db"
+    created = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+    conn = dbm.open_db(source)
+    try:
+        _seed(conn)
+        assert dbm.acquire_lock(conn, "scheduler", "live-daemon", 300)
+        backup_mod.create(conn, str(destination), now=created)
+        assert dbm.lock_holder(conn, "scheduler")["owner"] == "live-daemon"
+    finally:
+        dbm.release_lock(conn, "scheduler", "live-daemon")
+        conn.close()
+
+    restored = dbm.open_db(destination)
+    try:
+        leases = restored.execute(
+            "SELECT owner, acquired_at, expires_at FROM locks"
+        ).fetchall()
+        assert all(
+            row["owner"] is None
+            and row["acquired_at"] is None
+            and row["expires_at"] is None
+            for row in leases
+        )
+        assert dbm.get_meta(restored, backup_mod.LAST_BACKUP_META) == (
+            created.isoformat(timespec="seconds")
+        )
+    finally:
+        restored.close()
 
 
 def test_generated_backups_are_rotated_without_touching_other_files(tmp_path):

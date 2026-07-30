@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import socket
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -95,6 +96,30 @@ def _same_path(first: Path, second: Path) -> bool:
     return os.path.abspath(str(first)) == os.path.abspath(str(second))
 
 
+def _publish(
+    temporary: Path,
+    target: Path,
+    *,
+    generated: bool,
+    created: datetime,
+) -> Path:
+    """Publish a complete file without ever replacing an existing path.
+
+    A hard link is atomic and fails when ``target`` already exists. Because the
+    temporary database is in the same directory, this also keeps publication on
+    one filesystem. Generated names retry with a suffix if another process won
+    the same timestamp; an explicit destination remains strictly no-clobber.
+    """
+    while True:
+        try:
+            os.link(str(temporary), str(target))
+            return target
+        except FileExistsError:
+            if not generated:
+                raise
+            target = _generated_path(target.parent, created)
+
+
 def _prune(directory: Path, keep: int) -> list:
     if keep <= 0:
         return []
@@ -128,8 +153,10 @@ def create(
     timestamped name and may be rotated with ``keep``.
     """
     created = now or _utc_now()
+    created_at = _iso(created)
     source = Path(dbm.connection_path(conn)).expanduser()
     backup_dir = Path(directory).expanduser() if directory else default_directory()
+    generated = destination is None
 
     if destination:
         target = Path(destination).expanduser()
@@ -138,6 +165,7 @@ def create(
         if target.exists() and target.is_dir():
             backup_dir = target
             target = _generated_path(backup_dir, created)
+            generated = True
         elif target.exists():
             raise FileExistsError(f"backup already exists: {target}")
         else:
@@ -149,29 +177,30 @@ def create(
         raise ValueError("backup destination is the queue database itself")
 
     backup_dir.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        temporary.unlink()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.tmp-",
+        suffix=".db",
+        dir=str(backup_dir),
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
 
     target_conn = None
-    reserved = False
     try:
-        # Reserve the final name atomically. A file created after the existence
-        # check must not be overwritten by the final rename.
-        descriptor = os.open(
-            str(target),
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
-        os.close(descriptor)
-        reserved = True
         target_conn = sqlite3.connect(str(temporary))
         conn.backup(target_conn)
-        # A scheduled backup is taken while its source lease is held. The copy
-        # must not carry that live-looking lease into a future restore.
+        # Leases describe processes using the source database, not persistent
+        # queue state. None of them may survive into a restored snapshot.
         target_conn.execute(
-            "UPDATE locks SET owner=NULL, expires_at=NULL WHERE name = ?",
-            (BACKUP_LOCK,),
+            "UPDATE locks SET owner=NULL, acquired_at=NULL, expires_at=NULL"
+        )
+        # Record the snapshot's own creation time inside the copy as well as in
+        # the live source. A restored database then reports the backup it came
+        # from and does not immediately create a duplicate periodic snapshot.
+        target_conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (LAST_BACKUP_META, created_at),
         )
         target_conn.commit()
         check = target_conn.execute("PRAGMA quick_check").fetchone()
@@ -182,8 +211,12 @@ def create(
         target_conn.close()
         target_conn = None
         temporary.chmod(0o600)
-        os.replace(str(temporary), str(target))
-        reserved = False
+        target = _publish(
+            temporary,
+            target,
+            generated=generated,
+            created=created,
+        )
     finally:
         if target_conn is not None:
             target_conn.close()
@@ -191,13 +224,7 @@ def create(
             temporary.unlink()
         except OSError:
             pass
-        if reserved:
-            try:
-                target.unlink()
-            except OSError:
-                pass
 
-    created_at = _iso(created)
     dbm.set_meta(conn, LAST_BACKUP_META, created_at)
     removed = _prune(backup_dir, int(keep))
     return {
