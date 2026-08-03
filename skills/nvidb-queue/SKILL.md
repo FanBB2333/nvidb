@@ -208,11 +208,18 @@ nvidb job cancel 12          # kill the remote process group
 nvidb job requeue 12         # run a finished job again
 nvidb job note 12 --append "loss plateaued at epoch 30"
 nvidb queue drain gpu-node      # stop scheduling onto a node (`resume` undoes it)
+nvidb queue ignore offline-node     # do not probe, schedule, or normally display it
+nvidb queue unignore offline-node   # restore it (`nodes --include-ignored` finds hidden nodes)
 ```
 
 Cancelling is destructive and discards work in progress. **Confirm with the user
 before cancelling a job you did not submit** — another session may be waiting on
 it.
+
+Draining and ignoring are different. A drained node is still probed so jobs
+already running there can finish. Ignore an unavailable node only when it has no
+running queue jobs; it then disappears from normal status/TUI views and makes no
+SSH connections until it is unignored.
 
 ## Things to avoid
 

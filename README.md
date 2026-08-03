@@ -459,6 +459,8 @@ nvidb queue status --procs      # the same, with every GPU process listed
 nvidb queue events --since 42   # replay what happened while you were away
 nvidb queue drain gpu-node           # stop scheduling onto a node (`resume` undoes it);
                                 # jobs already on it keep running and still report back
+nvidb queue ignore offline-node        # stop probing/scheduling and hide a disconnected node
+nvidb queue unignore offline-node      # restore it; `nodes --include-ignored` lists hidden nodes
 nvidb queue tick                # force one scheduler pass
 ```
 

@@ -5,6 +5,7 @@ probing disabled, so they cover the command surface without touching a network.
 """
 import argparse
 import json
+import logging
 
 import pytest
 
@@ -61,6 +62,8 @@ def test_the_queue_commands_are_all_recognised(parser):
         ["queue", "nodes"],
         ["queue", "events"],
         ["queue", "drain", "n1"],
+        ["queue", "ignore", "n1"],
+        ["queue", "unignore", "n1"],
         ["job", "ls"],
         ["job", "show", "1"],
         ["job", "wait", "1"],
@@ -69,6 +72,20 @@ def test_the_queue_commands_are_all_recognised(parser):
         args = parser.parse_args(argv)
         assert args.queue_cli is True
         assert callable(args.func)
+
+
+def test_paramiko_internal_errors_are_quiet_in_machine_readable_commands():
+    loggers = [
+        logging.getLogger(name)
+        for name in ("paramiko", "paramiko.transport", "paramiko.transport.sftp")
+    ]
+    previous = [logger.level for logger in loggers]
+    try:
+        sched_cli.quiet_transport_logging()
+        assert all(not logger.isEnabledFor(logging.ERROR) for logger in loggers)
+    finally:
+        for logger, level in zip(loggers, previous):
+            logger.setLevel(level)
 
 
 def test_note_accepts_each_of_its_forms_without_ambiguity(parser):
@@ -129,6 +146,66 @@ def test_submit_refuses_limits_that_would_silently_mean_nothing(parser, queue_db
     conn = dbm.open_db(queue_db)
     try:
         assert dbm.list_jobs(conn) == []  # nothing was queued by a rejected call
+    finally:
+        conn.close()
+
+
+def test_ignore_hides_a_node_until_it_is_explicitly_requested(
+    parser, queue_db, capsys
+):
+    conn = dbm.open_db(queue_db)
+    try:
+        dbm.upsert_node(conn, "training-A100", hostname="10.0.0.42")
+    finally:
+        conn.close()
+
+    assert _run(
+        parser, ["queue", "ignore", "training", "--json"], queue_db
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "node": "training-A100",
+        "ignored": True,
+    }
+
+    assert _run(
+        parser, ["queue", "nodes", "--json", "--no-tick"], queue_db
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["nodes"] == []
+
+    assert _run(
+        parser,
+        ["queue", "nodes", "--json", "--no-tick", "--include-ignored"],
+        queue_db,
+    ) == 0
+    shown = json.loads(capsys.readouterr().out)["nodes"]
+    assert shown[0]["name"] == "training-A100"
+    assert shown[0]["ignored"] is True
+
+    assert _run(
+        parser, ["queue", "unignore", "TRAINING-A100", "--json"], queue_db
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["ignored"] is False
+
+
+def test_ignore_refuses_to_abandon_a_running_job(parser, queue_db, capsys):
+    conn = dbm.open_db(queue_db)
+    try:
+        dbm.upsert_node(conn, "busy-node", hostname="10.0.0.1")
+        job_id = dbm.insert_job(conn, command="train")
+        dbm.update_job(conn, job_id, state="running", node="busy-node")
+    finally:
+        conn.close()
+
+    assert _run(
+        parser, ["queue", "ignore", "busy", "--json"], queue_db
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "running job(s)" in payload["error"]
+
+    conn = dbm.open_db(queue_db)
+    try:
+        assert dbm.get_node(conn, "busy-node").ignored is False
     finally:
         conn.close()
 

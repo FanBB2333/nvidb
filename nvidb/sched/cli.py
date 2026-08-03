@@ -207,6 +207,8 @@ def _render_nodes(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
         flags = [node["state"]]
         if not node["enabled"]:
             flags.append("disabled")
+        if node.get("ignored"):
+            flags.append("ignored")
         header = f"  {node['name']}  [{'/'.join(flags)}]  {node['hostname'] or ''}"
         if node["state"] != "up" and node.get("last_error"):
             header += f"  ! {_short(node['last_error'], 70)}"
@@ -391,7 +393,9 @@ def cmd_status(args) -> int:
     scheduler = _open(args)
     try:
         _refresh(scheduler, args)
-        snapshot = scheduler.snapshot()
+        snapshot = scheduler.snapshot(
+            include_ignored=bool(getattr(args, "include_ignored", False))
+        )
         if args.json:
             _print_json(snapshot)
         else:
@@ -414,6 +418,8 @@ def cmd_tick(args) -> int:
                     f"dispatched={len(summary['dispatched'])}",
                     f"finished={len(summary['finished'])}",
                 ]
+                if summary.get("nodes_ignored"):
+                    bits.insert(1, f"ignored={summary['nodes_ignored']}")
                 if summary["skipped"]:
                     bits.insert(0, f"skipped={summary['skipped']}")
                 print("tick: " + "  ".join(bits))
@@ -721,7 +727,13 @@ def cmd_nodes(args) -> int:
     try:
         _refresh(scheduler, args)
         headroom = int(scheduler.settings["headroom_mb"])
-        nodes = [node.to_dict(headroom) for node in dbm.get_nodes(scheduler.conn)]
+        nodes = [
+            node.to_dict(headroom)
+            for node in dbm.get_nodes(
+                scheduler.conn,
+                include_ignored=bool(getattr(args, "include_ignored", False)),
+            )
+        ]
         if args.json:
             _print_json({"nodes": nodes})
         else:
@@ -744,6 +756,33 @@ def cmd_node_set(args) -> int:
             _print_json(payload)
         else:
             print(f"node {name} {'resumed' if enabled else 'drained'}")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_node_ignore(args) -> int:
+    scheduler = _open(args)
+    try:
+        name = dbm.resolve_node_name(scheduler.conn, args.name)
+        if name is None:
+            return _error(f"unknown node {args.name!r}", as_json=args.json)
+        ignored = args.action == "ignore"
+        if ignored:
+            running = dbm.live_jobs(scheduler.conn, name)
+            if running:
+                ids = ", ".join(str(job.id) for job in running)
+                return _error(
+                    f"node {name} has running job(s) {ids}; drain it and wait "
+                    "for them to finish before ignoring it",
+                    as_json=args.json,
+                )
+        dbm.set_node_ignored(scheduler.conn, name, ignored)
+        payload = {"ok": True, "node": name, "ignored": ignored}
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"node {name} {'ignored' if ignored else 'unignored'}")
         return 0
     finally:
         scheduler.close()
@@ -1135,6 +1174,14 @@ def _add_procs_flag(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_ignored_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--include-ignored",
+        action="store_true",
+        help="Include nodes that were administratively ignored",
+    )
+
+
 def register_parsers(subparsers) -> None:
     """Attach the `queue` and `job` command trees to the main nvidb parser."""
     queue = subparsers.add_parser(
@@ -1153,6 +1200,7 @@ def register_parsers(subparsers) -> None:
     _add_common(status)
     _add_refresh_flags(status)
     _add_procs_flag(status)
+    _add_ignored_flag(status)
     status.set_defaults(func=cmd_status)
 
     tick = queue_sub.add_parser("tick", help="Run one scheduler pass")
@@ -1274,6 +1322,7 @@ def register_parsers(subparsers) -> None:
     _add_common(nodes)
     _add_procs_flag(nodes)
     _add_refresh_flags(nodes)
+    _add_ignored_flag(nodes)
     nodes.set_defaults(func=cmd_nodes)
 
     drain = queue_sub.add_parser("drain", help="Stop scheduling new jobs onto a node")
@@ -1285,6 +1334,22 @@ def register_parsers(subparsers) -> None:
     _add_common(resume)
     resume.add_argument("name")
     resume.set_defaults(func=cmd_node_set, action="resume")
+
+    ignore = queue_sub.add_parser(
+        "ignore",
+        help="Stop probing, scheduling, and normally displaying a node",
+    )
+    _add_common(ignore)
+    ignore.add_argument("name")
+    ignore.set_defaults(func=cmd_node_ignore, action="ignore")
+
+    unignore = queue_sub.add_parser(
+        "unignore",
+        help="Restore a previously ignored node",
+    )
+    _add_common(unignore)
+    unignore.add_argument("name")
+    unignore.set_defaults(func=cmd_node_ignore, action="unignore")
 
     tui = queue_sub.add_parser("tui", help="Open the interactive queue TUI")
     _add_common(tui, json_flag=False)
@@ -1411,16 +1476,18 @@ def register_parsers(subparsers) -> None:
 
 
 def quiet_transport_logging() -> None:
-    """Keep paramiko's connection chatter out of the queue's output.
+    """Keep Paramiko's internal connection tracebacks out of queue output.
 
     Queue output is parsed by other programs and drawn over by the TUI, so a
-    stray "Authentication successful" line is a real problem here even though it
-    is harmless in the monitor.
+    library-generated line is a real problem here. Transport failures are
+    already raised to the scheduler as ``TransportError`` and recorded with the
+    affected node name, so Paramiko's background-thread ERROR traceback is both
+    redundant and missing the context a user needs.
     """
     import logging
 
     for name in ("paramiko", "paramiko.transport", "paramiko.transport.sftp"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        logging.getLogger(name).setLevel(logging.CRITICAL)
 
 
 def _forward_to_queue_host(target: Dict[str, Any], args) -> int:

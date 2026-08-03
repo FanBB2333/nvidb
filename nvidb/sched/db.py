@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from .. import config
 from .model import TERMINAL_JOB_STATES, GpuState, Job, Node, utcnow
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 15000
 
 _SCHEMA = """
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     username   TEXT,
     state      TEXT NOT NULL DEFAULT 'unknown',
     enabled    INTEGER NOT NULL DEFAULT 1,
+    ignored    INTEGER NOT NULL DEFAULT 0,
     last_seen  TEXT,
     last_error TEXT,
     gpu_count  INTEGER DEFAULT 0,
@@ -234,6 +235,9 @@ def open_db(path=None) -> sqlite3.Connection:
 # Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` will
 # not add them to a database that already exists, so they are applied here.
 _ADDED_COLUMNS = {
+    "nodes": {
+        "ignored": "INTEGER NOT NULL DEFAULT 0",
+    },
     "gpus": {
         "attribution": "TEXT DEFAULT 'processes'",
         "mem_util_percent": "INTEGER",
@@ -592,6 +596,20 @@ def set_node_enabled(conn: sqlite3.Connection, name: str, enabled: bool) -> None
         )
 
 
+def set_node_ignored(conn: sqlite3.Connection, name: str, ignored: bool) -> None:
+    """Hide a node from normal views and suspend all contact with it.
+
+    This is deliberately separate from draining. A drained node keeps being
+    probed so work already running there can finish; an ignored node is treated
+    as administratively absent until it is explicitly unignored.
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE nodes SET ignored = ? WHERE name = ?",
+            (1 if ignored else 0, name),
+        )
+
+
 def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict]) -> None:
     """Overwrite the cached GPU rows for one node."""
     now = utcnow()
@@ -627,9 +645,15 @@ def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict])
         )
 
 
-def get_nodes(conn: sqlite3.Connection, *, with_gpus: bool = True) -> List[Node]:
+def get_nodes(
+    conn: sqlite3.Connection,
+    *,
+    with_gpus: bool = True,
+    include_ignored: bool = True,
+) -> List[Node]:
+    where = "" if include_ignored else "WHERE ignored = 0"
     nodes = [Node.from_row(row) for row in conn.execute(
-        "SELECT * FROM nodes ORDER BY name"
+        f"SELECT * FROM nodes {where} ORDER BY name"
     ).fetchall()]
     if with_gpus:
         by_name = {node.name: node for node in nodes}

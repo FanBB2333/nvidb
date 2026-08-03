@@ -513,6 +513,7 @@ class Node:
     username: Optional[str] = None
     state: str = "unknown"
     enabled: bool = True
+    ignored: bool = False
     last_seen: Optional[str] = None
     last_error: Optional[str] = None
     gpu_count: int = 0
@@ -529,6 +530,7 @@ class Node:
             username=data.get("username"),
             state=data.get("state") or "unknown",
             enabled=bool(data.get("enabled", 1)),
+            ignored=bool(data.get("ignored", 0)),
             last_seen=data.get("last_seen"),
             last_error=data.get("last_error"),
             gpu_count=int(data.get("gpu_count") or 0),
@@ -537,7 +539,7 @@ class Node:
 
     @property
     def is_schedulable(self) -> bool:
-        return self.enabled and self.state == "up"
+        return not self.ignored and self.enabled and self.state == "up"
 
     def to_dict(self, headroom_mb: int = 0) -> Dict[str, Any]:
         return {
@@ -547,6 +549,7 @@ class Node:
             "username": self.username,
             "state": self.state,
             "enabled": self.enabled,
+            "ignored": self.ignored,
             "last_seen": self.last_seen,
             "last_error": self.last_error,
             "gpu_count": self.gpu_count,

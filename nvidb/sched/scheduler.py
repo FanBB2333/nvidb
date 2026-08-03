@@ -278,6 +278,12 @@ class Scheduler:
             if resolved_node is None:
                 known = ", ".join(n.name for n in dbm.get_nodes(self.conn, with_gpus=False))
                 raise ValueError(f"Unknown node {node!r}. Known nodes: {known or '(none)'}")
+            target = dbm.get_node(self.conn, resolved_node)
+            if target is not None and target.ignored:
+                raise ValueError(
+                    f"Node {resolved_node!r} is ignored; run "
+                    f"`nvidb queue unignore {resolved_node}` before submitting to it"
+                )
 
         depends_on = [int(x) for x in (depends_on or [])]
         for dep in depends_on:
@@ -402,6 +408,7 @@ class Scheduler:
             "skipped": None,
             "nodes_up": 0,
             "nodes_down": 0,
+            "nodes_ignored": 0,
             "finished": [],
             "dispatched": [],
             "errors": [],
@@ -430,6 +437,11 @@ class Scheduler:
             # node, and a node is usually drained precisely so its running jobs
             # can finish - which they can only be seen to do if it is probed.
             for node in dbm.get_nodes(self.conn, with_gpus=False):
+                # Ignoring is stronger than draining: it is an explicit request
+                # to make no connection attempts until the node is unignored.
+                if node.ignored:
+                    summary["nodes_ignored"] += 1
+                    continue
                 try:
                     up = self._refresh_node(node, summary)
                 except TransportError as error:
@@ -1205,10 +1217,10 @@ class Scheduler:
 
     # --- reads ------------------------------------------------------------
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self, *, include_ignored: bool = False) -> Dict[str, Any]:
         """A single JSON-friendly view of the whole queue, for other tools."""
         headroom = int(self.settings["headroom_mb"])
-        nodes = dbm.get_nodes(self.conn)
+        nodes = dbm.get_nodes(self.conn, include_ignored=include_ignored)
         jobs = dbm.list_jobs(self.conn, states=["pending", "running"])
         recent = dbm.list_jobs(self.conn, limit=20, newest_first=True)
         recent_terminal = [job for job in recent if job.is_terminal][:10]

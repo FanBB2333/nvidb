@@ -115,6 +115,38 @@ def test_a_drained_node_keeps_reporting_its_capacity(scheduler, cluster):
     assert gpu.external_mem_mb == 9000
 
 
+# --- ignoring ---------------------------------------------------------------
+
+def test_an_ignored_node_is_not_probed_scheduled_or_shown(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train", vram="4G", node="small-node")
+    dbm.set_node_ignored(scheduler.conn, "small-node", True)
+    cluster["small-node"].online = False
+
+    summary = scheduler.tick(force=True)
+
+    assert summary["nodes_ignored"] == 1
+    assert summary["nodes_down"] == 0
+    assert dbm.get_node(scheduler.conn, "small-node").state == "up"
+    assert dbm.get_job(scheduler.conn, job_id).state == "pending"
+    assert {node["name"] for node in scheduler.snapshot()["nodes"]} == {"big-node"}
+
+    included = scheduler.snapshot(include_ignored=True)["nodes"]
+    hidden = next(node for node in included if node["name"] == "small-node")
+    assert hidden["ignored"] is True
+
+    cluster["small-node"].online = True
+    dbm.set_node_ignored(scheduler.conn, "small-node", False)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "running"
+
+
+def test_submit_refuses_an_explicitly_ignored_node(scheduler):
+    dbm.set_node_ignored(scheduler.conn, "small-node", True)
+    with pytest.raises(ValueError, match="is ignored"):
+        scheduler.submit("train", vram="4G", node="small")
+
+
 # --- the event cursor -------------------------------------------------------
 
 def test_events_page_forward_from_a_cursor_without_skipping_any(scheduler):
@@ -419,6 +451,7 @@ def test_a_schema_upgrade_racing_another_client_is_not_an_error(tmp_path):
     first = dbm.open_db(path)
     try:
         first.execute("ALTER TABLE gpus DROP COLUMN processes_json")
+        first.execute("ALTER TABLE nodes DROP COLUMN ignored")
     finally:
         first.close()
 
@@ -428,5 +461,9 @@ def test_a_schema_upgrade_racing_another_client_is_not_an_error(tmp_path):
         try:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(gpus)")}
             assert "processes_json" in columns
+            node_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(nodes)")
+            }
+            assert "ignored" in node_columns
         finally:
             conn.close()
