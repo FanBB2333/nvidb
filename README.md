@@ -618,7 +618,7 @@ slows the numbers down but never freezes the interface.
 | `PgUp` / `PgDn`    | Move a page at a time                         |
 | `Tab`              | Switch focus between the node and job panes   |
 | `Enter`            | Show or hide the selected job's detail pane   |
-| `[` / `]`          | Page through wrapped detail text              |
+| `[` / `]`          | Page through wrapped detail or log text       |
 | `L`                | Toggle a live tail of the selected job's log  |
 | `c`                | Cancel the selected job (press twice)         |
 | `r`                | Re-queue the selected finished job            |
@@ -630,6 +630,18 @@ slows the numbers down but never freezes the interface.
 | `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
+| Mouse click        | Select rows or activate bracketed actions     |
+| Mouse wheel        | Move selections or page detail/log text       |
+
+Mouse reporting is enabled by default. Click anywhere in a node card to select
+that node, or click a job row to select it; clicking the selected job again
+shows or hides its detail pane. The wheel acts on the pane under the pointer.
+Status counts select their matching job filter, and clicking a job alert opens
+that job's log. The bottom action bar exposes the actions that apply to the
+current selection, including the second confirmation required for cancellation.
+Most terminals reserve normal text selection for `Shift`-drag or `Option`-drag
+while mouse reporting is active. Set `mouse: false` under `view` in
+`~/.nvidb/config.yml` to disable it in both nvidb TUIs.
 
 ### 3.8 What runs on the nodes
 

@@ -9,7 +9,8 @@ import re
 import pytest
 from blessed.keyboard import Keystroke
 
-from nvidb.sched.tui import QueueTUI
+from nvidb.mouse import MouseEvent
+from nvidb.sched.tui import QueueTUI, _Worker
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 _MISSING = object()
@@ -174,6 +175,25 @@ def _tui(width=150):
 
 def _render(tui, state=None):
     return _plain(tui.render(state or _state()))
+
+
+def _mouse_at(output, text, *, button=0, occurrence=0):
+    matches = []
+    for row, line in enumerate(output.splitlines()):
+        start = 0
+        while True:
+            column = line.find(text, start)
+            if column < 0:
+                break
+            matches.append((row, column))
+            start = column + 1
+    row, column = matches[occurrence]
+    return MouseEvent(
+        button=button,
+        column=column + 1,
+        row=row + 1,
+        pressed=True,
+    )
 
 
 # --- rendering -------------------------------------------------------------
@@ -416,6 +436,144 @@ def test_help_opens_and_closes_without_quitting():
     # `q` inside help closes the panel rather than exiting the program.
     assert _press(tui, "q") is True
     assert tui.show_help is False
+
+
+# --- mouse interaction -----------------------------------------------------
+
+def test_clicking_job_rows_selects_then_toggles_the_current_detail():
+    tui = _tui()
+    output = _render(tui)
+
+    click = _mouse_at(output, "eval")
+    assert tui.handle_mouse(click) is True
+    assert tui.focus == "jobs"
+    assert tui.selected_job()["id"] == 2
+
+    assert tui.show_detail is True
+    assert tui.handle_mouse(click) is True
+    assert tui.show_detail is False
+
+
+def test_clicking_any_line_in_a_node_card_selects_that_node():
+    tui = _tui()
+    output = _render(tui)
+
+    assert tui.handle_mouse(_mouse_at(output, "RTX 3090 Ti")) is True
+    assert tui.focus == "nodes"
+    assert tui.selected_node()["name"] == "small-node"
+
+
+def test_wheel_routes_to_the_pane_under_the_pointer():
+    tui = _tui()
+    output = _render(tui)
+
+    assert tui.handle_mouse(_mouse_at(output, "JOBS (2)", button=65)) is True
+    assert tui.focus == "jobs"
+    assert tui.selected_job()["id"] == 2
+
+    assert tui.handle_mouse(_mouse_at(output, "NODES", button=65)) is True
+    assert tui.focus == "nodes"
+    assert tui.selected_node()["name"] == "small-node"
+
+
+def test_wheel_pages_wrapped_detail_and_scrolls_back_through_logs():
+    os.environ["LINES"] = "20"
+    note = "\n".join(f"detail line {index}" for index in range(30))
+    snapshot = _snapshot(jobs=[_job(1, notes=note)], nodes=[])
+    state = _state(snapshot)
+    tui = _tui(width=80)
+    output = _render(tui, state)
+
+    assert tui.detail_pages > 1
+    assert tui.handle_mouse(_mouse_at(output, "JOB 1 DETAIL", button=65)) is True
+    assert tui.detail_page == 1
+
+    _press(tui, "L")
+    log_state = _state(
+        snapshot,
+        log_text="\n".join(f"log line {index}" for index in range(60)),
+        log_job=1,
+    )
+    output = _render(tui, log_state)
+    assert tui.handle_mouse(_mouse_at(output, "LOG job 1", button=64)) is True
+    assert tui.log_offset == 3
+    assert "3 line(s) above tail" in _render(tui, log_state)
+
+
+def test_action_bar_buttons_post_actions_and_keep_cancel_confirmation():
+    tui = _tui()
+    output = _render(tui)
+
+    assert tui.handle_mouse(_mouse_at(output, "[t tick]")) is True
+    assert tui.worker.actions.get_nowait() == ("tick",)
+
+    assert tui.handle_mouse(_mouse_at(output, "[c cancel]")) is True
+    assert tui.worker.actions.empty()
+    assert tui.pending_confirm is not None
+
+    output = _render(tui)
+    assert tui.handle_mouse(_mouse_at(output, "[c confirm cancel]")) is True
+    assert tui.worker.actions.get_nowait() == ("cancel", 1)
+
+
+def test_status_counts_and_alert_rows_are_clickable():
+    tui = _tui()
+    output = _render(tui)
+
+    assert tui.handle_mouse(_mouse_at(output, "pending 1")) is True
+    assert tui.filter == "pending"
+
+    failed = _job(7, state="failed", exit_code=1, finished_at="now")
+    snapshot = _snapshot(jobs=[], recent=[failed], counts={"failed": 1})
+    snapshot["alerts"] = [
+        {
+            "id": 3,
+            "kind": "job_failed",
+            "severity": "error",
+            "job_id": 7,
+            "node": "small-node",
+            "title": "job 7 failed",
+            "acknowledged_at": None,
+        }
+    ]
+    output = _render(tui, _state(snapshot))
+
+    assert tui.handle_mouse(_mouse_at(output, "job 7 failed")) is True
+    assert tui.filter == "all"
+    assert tui.selected_job()["id"] == 7
+    assert tui.show_log is True
+    assert tui.worker.log_request == (7, "stdout")
+
+
+def test_help_and_quit_buttons_are_clickable():
+    tui = _tui()
+    output = _render(tui)
+
+    assert tui.handle_mouse(_mouse_at(output, "[? help]")) is True
+    assert tui.show_help is True
+    help_output = _render(tui)
+    assert tui.handle_mouse(_mouse_at(help_output, "Mouse click")) is True
+    assert tui.show_help is False
+
+    output = _render(tui)
+    assert tui.handle_mouse(_mouse_at(output, "[q quit]")) is False
+
+
+def test_mouse_events_are_ignored_when_mouse_support_is_disabled():
+    tui = QueueTUI(mouse_enabled=False)
+    output = _render(tui)
+
+    assert tui.handle_mouse(_mouse_at(output, "[q quit]")) is True
+
+
+def test_worker_shutdown_can_join_without_shadowing_thread_stop():
+    worker = _Worker()
+    worker.run = lambda: None
+
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
 
 
 # --- actions ---------------------------------------------------------------

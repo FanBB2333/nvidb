@@ -29,8 +29,8 @@ view:
   trends: false          # GPU + selected-process history     ([t])
   group_by_node: true    # node bands in the unified view      ([g])
   hide_unsupported: true # skip nodes without NVIDIA GPUs       ([u])
-  # Click GPU/process rows or actions; the wheel scrolls the pane under it. Set
-  # to false to keep the terminal's own mouse selection (with reporting on,
+  # Click monitor/queue rows or actions; the wheel scrolls the pane under it.
+  # Set to false to keep the terminal's own mouse selection (with reporting on,
   # most terminals need Shift to drag-select).
   mouse: true
 

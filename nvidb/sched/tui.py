@@ -11,12 +11,19 @@ node can never freeze the interface.
 from __future__ import annotations
 
 import queue as queue_module
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from blessed import Terminal
 
+from .. import config as nvidb_config
+from ..mouse import (
+    DISABLE_SEQUENCE as MOUSE_DISABLE_SEQUENCE,
+    ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
+    MouseSequenceParser,
+)
 from . import db as dbm
 from .model import (
     GpuProcess,
@@ -71,7 +78,9 @@ class _Worker(threading.Thread):
         self.busy = False
         self.auto_tick = True
         self.error: Optional[str] = None
-        self._stop = threading.Event()
+        # Thread.join() calls Thread._stop() internally. Keep our event under a
+        # distinct name so quitting the TUI cannot replace that method.
+        self._stop_event = threading.Event()
         self._scheduler: Optional[Scheduler] = None
 
     # --- public API (render thread) --------------------------------------
@@ -80,7 +89,7 @@ class _Worker(threading.Thread):
         self.actions.put(action)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.actions.put(("quit",))
 
     def set_notice(self, message: str, style: str = "yellow") -> None:
@@ -122,7 +131,7 @@ class _Worker(threading.Thread):
             pass
 
         next_refresh = 0.0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 action = self.actions.get(timeout=0.2)
             except queue_module.Empty:
@@ -236,9 +245,17 @@ class _Worker(threading.Thread):
 
 
 class QueueTUI:
-    def __init__(self, db_path=None, refresh: float = 3.0):
+    def __init__(
+        self,
+        db_path=None,
+        refresh: float = 3.0,
+        *,
+        mouse_enabled: bool = True,
+    ):
         self.term = Terminal()
         self.worker = _Worker(db_path=db_path, refresh=refresh)
+        self.mouse_enabled = bool(mouse_enabled)
+        self._mouse_reporting = False
         self.focus = "jobs"  # jobs | nodes
         self.job_index = 0
         self.node_index = 0
@@ -250,9 +267,23 @@ class QueueTUI:
         self.detail_page = 0
         self.detail_pages = 1
         self._detail_job_id: Optional[int] = None
+        self.log_offset = 0
+        self._log_max_offset = 0
+        self._log_page_height = 1
         self.pending_confirm: Optional[Tuple[str, int, float]] = None
         self.jobs: List[Dict[str, Any]] = []
         self.nodes: List[Dict[str, Any]] = []
+        self._snapshot: Optional[Dict[str, Any]] = None
+        # Mouse coordinates are stored as zero-based screen rows/columns. A
+        # region wins over a whole-row target so buttons embedded in the footer
+        # remain clickable without changing how wheel routing works.
+        self._click_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
+        self._row_targets: Dict[int, Tuple[str, Any]] = {}
+        self._header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
+        self._alert_targets: Dict[int, Tuple[str, Any]] = {}
+        self._node_line_targets: Dict[int, int] = {}
+        self._job_line_targets: Dict[int, int] = {}
+        self._footer_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
 
     # --- data -------------------------------------------------------------
 
@@ -376,7 +407,9 @@ class QueueTUI:
     def _header_lines(self, state: Dict[str, Any], width: int) -> List[str]:
         snapshot = state["snapshot"] or {}
         counts = snapshot.get("counts") or {}
+        self._header_regions = [(0, 0, len(" nvidb queue ") - 1, ("help", None))]
         segments = [(" ", None)]
+        count_column = 1
         for label, style in (
             ("running", "green"),
             ("pending", "yellow"),
@@ -389,7 +422,19 @@ class QueueTUI:
             if counts.get(label):
                 if len(segments) > 1:
                     segments.append((" · ", "bright_black"))
-                segments.append((f"{label} {counts[label]}", style))
+                    count_column += 3
+                count_text = f"{label} {counts[label]}"
+                filter_name = label if label in ("running", "pending") else "finished"
+                self._header_regions.append(
+                    (
+                        1,
+                        count_column,
+                        count_column + display_width(count_text) - 1,
+                        ("filter", filter_name),
+                    )
+                )
+                segments.append((count_text, style))
+                count_column += display_width(count_text)
         if len(segments) == 1:
             segments.append(("queue empty", "bright_black"))
 
@@ -422,6 +467,7 @@ class QueueTUI:
         Alerts sit above everything else because they are the one thing on this
         screen that needs a decision rather than a glance.
         """
+        self._alert_targets = {}
         alerts = snapshot.get("alerts") or []
         open_alerts = [alert for alert in alerts if not alert.get("acknowledged_at")]
         if not open_alerts:
@@ -431,13 +477,14 @@ class QueueTUI:
             self._compose(
                 [
                     (f" ⚠ {len(open_alerts)} alert(s) ", "red"),
-                    ("— press A to acknowledge, L to read the job's log", "bright_black"),
+                    ("— click a row to inspect; A acknowledges all", "bright_black"),
                 ],
                 width,
             )
         ]
         for alert in shown:
             style = "red" if alert.get("severity") == "error" else "yellow"
+            line_index = len(lines)
             lines.append(
                 self._compose(
                     [
@@ -448,6 +495,10 @@ class QueueTUI:
                     width,
                 )
             )
+            if alert.get("job_id") is not None:
+                self._alert_targets[line_index] = ("job_log", alert["job_id"])
+            elif alert.get("node"):
+                self._alert_targets[line_index] = ("node_name", alert["node"])
         if len(open_alerts) > len(shown):
             lines.append(
                 self._style(
@@ -457,8 +508,10 @@ class QueueTUI:
         return lines
 
     def _node_lines(self, width: int) -> List[str]:
+        self._node_line_targets = {}
         lines = [self._style("─ NODES " + "─" * max(0, width - 8), "bright_black")]
         for position, node in enumerate(self.nodes):
+            node_start = len(lines)
             selected = self.focus == "nodes" and position == self.node_index
             marker = "›" if selected else " "
             state = node["state"]
@@ -493,6 +546,8 @@ class QueueTUI:
                 lines.append(
                     self._style(self._fit(f"    ! {node['last_error']}", width), "red")
                 )
+                for line_index in range(node_start, len(lines)):
+                    self._node_line_targets[line_index] = position
                 continue
 
             for gpu in node["gpus"]:
@@ -539,6 +594,8 @@ class QueueTUI:
                     )
                 )
                 lines.extend(self._gpu_process_lines(gpu, width))
+            for line_index in range(node_start, len(lines)):
+                self._node_line_targets[line_index] = position
         return lines
 
     def _gpu_process_lines(self, gpu: Dict[str, Any], width: int) -> List[str]:
@@ -597,6 +654,7 @@ class QueueTUI:
         return lines
 
     def _job_lines(self, width: int, height: int) -> List[str]:
+        self._job_line_targets = {}
         title = f"─ JOBS ({len(self.jobs)}) "
         lines = [self._style(title + "─" * max(0, width - len(title)), "bright_black")]
         columns = [
@@ -671,6 +729,7 @@ class QueueTUI:
                     reverse=selected,
                 )
             )
+            self._job_line_targets[len(lines) - 1] = position
         if start + rows < len(self.jobs):
             lines.append(
                 self._style(f"  … {len(self.jobs) - start - rows} more", "bright_black")
@@ -684,6 +743,7 @@ class QueueTUI:
             self._detail_job_id = job_id
             self.detail_page = 0
             self.detail_pages = 1
+            self.log_offset = 0
 
     def _collapsed_detail_line(self, width: int) -> Optional[str]:
         job = self.selected_job()
@@ -702,13 +762,38 @@ class QueueTUI:
         if self.show_log:
             self.detail_page = 0
             self.detail_pages = 1
-            title = f"─ LOG job {job['id']} "
-            lines = [self._style(title + "─" * max(0, width - len(title)), "bright_black")]
             text = state["log_text"] if state["log_job"] == job["id"] else ""
             if not text:
+                self.log_offset = 0
+                self._log_max_offset = 0
+                title = f"─ LOG job {job['id']} [tail] "
+                lines = [
+                    self._style(
+                        title + "─" * max(0, width - len(title)),
+                        "bright_black",
+                    )
+                ]
                 lines.append(self._style("  (fetching…)", "bright_black"))
                 return lines
-            body = text.rstrip("\n").splitlines()[-(height - 1):]
+            log_lines = text.rstrip("\n").splitlines()
+            self._log_page_height = max(1, height - 1)
+            self._log_max_offset = max(0, len(log_lines) - self._log_page_height)
+            self.log_offset = max(0, min(self.log_offset, self._log_max_offset))
+            title = f"─ LOG job {job['id']}"
+            if self.log_offset:
+                title += f" [{self.log_offset} line(s) above tail]"
+            else:
+                title += " [tail]"
+            title += " "
+            lines = [
+                self._style(
+                    title + "─" * max(0, width - len(title)),
+                    "bright_black",
+                )
+            ]
+            end = len(log_lines) - self.log_offset
+            start = max(0, end - self._log_page_height)
+            body = log_lines[start:end]
             lines.extend("  " + self._fit(line, width - 2) for line in body)
             return lines
 
@@ -769,10 +854,50 @@ class QueueTUI:
         lines.extend(content[start : start + page_height])
         return lines
 
+    def _control_lines(self, controls, width: int):
+        """Render a wrapping action bar and retain each button's hit box."""
+        lines: List[str] = []
+        regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
+        segments = []
+        column = 0
+
+        def finish_line() -> None:
+            nonlocal segments, column
+            if segments:
+                lines.append(self._compose(segments, width))
+            segments = []
+            column = 0
+
+        for label, action, value, style in controls:
+            token = f"[{label}]"
+            token_width = display_width(token)
+            needed = 1 + token_width
+            if segments and column + needed > width:
+                finish_line()
+            prefix = " "
+            start = column + display_width(prefix)
+            available = max(1, width - start)
+            shown = fit_display(token, available)
+            shown_width = display_width(shown)
+            segments.extend(((prefix, None), (shown, style)))
+            if shown_width:
+                regions.append(
+                    (
+                        len(lines),
+                        start,
+                        start + shown_width - 1,
+                        (action, value),
+                    )
+                )
+            column = start + shown_width
+        finish_line()
+        return lines, regions
+
     def _footer_lines(self, state: Dict[str, Any], width: int) -> List[str]:
         notice = state.get("notice")
         error = state.get("error")
         lines = []
+        self._footer_regions = []
         if error:
             lines.append(self._style(self._fit(f" ! {error}", width), "red"))
         elif notice:
@@ -783,19 +908,107 @@ class QueueTUI:
             lines.append(
                 self._style(
                     self._fit(
-                        f" press {action[0]} again to {action} job {job_id} (Esc cancels)",
+                        f" press {action[0]} again or click confirm to {action} job "
+                        f"{job_id} (Esc cancels)",
                         width,
                     ),
                     "yellow",
                 )
             )
-        detail_action = "hide detail" if self.show_detail else "show detail"
-        keys = (
-            f"j/k move  Tab pane  Enter {detail_action}  [/] page  "
-            "L log  c cancel  r requeue  "
-            "A ack  t tick  a auto  f filter  p procs  d drain  ? help  q quit"
+
+        controls = []
+        job = self.selected_job()
+        node = self.selected_node()
+        if job is not None:
+            controls.extend(
+                [
+                    (
+                        f"Enter {'hide' if self.show_detail else 'show'} detail",
+                        "detail",
+                        None,
+                        "cyan" if self.show_detail else "bright_black",
+                    ),
+                    (
+                        f"L log:{'on' if self.show_log else 'off'}",
+                        "log",
+                        None,
+                        "cyan" if self.show_log else "bright_black",
+                    ),
+                ]
+            )
+            if job["state"] in ("pending", "running"):
+                confirming = bool(
+                    self.pending_confirm
+                    and self.pending_confirm[0] == "cancel"
+                    and self.pending_confirm[1] == job["id"]
+                )
+                controls.append(
+                    (
+                        "c confirm cancel" if confirming else "c cancel",
+                        "cancel",
+                        None,
+                        "red" if confirming else "yellow",
+                    )
+                )
+            elif job["state"] in ("completed", "failed", "cancelled", "timeout", "lost"):
+                controls.append(("r requeue", "requeue", None, "yellow"))
+        if node is not None:
+            node_name = fit_display(node["name"], 12)
+            controls.append(
+                (
+                    f"d {'resume' if not node['enabled'] else 'drain'}:{node_name}",
+                    "node_toggle",
+                    None,
+                    "green" if not node["enabled"] else "yellow",
+                )
+            )
+
+        controls.extend(
+            [
+                (
+                    f"Tab {'nodes' if self.focus == 'jobs' else 'jobs'}",
+                    "switch_pane",
+                    None,
+                    "cyan",
+                ),
+                ("t tick", "tick", None, "bright_black"),
+                (
+                    f"a auto:{'on' if state['auto_tick'] else 'off'}",
+                    "auto",
+                    not state["auto_tick"],
+                    "cyan" if state["auto_tick"] else "yellow",
+                ),
+                (
+                    f"f filter:{self.filter}",
+                    "filter",
+                    None,
+                    "bright_black",
+                ),
+                (
+                    f"p procs:{self.proc_view}",
+                    "procs",
+                    None,
+                    "bright_black",
+                ),
+            ]
         )
-        lines.append(self._style(self._fit(" " + keys, width), "bright_black"))
+        alerts = (state.get("snapshot") or {}).get("alerts") or []
+        if alerts:
+            controls.append((f"A ack:{len(alerts)}", "ack", None, "red"))
+        controls.extend(
+            [
+                ("? help", "help", None, "bright_black"),
+                ("q quit", "quit", None, "bright_black"),
+            ]
+        )
+
+        control_offset = len(lines)
+        control_lines, control_regions = self._control_lines(controls, width)
+        lines.extend(control_lines)
+        self._footer_regions = [
+            (line + control_offset, start, end, target)
+            for line, start, end, target in control_regions
+        ]
         return lines
 
     def _help_lines(self, width: int) -> List[str]:
@@ -804,7 +1017,7 @@ class QueueTUI:
             ("PgUp / PgDn", "Move a page at a time"),
             ("Tab", "Switch focus between the node and job panes"),
             ("Enter", "Show or hide the selected job's detail pane"),
-            ("[ / ]", "Page through wrapped detail text"),
+            ("[ / ]", "Page through wrapped detail or log text"),
             ("L", "Toggle the log tail for the selected job"),
             ("c", "Cancel the selected job (press twice)"),
             ("r", "Re-queue the selected finished job"),
@@ -814,6 +1027,8 @@ class QueueTUI:
             ("p", "GPU processes: unmanaged only / all / none"),
             ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
+            ("Mouse click", "Select rows and activate bracketed actions"),
+            ("Mouse wheel", "Move in nodes/jobs; page detail or log text"),
             ("q", "Quit"),
         ]
         lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
@@ -825,7 +1040,11 @@ class QueueTUI:
     def render(self, state: Dict[str, Any]) -> str:
         width = max(60, self.term.width or 100)
         height = max(20, self.term.height or 30)
+        self._click_regions = []
+        self._row_targets = {}
+        self._alert_targets = {}
         snapshot = state["snapshot"]
+        self._snapshot = snapshot
         if snapshot is None:
             message = state.get("error") or "connecting to nodes…"
             return self.term.home + self.term.clear + f"\n  {message}\n"
@@ -837,12 +1056,30 @@ class QueueTUI:
         # Leave the bottom row free so writing the last line cannot scroll the
         # screen and shear the frame.
         usable = height - 1
-        lines: List[str] = list(self._header_lines(state, width))
-        lines.extend(self._alert_lines(snapshot, width))
+        header_lines = self._header_lines(state, width)
+        lines: List[str] = list(header_lines)
+        for row, start, end, target in self._header_regions:
+            if row < len(header_lines) and start < width:
+                self._click_regions.append(
+                    (row, start, min(end, width - 1), target)
+                )
+
+        alert_start = len(lines)
+        alert_lines = self._alert_lines(snapshot, width)
+        lines.extend(alert_lines)
+        for relative_row, target in self._alert_targets.items():
+            if relative_row < len(alert_lines):
+                self._row_targets[alert_start + relative_row] = target
 
         if self.show_help:
-            lines.extend(self._help_lines(width))
+            help_start = len(lines)
+            help_lines = self._help_lines(width)
+            lines.extend(help_lines)
             lines = lines[:usable]
+            if help_start < len(lines):
+                help_end = len(lines) - 1
+                for row in range(help_start, help_end + 1):
+                    self._row_targets[row] = ("close_help", None)
         else:
             # Process listings can make the node pane arbitrarily tall, and the
             # job table is what this screen is for, so cap it at half the height.
@@ -854,7 +1091,18 @@ class QueueTUI:
                 node_lines.append(
                     self._style(f"    … {hidden} more line(s), press p", "bright_black")
                 )
+            node_start = len(lines)
             lines.extend(node_lines)
+            if node_lines:
+                node_end = node_start + len(node_lines) - 1
+                for row in range(node_start, node_end + 1):
+                    self._row_targets[row] = ("pane", "nodes")
+                for relative_row, position in self._node_line_targets.items():
+                    if relative_row < len(node_lines):
+                        self._row_targets[node_start + relative_row] = (
+                            "node",
+                            position,
+                        )
             footer = self._footer_lines(state, width)
             body_height = usable - len(footer)
             available = max(0, body_height - len(lines))
@@ -867,22 +1115,74 @@ class QueueTUI:
                 job_lines = self._job_lines(width, job_height)
                 # At least three rows are needed for a useful detail pane.
                 job_lines = job_lines[: max(0, available - 3)]
+                job_start = len(lines)
                 lines.extend(job_lines)
+                if job_lines:
+                    job_end = job_start + len(job_lines) - 1
+                    for row in range(job_start, job_end + 1):
+                        self._row_targets[row] = ("pane", "jobs")
+                    for relative_row, position in self._job_line_targets.items():
+                        if relative_row < len(job_lines):
+                            self._row_targets[job_start + relative_row] = (
+                                "job",
+                                position,
+                            )
                 detail_height = max(0, body_height - len(lines))
-                lines.extend(self._detail_lines(state, width, detail_height))
+                detail_start = len(lines)
+                detail_lines = self._detail_lines(state, width, detail_height)
+                lines.extend(detail_lines)
+                if detail_lines:
+                    detail_end = detail_start + len(detail_lines) - 1
+                    for row in range(detail_start, detail_end + 1):
+                        self._row_targets[row] = ("detail_scroll", None)
+                    self._click_regions.append(
+                        (detail_start, 0, width - 1, ("detail", None))
+                    )
             else:
                 collapsed_height = 1 if self.jobs else 0
                 job_height = max(4, available - collapsed_height)
                 job_lines = self._job_lines(width, job_height)
-                lines.extend(job_lines[: max(0, available - collapsed_height)])
+                job_lines = job_lines[: max(0, available - collapsed_height)]
+                job_start = len(lines)
+                lines.extend(job_lines)
+                if job_lines:
+                    job_end = job_start + len(job_lines) - 1
+                    for row in range(job_start, job_end + 1):
+                        self._row_targets[row] = ("pane", "jobs")
+                    for relative_row, position in self._job_line_targets.items():
+                        if relative_row < len(job_lines):
+                            self._row_targets[job_start + relative_row] = (
+                                "job",
+                                position,
+                            )
                 collapsed = self._collapsed_detail_line(width)
                 if collapsed:
+                    collapsed_row = len(lines)
                     lines.append(collapsed)
+                    self._row_targets[collapsed_row] = ("detail", None)
             # The footer holds the keybindings, so it is reserved rather than
             # left to whatever space happens to remain.
             lines = lines[:body_height]
             lines.extend([""] * (body_height - len(lines)))
+            footer_start = len(lines)
             lines.extend(footer)
+            for relative_row, start, end, target in self._footer_regions:
+                if relative_row < len(footer) and start < width:
+                    self._click_regions.append(
+                        (
+                            footer_start + relative_row,
+                            start,
+                            min(end, width - 1),
+                            target,
+                        )
+                    )
+
+        self._click_regions = [
+            region for region in self._click_regions if region[0] < len(lines)
+        ]
+        self._row_targets = {
+            row: target for row, target in self._row_targets.items() if row < len(lines)
+        }
 
         output = [self.term.home + self.term.clear]
         for line in lines:
@@ -900,6 +1200,105 @@ class QueueTUI:
             self.job_index = max(0, min(self.job_index + delta, len(self.jobs) - 1))
             if self.job_index != previous:
                 self.detail_page = 0
+                self.log_offset = 0
+                self.pending_confirm = None
+                if self.show_log:
+                    job = self.selected_job()
+                    self.worker.set_log_request(
+                        (job["id"], "stdout") if job is not None else None
+                    )
+
+    def _toggle_detail(self) -> None:
+        if self.selected_job() is None:
+            return
+        self.show_detail = not self.show_detail
+        if self.show_detail:
+            self.detail_page = 0
+            self.log_offset = 0
+        elif self.show_log:
+            self.worker.set_log_request(None)
+
+    def _toggle_log(self) -> None:
+        job = self.selected_job()
+        if job is None:
+            return
+        self.show_log = not self.show_log
+        self.show_detail = True
+        self.detail_page = 0
+        self.log_offset = 0
+        self.worker.set_log_request(
+            (job["id"], "stdout") if self.show_log else None
+        )
+
+    def _scroll_detail(self, delta: int, *, page: bool = False) -> bool:
+        if not self.show_detail or not delta:
+            return False
+        if self.show_log:
+            amount = self._log_page_height if page else 3
+            previous = self.log_offset
+            if delta < 0:
+                self.log_offset = min(self._log_max_offset, self.log_offset + amount)
+            else:
+                self.log_offset = max(0, self.log_offset - amount)
+            return self.log_offset != previous
+        previous = self.detail_page
+        self.detail_page = max(
+            0,
+            min(self.detail_pages - 1, self.detail_page + delta),
+        )
+        return self.detail_page != previous
+
+    def _select_job_position(self, position: int, *, toggle_current: bool) -> None:
+        if not (0 <= position < len(self.jobs)):
+            return
+        current = self.focus == "jobs" and position == self.job_index
+        changed = position != self.job_index
+        self.focus = "jobs"
+        self.job_index = position
+        if changed:
+            self.detail_page = 0
+            self.log_offset = 0
+            self.pending_confirm = None
+            if self.show_log:
+                job = self.selected_job()
+                self.worker.set_log_request(
+                    (job["id"], "stdout") if job is not None else None
+                )
+        elif current and toggle_current:
+            self._toggle_detail()
+
+    def _select_node_position(self, position: int) -> None:
+        if not (0 <= position < len(self.nodes)):
+            return
+        self.focus = "nodes"
+        self.node_index = position
+
+    def _select_job_id(self, job_id: int, *, show_log: bool = False) -> bool:
+        snapshot = self._snapshot or {}
+        pool = list(snapshot.get("jobs") or []) + list(snapshot.get("recent") or [])
+        if not any(job.get("id") == job_id for job in pool):
+            self.worker.set_notice(f"job {job_id} is no longer in the snapshot", "yellow")
+            return False
+        self.filter = "all"
+        self.jobs = self._visible_jobs(snapshot)
+        for position, job in enumerate(self.jobs):
+            if job.get("id") == job_id:
+                self._select_job_position(position, toggle_current=False)
+                if show_log:
+                    self.show_log = True
+                    self.show_detail = True
+                    self.log_offset = 0
+                    self.worker.set_log_request((job_id, "stdout"))
+                return True
+        return False
+
+    def _select_node_name(self, name: str) -> bool:
+        for position, node in enumerate(self.nodes):
+            if node.get("name") == name:
+                self._select_node_position(position)
+                return True
+        self.worker.set_notice(f"node {name} is no longer in the snapshot", "yellow")
+        return False
 
     def _confirm(self, action: str, job_id: int) -> bool:
         """Two-step confirmation: the same key twice within a few seconds."""
@@ -916,6 +1315,113 @@ class QueueTUI:
         self.pending_confirm = (action, job_id, now)
         return False
 
+    def _activate(self, action: str, value=None) -> bool:
+        """Run one named UI action. False means the caller should quit."""
+        if action == "quit":
+            return False
+        if action == "help":
+            self.show_help = True
+        elif action == "close_help":
+            self.show_help = False
+        elif action == "switch_pane":
+            self.focus = "nodes" if self.focus == "jobs" else "jobs"
+        elif action == "detail":
+            self._toggle_detail()
+        elif action == "log":
+            self._toggle_log()
+        elif action == "filter":
+            if value in FILTERS:
+                self.filter = value
+            else:
+                self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
+            self.job_index = 0
+            self.detail_page = 0
+            self.log_offset = 0
+            self.pending_confirm = None
+            if self._snapshot is not None:
+                self.jobs = self._visible_jobs(self._snapshot)
+            if self.show_log:
+                job = self.selected_job()
+                self.worker.set_log_request(
+                    (job["id"], "stdout") if job is not None else None
+                )
+        elif action == "procs":
+            self.proc_view = PROC_VIEWS[
+                (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
+            ]
+        elif action == "tick":
+            self.worker.post("tick")
+        elif action == "auto":
+            enabled = not self.worker.auto_tick if value is None else bool(value)
+            self.worker.post("auto", enabled)
+        elif action == "cancel":
+            job = self.selected_job()
+            if job and self._confirm("cancel", job["id"]):
+                self.worker.post("cancel", job["id"])
+        elif action == "requeue":
+            job = self.selected_job()
+            if job:
+                self.worker.post("requeue", job["id"])
+        elif action == "node_toggle":
+            node = self.selected_node()
+            if node:
+                self.worker.post(
+                    "resume" if not node["enabled"] else "drain",
+                    node["name"],
+                )
+        elif action == "ack":
+            self.worker.post("ack")
+        elif action == "job_log" and value is not None:
+            self._select_job_id(int(value), show_log=True)
+        elif action == "node_name" and value is not None:
+            self._select_node_name(str(value))
+        elif action == "pane" and value in ("jobs", "nodes"):
+            self.focus = value
+        return True
+
+    def handle_mouse(self, event) -> bool:
+        """Handle one decoded SGR mouse event. False requests TUI exit."""
+        if not self.mouse_enabled:
+            return True
+        row = event.row - 1
+        column = event.column - 1
+        target = None
+        for region_row, start, end, region_target in self._click_regions:
+            if region_row == row and start <= column <= end:
+                target = region_target
+                break
+        if target is None:
+            target = self._row_targets.get(row)
+
+        if self.show_help:
+            if event.is_left_press and target == ("close_help", None):
+                self.show_help = False
+            return True
+
+        if event.is_wheel_up or event.is_wheel_down:
+            delta = -1 if event.is_wheel_up else 1
+            kind, value = target if target is not None else (None, None)
+            if kind == "node" or (kind == "pane" and value == "nodes"):
+                self.focus = "nodes"
+                self._move(delta)
+            elif kind == "job" or (kind == "pane" and value == "jobs"):
+                self.focus = "jobs"
+                self._move(delta)
+            elif kind in ("detail", "detail_scroll"):
+                self._scroll_detail(delta)
+            return True
+
+        if not event.is_left_press or target is None:
+            return True
+        kind, value = target
+        if kind == "job":
+            self._select_job_position(int(value), toggle_current=True)
+            return True
+        if kind == "node":
+            self._select_node_position(int(value))
+            return True
+        return self._activate(kind, value)
+
     def handle_key(self, key) -> bool:
         """Return False to quit."""
         name = key.name or ""
@@ -930,17 +1436,16 @@ class QueueTUI:
             self.pending_confirm = None
             return True
         if text == "q":
-            return False
+            return self._activate("quit")
         if text == "?":
-            self.show_help = True
-            return True
+            return self._activate("help")
         if text in ("j",) or name == "KEY_DOWN":
             self._move(1)
         elif text in ("k",) or name == "KEY_UP":
             self._move(-1)
-        elif name == "KEY_PGDOWN":
+        elif name in ("KEY_PGDOWN", "KEY_NPAGE", "KEY_PAGEDOWN"):
             self._move(10)
-        elif name == "KEY_PGUP":
+        elif name in ("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP"):
             self._move(-10)
         elif text == "g":
             self.job_index = 0
@@ -949,77 +1454,90 @@ class QueueTUI:
             self.job_index = max(0, len(self.jobs) - 1)
             self.detail_page = 0
         elif name == "KEY_TAB":
-            self.focus = "nodes" if self.focus == "jobs" else "jobs"
+            self._activate("switch_pane")
         elif name in ("KEY_ENTER", "KEY_RETURN") or text in ("\n", "\r"):
-            if self.selected_job() is not None:
-                self.show_detail = not self.show_detail
-                if self.show_detail:
-                    self.detail_page = 0
-                elif self.show_log:
-                    self.worker.set_log_request(None)
-        elif text == "[" and self.show_detail and not self.show_log:
-            self.detail_page = max(0, self.detail_page - 1)
-        elif text == "]" and self.show_detail and not self.show_log:
-            self.detail_page = min(self.detail_pages - 1, self.detail_page + 1)
+            self._activate("detail")
+        elif text == "[" and self.show_detail:
+            self._scroll_detail(-1, page=True)
+        elif text == "]" and self.show_detail:
+            self._scroll_detail(1, page=True)
         elif text == "L":
-            job = self.selected_job()
-            self.show_log = not self.show_log
-            self.show_detail = True
-            self.worker.set_log_request(
-                (job["id"], "stdout") if (self.show_log and job) else None
-            )
+            self._activate("log")
         elif text == "f":
-            self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
-            self.job_index = 0
-            self.detail_page = 0
+            self._activate("filter")
         elif text == "p":
-            self.proc_view = PROC_VIEWS[
-                (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
-            ]
+            self._activate("procs")
         elif text == "t":
-            self.worker.post("tick")
+            self._activate("tick")
         elif text == "a":
-            self.worker.post("auto", not self.worker.auto_tick)
+            self._activate("auto")
         elif text == "c":
-            job = self.selected_job()
-            if job and self._confirm("cancel", job["id"]):
-                self.worker.post("cancel", job["id"])
+            self._activate("cancel")
         elif text == "r":
-            job = self.selected_job()
-            if job:
-                self.worker.post("requeue", job["id"])
+            self._activate("requeue")
         elif text == "d":
-            node = self.selected_node()
-            if node:
-                self.worker.post(
-                    "resume" if not node["enabled"] else "drain", node["name"]
-                )
+            self._activate("node_toggle")
         elif text == "A":
-            self.worker.post("ack")
+            self._activate("ack")
         return True
 
     # --- main loop --------------------------------------------------------
 
+    def _start_mouse_reporting(self) -> None:
+        self._mouse_reporting = False
+        if not self.mouse_enabled or not sys.stdout.isatty():
+            return
+        try:
+            sys.stdout.write(MOUSE_ENABLE_SEQUENCE)
+            sys.stdout.flush()
+            self._mouse_reporting = True
+        except Exception:
+            self._mouse_reporting = False
+
+    def _stop_mouse_reporting(self) -> None:
+        if not self._mouse_reporting:
+            return
+        self._mouse_reporting = False
+        try:
+            sys.stdout.write(MOUSE_DISABLE_SEQUENCE)
+            sys.stdout.flush()
+        except Exception:
+            pass
+
     def run(self) -> int:
         term = self.term
+        parser = MouseSequenceParser()
         self.worker.start()
         try:
             with term.fullscreen(), term.cbreak(), term.hidden_cursor():
-                while True:
-                    state = self.worker.read_state()
-                    if self.show_log and self.show_detail:
-                        job = self.selected_job()
-                        if job:
-                            self.worker.set_log_request((job["id"], "stdout"))
-                    print(self.render(state), end="", flush=True)
-                    key = term.inkey(timeout=0.4)
-                    if key and not self.handle_key(key):
-                        break
-                    if (
-                        self.pending_confirm
-                        and time.time() - self.pending_confirm[2] > CONFIRM_SECONDS
-                    ):
-                        self.pending_confirm = None
+                self._start_mouse_reporting()
+                try:
+                    running = True
+                    while running:
+                        state = self.worker.read_state()
+                        if self.show_log and self.show_detail:
+                            job = self.selected_job()
+                            if job:
+                                self.worker.set_log_request((job["id"], "stdout"))
+                        print(self.render(state), end="", flush=True)
+                        key = term.inkey(timeout=0.4)
+                        events, keys = parser.feed(key) if key else ([], parser.flush())
+                        for event in events:
+                            if not self.handle_mouse(event):
+                                running = False
+                                break
+                        if running:
+                            for pending in keys:
+                                if not self.handle_key(pending):
+                                    running = False
+                                    break
+                        if (
+                            self.pending_confirm
+                            and time.time() - self.pending_confirm[2] > CONFIRM_SECONDS
+                        ):
+                            self.pending_confirm = None
+                finally:
+                    self._stop_mouse_reporting()
         except KeyboardInterrupt:
             pass
         finally:
@@ -1033,4 +1551,9 @@ def run_tui(db_path=None, refresh: float = 3.0) -> int:
 
     # Log records written straight to the terminal would scribble over the UI.
     quiet_transport_logging()
-    return QueueTUI(db_path=db_path, refresh=refresh).run()
+    mouse_enabled = nvidb_config.load_view_settings()["mouse"]
+    return QueueTUI(
+        db_path=db_path,
+        refresh=refresh,
+        mouse_enabled=mouse_enabled,
+    ).run()
