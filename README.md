@@ -624,6 +624,9 @@ slows the numbers down but never freezes the interface.
 | `L`                | Toggle a live tail of the selected job's log  |
 | `c`                | Cancel the selected job (press twice)         |
 | `r`                | Re-queue the selected finished job            |
+| `+` / `-`          | Raise or lower the selected job's priority    |
+| `K` / `J`          | Move a pending job up/down the dispatch order |
+| `s` / `S`          | Cycle the sort column / flip its direction    |
 | `t`                | Force a scheduler tick now                    |
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
@@ -632,8 +635,18 @@ slows the numbers down but never freezes the interface.
 | `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
-| Mouse click        | Select rows or activate bracketed actions     |
+| Mouse click        | Select rows, activate actions, sort by column |
 | Mouse wheel        | Move selections or page detail/log text       |
+
+The job table opens in *queue* order — running jobs first, then pending jobs
+exactly as the scheduler would dispatch them — so `K`/`J` visibly reorder the
+line a job is waiting in. Reordering rewrites the priorities of the pending
+jobs the moved one passes; the `PRI` column always shows the real values.
+Clicking a column header sorts by that column (a second click flips it), and
+each GPU line draws one memory bar whose segments distinguish foreign memory
+(amber) from this queue's reservations (teal) and free space (dim). Colours
+are deliberately muted: healthy values render grey or plain, and saturation
+is reserved for states that need attention.
 
 Mouse reporting is enabled by default. Click anywhere in a node card to select
 that node, or click a job row to select it; clicking the selected job again

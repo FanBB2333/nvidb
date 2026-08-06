@@ -48,6 +48,23 @@ FILTER_STATES = {
     "finished": ("completed", "failed", "cancelled", "timeout", "lost"),
 }
 
+# Muted tokscale-style palette. Call sites keep semantic ANSI names; this maps
+# them to softer absolute tones so ordinary data stays calm and saturated
+# colour is left meaning "look at this". blessed degrades each name to the
+# nearest colour the terminal actually has.
+PALETTE = {
+    "green": "mediumseagreen",
+    "yellow": "darkkhaki",
+    "red": "indianred",
+    "cyan": "cadetblue",
+    "magenta": "rosybrown",
+    "bright_blue": "steelblue",
+}
+
+# The selection band: a grey clearly lighter than a dark terminal background,
+# so the cursor is findable at a glance yet still reads as a tint, not a bar.
+SELECTION_BG = "gray27"
+
 STATE_STYLE = {
     "running": "green",
     "pending": "yellow",
@@ -57,6 +74,38 @@ STATE_STYLE = {
     "lost": "red",
     "cancelled": "bright_black",
 }
+
+# A glyph plus a four-letter word reads at a glance and costs six columns
+# where the full state name cost nine.
+STATE_BADGE = {
+    "running": "● run",
+    "pending": "· pend",
+    "completed": "✓ done",
+    "failed": "✗ fail",
+    "cancelled": "⊘ canc",
+    "timeout": "! tout",
+    "lost": "? lost",
+}
+
+# "queue" is the order the scheduler will actually dispatch in - running
+# first, then pending by (priority DESC, id ASC) - which is what makes the
+# reorder keys make visual sense.
+SORT_KEYS = ("queue", "id", "state", "pri", "name", "node", "vram", "used", "time")
+
+# (title, width, sort key or None when the column is not worth sorting by).
+JOB_COLUMNS = (
+    ("ID", 4, "id"),
+    ("ST", 6, "state"),
+    ("PRI", 3, "pri"),
+    ("NAME", 16, "name"),
+    ("NODE", 14, "node"),
+    ("GPU", 4, None),
+    ("VRAM", 6, "vram"),
+    ("USED", 6, "used"),
+    ("TIME", 9, "time"),
+    ("RC", 3, None),
+)
+RIGHT_ALIGNED_COLUMNS = frozenset({"ID", "PRI", "VRAM", "USED", "TIME", "RC"})
 
 CONFIRM_SECONDS = 5.0
 
@@ -238,6 +287,22 @@ class _Worker(threading.Thread):
                 self.set_notice(
                     f"auto tick {'on' if self.auto_tick else 'off'}", "cyan"
                 )
+            elif name == "priority":
+                value = scheduler.adjust_priority(action[1], action[2])
+                self.set_notice(
+                    f"job {action[1]} priority → {value}"
+                    if value is not None
+                    else f"job {action[1]} is finished; priority no longer matters",
+                    "cyan" if value is not None else "yellow",
+                )
+            elif name == "move":
+                ok = scheduler.move_pending(action[1], action[2])
+                self.set_notice(
+                    f"job {action[1]} moved {'up' if action[2] < 0 else 'down'}"
+                    if ok
+                    else f"job {action[1]} is already at that end of the queue",
+                    "cyan" if ok else "yellow",
+                )
         except Exception as error:
             self.set_notice(f"{type(error).__name__}: {error}", "red")
         finally:
@@ -260,6 +325,11 @@ class QueueTUI:
         self.job_index = 0
         self.node_index = 0
         self.filter = "active"
+        self.sort_key = "queue"
+        self.sort_reverse = False
+        # The cursor follows a job, not a row number: a refresh or a priority
+        # change may reorder the table under the selection.
+        self._selected_job_id: Optional[int] = None
         self.proc_view = "summary"
         self.show_detail = True
         self.show_log = False
@@ -283,6 +353,8 @@ class QueueTUI:
         self._alert_targets: Dict[int, Tuple[str, Any]] = {}
         self._node_line_targets: Dict[int, int] = {}
         self._job_line_targets: Dict[int, int] = {}
+        # (row offset within the job pane, start col, end col, target).
+        self._job_header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
         self._footer_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
 
     # --- data -------------------------------------------------------------
@@ -294,8 +366,57 @@ class QueueTUI:
             wanted = FILTER_STATES[self.filter]
             pool = list(snapshot["jobs"]) + list(snapshot["recent"])
             jobs = [job for job in pool if job["state"] in wanted]
-        jobs.sort(key=lambda job: job["id"])
+        self._sort_jobs(jobs)
         return jobs
+
+    def _sort_jobs(self, jobs: List[Dict[str, Any]]) -> None:
+        def queue_key(job):
+            # Running jobs head the table (they hold GPUs now), pending follow
+            # in the exact order the scheduler would dispatch them, finished
+            # jobs sink to the bottom.
+            rank = {"running": 0, "pending": 1}.get(job["state"], 2)
+            pri = -(job.get("priority") or 0) if job["state"] == "pending" else 0
+            return (rank, pri, job["id"])
+
+        key_funcs = {
+            "queue": queue_key,
+            "id": lambda job: job["id"],
+            "state": lambda job: (job["state"], job["id"]),
+            "pri": lambda job: (-(job.get("priority") or 0), job["id"]),
+            "name": lambda job: ((job.get("name") or "").lower(), job["id"]),
+            "node": lambda job: (
+                job.get("node") or job.get("node_constraint") or "~",
+                job["id"],
+            ),
+            # Sizes and durations start biggest-first; S flips them.
+            "vram": lambda job: (-(job.get("vram_mb") or 0), job["id"]),
+            "used": lambda job: (-(job.get("gpu_mem_mb") or 0), job["id"]),
+            "time": lambda job: (-(job.get("elapsed_s") or 0.0), job["id"]),
+        }
+        jobs.sort(key=key_funcs.get(self.sort_key, queue_key))
+        if self.sort_reverse:
+            jobs.reverse()
+
+    def _reanchor_selection(self) -> None:
+        """Put the cursor back on the job it was on before rows moved."""
+        if not self.jobs:
+            self.job_index = 0
+            return
+        if self._selected_job_id is not None:
+            for position, job in enumerate(self.jobs):
+                if job["id"] == self._selected_job_id:
+                    self.job_index = position
+                    return
+        self.job_index = max(0, min(self.job_index, len(self.jobs) - 1))
+        self._selected_job_id = self.jobs[self.job_index]["id"]
+
+    def _set_job_index(self, position: int) -> None:
+        if not self.jobs:
+            self.job_index = 0
+            self._selected_job_id = None
+            return
+        self.job_index = max(0, min(position, len(self.jobs) - 1))
+        self._selected_job_id = self.jobs[self.job_index]["id"]
 
     def selected_job(self) -> Optional[Dict[str, Any]]:
         if not self.jobs:
@@ -314,7 +435,7 @@ class QueueTUI:
     def _style(self, text: str, style: Optional[str]) -> str:
         if not style:
             return text
-        formatter = getattr(self.term, style, None)
+        formatter = getattr(self.term, PALETTE.get(style, style), None)
         return formatter(text) if callable(formatter) else text
 
     def _fit(self, text: str, width: int) -> str:
@@ -376,7 +497,7 @@ class QueueTUI:
             for index, line in enumerate(values)
         ]
 
-    def _compose(self, segments, width: int, *, reverse: bool = False) -> str:
+    def _compose(self, segments, width: int, *, highlight: bool = False) -> str:
         """Join `(text, style)` pairs, truncating on plain text before styling.
 
         Truncating first is what keeps escape sequences from being counted as
@@ -391,18 +512,34 @@ class QueueTUI:
                 continue
             plain_parts.append(fit_display(text, remaining))
             remaining -= display_width(plain_parts[-1])
-        if reverse:
-            return self.term.reverse(pad_display("".join(plain_parts), width))
+        if highlight:
+            return self._highlight_row(plain_parts, segments, width)
         return "".join(
             self._style(part, style)
             for part, (_text, style) in zip(plain_parts, segments)
         )
 
-    @staticmethod
-    def _bar(fraction: float, width: int) -> str:
-        width = max(0, width)
-        filled = int(round(max(0.0, min(1.0, fraction)) * width))
-        return "█" * filled + "░" * (width - filled)
+    def _highlight_row(self, plain_parts, segments, width: int) -> str:
+        """The selection cursor: a dim band under the row.
+
+        Reverse video would paint a solid block and discard every column's
+        colour; laying a near-background grey underneath keeps the row
+        readable as data while still being findable as the cursor.
+        """
+        out = []
+        for part, (_text, style) in zip(plain_parts, segments):
+            if not part:
+                continue
+            fg = PALETTE.get(style, style) if style else None
+            attr = f"{fg}_on_{SELECTION_BG}" if fg else f"on_{SELECTION_BG}"
+            formatter = getattr(self.term, attr, None)
+            out.append(formatter(part) if callable(formatter) else part)
+        used = sum(display_width(part) for part in plain_parts)
+        pad = " " * max(0, width - used)
+        if pad:
+            formatter = getattr(self.term, f"on_{SELECTION_BG}", None)
+            out.append(formatter(pad) if callable(formatter) else pad)
+        return "".join(out)
 
     def _header_lines(self, state: Dict[str, Any], width: int) -> List[str]:
         snapshot = state["snapshot"] or {}
@@ -448,6 +585,7 @@ class QueueTUI:
         keeper_text = ""
         if keeper.get("installed") or keeper.get("running"):
             keeper_text = f"keeper {'up' if keeper.get('running') else 'DOWN'} · "
+        # A coloured wordmark, tokscale-style, instead of a reverse-video block.
         title = " nvidb queue "
         meta = (
             f"tick {tick_text} · {keeper_text}{mode} · {status} · filter {self.filter} "
@@ -456,7 +594,7 @@ class QueueTUI:
         gap = max(1, width - len(title) - len(meta))
         return [
             self._compose(
-                [(title, "reverse"), (" " * gap, None), (meta, "bright_black")], width
+                [(title, "cyan"), (" " * gap, None), (meta, "bright_black")], width
             ),
             self._compose(segments, width),
         ]
@@ -515,7 +653,9 @@ class QueueTUI:
             selected = self.focus == "nodes" and position == self.node_index
             marker = "›" if selected else " "
             state = node["state"]
-            state_style = {"up": "green", "down": "red", "drain": "yellow"}.get(
+            # An up node is the normal case and stays quiet; only trouble
+            # (down, drain) earns colour.
+            state_style = {"down": "red", "drain": "yellow"}.get(
                 state, "bright_black"
             )
             label = node["name"]
@@ -538,7 +678,7 @@ class QueueTUI:
                         (state, state_style),
                     ],
                     width,
-                    reverse=selected,
+                    highlight=selected,
                 )
             )
 
@@ -551,52 +691,87 @@ class QueueTUI:
                 continue
 
             for gpu in node["gpus"]:
-                total = max(1, gpu["mem_total_mb"])
-                # The bar shows how much of the card is already spoken for:
-                # foreign processes plus this queue's reservations.
-                committed = (gpu["external_mem_mb"] + gpu["reserved_mb"]) / total
-                bar_width = 18 if width >= 100 else 10
-                util = gpu["util_percent"]
-                util_text = f"{util:>3}%" if util is not None else "  -%"
-                free_style = (
-                    "green" if gpu["free_mb"] >= 4096
-                    else "yellow" if gpu["free_mb"] >= 1024
-                    else "red"
-                )
-                name_width = 26 if width >= 100 else 16
-                left = (
-                    f"    GPU{gpu['index']} "
-                    f"{self._fit(gpu['name'] or '-', name_width):<{name_width}} "
-                    f"util {util_text}  [{self._bar(committed, bar_width)}] "
-                )
-                free = f"free {format_mb(gpu['free_mb']):>6}"
-                source = (
-                    "blind"
-                    if gpu.get("attribution") == "blind"
-                    else f"{gpu['external_procs']}p"
-                )
-                # Whole-card occupancy first: what is actually on the GPU matters
-                # even when none of it came from this queue.
-                occupancy = (
-                    f"  mem {format_mb(gpu['mem_used_mb'])}/{format_mb(gpu['mem_total_mb'])}"
-                    if width >= 120
-                    else ""
-                )
-                rest = (
-                    f"{occupancy}"
-                    f"  other {format_mb(gpu['external_mem_mb']):>6} ({source})"
-                    f"  res {format_mb(gpu['reserved_mb']):>6}  jobs {gpu['queue_jobs']}"
-                )
-                lines.append(
-                    self._compose(
-                        [(left, "bright_black"), (free, free_style), (rest, "bright_black")],
-                        width,
-                    )
-                )
+                lines.append(self._compose(self._gpu_segments(gpu, width), width))
                 lines.extend(self._gpu_process_lines(gpu, width))
             for line_index in range(node_start, len(lines)):
                 self._node_line_targets[line_index] = position
         return lines
+
+    def _gpu_segments(
+        self, gpu: Dict[str, Any], width: int
+    ) -> List[Tuple[str, Optional[str]]]:
+        """One GPU as a btop-style line: temp, util, and a memory bar whose
+        segments say *whose* memory it is - foreign processes (yellow), this
+        queue's reservations (cyan), free (dim)."""
+        total = max(1, gpu["mem_total_mb"])
+        bar_width = 20 if width >= 110 else 10
+        external = max(0, gpu["external_mem_mb"])
+        reserved = max(0, gpu["reserved_mb"])
+        external_cells = int(round(bar_width * min(1.0, external / total)))
+        reserved_cells = (
+            int(round(bar_width * min(1.0, (external + reserved) / total)))
+            - external_cells
+        )
+        reserved_cells = max(0, reserved_cells)
+        free_cells = max(0, bar_width - external_cells - reserved_cells)
+
+        # Quiet by default: a healthy number is grey, colour appears only once
+        # a value is worth a second look.
+        util = gpu["util_percent"]
+        util_text = f"{util:>3}%" if util is not None else "  -%"
+        util_style = (
+            "red" if util is not None and util >= 90
+            else "yellow" if util is not None and util >= 50
+            else "bright_black"
+        )
+        temp = gpu.get("temperature_c")
+        temp_text = f"{temp:>3}°" if temp is not None else "  -°"
+        temp_style = (
+            "red" if temp is not None and temp >= 85
+            else "yellow" if temp is not None and temp >= 70
+            else "bright_black"
+        )
+        free_style = (
+            None if gpu["free_mb"] >= 4096
+            else "yellow" if gpu["free_mb"] >= 1024
+            else "red"
+        )
+        source = (
+            "blind"
+            if gpu.get("attribution") == "blind"
+            else f"{gpu['external_procs']}p"
+        )
+        name_width = 20 if width >= 100 else 14
+        segments: List[Tuple[str, Optional[str]]] = [
+            (f"    GPU{gpu['index']} ", "bright_black"),
+            (pad_display(fit_display(gpu["name"] or "-", name_width), name_width + 1), None),
+            (temp_text + " ", temp_style),
+            (util_text + " ", util_style),
+            ("▕", "bright_black"),
+            ("█" * external_cells, "yellow"),
+            ("█" * reserved_cells, "cyan"),
+            ("░" * free_cells, "bright_black"),
+            ("▏ ", "bright_black"),
+            (f"free {format_mb(gpu['free_mb']):>6}", free_style),
+        ]
+        # Whole-card occupancy: what is actually on the GPU matters even when
+        # none of it came from this queue.
+        if width >= 120:
+            segments.append(
+                (
+                    f"  use {format_mb(gpu['mem_used_mb'])}/{format_mb(gpu['mem_total_mb'])}",
+                    "bright_black",
+                )
+            )
+        segments.append(
+            (
+                f"  ext {format_mb(external)}·{source}"
+                f"  res {format_mb(reserved)}"
+                f"  jobs {gpu['queue_jobs']}",
+                "bright_black",
+            )
+        )
+        return segments
 
     def _gpu_process_lines(self, gpu: Dict[str, Any], width: int) -> List[str]:
         """Name what is on the card, so a full GPU explains itself.
@@ -653,31 +828,83 @@ class QueueTUI:
             )
         return lines
 
+    @staticmethod
+    def _cell(text: str, size: int, *, right: bool) -> str:
+        """One fixed-width column cell plus its separator space."""
+        text = fit_display(text, size)
+        pad = " " * (size - display_width(text))
+        return (pad + text if right else text + pad) + " "
+
+    def _job_cell_style(self, job: Dict[str, Any], column: str) -> Optional[str]:
+        """tokscale-style colouring: each column keeps one colour, and rows
+        that are already finished fade out so the live ones carry the eye."""
+        if column == "ST":
+            return STATE_STYLE.get(job["state"])
+        if job["state"] not in ("pending", "running"):
+            if column == "RC" and job.get("exit_code"):
+                return "red"
+            return "bright_black"
+        return {
+            "PRI": "yellow" if job.get("priority") else "bright_black",
+            "NODE": "bright_black",
+            "GPU": "bright_black",
+            "VRAM": "green",
+            "USED": "magenta",
+            "TIME": "bright_black",
+            "RC": "bright_black",
+        }.get(column)
+
     def _job_lines(self, width: int, height: int) -> List[str]:
         self._job_line_targets = {}
-        title = f"─ JOBS ({len(self.jobs)}) "
-        lines = [self._style(title + "─" * max(0, width - len(title)), "bright_black")]
-        columns = [
-            ("ID", 5),
-            ("STATE", 9),
-            ("NAME", 16),
-            ("NODE", 20),
-            ("GPU", 4),
-            ("VRAM", 6),
-            ("USED", 6),
-            ("ELAPSED", 9),
-            ("RC", 3),
+        self._job_header_regions = []
+        order = "▲" if self.sort_reverse else "▼"
+        title = f"─ JOBS ({len(self.jobs)}) ── "
+        sort_label = f"sort {self.sort_key}{order}"
+        self._job_header_regions.append(
+            (
+                0,
+                display_width(title),
+                display_width(title) + display_width(sort_label) - 1,
+                ("sort", None),
+            )
+        )
+        rule = title + sort_label + " "
+        lines = [
+            self._compose(
+                [
+                    (title, "bright_black"),
+                    (sort_label, "cyan"),
+                    (" " + "─" * max(0, width - display_width(rule) - 1), "bright_black"),
+                ],
+                width,
+            )
         ]
+        columns = list(JOB_COLUMNS)
         if width < 100:
             columns = [column for column in columns if column[0] not in ("USED", "NODE")]
-        used = sum(size + 1 for _, size in columns)
+        used = sum(size + 1 for _, size, _ in columns)
         command_width = max(10, width - used - 2)
         # A job that reports its own progress is being watched for exactly that,
         # so the last column names whichever of the two it will show.
         any_progress = any(job.get("progress") for job in self.jobs)
         last_column = "PROGRESS / COMMAND" if any_progress else "COMMAND"
-        header = " " + "".join(name.ljust(size + 1) for name, size in columns) + last_column
-        lines.append(self._style(self._fit(header, width), "bright_black"))
+        header_segments: List[Tuple[str, Optional[str]]] = [(" ", None)]
+        column_start = 1
+        for name, size, sort_key in columns:
+            label = f"{name}{order}" if sort_key and sort_key == self.sort_key else name
+            if sort_key:
+                self._job_header_regions.append(
+                    (1, column_start, column_start + size, ("sort", sort_key))
+                )
+            header_segments.append(
+                (
+                    self._cell(label, size, right=name in RIGHT_ALIGNED_COLUMNS),
+                    "cyan" if sort_key == self.sort_key else "bright_black",
+                )
+            )
+            column_start += size + 1
+        header_segments.append((last_column, "bright_black"))
+        lines.append(self._compose(header_segments, width))
 
         if not self.jobs:
             lines.append(self._style("  (no jobs match this filter)", "bright_black"))
@@ -693,42 +920,45 @@ class QueueTUI:
             job = self.jobs[position]
             values = {
                 "ID": str(job["id"]),
-                "STATE": job["state"],
+                "ST": STATE_BADGE.get(job["state"], job["state"]),
+                "PRI": str(job.get("priority") or 0),
                 "NAME": job["name"] or "-",
                 "NODE": job["node"] or job["node_constraint"] or "-",
                 "GPU": ",".join(str(i) for i in job["gpu_ids"]) or "-",
                 "VRAM": format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
                 "USED": format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-",
-                "ELAPSED": format_duration(job["elapsed_s"])
+                "TIME": format_duration(job["elapsed_s"])
                 if job.get("elapsed_s") is not None
                 else "-",
                 "RC": "-" if job["exit_code"] is None else str(job["exit_code"]),
             }
-            body = "".join(
-                pad_display(fit_display(values[name], size), size + 1)
-                for name, size in columns
-            )
             # What the job says about itself beats the command line it was
             # started with; `▸` marks which one is on screen.
             progress = job.get("progress")
             if progress:
                 tail, tail_style = f"▸ {' '.join(progress.split())}", "cyan"
             else:
-                tail, tail_style = " ".join(job["command"].split()), None
+                tail = " ".join(job["command"].split())
+                tail_style = (
+                    "bright_black"
+                    if job["state"] not in ("pending", "running")
+                    else None
+                )
             current = position == self.job_index
             selected = self.focus == "jobs" and current
-            marker = ("▾" if self.show_detail else "▸") if current else " "
-            lines.append(
-                self._compose(
-                    [
-                        (marker, "bright_black"),
-                        (body, STATE_STYLE.get(job["state"])),
-                        (self._fit(tail, command_width), tail_style),
-                    ],
-                    width,
-                    reverse=selected,
+            # Full-size triangles in the accent colour: the small ▸/▾ pair is
+            # indistinguishable at ordinary font sizes.
+            marker = ("▼" if self.show_detail else "▶") if current else " "
+            segments: List[Tuple[str, Optional[str]]] = [(marker, "cyan")]
+            segments.extend(
+                (
+                    self._cell(values[name], size, right=name in RIGHT_ALIGNED_COLUMNS),
+                    self._job_cell_style(job, name),
                 )
+                for name, size, _ in columns
             )
+            segments.append((self._fit(tail, command_width), tail_style))
+            lines.append(self._compose(segments, width, highlight=selected))
             self._job_line_targets[len(lines) - 1] = position
         if start + rows < len(self.jobs):
             lines.append(
@@ -749,7 +979,7 @@ class QueueTUI:
         job = self.selected_job()
         if job is None:
             return None
-        title = f"─ ▸ JOB {job['id']} DETAIL HIDDEN — Enter to show "
+        title = f"─ ▶ JOB {job['id']} DETAIL HIDDEN — Enter to show "
         return self._style(
             title + "─" * max(0, width - display_width(title)),
             "bright_black",
@@ -840,7 +1070,7 @@ class QueueTUI:
         self.detail_pages = max(1, (len(content) + page_height - 1) // page_height)
         self.detail_page = max(0, min(self.detail_page, self.detail_pages - 1))
         page = self.detail_page + 1
-        title = f"─ ▾ JOB {job['id']} DETAIL"
+        title = f"─ ▼ JOB {job['id']} DETAIL"
         if self.detail_pages > 1:
             title += f" [{page}/{self.detail_pages} · [/] page]"
         title += " "
@@ -853,6 +1083,16 @@ class QueueTUI:
         start = self.detail_page * page_height
         lines.extend(content[start : start + page_height])
         return lines
+
+    def _register_job_header_regions(
+        self, job_start: int, shown: int, width: int
+    ) -> None:
+        """Make the job pane's sort label and column headers clickable."""
+        for row_offset, start, end, target in self._job_header_regions:
+            if row_offset < shown and start < width:
+                self._click_regions.append(
+                    (job_start + row_offset, start, min(end, width - 1), target)
+                )
 
     def _control_lines(self, controls, width: int):
         """Render a wrapping action bar and retain each button's hit box."""
@@ -950,6 +1190,19 @@ class QueueTUI:
                         "red" if confirming else "yellow",
                     )
                 )
+                controls.extend(
+                    [
+                        (f"+ pri:{job.get('priority') or 0}", "priority", 1, "cyan"),
+                        ("-", "priority", -1, "cyan"),
+                    ]
+                )
+                if job["state"] == "pending":
+                    controls.extend(
+                        [
+                            ("K ▲queue", "move", -1, "cyan"),
+                            ("J ▼", "move", 1, "cyan"),
+                        ]
+                    )
             elif job["state"] in ("completed", "failed", "cancelled", "timeout", "lost"):
                 controls.append(("r requeue", "requeue", None, "yellow"))
         if node is not None:
@@ -981,6 +1234,12 @@ class QueueTUI:
                 (
                     f"f filter:{self.filter}",
                     "filter",
+                    None,
+                    "bright_black",
+                ),
+                (
+                    f"s sort:{self.sort_key}{'▲' if self.sort_reverse else '▼'}",
+                    "sort",
                     None,
                     "bright_black",
                 ),
@@ -1021,14 +1280,18 @@ class QueueTUI:
             ("L", "Toggle the log tail for the selected job"),
             ("c", "Cancel the selected job (press twice)"),
             ("r", "Re-queue the selected finished job"),
+            ("+ / -", "Raise or lower the selected job's priority"),
+            ("K / J", "Move a pending job up / down the dispatch order"),
+            ("s / S", "Cycle the sort column / flip its direction"),
             ("t", "Force a scheduler tick now"),
             ("a", "Toggle automatic ticking"),
             ("f", "Cycle the job filter"),
             ("p", "GPU processes: unmanaged only / all / none"),
             ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
-            ("Mouse click", "Select rows and activate bracketed actions"),
+            ("Mouse click", "Select rows, activate [buttons], sort by a column header"),
             ("Mouse wheel", "Move in nodes/jobs; page detail or log text"),
+            ("GPU bar", "amber: others' memory · teal: queue reservations · dim: free"),
             ("q", "Quit"),
         ]
         lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
@@ -1051,6 +1314,7 @@ class QueueTUI:
 
         self.nodes = snapshot["nodes"]
         self.jobs = self._visible_jobs(snapshot)
+        self._reanchor_selection()
         self._sync_detail_selection()
 
         # Leave the bottom row free so writing the last line cannot scroll the
@@ -1127,6 +1391,7 @@ class QueueTUI:
                                 "job",
                                 position,
                             )
+                    self._register_job_header_regions(job_start, len(job_lines), width)
                 detail_height = max(0, body_height - len(lines))
                 detail_start = len(lines)
                 detail_lines = self._detail_lines(state, width, detail_height)
@@ -1155,6 +1420,7 @@ class QueueTUI:
                                 "job",
                                 position,
                             )
+                    self._register_job_header_regions(job_start, len(job_lines), width)
                 collapsed = self._collapsed_detail_line(width)
                 if collapsed:
                     collapsed_row = len(lines)
@@ -1197,7 +1463,7 @@ class QueueTUI:
                 self.node_index = max(0, min(self.node_index + delta, len(self.nodes) - 1))
         elif self.jobs:
             previous = self.job_index
-            self.job_index = max(0, min(self.job_index + delta, len(self.jobs) - 1))
+            self._set_job_index(self.job_index + delta)
             if self.job_index != previous:
                 self.detail_page = 0
                 self.log_offset = 0
@@ -1254,7 +1520,7 @@ class QueueTUI:
         current = self.focus == "jobs" and position == self.job_index
         changed = position != self.job_index
         self.focus = "jobs"
-        self.job_index = position
+        self._set_job_index(position)
         if changed:
             self.detail_page = 0
             self.log_offset = 0
@@ -1335,6 +1601,7 @@ class QueueTUI:
             else:
                 self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
             self.job_index = 0
+            self._selected_job_id = None
             self.detail_page = 0
             self.log_offset = 0
             self.pending_confirm = None
@@ -1345,6 +1612,44 @@ class QueueTUI:
                 self.worker.set_log_request(
                     (job["id"], "stdout") if job is not None else None
                 )
+        elif action == "sort":
+            if value in SORT_KEYS:
+                if value == self.sort_key:
+                    self.sort_reverse = not self.sort_reverse
+                else:
+                    self.sort_key = value
+                    self.sort_reverse = False
+            else:
+                self.sort_key = SORT_KEYS[
+                    (SORT_KEYS.index(self.sort_key) + 1) % len(SORT_KEYS)
+                ]
+                self.sort_reverse = False
+            if self._snapshot is not None:
+                self.jobs = self._visible_jobs(self._snapshot)
+                self._reanchor_selection()
+        elif action == "priority":
+            job = self.selected_job()
+            if job is not None:
+                if job["state"] in ("pending", "running"):
+                    self.worker.post("priority", job["id"], int(value or 0))
+                else:
+                    self.worker.set_notice(
+                        "finished jobs have no priority to change", "yellow"
+                    )
+        elif action == "move":
+            job = self.selected_job()
+            if job is not None:
+                if job["state"] == "pending":
+                    # Reordering only reads sensibly in dispatch order, so
+                    # moving a job snaps the table back to it.
+                    if self.sort_key != "queue" or self.sort_reverse:
+                        self.sort_key = "queue"
+                        self.sort_reverse = False
+                    self.worker.post("move", job["id"], int(value or 0))
+                else:
+                    self.worker.set_notice(
+                        "only pending jobs can be reordered", "yellow"
+                    )
         elif action == "procs":
             self.proc_view = PROC_VIEWS[
                 (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
@@ -1404,7 +1709,7 @@ class QueueTUI:
             if kind == "node" or (kind == "pane" and value == "nodes"):
                 self.focus = "nodes"
                 self._move(delta)
-            elif kind == "job" or (kind == "pane" and value == "jobs"):
+            elif kind in ("job", "sort") or (kind == "pane" and value == "jobs"):
                 self.focus = "jobs"
                 self._move(delta)
             elif kind in ("detail", "detail_scroll"):
@@ -1448,10 +1753,10 @@ class QueueTUI:
         elif name in ("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP"):
             self._move(-10)
         elif text == "g":
-            self.job_index = 0
+            self._set_job_index(0)
             self.detail_page = 0
         elif text == "G":
-            self.job_index = max(0, len(self.jobs) - 1)
+            self._set_job_index(len(self.jobs) - 1)
             self.detail_page = 0
         elif name == "KEY_TAB":
             self._activate("switch_pane")
@@ -1465,6 +1770,21 @@ class QueueTUI:
             self._activate("log")
         elif text == "f":
             self._activate("filter")
+        elif text == "s":
+            self._activate("sort")
+        elif text == "S":
+            self.sort_reverse = not self.sort_reverse
+            if self._snapshot is not None:
+                self.jobs = self._visible_jobs(self._snapshot)
+                self._reanchor_selection()
+        elif text in ("+", "="):
+            self._activate("priority", 1)
+        elif text == "-":
+            self._activate("priority", -1)
+        elif text == "K" or name == "KEY_SR":
+            self._activate("move", -1)
+        elif text == "J" or name == "KEY_SF":
+            self._activate("move", 1)
         elif text == "p":
             self._activate("procs")
         elif text == "t":

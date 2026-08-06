@@ -202,7 +202,7 @@ def test_the_screen_shows_nodes_capacity_and_jobs():
     output = _render(_tui())
     assert "big-node" in output and "small-node" in output
     assert "RTX PRO 5000" in output
-    assert "free" in output and "other" in output
+    assert "free" in output and "ext" in output
     assert "python train.py" in output
     # The keybinding footer is always reachable.
     assert "q quit" in output
@@ -219,7 +219,7 @@ def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
     snapshot["nodes"][1]["gpus"] = [_gpu(used=8000, external=0, reserved=8192,
                                          attribution="blind", jobs=1)]
     output = _render(_tui(), _state(snapshot))
-    assert "(blind)" in output
+    assert "·blind" in output
 
 
 def test_progress_replaces_the_command_in_the_job_row():
@@ -378,20 +378,20 @@ def test_enter_has_visible_expand_and_collapse_states():
     tui = _tui()
 
     expanded = _render(tui, state)
-    assert "▾ JOB 1 DETAIL" in expanded
+    assert "▼ JOB 1 DETAIL" in expanded
     assert "Enter hide detail" in expanded
     assert "note visible detail" in expanded
 
     _press(tui, "", name="KEY_ENTER")
     collapsed = _render(tui, state)
-    assert "▸ JOB 1 DETAIL HIDDEN" in collapsed
+    assert "▶ JOB 1 DETAIL HIDDEN" in collapsed
     assert "Enter show detail" in collapsed
     assert "note visible detail" not in collapsed
 
     # Some terminal definitions report Return separately from KEY_ENTER.
     _press(tui, "", name="KEY_RETURN")
     reopened = _render(tui, state)
-    assert "▾ JOB 1 DETAIL" in reopened
+    assert "▼ JOB 1 DETAIL" in reopened
     assert "note visible detail" in reopened
 
 
@@ -634,3 +634,149 @@ def test_the_log_view_asks_the_worker_for_the_selected_job():
 
     _press(tui, "L")
     assert tui.worker.log_request is None
+
+
+# --- sorting, priority and reordering --------------------------------------
+
+def test_the_default_sort_is_dispatch_order():
+    tui = _tui()
+    snapshot = _snapshot(
+        jobs=[
+            _job(1, state="pending", name="low", priority=0),
+            _job(2, state="pending", name="high", priority=5),
+            _job(3, state="running", name="busy"),
+        ]
+    )
+    _render(tui, _state(snapshot))
+    # Running first, then pending exactly as the scheduler would dispatch.
+    assert [job["id"] for job in tui.jobs] == [3, 2, 1]
+
+
+def test_the_job_table_shows_priority_and_compact_states():
+    tui = _tui()
+    snapshot = _snapshot(
+        jobs=[_job(1), _job(2, state="pending", name="eval", priority=3)]
+    )
+    output = _render(tui, _state(snapshot))
+    assert "PRI" in output
+    assert "● run" in output and "· pend" in output
+
+
+def test_s_cycles_the_sort_and_S_flips_it():
+    tui = _tui()
+    _render(tui)
+    assert tui.sort_key == "queue" and tui.sort_reverse is False
+    _press(tui, "s")
+    assert tui.sort_key == "id"
+    _press(tui, "S")
+    assert tui.sort_reverse is True
+    _render(tui)
+    assert [job["id"] for job in tui.jobs] == [2, 1]
+
+
+def test_clicking_a_column_header_sorts_then_flips():
+    tui = _tui()
+    output = _render(tui)
+    assert tui.handle_mouse(_mouse_at(output, "NAME")) is True
+    assert tui.sort_key == "name" and tui.sort_reverse is False
+
+    output = _render(tui)
+    assert "NAME▼" in output
+    assert tui.handle_mouse(_mouse_at(output, "NAME▼")) is True
+    assert tui.sort_reverse is True
+
+
+def test_clicking_the_sort_label_cycles_the_sort():
+    tui = _tui()
+    output = _render(tui)
+    assert tui.handle_mouse(_mouse_at(output, "sort queue▼")) is True
+    assert tui.sort_key == "id"
+
+
+def test_the_selection_follows_a_job_when_the_order_changes():
+    tui = _tui()
+    snapshot = _snapshot(
+        jobs=[
+            _job(1, state="pending", name="a", priority=0),
+            _job(2, state="pending", name="b", priority=0),
+        ]
+    )
+    _render(tui, _state(snapshot))
+    _press(tui, "j")
+    assert tui.selected_job()["id"] == 2
+
+    # Job 2 gains priority and jumps to the head; the cursor rides along.
+    snapshot["jobs"][1]["priority"] = 5
+    _render(tui, _state(snapshot))
+    assert tui.selected_job()["id"] == 2
+    assert tui.job_index == 0
+
+
+def test_priority_keys_post_adjustments_for_the_selected_job():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "+")
+    assert tui.worker.actions.get_nowait() == ("priority", 1, 1)
+    _press(tui, "-")
+    assert tui.worker.actions.get_nowait() == ("priority", 1, -1)
+
+
+def test_priority_keys_refuse_finished_jobs():
+    tui = _tui()
+    tui.filter = "finished"
+    snapshot = _snapshot(
+        jobs=[],
+        recent=[_job(9, state="failed", exit_code=1)],
+        counts={"failed": 1},
+    )
+    _render(tui, _state(snapshot))
+    _press(tui, "+")
+    assert tui.worker.actions.empty()
+    assert "no priority" in tui.worker.notice[0]
+
+
+def test_move_keys_reorder_only_pending_jobs():
+    tui = _tui()
+    _render(tui)  # job 1 (running) is selected
+    _press(tui, "K")
+    assert tui.worker.actions.empty()
+    assert "only pending" in tui.worker.notice[0]
+
+    _press(tui, "j")  # job 2 is pending
+    _press(tui, "K")
+    assert tui.worker.actions.get_nowait() == ("move", 2, -1)
+    _press(tui, "J")
+    assert tui.worker.actions.get_nowait() == ("move", 2, 1)
+
+
+def test_moving_a_job_snaps_the_table_back_to_queue_order():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "s")  # sort by id instead
+    _press(tui, "j")  # select the pending job
+    _press(tui, "K")
+    assert tui.sort_key == "queue" and tui.sort_reverse is False
+    assert tui.worker.actions.get_nowait() == ("move", 2, -1)
+
+
+def test_priority_and_move_buttons_are_clickable():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "j")  # the pending job has both button groups
+    output = _render(tui)
+    assert tui.handle_mouse(_mouse_at(output, "[+ pri:0]")) is True
+    assert tui.worker.actions.get_nowait() == ("priority", 2, 1)
+    assert tui.handle_mouse(_mouse_at(output, "[K ▲queue]")) is True
+    assert tui.worker.actions.get_nowait() == ("move", 2, -1)
+
+
+def test_the_row_marker_tracks_the_detail_state():
+    tui = _tui()
+    output = _render(tui)
+    row = next(l for l in output.splitlines() if "train" in l and "python" in l)
+    assert row.startswith("▼")
+
+    _press(tui, "", name="KEY_ENTER")
+    output = _render(tui)
+    row = next(l for l in output.splitlines() if "train" in l and "python" in l)
+    assert row.startswith("▶")
