@@ -47,6 +47,8 @@ EVENT_KINDS = (
     "job_finished",
     "job_cancelled",
     "job_requeued",
+    # A person changed where the job sits in the dispatch order.
+    "job_priority",
     "job_failed",
     "job_lost",
     "job_timeout",

@@ -207,6 +207,8 @@ measured, so treat it as approximate.
 nvidb job cancel 12          # kill the remote process group
 nvidb job requeue 12         # run a finished job again
 nvidb job note 12 --append "loss plateaued at epoch 30"
+nvidb job priority 12 5      # dispatch earlier (bare number sets, +1/-2 adjust)
+nvidb job priority 12 --up 2 # move a pending job two slots earlier instead
 nvidb queue drain gpu-node      # stop scheduling onto a node (`resume` undoes it)
 nvidb queue ignore offline-node     # do not probe, schedule, or normally display it
 nvidb queue unignore offline-node   # restore it (`nodes --include-ignored` finds hidden nodes)

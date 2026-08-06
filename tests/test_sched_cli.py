@@ -239,6 +239,33 @@ def test_note_on_a_missing_job_reports_an_error(parser, queue_db, capsys):
     assert "not found" in capsys.readouterr().err
 
 
+def test_priority_reads_sets_adjusts_and_moves(parser, queue_db, capsys):
+    _submit(parser, queue_db, "--", "true")
+    _submit(parser, queue_db, "--", "true")
+    capsys.readouterr()
+
+    assert _run(parser, ["job", "priority", "1"], queue_db) == 0
+    assert "priority: 0" in capsys.readouterr().out
+
+    assert _run(parser, ["job", "priority", "1", "5"], queue_db) == 0
+    assert "priority: 5" in capsys.readouterr().out
+
+    assert _run(parser, ["job", "priority", "1", "-2"], queue_db) == 0
+    assert "priority: 3" in capsys.readouterr().out
+
+    assert _run(parser, ["job", "priority", "2", "--up", "1"], queue_db) == 0
+    assert "moved up" in capsys.readouterr().out
+    conn = dbm.open_db(queue_db)
+    try:
+        pending = [job.id for job in dbm.pending_jobs(conn)]
+    finally:
+        conn.close()
+    assert pending == [2, 1]
+
+    assert _run(parser, ["job", "priority", "404", "1"], queue_db) == 1
+    assert "not found" in capsys.readouterr().err
+
+
 def test_wait_reports_a_timeout_differently_from_a_failure(parser, queue_db, capsys):
     """"It failed" and "I stopped waiting" call for opposite next steps."""
     _submit(parser, queue_db, "--name", "slow", "--", "true")

@@ -341,6 +341,79 @@ class Scheduler:
         dbm.update_job(self.conn, job_id, notes=value)
         return value
 
+    def set_priority(self, job_id: int, priority: int) -> Optional[int]:
+        """Set a job's priority; returns the new value, or None when the job
+        is finished (its place in the queue no longer exists to change)."""
+        job = dbm.get_job(self.conn, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+        if job.is_terminal:
+            return None
+        priority = int(priority)
+        if priority != job.priority:
+            dbm.update_job(self.conn, job_id, priority=priority)
+            dbm.add_event(
+                self.conn,
+                "job_priority",
+                job_id=job_id,
+                message=f"priority {job.priority} -> {priority}",
+            )
+        return priority
+
+    def adjust_priority(self, job_id: int, delta: int) -> Optional[int]:
+        """Nudge a job's priority up or down; returns the new value."""
+        job = dbm.get_job(self.conn, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+        if job.is_terminal:
+            return None
+        return self.set_priority(job_id, job.priority + int(delta))
+
+    def move_pending(self, job_id: int, delta: int) -> bool:
+        """Move a pending job by `delta` slots in the dispatch order.
+
+        Dispatch order is `priority DESC, id ASC`, so an arbitrary manual
+        order can only be persisted through priorities. The new order is
+        written back by walking the list once and lowering the priority of
+        whichever job would otherwise sit out of place, so only the jobs
+        from the insertion point onwards can change.
+        """
+        delta = int(delta)
+        if not delta:
+            return False
+        with dbm.transaction(self.conn):
+            pending = dbm.pending_jobs(self.conn)
+            ids = [job.id for job in pending]
+            if job_id not in ids:
+                return False
+            index = ids.index(job_id)
+            target = max(0, min(len(pending) - 1, index + delta))
+            if target == index:
+                return False
+            moved = pending.pop(index)
+            pending.insert(target, moved)
+            previous = None
+            for job in pending:
+                if previous is not None:
+                    ordered = job.priority < previous.priority or (
+                        job.priority == previous.priority and job.id > previous.id
+                    )
+                    if not ordered:
+                        job.priority = (
+                            previous.priority
+                            if job.id > previous.id
+                            else previous.priority - 1
+                        )
+                        dbm.update_job(self.conn, job.id, priority=job.priority)
+                previous = job
+            dbm.add_event(
+                self.conn,
+                "job_priority",
+                job_id=job_id,
+                message=f"moved {'up' if delta < 0 else 'down'} to slot {target + 1}",
+            )
+        return True
+
     def cancel(self, job_id: int, *, reason: str = "cancelled by user") -> bool:
         """Cancel a job, killing its process group when it is already running."""
         job = dbm.get_job(self.conn, job_id)

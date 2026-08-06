@@ -452,6 +452,8 @@ nvidb job logs 12 -f            # follow the output
 nvidb job wait 12 13            # block until both finish (0 ok, 1 failed, 2 timed out)
 nvidb job cancel 12             # kill the remote process group
 nvidb job requeue 12            # run a finished job again
+nvidb job priority 12 5         # set the priority (bare number sets, +1/-2 adjust)
+nvidb job priority 12 --up 2    # move a pending job two slots earlier instead
 nvidb job purge                 # forget finished job records
 
 nvidb queue status              # nodes, capacity and jobs in one view

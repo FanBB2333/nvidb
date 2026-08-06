@@ -853,3 +853,65 @@ def test_events_form_a_replayable_stream(scheduler, cluster):
     midpoint = events[1]["id"]
     later = dbm.list_events(scheduler.conn, since_id=midpoint)
     assert all(event["id"] > midpoint for event in later)
+
+
+# --- priority and manual ordering ------------------------------------------
+
+def _pending_order(scheduler):
+    return [job.id for job in dbm.pending_jobs(scheduler.conn)]
+
+
+def test_priority_can_be_set_and_nudged(scheduler):
+    job_id = scheduler.submit("a", vram="1G")
+    assert scheduler.set_priority(job_id, 5) == 5
+    assert dbm.get_job(scheduler.conn, job_id).priority == 5
+    assert scheduler.adjust_priority(job_id, -2) == 3
+    assert dbm.get_job(scheduler.conn, job_id).priority == 3
+
+    kinds = [event["kind"] for event in dbm.list_events(scheduler.conn, limit=100)]
+    assert kinds.count("job_priority") == 2
+
+    with pytest.raises(ValueError):
+        scheduler.set_priority(9999, 1)
+
+
+def test_a_finished_job_refuses_a_priority(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("a", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    cluster["small-node"].finish_job(job_id, exit_code=0)
+    scheduler.tick(force=True)
+
+    assert scheduler.set_priority(job_id, 5) is None
+    assert scheduler.adjust_priority(job_id, 1) is None
+
+
+def test_moving_a_pending_job_changes_the_dispatch_order(scheduler):
+    first = scheduler.submit("a", vram="1G")
+    second = scheduler.submit("b", vram="1G")
+    third = scheduler.submit("c", vram="1G")
+    assert _pending_order(scheduler) == [first, second, third]
+
+    # One slot up: the moved job passes exactly one neighbour.
+    assert scheduler.move_pending(third, -1) is True
+    assert _pending_order(scheduler) == [first, third, second]
+
+    # And back down again.
+    assert scheduler.move_pending(third, 1) is True
+    assert _pending_order(scheduler) == [first, second, third]
+
+    # All the way to the front, across jobs with differing priorities.
+    scheduler.set_priority(first, 7)
+    assert scheduler.move_pending(third, -2) is True
+    assert _pending_order(scheduler) == [third, first, second]
+
+
+def test_moving_past_the_edge_or_a_non_pending_job_is_refused(scheduler, cluster):
+    scheduler.tick(force=True)
+    running = scheduler.submit("a", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    waiting = scheduler.submit("b", vram="200G")  # can never fit anywhere
+
+    assert scheduler.move_pending(waiting, -1) is False  # already first
+    assert scheduler.move_pending(running, 1) is False  # not pending
+    assert scheduler.move_pending(waiting, 0) is False

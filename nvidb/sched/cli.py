@@ -1124,6 +1124,68 @@ def cmd_note(args) -> int:
         scheduler.close()
 
 
+def cmd_priority(args) -> int:
+    scheduler = _open(args)
+    try:
+        if args.up or args.down:
+            slots = args.up or args.down
+            moved = scheduler.move_pending(args.id, -slots if args.up else slots)
+            job = dbm.get_job(scheduler.conn, args.id)
+            if args.json:
+                _print_json(
+                    {
+                        "id": args.id,
+                        "moved": moved,
+                        "priority": job.priority if job else None,
+                    }
+                )
+            else:
+                direction = "up" if args.up else "down"
+                print(
+                    f"job {args.id}: "
+                    + (f"moved {direction}" if moved else "not moved (not pending?)")
+                )
+            return 0
+
+        if args.value is None:
+            job = dbm.get_job(scheduler.conn, args.id)
+            if job is None:
+                return _error(f"job {args.id} not found", as_json=args.json)
+            if args.json:
+                _print_json({"id": job.id, "priority": job.priority, "state": job.state})
+            else:
+                print(f"job {job.id} priority: {job.priority}")
+            return 0
+
+        text = str(args.value)
+        try:
+            relative = text.startswith(("+", "-")) and text not in ("+", "-")
+            amount = int(text)
+        except ValueError:
+            return _error(
+                f"invalid priority {text!r} (use 5, +1, or -2)", as_json=args.json
+            )
+        try:
+            if relative:
+                value = scheduler.adjust_priority(args.id, amount)
+            else:
+                value = scheduler.set_priority(args.id, amount)
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
+        if value is None:
+            return _error(
+                f"job {args.id} is finished; its priority no longer matters",
+                as_json=args.json,
+            )
+        if args.json:
+            _print_json({"ok": True, "id": args.id, "priority": value})
+        else:
+            print(f"job {args.id} priority: {value}")
+        return 0
+    finally:
+        scheduler.close()
+
+
 def cmd_purge(args) -> int:
     scheduler = _open(args)
     try:
@@ -1468,6 +1530,26 @@ def register_parsers(subparsers) -> None:
                       help="Add this to the existing note")
     note.add_argument("--clear", action="store_true", help="Remove the note")
     note.set_defaults(func=cmd_note)
+
+    priority = job_sub.add_parser(
+        "priority",
+        help="Read or change a job's priority / queue position",
+        description=(
+            "With no value the current priority is printed. A bare number "
+            "sets it, +N/-N adjusts it, and --up/--down move a pending job "
+            "that many slots in the dispatch order (rewriting the "
+            "priorities of the jobs it passes)."
+        ),
+    )
+    _add_common(priority)
+    priority.add_argument("id", type=int)
+    priority.add_argument("value", nargs="?", default=None,
+                          help="New priority: 5 sets, +1/-2 adjust")
+    priority.add_argument("--up", type=int, default=0, metavar="N",
+                          help="Move a pending job N slots earlier")
+    priority.add_argument("--down", type=int, default=0, metavar="N",
+                          help="Move a pending job N slots later")
+    priority.set_defaults(func=cmd_priority)
 
     purge = job_sub.add_parser("purge", help="Delete finished job records")
     _add_common(purge)
