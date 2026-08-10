@@ -768,16 +768,10 @@ def cmd_node_ignore(args) -> int:
         if name is None:
             return _error(f"unknown node {args.name!r}", as_json=args.json)
         ignored = args.action == "ignore"
-        if ignored:
-            running = dbm.live_jobs(scheduler.conn, name)
-            if running:
-                ids = ", ".join(str(job.id) for job in running)
-                return _error(
-                    f"node {name} has running job(s) {ids}; drain it and wait "
-                    "for them to finish before ignoring it",
-                    as_json=args.json,
-                )
-        dbm.set_node_ignored(scheduler.conn, name, ignored)
+        try:
+            scheduler.set_node_ignored(name, ignored)
+        except (RuntimeError, ValueError) as error:
+            return _error(str(error), as_json=args.json)
         payload = {"ok": True, "node": name, "ignored": ignored}
         if args.json:
             _print_json(payload)

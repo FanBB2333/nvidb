@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import threading
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -246,6 +247,35 @@ class Scheduler:
             names.append(local_name)
         return names
 
+    # --- administration ---------------------------------------------------
+
+    def set_node_ignored(self, name: str, ignored: bool) -> None:
+        """Ignore or restore a node without racing an active scheduler tick."""
+        operation_owner = f"{self.owner}:node-ignore:{uuid.uuid4().hex}"
+        if not dbm.acquire_lock(
+            self.conn,
+            TICK_LOCK,
+            operation_owner,
+            int(self.settings["lock_ttl"]),
+        ):
+            raise RuntimeError(
+                "scheduler is busy; retry after the current tick finishes"
+            )
+
+        try:
+            with dbm.transaction(self.conn):
+                if ignored:
+                    running = dbm.live_jobs(self.conn, name)
+                    if running:
+                        ids = ", ".join(str(job.id) for job in running)
+                        raise ValueError(
+                            f"node {name} has running job(s) {ids}; drain it and "
+                            "wait for them to finish before ignoring it"
+                        )
+                dbm.set_node_ignored(self.conn, name, ignored)
+        finally:
+            dbm.release_lock(self.conn, TICK_LOCK, operation_owner)
+
     # --- submission -------------------------------------------------------
 
     def submit(
@@ -341,33 +371,35 @@ class Scheduler:
         dbm.update_job(self.conn, job_id, notes=value)
         return value
 
+    def _change_priority(
+        self, job_id: int, value: int, *, relative: bool
+    ) -> Optional[int]:
+        """Apply one priority change and its event in a single write transaction."""
+        with dbm.transaction(self.conn):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None:
+                raise ValueError(f"Job {job_id} not found")
+            if job.is_terminal:
+                return None
+            priority = job.priority + int(value) if relative else int(value)
+            if priority != job.priority:
+                dbm.update_job(self.conn, job_id, priority=priority)
+                dbm.add_event(
+                    self.conn,
+                    "job_priority",
+                    job_id=job_id,
+                    message=f"priority {job.priority} -> {priority}",
+                )
+            return priority
+
     def set_priority(self, job_id: int, priority: int) -> Optional[int]:
         """Set a job's priority; returns the new value, or None when the job
         is finished (its place in the queue no longer exists to change)."""
-        job = dbm.get_job(self.conn, job_id)
-        if job is None:
-            raise ValueError(f"Job {job_id} not found")
-        if job.is_terminal:
-            return None
-        priority = int(priority)
-        if priority != job.priority:
-            dbm.update_job(self.conn, job_id, priority=priority)
-            dbm.add_event(
-                self.conn,
-                "job_priority",
-                job_id=job_id,
-                message=f"priority {job.priority} -> {priority}",
-            )
-        return priority
+        return self._change_priority(job_id, priority, relative=False)
 
     def adjust_priority(self, job_id: int, delta: int) -> Optional[int]:
         """Nudge a job's priority up or down; returns the new value."""
-        job = dbm.get_job(self.conn, job_id)
-        if job is None:
-            raise ValueError(f"Job {job_id} not found")
-        if job.is_terminal:
-            return None
-        return self.set_priority(job_id, job.priority + int(delta))
+        return self._change_priority(job_id, delta, relative=True)
 
     def move_pending(self, job_id: int, delta: int) -> bool:
         """Move a pending job by `delta` slots in the dispatch order.

@@ -1,6 +1,7 @@
 """Tests for the nvidb job queue: storage, scheduling policy and job lifecycle."""
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -873,6 +874,42 @@ def test_priority_can_be_set_and_nudged(scheduler):
 
     with pytest.raises(ValueError):
         scheduler.set_priority(9999, 1)
+
+
+def test_concurrent_priority_adjustments_are_not_lost(scheduler):
+    job_id = scheduler.submit("a", vram="1G")
+    db_path = dbm.connection_path(scheduler.conn)
+    workers = 4
+    increments = 20
+    barrier = threading.Barrier(workers)
+    errors = []
+
+    def adjust_repeatedly():
+        conn = dbm.open_db(db_path)
+        concurrent = Scheduler(conn, cfg={"servers": []})
+        try:
+            for _ in range(increments):
+                barrier.wait(timeout=10)
+                concurrent.adjust_priority(job_id, 1)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            concurrent.close()
+            conn.close()
+
+    threads = [threading.Thread(target=adjust_repeatedly) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert dbm.get_job(scheduler.conn, job_id).priority == workers * increments
+    events = dbm.list_events(scheduler.conn, job_id=job_id, limit=100)
+    assert [event["kind"] for event in events].count("job_priority") == (
+        workers * increments
+    )
 
 
 def test_a_finished_job_refuses_a_priority(scheduler, cluster):

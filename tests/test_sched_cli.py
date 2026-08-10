@@ -6,11 +6,14 @@ probing disabled, so they cover the command surface without touching a network.
 import argparse
 import json
 import logging
+import os
+import socket
 
 import pytest
 
 from nvidb.sched import cli as sched_cli
 from nvidb.sched import db as dbm
+from nvidb.sched.scheduler import TICK_LOCK
 
 
 @pytest.fixture
@@ -207,6 +210,27 @@ def test_ignore_refuses_to_abandon_a_running_job(parser, queue_db, capsys):
     try:
         assert dbm.get_node(conn, "busy-node").ignored is False
     finally:
+        conn.close()
+
+
+def test_ignore_waits_for_an_active_scheduler_tick(parser, queue_db, capsys):
+    conn = dbm.open_db(queue_db)
+    tick_owner = f"{socket.gethostname()}:{os.getpid()}"
+    try:
+        dbm.upsert_node(conn, "busy-node", hostname="10.0.0.1")
+        # The command runs in the same process as this simulated tick. Its
+        # administrative lease still needs a distinct owner to avoid treating
+        # the scheduler's lease as reentrant.
+        assert dbm.acquire_lock(conn, TICK_LOCK, tick_owner, 60) is True
+
+        assert _run(
+            parser, ["queue", "ignore", "busy", "--json"], queue_db
+        ) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert "scheduler is busy" in payload["error"]
+        assert dbm.get_node(conn, "busy-node").ignored is False
+    finally:
+        dbm.release_lock(conn, TICK_LOCK, tick_owner)
         conn.close()
 
 
