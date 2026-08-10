@@ -42,7 +42,7 @@ queue:
 # from a laptop, close it, and the queue keeps scheduling.
 #
 # remote:
-#   host: "queue-host.example.com"        # or an ~/.ssh/config alias
+#   host: "queue-host.example.com" # or an ~/.ssh/config alias
 #   port: 22                     # optional when the alias covers it
 #   username: "user"             # optional, likewise
 #   # Absolute path: `ssh host 'nvidb ...'` gets a non-interactive shell whose

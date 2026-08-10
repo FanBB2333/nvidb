@@ -437,7 +437,8 @@ def test_no_target_without_configuration(nvidb_home):
 def test_target_is_read_from_queue_yml(nvidb_home):
     _write(
         nvidb_home / "queue.yml",
-        "remote:\n  host: queue-host.example.com\n  nvidb: /home/alice/.local/bin/nvidb\n",
+        "remote:\n  host: queue-host.example.com\n"
+        "  nvidb: /home/alice/.local/bin/nvidb\n",
     )
     assert remote_mod.load_target() == {
         "host": "queue-host.example.com",
@@ -556,4 +557,7 @@ def test_a_local_script_travels_with_the_command(target):
 def test_ssh_arguments_carry_the_port_and_user(target):
     target["ssh_options"] = ["ConnectTimeout=8"]
     argv = remote_mod.ssh_argv(target, "true", tty=True)
-    assert argv[:8] == ["ssh", "-t", "-p", "2222", "-o", "ConnectTimeout=8", "alice@queue-host", "true"]
+    assert argv[:8] == [
+        "ssh", "-t", "-p", "2222", "-o", "ConnectTimeout=8",
+        "alice@queue-host", "true",
+    ]
