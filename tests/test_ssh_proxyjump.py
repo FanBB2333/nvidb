@@ -74,6 +74,41 @@ def test_invalid_proxyjump_is_rejected(value):
             normalize_proxyjump(value)
 
 
+def _open_proxy_socket_running(monkeypatch, argv):
+    """Open a proxy socket whose 'ssh' is an arbitrary local command."""
+    from nvidb import ssh_proxy
+
+    monkeypatch.setattr(ssh_proxy.shutil, "which", lambda name: "/bin/sh")
+    monkeypatch.setattr(
+        ssh_proxy, "_proxy_command_args", lambda *args, **kwargs: argv
+    )
+    return ssh_proxy.open_proxyjump_socket("jump", "10.0.0.42")
+
+
+def test_proxy_socket_is_a_real_socket_wired_to_the_command(monkeypatch):
+    sock = _open_proxy_socket_running(monkeypatch, ["/bin/cat"])
+    try:
+        sock.settimeout(10)
+        sock.sendall(b"hello through the jump\n")
+        assert sock.recv(64) == b"hello through the jump\n"
+    finally:
+        sock.close()
+    # Closing the socket also ended and reaped the subprocess.
+    assert sock._process is None
+
+
+def test_a_dead_proxy_command_reads_as_eof_not_a_busy_loop(monkeypatch):
+    """The reason ProxyCommand was replaced: its recv() spins at full CPU
+    forever once the ssh process exits. A real socketpair must deliver a
+    plain EOF instead."""
+    sock = _open_proxy_socket_running(monkeypatch, ["/bin/sh", "-c", "exit 0"])
+    try:
+        sock.settimeout(10)  # a regression would raise timeout, not hang CI
+        assert sock.recv(1) == b""
+    finally:
+        sock.close()
+
+
 class _FakeProxy:
     def __init__(self):
         self.closed = False

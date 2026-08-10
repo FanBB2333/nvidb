@@ -1,12 +1,21 @@
-"""OpenSSH ProxyJump support for Paramiko connections."""
+"""OpenSSH ProxyJump support for Paramiko connections.
+
+The jump is an `ssh -W` stdio forward wired to one end of a socketpair, so
+Paramiko talks to a real kernel socket. `paramiko.ProxyCommand` is avoided
+deliberately: it pumps the subprocess pipes through a select()+os.read()
+loop that spins at full CPU forever once the ssh process exits, because EOF
+keeps select() reporting readable while os.read() returns nothing - a stuck
+daemon burning a whole core until someone notices. With a socketpair the
+subprocess exiting is an ordinary connection close.
+"""
 from __future__ import annotations
 
 import math
 import shlex
 import shutil
-from typing import Optional
-
-import paramiko
+import socket
+import subprocess
+from typing import List, Optional
 
 
 class ProxyJumpError(OSError):
@@ -80,7 +89,7 @@ def _final_jump_destination(spec: str):
     return destination, port
 
 
-def build_proxy_command(
+def _proxy_command_args(
     proxyjump,
     hostname: str,
     port: int = 22,
@@ -88,8 +97,8 @@ def build_proxy_command(
     ssh_executable: str = "ssh",
     connect_timeout: Optional[float] = None,
     batch_mode: bool = False,
-) -> str:
-    """Build the OpenSSH command used as Paramiko's socket."""
+) -> List[str]:
+    """The OpenSSH argv for the stdio forward."""
     normalized = normalize_proxyjump(proxyjump)
     if normalized is None:
         raise ProxyJumpError("ProxyJump is empty")
@@ -109,7 +118,66 @@ def build_proxy_command(
     if jump_port is not None:
         args.extend(["-p", str(jump_port)])
     args.extend(["--", destination])
-    return shlex.join(args)
+    return args
+
+
+def build_proxy_command(
+    proxyjump,
+    hostname: str,
+    port: int = 22,
+    *,
+    ssh_executable: str = "ssh",
+    connect_timeout: Optional[float] = None,
+    batch_mode: bool = False,
+) -> str:
+    """The stdio-forward command as one shell-quoted string (for display)."""
+    return shlex.join(
+        _proxy_command_args(
+            proxyjump,
+            hostname,
+            port,
+            ssh_executable=ssh_executable,
+            connect_timeout=connect_timeout,
+            batch_mode=batch_mode,
+        )
+    )
+
+
+class _ProxyJumpSocket(socket.socket):
+    """One end of a socketpair whose other end is the `ssh -W` process.
+
+    Closing the socket also ends the subprocess: terminate covers an ssh
+    that outlives its connection, and the wait() reaps it so a long-running
+    daemon cannot accumulate zombies.
+    """
+
+    def __init__(self, fileno: int, process: subprocess.Popen):
+        super().__init__(socket.AF_UNIX, socket.SOCK_STREAM, 0, fileno)
+        self._process: Optional[subprocess.Popen] = process
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            process = getattr(self, "_process", None)
+            self._process = None
+            if process is None:
+                return
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    process.wait()
+            else:
+                process.wait()
 
 
 def open_proxyjump_socket(
@@ -120,7 +188,12 @@ def open_proxyjump_socket(
     connect_timeout: Optional[float] = None,
     batch_mode: bool = False,
 ):
-    """Start an OpenSSH stdio forward suitable for ``SSHClient.connect(sock=...)``."""
+    """Start an OpenSSH stdio forward suitable for ``SSHClient.connect(sock=...)``.
+
+    Returns a real socket: the ssh process reads and writes the other end of
+    a socketpair, the kernel moves the bytes, and the process exiting shows
+    up as a clean EOF instead of wedging a reader.
+    """
     normalized = normalize_proxyjump(proxyjump)
     if normalized is None:
         return None
@@ -130,7 +203,7 @@ def open_proxyjump_socket(
         raise ProxyJumpError(
             "ProxyJump requires the OpenSSH client (`ssh`) on the local machine"
         )
-    command = build_proxy_command(
+    args = _proxy_command_args(
         normalized,
         hostname,
         port,
@@ -138,9 +211,26 @@ def open_proxyjump_socket(
         connect_timeout=connect_timeout,
         batch_mode=batch_mode,
     )
+    ours = None
+    theirs = None
     try:
-        return paramiko.ProxyCommand(command)
+        ours, theirs = socket.socketpair()
+        process = subprocess.Popen(
+            args,
+            stdin=theirs,
+            stdout=theirs,
+            # ssh's own diagnostics would interleave with TUI output; the
+            # errors that matter surface through Paramiko as banner/EOF
+            # failures either way.
+            stderr=subprocess.DEVNULL,
+        )
     except Exception as error:
+        if ours is not None:
+            ours.close()
         raise ProxyJumpError(
             f"Could not start ProxyJump command: {type(error).__name__}: {error}"
         ) from error
+    finally:
+        if theirs is not None:
+            theirs.close()
+    return _ProxyJumpSocket(ours.detach(), process)
