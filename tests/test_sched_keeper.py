@@ -42,6 +42,24 @@ def test_without_queue_yml_the_main_config_is_used_unchanged(nvidb_home, monkeyp
     assert cfg["queue"]["headroom_mb"] == 99
 
 
+def test_invalid_queue_yml_fails_instead_of_using_monitor_nodes(nvidb_home):
+    _write(
+        nvidb_home / "config.yml",
+        "servers:\n  - hostname: colleague\n    nickname: monitor-only\n",
+    )
+    _write(nvidb_home / "queue.yml", "servers: [\n")
+
+    with pytest.raises(ValueError, match="queue[.]yml"):
+        nvidb_config.load_queue_config()
+
+
+def test_queue_yml_must_contain_a_mapping(nvidb_home):
+    _write(nvidb_home / "queue.yml", "- hostname: mine\n")
+
+    with pytest.raises(ValueError, match="queue[.]yml.*mapping"):
+        nvidb_config.load_queue_config()
+
+
 def test_queue_yml_replaces_the_server_list(nvidb_home):
     """The monitor watches machines the queue must not dispatch onto."""
     _write(

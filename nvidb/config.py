@@ -54,8 +54,8 @@ def get_queue_config_path():
     return WORKING_DIR / 'queue.yml'
 
 
-def _read_yaml(path) -> dict:
-    """Load a YAML mapping, returning an empty dict when it is missing or invalid."""
+def _read_yaml(path, *, strict=False) -> dict:
+    """Load a YAML mapping, optionally reporting invalid or unreadable files."""
     import yaml
 
     path = Path(path).expanduser()
@@ -64,9 +64,15 @@ def _read_yaml(path) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = yaml.load(handle, Loader=yaml.FullLoader) or {}
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise ValueError(f"could not read YAML configuration {path}: {exc}") from exc
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        if strict:
+            raise ValueError(f"YAML configuration {path} must contain a mapping")
+        return {}
+    return data
 
 
 def load_config(config_path=None) -> dict:
@@ -87,7 +93,13 @@ def load_queue_config(config_path=None) -> dict:
     `servers` and `queue` without knowing which file they came from.
     """
     main = load_config()
-    queue_cfg = _read_yaml(config_path or get_queue_config_path())
+    queue_path = Path(config_path or get_queue_config_path()).expanduser()
+    if not queue_path.exists():
+        return main
+
+    # An invalid queue file must not silently fall back to config.yml: every
+    # server in that file is a potential dispatch target.
+    queue_cfg = _read_yaml(queue_path, strict=True)
     if not queue_cfg:
         return main
 
