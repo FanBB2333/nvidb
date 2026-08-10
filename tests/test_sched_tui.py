@@ -773,10 +773,14 @@ def test_priority_and_move_buttons_are_clickable():
 def test_the_row_marker_tracks_the_detail_state():
     tui = _tui()
     output = _render(tui)
-    row = next(l for l in output.splitlines() if "train" in l and "python" in l)
+    row = next(
+        line for line in output.splitlines() if "train" in line and "python" in line
+    )
     assert row.startswith("▼")
 
     _press(tui, "", name="KEY_ENTER")
     output = _render(tui)
-    row = next(l for l in output.splitlines() if "train" in l and "python" in l)
+    row = next(
+        line for line in output.splitlines() if "train" in line and "python" in line
+    )
     assert row.startswith("▶")
