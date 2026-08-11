@@ -1,7 +1,7 @@
 import logging
 import sys
 import os
-from typing import Optional
+from typing import List, Optional
 from typing import Literal
 import getpass
 from dataclasses import dataclass, asdict, field
@@ -12,6 +12,8 @@ from paramiko import AuthenticationException
 from paramiko.client import SSHClient, AutoAddPolicy
 from paramiko.ssh_exception import NoValidConnectionsError
 import pandas as pd
+
+from .config import normalize_gpu_indices
 
 
     
@@ -101,8 +103,10 @@ class ServerInfo:
     password: str = field(repr=False, default=None)
     auth: Literal['password', 'key', 'auto'] = 'auto'
     proxyjump: Optional[str] = None
+    gpus: Optional[List[int]] = None
     
     def __post_init__(self):
+        self.gpus = normalize_gpu_indices(self.gpus)
         if self.description is None:
             self.description = f'{self.username}@{self.host}:{self.port}'
 

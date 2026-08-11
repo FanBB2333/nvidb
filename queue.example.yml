@@ -18,6 +18,10 @@ servers:
     username: "user"
     nickname: "gpu-node"
     auth: "auto"          # auto | key | password
+    # Optional queue-only allowlist. All cards remain visible in monitoring;
+    # running jobs outside this list continue until they finish. Use [] to
+    # disable new GPU placements on this node while retaining CPU-only jobs.
+    gpus: [0, 1]
 
 queue:
   include_local: true     # also schedule onto this machine

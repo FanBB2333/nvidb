@@ -57,6 +57,7 @@ servers:
     auth: "auto"                   # Authentication method: auto | key | password
     identityfile: "~/.ssh/id_ed25519"  # Optional, used only when auth is auto/key
     proxyjump: "login.example.com" # Optional OpenSSH ProxyJump host or alias
+    gpus: [0, 1]                    # Optional queue placement allowlist
 ```
 
 **Configuration Options:**
@@ -69,6 +70,13 @@ servers:
 - `password`: SSH password (optional, will prompt if needed)
 - `proxyjump`: OpenSSH jump host, alias, or comma-separated chain (optional; for
   example `login` or `login-a,alice@login-b:2222`)
+- `gpus`: GPU indices available to new queue placements on this server
+  (optional). Monitoring still shows every card, and running jobs outside the
+  allowlist continue normally. An empty list disables GPU placement on the
+  node while still permitting CPU-only queue jobs.
+
+The server-level `gpus` list is a placement policy. The job option `--gpus N`
+still means "request N cards"; it does not name individual indices.
 
 > **Warning**: Storing passwords in plaintext in the configuration file is **NOT RECOMMENDED** for security reasons. Consider using SSH key-based authentication (`auth: key`) instead.
 
@@ -689,6 +697,7 @@ servers:
     port: 2222
     username: "user"
     nickname: "gpu-node"
+    gpus: [0, 1]  # optional: only new queue jobs are restricted
 queue:
   include_local: true
   local_node_name: "queue-host"

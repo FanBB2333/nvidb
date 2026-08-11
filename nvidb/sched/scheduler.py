@@ -21,7 +21,7 @@ import socket
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import config as nvidb_config
 from . import db as dbm
@@ -106,7 +106,7 @@ def node_name_for_server(server: dict) -> str:
     return f"{server.get('username', '')}@{host}:{server.get('port', 22)}"
 
 
-def gpu_allowlists(cfg: Optional[dict]) -> Dict[str, set]:
+def gpu_allowlists(cfg: Optional[dict]) -> Dict[str, Set[int]]:
     """Per-node GPU allowlists from the server config's optional `gpus:` key.
 
     A server entry may restrict scheduling to specific GPU indices:
@@ -118,12 +118,16 @@ def gpu_allowlists(cfg: Optional[dict]) -> Dict[str, set]:
     Nodes without the key are unrestricted. Jobs already running on an
     excluded GPU are untouched; the mask only affects new placements.
     """
-    out: Dict[str, set] = {}
+    out: Dict[str, Set[int]] = {}
     for server in (cfg or {}).get("servers") or []:
         gpus = server.get("gpus")
         if gpus is None:
             continue
-        out[node_name_for_server(server)] = {int(g) for g in gpus}
+        node_name = node_name_for_server(server)
+        normalized = nvidb_config.normalize_gpu_indices(
+            gpus, label=f"server {node_name!r} gpus"
+        )
+        out[node_name] = set(normalized or [])
     return out
 
 
@@ -194,6 +198,7 @@ class Scheduler:
         self.conn = conn
         self.cfg = cfg if cfg is not None else nvidb_config.load_queue_config()
         self.settings = settings or load_settings(self.cfg)
+        self._gpu_allowlists = gpu_allowlists(self.cfg)
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}"
         self._backend_factory = backend_factory or self._default_backend_factory
         self._backends: Dict[str, NodeBackend] = {}
@@ -1061,6 +1066,13 @@ class Scheduler:
 
     # --- pass 3: dispatch -------------------------------------------------
 
+    def _schedulable_gpus(self, node: Node):
+        """GPUs available to new queue placements on a node."""
+        mask = self._gpu_allowlists.get(node.name)
+        if mask is None:
+            return list(node.gpus)
+        return [gpu for gpu in node.gpus if gpu.index in mask]
+
     def _dispatch(self, summary: Dict[str, Any]) -> None:
         pending = dbm.pending_jobs(self.conn)
         if not pending:
@@ -1088,9 +1100,7 @@ class Scheduler:
                 cpu_slots[node.name] = max(0, max_cpu_jobs - running_cpu.get(node.name, 0))
 
         budgets: Dict[str, List[GpuBudget]] = {}
-        allowed = gpu_allowlists(self.cfg)
         for node in nodes:
-            mask = allowed.get(node.name)
             budgets[node.name] = [
                 GpuBudget(
                     node=node.name,
@@ -1099,8 +1109,7 @@ class Scheduler:
                     jobs=gpu.queue_jobs,
                     util_percent=int(gpu.util_percent or 0),
                 )
-                for gpu in node.gpus
-                if mask is None or gpu.index in mask
+                for gpu in self._schedulable_gpus(node)
             ]
 
         for job in pending:
@@ -1212,18 +1221,28 @@ class Scheduler:
         if not candidates:
             return None
 
-        widest = max(len(node.gpus) for node in candidates)
+        gpu_inventory = [
+            (node, self._schedulable_gpus(node)) for node in candidates
+        ]
+        widest = max((len(gpus) for _node, gpus in gpu_inventory), default=0)
         if job.gpus > widest:
             where = job.node_constraint or "the largest known node"
-            return f"needs {job.gpus} GPUs; {where} has {widest}"
+            requested_unit = "GPU" if job.gpus == 1 else "GPUs"
+            available_unit = "GPU" if widest == 1 else "GPUs"
+            return (
+                f"needs {job.gpus} {requested_unit}; {where} has {widest} "
+                f"schedulable {available_unit}"
+            )
 
-        biggest = max(gpu.mem_total_mb for node in candidates for gpu in node.gpus)
+        biggest = max(
+            gpu.mem_total_mb for _node, gpus in gpu_inventory for gpu in gpus
+        )
         usable = max(0, biggest - headroom_mb)
         if job.vram_mb > usable:
             where = (
-                f"the largest GPU on {job.node_constraint}"
+                f"the largest schedulable GPU on {job.node_constraint}"
                 if job.node_constraint
-                else "the largest GPU the queue knows of"
+                else "the largest schedulable GPU the queue knows of"
             )
             return (
                 f"reserves {format_mb(job.vram_mb)}; {where} holds "

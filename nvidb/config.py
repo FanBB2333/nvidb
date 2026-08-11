@@ -134,6 +134,24 @@ def _dq(value) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def normalize_gpu_indices(value, *, label="gpus"):
+    """Validate and normalize an optional GPU-index allowlist."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{label} must be a list of non-negative GPU indices")
+
+    normalized = []
+    seen = set()
+    for index in value:
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError(f"{label} must contain only non-negative integers")
+        if index not in seen:
+            normalized.append(index)
+            seen.add(index)
+    return normalized
+
+
 def format_servers_yaml(servers) -> str:
     """Render the `servers` section with one readable block per server."""
     lines = ["servers:"]
@@ -175,6 +193,10 @@ def format_servers_yaml(servers) -> str:
         proxyjump = server.get("proxyjump")
         if proxyjump:
             lines.append(f"    proxyjump: {_dq(proxyjump)}")
+
+        gpus = normalize_gpu_indices(server.get("gpus"))
+        if gpus is not None:
+            lines.append(f"    gpus: {json.dumps(gpus)}")
 
     return "\n".join(lines) + "\n"
 

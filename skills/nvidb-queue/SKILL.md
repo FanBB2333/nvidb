@@ -61,6 +61,8 @@ Key options:
 - `--node <name>` — pin to one machine; prefix matches, so `--node gpu-node` works.
   Leave it off unless the job genuinely needs that machine (its data is there,
   it needs that GPU's memory); the scheduler places it better than you can.
+  A server-level `gpus: [0, 1]` allowlist is applied automatically to new
+  placements and must not be treated as hiding the node's other cards.
 - `--note "..."` — **write one.** Say what the job is for and what would make it
   a success. Another session, or the user in a week, reads this to understand
   why the job exists. `--name` is a label; the note is the explanation.
