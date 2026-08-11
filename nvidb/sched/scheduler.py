@@ -106,6 +106,27 @@ def node_name_for_server(server: dict) -> str:
     return f"{server.get('username', '')}@{host}:{server.get('port', 22)}"
 
 
+def gpu_allowlists(cfg: Optional[dict]) -> Dict[str, set]:
+    """Per-node GPU allowlists from the server config's optional `gpus:` key.
+
+    A server entry may restrict scheduling to specific GPU indices:
+
+        servers:
+          - nickname: "shared-box"
+            gpus: [0, 1]   # never dispatch queue jobs onto the other cards
+
+    Nodes without the key are unrestricted. Jobs already running on an
+    excluded GPU are untouched; the mask only affects new placements.
+    """
+    out: Dict[str, set] = {}
+    for server in (cfg or {}).get("servers") or []:
+        gpus = server.get("gpus")
+        if gpus is None:
+            continue
+        out[node_name_for_server(server)] = {int(g) for g in gpus}
+    return out
+
+
 class NodeBackend:
     """Everything the scheduler needs to talk to one node."""
 
@@ -1067,7 +1088,9 @@ class Scheduler:
                 cpu_slots[node.name] = max(0, max_cpu_jobs - running_cpu.get(node.name, 0))
 
         budgets: Dict[str, List[GpuBudget]] = {}
+        allowed = gpu_allowlists(self.cfg)
         for node in nodes:
+            mask = allowed.get(node.name)
             budgets[node.name] = [
                 GpuBudget(
                     node=node.name,
@@ -1077,6 +1100,7 @@ class Scheduler:
                     util_percent=int(gpu.util_percent or 0),
                 )
                 for gpu in node.gpus
+                if mask is None or gpu.index in mask
             ]
 
         for job in pending:
