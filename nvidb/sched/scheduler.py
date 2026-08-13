@@ -20,13 +20,14 @@ import os
 import socket
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import config as nvidb_config
 from . import db as dbm
 from . import keeper as keeper_mod
-from .executor import JobExecutor, NodeProbe
+from .executor import JobExecutor, LaunchRejected, NodeProbe
 from .model import (
     GpuProcess,
     Job,
@@ -38,6 +39,10 @@ from .model import (
 from .transport import LocalTransport, SSHTransport, Transport, TransportError
 
 TICK_LOCK = "scheduler"
+
+
+class SchedulerLeaseLost(RuntimeError):
+    """The scheduler must stop because another owner acquired its lease."""
 
 # How much of a failed job's stderr to keep locally. Enough to see a traceback's
 # last frames without turning the queue database into a log store.
@@ -196,10 +201,13 @@ class Scheduler:
         owner: Optional[str] = None,
     ):
         self.conn = conn
+        self._load_config_on_tick = cfg is None
+        self._settings_from_config = settings is None
         self.cfg = cfg if cfg is not None else nvidb_config.load_queue_config()
         self.settings = settings or load_settings(self.cfg)
         self._gpu_allowlists = gpu_allowlists(self.cfg)
-        self.owner = owner or f"{socket.gethostname()}:{os.getpid()}"
+        self._configured_nodes = self._configured_node_names()
+        self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
         self._backend_factory = backend_factory or self._default_backend_factory
         self._backends: Dict[str, NodeBackend] = {}
         self._lock = threading.RLock()
@@ -252,8 +260,33 @@ class Scheduler:
 
     # --- configuration sync ----------------------------------------------
 
+    def _configured_node_names(self) -> Set[str]:
+        names = {
+            node_name_for_server(server)
+            for server in (self.cfg or {}).get("servers") or []
+        }
+        if self.settings.get("include_local"):
+            names.add(str(self.settings.get("local_node_name") or "local"))
+        return names
+
+    def _reload_config(self) -> None:
+        """Refresh file-backed settings before a daemon scheduler pass."""
+        if not self._load_config_on_tick:
+            return
+        fresh = nvidb_config.load_queue_config()
+        if fresh == self.cfg:
+            return
+        self.cfg = fresh
+        if self._settings_from_config:
+            self.settings = load_settings(fresh)
+        self._gpu_allowlists = gpu_allowlists(fresh)
+        # Connection details may have changed alongside the allowlist. Closing
+        # an SSH client does not touch detached jobs; the next probe reconnects.
+        self.close()
+
     def sync_nodes_from_config(self) -> List[str]:
         """Mirror the queue configuration's server list into the `nodes` table."""
+        self._gpu_allowlists = gpu_allowlists(self.cfg)
         names = []
         for server in (self.cfg or {}).get("servers") or []:
             name = node_name_for_server(server)
@@ -271,24 +304,41 @@ class Scheduler:
                 self.conn, local_name, hostname="localhost", port=0, username=None
             )
             names.append(local_name)
+        self._configured_nodes = set(names)
         return names
 
     # --- administration ---------------------------------------------------
 
-    def set_node_ignored(self, name: str, ignored: bool) -> None:
-        """Ignore or restore a node without racing an active scheduler tick."""
-        operation_owner = f"{self.owner}:node-ignore:{uuid.uuid4().hex}"
-        if not dbm.acquire_lock(
-            self.conn,
-            TICK_LOCK,
-            operation_owner,
+    def _lease_ttl(self) -> int:
+        """Lease long enough for one bounded remote operation."""
+        return max(
+            60,
             int(self.settings["lock_ttl"]),
+            int(float(self.settings["probe_timeout"]) * 2 + 30),
+            int(float(self.settings["launch_timeout"]) * 2 + 60),
+        )
+
+    def _renew_tick_lease(self) -> None:
+        if not dbm.acquire_lock(
+            self.conn, TICK_LOCK, self.owner, self._lease_ttl()
         ):
+            raise SchedulerLeaseLost("scheduler lease was lost during the tick")
+
+    @contextmanager
+    def _operation_lease(self, operation: str):
+        owner = f"{self.owner}:{operation}:{uuid.uuid4().hex}"
+        if not dbm.acquire_lock(self.conn, TICK_LOCK, owner, self._lease_ttl()):
             raise RuntimeError(
                 "scheduler is busy; retry after the current tick finishes"
             )
-
         try:
+            yield
+        finally:
+            dbm.release_lock(self.conn, TICK_LOCK, owner)
+
+    def set_node_ignored(self, name: str, ignored: bool) -> None:
+        """Ignore or restore a node without racing an active scheduler tick."""
+        with self._operation_lease("node-ignore"):
             with dbm.transaction(self.conn):
                 if ignored:
                     running = dbm.live_jobs(self.conn, name)
@@ -299,8 +349,11 @@ class Scheduler:
                             "wait for them to finish before ignoring it"
                         )
                 dbm.set_node_ignored(self.conn, name, ignored)
-        finally:
-            dbm.release_lock(self.conn, TICK_LOCK, operation_owner)
+
+    def set_node_enabled(self, name: str, enabled: bool) -> None:
+        """Drain or resume a node without racing a placement decision."""
+        with self._operation_lease("node-enabled"):
+            dbm.set_node_enabled(self.conn, name, enabled)
 
     # --- submission -------------------------------------------------------
 
@@ -335,6 +388,8 @@ class Scheduler:
                 known = ", ".join(n.name for n in dbm.get_nodes(self.conn, with_gpus=False))
                 raise ValueError(f"Unknown node {node!r}. Known nodes: {known or '(none)'}")
             target = dbm.get_node(self.conn, resolved_node)
+            if resolved_node not in self._configured_nodes:
+                raise ValueError(f"Node {resolved_node!r} is no longer configured")
             if target is not None and target.ignored:
                 raise ValueError(
                     f"Node {resolved_node!r} is ignored; run "
@@ -342,39 +397,40 @@ class Scheduler:
                 )
 
         depends_on = [int(x) for x in (depends_on or [])]
-        for dep in depends_on:
-            if dbm.get_job(self.conn, dep) is None:
-                raise ValueError(f"Dependency job {dep} does not exist")
+        with dbm.transaction(self.conn):
+            for dep in depends_on:
+                if dbm.get_job(self.conn, dep) is None:
+                    raise ValueError(f"Dependency job {dep} does not exist")
 
-        job_id = dbm.insert_job(
-            self.conn,
-            name=name,
-            command=command,
-            workdir=workdir,
-            env=env or {},
-            gpus=int(gpus),
-            vram_mb=vram_mb,
-            priority=int(priority),
-            node_constraint=resolved_node,
-            depends_on=depends_on,
-            max_runtime_s=max_runtime_s,
-            submitter=submitter,
-            tags=list(tags or []),
-            max_retries=int(max_retries),
-            notes=notes,
-        )
-        dbm.add_event(
-            self.conn,
-            "job_submitted",
-            job_id=job_id,
-            message=name or command[:80],
-            data={
-                "gpus": int(gpus),
-                "vram_mb": vram_mb,
-                "node": resolved_node,
-                "submitter": submitter,
-            },
-        )
+            job_id = dbm.insert_job(
+                self.conn,
+                name=name,
+                command=command,
+                workdir=workdir,
+                env=env or {},
+                gpus=int(gpus),
+                vram_mb=vram_mb,
+                priority=int(priority),
+                node_constraint=resolved_node,
+                depends_on=depends_on,
+                max_runtime_s=max_runtime_s,
+                submitter=submitter,
+                tags=list(tags or []),
+                max_retries=int(max_retries),
+                notes=notes,
+            )
+            dbm.add_event(
+                self.conn,
+                "job_submitted",
+                job_id=job_id,
+                message=name or command[:80],
+                data={
+                    "gpus": int(gpus),
+                    "vram_mb": vram_mb,
+                    "node": resolved_node,
+                    "submitter": submitter,
+                },
+            )
         return job_id
 
     def set_notes(
@@ -474,59 +530,65 @@ class Scheduler:
 
     def cancel(self, job_id: int, *, reason: str = "cancelled by user") -> bool:
         """Cancel a job, killing its process group when it is already running."""
-        job = dbm.get_job(self.conn, job_id)
-        if job is None or job.is_terminal:
-            return False
-        if job.state == "running" and job.node:
-            node = dbm.get_node(self.conn, job.node)
-            if node is not None:
-                try:
-                    backend = self.backend(node)
-                    self._terminate(backend, job)
-                except TransportError:
-                    # The node is unreachable, so the record becomes final now
-                    # and the process is killed when the node answers again -
-                    # otherwise a cancelled job keeps a GPU for as long as the
-                    # outage lasts, with nothing left that knows about it.
-                    self._remember_orphan(job, reason="cancelled while unreachable")
-        dbm.update_job(
-            self.conn,
-            job_id,
-            state="cancelled",
-            finished_at=utcnow(),
-            last_error=reason,
-        )
-        dbm.add_event(self.conn, "job_cancelled", job_id=job_id, message=reason)
-        return True
+        with self._operation_lease("cancel"):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None or job.is_terminal:
+                return False
+            orphan_reason = None
+            if job.state == "running" and job.node:
+                node = dbm.get_node(self.conn, job.node)
+                if node is not None:
+                    try:
+                        self._terminate(self.backend(node), job)
+                    except TransportError:
+                        orphan_reason = "cancelled while unreachable"
+            with dbm.transaction(self.conn):
+                if orphan_reason:
+                    self._remember_orphan(job, reason=orphan_reason)
+                dbm.update_job(
+                    self.conn,
+                    job_id,
+                    state="cancelled",
+                    finished_at=utcnow(),
+                    last_error=reason,
+                )
+                dbm.add_event(
+                    self.conn, "job_cancelled", job_id=job_id, message=reason
+                )
+            return True
 
     def requeue(self, job_id: int) -> bool:
         """Put a terminal job back in the queue as a fresh attempt."""
-        job = dbm.get_job(self.conn, job_id)
-        if job is None or not job.is_terminal:
-            return False
-        dbm.update_job(
-            self.conn,
-            job_id,
-            state="pending",
-            node=None,
-            gpu_ids="",
-            remote_pid=None,
-            remote_pgid=None,
-            run_dir=None,
-            exit_code=None,
-            started_at=None,
-            finished_at=None,
-            heartbeat_at=None,
-            gpu_mem_mb=None,
-            last_error=None,
-            attempt=job.attempt,
-            # The annotation survives a re-run; the previous attempt's status
-            # line does not.
-            progress=None,
-            progress_at=None,
-        )
-        dbm.add_event(self.conn, "job_requeued", job_id=job_id, message="requeued")
-        return True
+        with self._operation_lease("requeue"):
+            with dbm.transaction(self.conn):
+                job = dbm.get_job(self.conn, job_id)
+                if job is None or not job.is_terminal:
+                    return False
+                dbm.update_job(
+                    self.conn,
+                    job_id,
+                    state="pending",
+                    node=None,
+                    gpu_ids="",
+                    remote_pid=None,
+                    remote_pgid=None,
+                    run_dir=None,
+                    exit_code=None,
+                    started_at=None,
+                    finished_at=None,
+                    heartbeat_at=None,
+                    gpu_mem_mb=None,
+                    last_error=None,
+                    attempt=job.attempt,
+                    # The annotation survives a re-run; the previous attempt's
+                    # status line does not.
+                    progress=None,
+                    progress_at=None,
+                )
+                dbm.add_event(
+                    self.conn, "job_requeued", job_id=job_id, message="requeued"
+                )
+            return True
 
     # --- the tick ---------------------------------------------------------
 
@@ -554,7 +616,7 @@ class Scheduler:
                 return summary
 
         if not dbm.acquire_lock(
-            self.conn, TICK_LOCK, self.owner, int(self.settings["lock_ttl"])
+            self.conn, TICK_LOCK, self.owner, self._lease_ttl()
         ):
             holder = dbm.lock_holder(self.conn, TICK_LOCK)
             summary["skipped"] = "locked"
@@ -563,18 +625,31 @@ class Scheduler:
 
         try:
             summary["ran"] = True
+            self._reload_config()
+            self._renew_tick_lease()
             self.sync_nodes_from_config()
             # Drained nodes are refreshed too. Draining stops *dispatch* onto a
             # node, and a node is usually drained precisely so its running jobs
             # can finish - which they can only be seen to do if it is probed.
             for node in dbm.get_nodes(self.conn, with_gpus=False):
+                self._renew_tick_lease()
                 # Ignoring is stronger than draining: it is an explicit request
                 # to make no connection attempts until the node is unignored.
                 if node.ignored:
                     summary["nodes_ignored"] += 1
                     continue
+                # A removed server must not receive new work. Keep observing it
+                # only while a running job or deferred cleanup still needs it.
+                if (
+                    node.name not in self._configured_nodes
+                    and not dbm.live_jobs(self.conn, node.name)
+                    and not dbm.list_orphans(self.conn, node.name)
+                ):
+                    continue
                 try:
                     up = self._refresh_node(node, summary)
+                except SchedulerLeaseLost:
+                    raise
                 except TransportError as error:
                     up = False
                     self._mark_node_down(node, str(error), summary)
@@ -586,8 +661,10 @@ class Scheduler:
                     summary["errors"].append({"node": node.name, "error": str(error)})
                 summary["nodes_up" if up else "nodes_down"] += 1
 
+            self._renew_tick_lease()
             self._enforce_timeouts(summary)
             if dispatch:
+                self._renew_tick_lease()
                 self._dispatch(summary)
             dbm.set_meta(self.conn, "last_tick_at", utcnow())
         finally:
@@ -604,11 +681,13 @@ class Scheduler:
         # Getting past both calls proves the node answers commands, even when
         # NVML itself is unhappy (driver reload, WSL quirk, no GPU at all).
         payload = backend.probe_gpus()
+        self._renew_tick_lease()
         probe = backend.executor.probe(
             [(job.id, job.run_dir) for job in running if job.run_dir],
             want_process_table=True,
             timeout=float(self.settings["probe_timeout"]),
         )
+        self._renew_tick_lease()
 
         self._reconcile_jobs(node, backend, running, probe, summary)
         self._reap_orphans(node, backend, summary)
@@ -662,6 +741,7 @@ class Scheduler:
         summary: Dict[str, Any],
     ) -> None:
         for job in running:
+            self._renew_tick_lease()
             observed = probe.jobs.get(job.id)
             if observed is None:
                 continue  # nothing learned this round; leave the job alone
@@ -683,6 +763,7 @@ class Scheduler:
                     result = backend.executor.read_result(job.run_dir)
                 except TransportError:
                     pass
+                self._renew_tick_lease()
 
                 detail = None
                 last_error = None
@@ -824,6 +905,7 @@ class Scheduler:
         gets through finishes the job the cancel could not.
         """
         for orphan in dbm.list_orphans(self.conn, node.name):
+            self._renew_tick_lease()
             try:
                 killed = backend.executor.reap(
                     run_dir=orphan["run_dir"],
@@ -832,6 +914,7 @@ class Scheduler:
                 )
             except TransportError:
                 continue  # still unreachable; the row keeps it on the list
+            self._renew_tick_lease()
             dbm.drop_orphan(self.conn, orphan["id"])
             if not killed:
                 continue  # already gone on its own, which is the usual case
@@ -848,6 +931,7 @@ class Scheduler:
 
     def _enforce_timeouts(self, summary: Dict[str, Any]) -> None:
         for job in dbm.live_jobs(self.conn):
+            self._renew_tick_lease()
             if not job.max_runtime_s:
                 continue
             elapsed = job.elapsed_seconds()
@@ -899,6 +983,7 @@ class Scheduler:
         if not job.run_dir:
             return None
         for stream in ("stderr", "stdout"):
+            self._renew_tick_lease()
             try:
                 text = backend.executor.read_log(
                     job.run_dir, stream=stream, lines=FAILURE_LOG_LINES
@@ -936,14 +1021,13 @@ class Scheduler:
             )
 
     def _terminate(self, backend: NodeBackend, job: Job, grace: int = 5) -> None:
-        """Ask the process group to stop, escalating to SIGKILL in the background."""
-        backend.executor.kill(pid=job.remote_pid, pgid=job.remote_pgid, signal="TERM")
-        if job.remote_pgid or job.remote_pid:
-            target = f"-{job.remote_pgid}" if job.remote_pgid else str(job.remote_pid)
-            backend.transport.run(
-                f"( sleep {int(grace)}; kill -KILL {target} 2>/dev/null ) >/dev/null 2>&1 &",
-                timeout=10,
-            )
+        """Stop the process only if its pid still belongs to this job."""
+        backend.executor.terminate(
+            run_dir=job.run_dir,
+            pid=job.remote_pid,
+            pgid=job.remote_pgid,
+            grace=grace,
+        )
 
     # --- capacity accounting ----------------------------------------------
 
@@ -1078,7 +1162,11 @@ class Scheduler:
         if not pending:
             return
 
-        all_nodes = dbm.get_nodes(self.conn)
+        all_nodes = [
+            node
+            for node in dbm.get_nodes(self.conn)
+            if node.name in self._configured_nodes
+        ]
         # Everything the queue knows a GPU about, drained or not. Used only to
         # tell "waiting for room" apart from "will never fit anywhere"; a node
         # that is down has no GPU rows, so it cannot make a job look doomed.
@@ -1113,6 +1201,7 @@ class Scheduler:
             ]
 
         for job in pending:
+            self._renew_tick_lease()
             impossible = self._impossible_reason(job, inventory, headroom)
             if impossible:
                 dbm.update_job(
@@ -1155,52 +1244,83 @@ class Scheduler:
             if not ready:
                 continue
 
-            placement = self._find_placement(
-                job, nodes, budgets, max_jobs, cpu_slots if max_cpu_jobs > 0 else None
-            )
-            if placement is None:
-                continue
-            node_name, gpu_ids = placement
-
-            node = next((n for n in nodes if n.name == node_name), None)
-            if node is None:
-                continue
-            try:
-                self._launch(node, job, gpu_ids)
-            except TransportError as error:
-                dbm.update_job(
-                    self.conn, job.id, last_error=f"launch failed: {error}"[:500]
+            excluded: Set[str] = set()
+            launch_errors: List[Tuple[str, str]] = []
+            launched = False
+            while True:
+                placement = self._find_placement(
+                    job,
+                    nodes,
+                    budgets,
+                    max_jobs,
+                    cpu_slots if max_cpu_jobs > 0 else None,
+                    excluded_nodes=excluded,
                 )
+                if placement is None:
+                    break
+                node_name, gpu_ids = placement
+                node = next((n for n in nodes if n.name == node_name), None)
+                if node is None:
+                    break
+                try:
+                    self._launch(node, job, gpu_ids)
+                except LaunchRejected as error:
+                    launch_errors.append((node_name, str(error)))
+                    summary["errors"].append({"job": job.id, "error": str(error)})
+                    excluded.add(node_name)
+                    self._renew_tick_lease()
+                    continue
+                except TransportError as error:
+                    # A channel failure may happen after the remote process was
+                    # started. Do not try a second node in that uncertain case.
+                    launch_errors.append((node_name, str(error)))
+                    summary["errors"].append({"job": job.id, "error": str(error)})
+                    self._renew_tick_lease()
+                    break
+
+                launched = True
+                self._renew_tick_lease()
+                if job.gpus <= 0 and node_name in cpu_slots:
+                    cpu_slots[node_name] = max(0, cpu_slots[node_name] - 1)
+                for budget in budgets[node_name]:
+                    if budget.index in gpu_ids:
+                        budget.free_mb = max(0, budget.free_mb - job.vram_mb)
+                        budget.jobs += 1
+                summary["dispatched"].append(
+                    {"id": job.id, "node": node_name, "gpu_ids": gpu_ids}
+                )
+                break
+
+            if launched or not launch_errors:
+                continue
+
+            detail = "; ".join(
+                f"{node_name}: {error}" for node_name, error in launch_errors
+            )[:FAILURE_DETAIL_CHARS]
+            message = f"launch failed: {detail}"[:500]
+            # A persistent node fault should produce one warning, not one on
+            # every daemon pass.
+            if job.last_error == message:
+                continue
+            last_node = launch_errors[-1][0]
+            with dbm.transaction(self.conn):
+                dbm.update_job(self.conn, job.id, last_error=message)
                 dbm.add_event(
                     self.conn,
                     "job_failed",
                     job_id=job.id,
-                    node=node_name,
-                    message=f"launch failed: {error}"[:200],
+                    node=last_node,
+                    message=message[:200],
                 )
-                # The job stays pending and will be retried, so this is a
-                # warning rather than a final failure.
                 self._raise_alert(
                     "launch_failed",
-                    f"could not start {job.name or 'job'} on {node_name}",
+                    f"could not start {job.name or 'job'}",
                     severity="warning",
                     job_id=job.id,
-                    node=node_name,
-                    detail=str(error)[:FAILURE_DETAIL_CHARS],
+                    node=last_node,
+                    detail=detail,
                     summary=summary,
                 )
-                summary["errors"].append({"job": job.id, "error": str(error)})
-                continue
-
-            if job.gpus <= 0 and node_name in cpu_slots:
-                cpu_slots[node_name] = max(0, cpu_slots[node_name] - 1)
-            for budget in budgets[node_name]:
-                if budget.index in gpu_ids:
-                    budget.free_mb = max(0, budget.free_mb - job.vram_mb)
-                    budget.jobs += 1
-            summary["dispatched"].append(
-                {"id": job.id, "node": node_name, "gpu_ids": gpu_ids}
-            )
 
     def _impossible_reason(
         self, job: Job, inventory: List[Node], headroom_mb: int
@@ -1248,6 +1368,24 @@ class Scheduler:
                 f"reserves {format_mb(job.vram_mb)}; {where} holds "
                 f"{format_mb(usable)} at most"
             )
+
+        fitting_width = max(
+            (
+                sum(
+                    1
+                    for gpu in gpus
+                    if max(0, gpu.mem_total_mb - headroom_mb) >= job.vram_mb
+                )
+                for _node, gpus in gpu_inventory
+            ),
+            default=0,
+        )
+        if job.gpus > fitting_width:
+            where = job.node_constraint or "any known node"
+            return (
+                f"needs {job.gpus} GPUs each reserving {format_mb(job.vram_mb)}; "
+                f"{where} has at most {fitting_width} matching GPUs"
+            )
         return None
 
     def _dependencies_ready(self, job: Job) -> Tuple[bool, Optional[str]]:
@@ -1270,11 +1408,15 @@ class Scheduler:
         budgets: Dict[str, List[GpuBudget]],
         max_jobs: int,
         cpu_slots: Optional[Dict[str, int]] = None,
+        excluded_nodes: Optional[Set[str]] = None,
     ) -> Optional[Tuple[str, List[int]]]:
         """Pick a node and GPU set for one job, or None when nothing fits."""
-        candidates = nodes
+        excluded_nodes = excluded_nodes or set()
+        candidates = [node for node in nodes if node.name not in excluded_nodes]
         if job.node_constraint:
-            candidates = [node for node in nodes if node.name == job.node_constraint]
+            candidates = [
+                node for node in candidates if node.name == job.node_constraint
+            ]
         if not candidates:
             return None
 
@@ -1332,36 +1474,41 @@ class Scheduler:
             env=job.env,
             gpu_ids=gpu_ids,
             node_name=node.name,
+            attempt=job.attempt + 1,
             timeout=float(self.settings["launch_timeout"]),
         )
         now = utcnow()
-        dbm.update_job(
-            self.conn,
-            job.id,
-            state="running",
-            node=node.name,
-            gpu_ids=gpu_ids,
-            remote_pid=launched.pid,
-            remote_pgid=launched.pgid,
-            run_dir=launched.run_dir,
-            started_at=now,
-            heartbeat_at=now,
-            attempt=job.attempt + 1,
-            last_error=None,
-        )
-        dbm.add_event(
-            self.conn,
-            "job_started",
-            job_id=job.id,
-            node=node.name,
-            message=f"pid {launched.pid} on GPU {','.join(str(i) for i in gpu_ids) or '-'}",
-            data={
-                "pid": launched.pid,
-                "gpu_ids": gpu_ids,
-                "vram_mb": job.vram_mb,
-                "vram": format_mb(job.vram_mb),
-            },
-        )
+        with dbm.transaction(self.conn):
+            dbm.update_job(
+                self.conn,
+                job.id,
+                state="running",
+                node=node.name,
+                gpu_ids=gpu_ids,
+                remote_pid=launched.pid,
+                remote_pgid=launched.pgid,
+                run_dir=launched.run_dir,
+                started_at=now,
+                heartbeat_at=now,
+                attempt=job.attempt + 1,
+                last_error=None,
+            )
+            dbm.add_event(
+                self.conn,
+                "job_started",
+                job_id=job.id,
+                node=node.name,
+                message=(
+                    f"pid {launched.pid} on GPU "
+                    f"{','.join(str(i) for i in gpu_ids) or '-'}"
+                ),
+                data={
+                    "pid": launched.pid,
+                    "gpu_ids": gpu_ids,
+                    "vram_mb": job.vram_mb,
+                    "vram": format_mb(job.vram_mb),
+                },
+            )
 
     # --- reads ------------------------------------------------------------
 

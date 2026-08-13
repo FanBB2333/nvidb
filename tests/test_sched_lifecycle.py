@@ -115,6 +115,30 @@ def test_a_drained_node_keeps_reporting_its_capacity(scheduler, cluster):
     assert gpu.external_mem_mb == 9000
 
 
+def test_a_removed_config_node_only_finishes_existing_work(scheduler, cluster):
+    scheduler.tick(force=True)
+    running_id = scheduler.submit("existing", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, running_id).state == "running"
+
+    scheduler.cfg["servers"] = [
+        server
+        for server in scheduler.cfg["servers"]
+        if server["nickname"] != "small-node"
+    ]
+    scheduler.tick(force=True)
+
+    with pytest.raises(ValueError, match="no longer configured"):
+        scheduler.submit("new-pinned", vram="1G", node="small-node")
+    new_id = scheduler.submit("new-unpinned", vram="1G")
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, new_id).node == "big-node"
+
+    cluster["small-node"].finish_job(running_id)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, running_id).state == "completed"
+
+
 # --- ignoring ---------------------------------------------------------------
 
 def test_an_ignored_node_is_not_probed_scheduled_or_shown(scheduler, cluster):
@@ -197,6 +221,35 @@ def test_a_job_wanting_more_gpus_than_exist_fails_with_a_reason(scheduler):
     job = dbm.get_job(scheduler.conn, job_id)
     assert job.state == "failed"
     assert "needs 8 GPUs" in job.last_error
+
+
+def test_a_multi_gpu_request_must_fit_on_the_same_node(tmp_path):
+    cluster = FakeCluster(
+        FakeNode(
+            "mixed-node",
+            [FakeGpu(0, "A100", 81920), FakeGpu(1, "small", 8192)],
+        )
+    )
+    conn = dbm.open_db(tmp_path / "queue.db")
+    scheduler = Scheduler(
+        conn,
+        cfg=cluster.config(),
+        settings=dict(SETTINGS),
+        backend_factory=cluster.backend_factory,
+        owner="test",
+    )
+    try:
+        scheduler.sync_nodes_from_config()
+        scheduler.tick(force=True)
+        job_id = scheduler.submit("wide", gpus=2, vram="40G")
+        scheduler.tick(force=True)
+
+        job = dbm.get_job(conn, job_id)
+        assert job.state == "failed"
+        assert "at most 1 matching GPUs" in job.last_error
+    finally:
+        scheduler.close()
+        conn.close()
 
 
 def test_the_pinned_node_is_what_a_pinned_job_is_judged_against(scheduler):

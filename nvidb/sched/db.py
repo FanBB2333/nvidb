@@ -859,7 +859,7 @@ def purge_jobs(
     states: Optional[Iterable[str]] = None,
     before_id: Optional[int] = None,
 ) -> int:
-    """Delete terminal jobs. Active jobs are never removed."""
+    """Delete unreferenced terminal jobs. Active jobs are never removed."""
     states = list(states) if states else sorted(TERMINAL_JOB_STATES)
     states = [state for state in states if state in TERMINAL_JOB_STATES]
     if not states:
@@ -869,7 +869,24 @@ def purge_jobs(
     if before_id is not None:
         clauses.append("id < ?")
         params.append(int(before_id))
-    where = " AND ".join(clauses)
     with transaction(conn):
+        # A pending/running job still needs its completed prerequisites to
+        # exist so dependency checks remain meaningful. Keep those rows until
+        # the dependent itself becomes terminal.
+        protected = set()
+        for row in conn.execute(
+            "SELECT depends_on FROM jobs "
+            "WHERE state IN ('pending', 'running') AND depends_on IS NOT NULL"
+        ):
+            protected.update(
+                int(value)
+                for value in (row["depends_on"] or "").split(",")
+                if value.strip()
+            )
+        if protected:
+            placeholders = ", ".join("?" for _ in protected)
+            clauses.append(f"id NOT IN ({placeholders})")
+            params.extend(sorted(protected))
+        where = " AND ".join(clauses)
         cursor = conn.execute(f"DELETE FROM jobs WHERE {where}", params)
         return int(cursor.rowcount or 0)

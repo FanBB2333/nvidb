@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from nvidb.sched.executor import JobProbe, LaunchResult, NodeProbe
+from nvidb.sched.executor import JobProbe, LaunchRejected, LaunchResult, NodeProbe
 from nvidb.sched.transport import CommandResult, TransportError
 
 MB = 1024 * 1024
@@ -181,14 +181,16 @@ class FakeExecutor:
         env=None,
         gpu_ids=None,
         node_name=None,
+        attempt=1,
         timeout=None,
     ) -> LaunchResult:
         if not self.node.online:
             raise TransportError(f"{self.node.name}: unreachable")
         if self.node.launch_error:
-            raise TransportError(self.node.launch_error)
+            raise LaunchRejected(self.node.launch_error)
         pid = self.node._allocate_pid()
-        run_dir = f"/fake/{self.node.name}/jobs/{job_id}"
+        suffix = str(job_id) if int(attempt) <= 1 else f"{job_id}-attempt-{attempt}"
+        run_dir = f"/fake/{self.node.name}/jobs/{suffix}"
         self.node.jobs[job_id] = {
             "pid": pid,
             "pgid": pid,
@@ -246,6 +248,20 @@ class FakeExecutor:
             record["alive"] = False
             self.node._release_job_memory(record)
             self.node.reaped.append(job_id)
+            return True
+        return False
+
+    def terminate(self, *, run_dir, pid, pgid=None, grace=5):
+        if not self.node.online:
+            raise TransportError(f"{self.node.name}: unreachable")
+        for job_id, record in self.node.jobs.items():
+            if record["pid"] != pid or record["run_dir"] != run_dir:
+                continue
+            if not record["alive"]:
+                return False
+            record["alive"] = False
+            self.node._release_job_memory(record)
+            self.node.killed.append(job_id)
             return True
         return False
 

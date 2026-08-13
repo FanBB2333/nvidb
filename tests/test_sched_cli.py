@@ -13,7 +13,7 @@ import pytest
 
 from nvidb.sched import cli as sched_cli
 from nvidb.sched import db as dbm
-from nvidb.sched.scheduler import TICK_LOCK
+from nvidb.sched.scheduler import TICK_LOCK, Scheduler
 
 
 @pytest.fixture
@@ -317,6 +317,27 @@ def test_wait_reports_a_timeout_differently_from_a_failure(parser, queue_db, cap
     assert _run(parser, ["job", "wait", "1", "--json"], queue_db) == 0
 
 
+def test_wait_fails_if_a_finished_job_is_purged_while_waiting(
+    parser, queue_db, monkeypatch, capsys
+):
+    _submit(parser, queue_db, "--name", "failed", "--", "false")
+    capsys.readouterr()
+    conn = dbm.open_db(queue_db)
+    try:
+        dbm.update_job(conn, 1, state="failed", exit_code=1)
+    finally:
+        conn.close()
+
+    def purge_during_tick(scheduler, *args, **kwargs):
+        dbm.purge_jobs(scheduler.conn)
+        return {"ran": True}
+
+    monkeypatch.setattr(Scheduler, "tick", purge_during_tick)
+    assert _run(parser, ["job", "wait", "1", "--json"], queue_db) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "disappeared while waiting" in payload["error"]
+
+
 def test_status_names_the_database_it_actually_read(parser, tmp_path, monkeypatch, capsys):
     """Clients decide whether they are looking at the same queue by this path."""
     monkeypatch.setattr("nvidb.config.load_config", lambda *a, **k: {"servers": []})
@@ -489,6 +510,25 @@ def test_the_daemon_ticks_and_delivers_in_one_pass(parser, queue_db, capsys, tmp
         assert "train failed" in log_path.read_text()
     finally:
         notify_module.alert_log_path = original
+
+
+def test_the_daemon_honours_queue_notify_settings(
+    parser, queue_db, capsys, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "nvidb.config.load_config",
+        lambda *a, **k: {
+            "servers": [],
+            "queue": {"notify": {"desktop": False, "log": False}},
+        },
+    )
+    log_path = tmp_path / "disabled-alerts.log"
+    monkeypatch.setattr("nvidb.sched.notify.alert_log_path", lambda: log_path)
+    _raise_alert(queue_db, title="should not be logged")
+
+    assert _run(parser, ["queue", "daemon", "--once", "--json"], queue_db) == 0
+    assert json.loads(capsys.readouterr().out)["notified"] == 1
+    assert not log_path.exists()
 
 
 def test_the_daemon_can_tick_without_notifying(parser, queue_db, capsys):

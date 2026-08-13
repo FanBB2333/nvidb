@@ -170,6 +170,44 @@ def test_expired_lease_can_be_stolen(tmp_path):
         conn.close()
 
 
+def test_scheduler_instances_have_distinct_lease_owners(tmp_path):
+    path = tmp_path / "queue.db"
+    first_conn = dbm.open_db(path)
+    second_conn = dbm.open_db(path)
+    try:
+        first = Scheduler(first_conn, cfg={"servers": []})
+        second = Scheduler(second_conn, cfg={"servers": []})
+        assert first.owner != second.owner
+    finally:
+        first_conn.close()
+        second_conn.close()
+
+
+def test_scheduler_lease_cannot_expire_during_one_remote_operation(tmp_path):
+    path = tmp_path / "queue.db"
+    first_conn = dbm.open_db(path)
+    second_conn = dbm.open_db(path)
+    settings = {
+        **Scheduler(first_conn, cfg={"servers": []}).settings,
+        "lock_ttl": 1,
+        "tick_min_interval": 0,
+    }
+    first = Scheduler(first_conn, cfg={"servers": []}, settings=settings)
+    second = Scheduler(second_conn, cfg={"servers": []}, settings=settings)
+    try:
+        assert dbm.acquire_lock(
+            first_conn, "scheduler", first.owner, first._lease_ttl()
+        )
+        time.sleep(1.1)
+        assert second.tick(force=True)["skipped"] == "locked"
+    finally:
+        dbm.release_lock(first_conn, "scheduler", first.owner)
+        first.close()
+        second.close()
+        first_conn.close()
+        second_conn.close()
+
+
 def test_two_connections_see_each_others_writes(tmp_path):
     path = tmp_path / "queue.db"
     first = dbm.open_db(path)
@@ -193,6 +231,24 @@ def test_purge_only_removes_finished_jobs(tmp_path):
         assert dbm.purge_jobs(conn) == 1
         assert dbm.get_job(conn, keep) is not None
         assert dbm.get_job(conn, drop) is None
+    finally:
+        conn.close()
+
+
+def test_purge_keeps_dependencies_of_active_jobs(tmp_path):
+    conn = dbm.open_db(tmp_path / "queue.db")
+    try:
+        dependency = dbm.insert_job(conn, command="stage-one")
+        dbm.update_job(conn, dependency, state="completed")
+        dependent = dbm.insert_job(
+            conn, command="stage-two", depends_on=[dependency]
+        )
+
+        assert dbm.purge_jobs(conn) == 0
+        assert dbm.get_job(conn, dependency) is not None
+
+        dbm.update_job(conn, dependent, state="cancelled")
+        assert dbm.purge_jobs(conn) == 2
     finally:
         conn.close()
 
@@ -392,6 +448,21 @@ def test_cancel_kills_a_running_job(scheduler, cluster):
     assert job_id in cluster["small-node"].killed
     # A cancelled job must not be resurrected as "lost" on the next pass.
     scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "cancelled"
+
+
+def test_cancel_never_reports_success_during_an_active_tick(scheduler):
+    job_id = scheduler.submit("python train.py", vram="1G")
+    tick_owner = "another-active-tick"
+    assert dbm.acquire_lock(scheduler.conn, "scheduler", tick_owner, 60)
+    try:
+        with pytest.raises(RuntimeError, match="scheduler is busy"):
+            scheduler.cancel(job_id)
+        assert dbm.get_job(scheduler.conn, job_id).state == "pending"
+    finally:
+        dbm.release_lock(scheduler.conn, "scheduler", tick_owner)
+
+    assert scheduler.cancel(job_id) is True
     assert dbm.get_job(scheduler.conn, job_id).state == "cancelled"
 
 
@@ -683,6 +754,52 @@ def test_a_launch_failure_leaves_the_job_pending_for_a_retry(scheduler, cluster)
     cluster["big-node"].launch_error = None
     scheduler.tick(force=True)
     assert dbm.get_job(scheduler.conn, job_id).state == "running"
+
+
+def test_a_rejected_preferred_node_falls_back_to_another_node(scheduler, cluster):
+    scheduler.tick(force=True)
+    cluster["big-node"].launch_error = "disk full"
+    job_id = scheduler.submit("python train.py", vram="1G")
+
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "running"
+    assert job.node == "small-node"
+    assert not [
+        alert
+        for alert in dbm.list_alerts(scheduler.conn)
+        if alert["kind"] == "launch_failed"
+    ]
+
+
+def test_repeated_launch_rejection_creates_one_alert(scheduler, cluster):
+    scheduler.tick(force=True)
+    cluster["small-node"].launch_error = "disk full"
+    cluster["big-node"].launch_error = "disk full"
+    scheduler.submit("python train.py", vram="1G")
+
+    scheduler.tick(force=True)
+    scheduler.tick(force=True)
+
+    alerts = [
+        alert
+        for alert in dbm.list_alerts(scheduler.conn)
+        if alert["kind"] == "launch_failed"
+    ]
+    assert len(alerts) == 1
+
+
+def test_a_pinned_launch_rejection_stays_pending(scheduler, cluster):
+    scheduler.tick(force=True)
+    cluster["small-node"].launch_error = "disk full"
+    job_id = scheduler.submit("python train.py", vram="1G", node="small-node")
+
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "pending"
+    assert "disk full" in job.last_error
 
 
 def test_one_broken_node_does_not_stop_the_other(scheduler, cluster):

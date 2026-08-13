@@ -270,10 +270,10 @@ class _Worker(threading.Thread):
                     "green" if ok else "yellow",
                 )
             elif name == "drain":
-                dbm.set_node_enabled(scheduler.conn, action[1], False)
+                scheduler.set_node_enabled(action[1], False)
                 self.set_notice(f"{action[1]} drained", "yellow")
             elif name == "resume":
-                dbm.set_node_enabled(scheduler.conn, action[1], True)
+                scheduler.set_node_enabled(action[1], True)
                 scheduler.tick(force=True)
                 self.set_notice(f"{action[1]} resumed", "green")
             elif name == "ack":

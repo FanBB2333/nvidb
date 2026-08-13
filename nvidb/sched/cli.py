@@ -531,10 +531,10 @@ def cmd_daemon(args) -> int:
     from .notify import Notifier
 
     scheduler = _open(args)
-    notifier = Notifier(scheduler.settings)
     queue_settings = ((scheduler.cfg or {}).get("queue") or {})
     if not isinstance(queue_settings, dict):
         queue_settings = {}
+    notifier = Notifier(queue_settings)
     interval = max(2, int(args.interval))
     if not args.json:
         channels = [
@@ -750,7 +750,10 @@ def cmd_node_set(args) -> int:
         if name is None:
             return _error(f"unknown node {args.name!r}", as_json=args.json)
         enabled = args.action == "resume"
-        dbm.set_node_enabled(scheduler.conn, name, enabled)
+        try:
+            scheduler.set_node_enabled(name, enabled)
+        except RuntimeError as error:
+            return _error(str(error), as_json=args.json)
         payload = {"ok": True, "node": name, "enabled": enabled}
         if args.json:
             _print_json(payload)
@@ -963,7 +966,9 @@ def _wait_for(scheduler: Scheduler, job_ids: Sequence[int], *, timeout: Optional
     while True:
         scheduler.tick()
         jobs = [dbm.get_job(scheduler.conn, job_id) for job_id in job_ids]
-        jobs = [job for job in jobs if job is not None]
+        missing = [job_id for job_id, job in zip(job_ids, jobs) if job is None]
+        if missing:
+            raise ValueError(f"job ids disappeared while waiting: {missing}")
         if all(job.is_terminal for job in jobs):
             return jobs
         if deadline is not None and time.time() >= deadline:
@@ -982,6 +987,8 @@ def cmd_wait(args) -> int:
             jobs = _wait_for(scheduler, ids, timeout=args.timeout)
         except KeyboardInterrupt:
             return 130
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
         payload = {"jobs": []}
         for job in jobs:
             entry = job.to_dict()
@@ -1017,9 +1024,12 @@ def cmd_cancel(args) -> int:
     scheduler = _open(args)
     try:
         results = []
-        for job_id in _resolve_ids(scheduler, args.ids):
-            ok = scheduler.cancel(job_id)
-            results.append({"id": job_id, "cancelled": ok})
+        try:
+            for job_id in _resolve_ids(scheduler, args.ids):
+                ok = scheduler.cancel(job_id)
+                results.append({"id": job_id, "cancelled": ok})
+        except RuntimeError as error:
+            return _error(str(error), as_json=args.json)
         if args.json:
             _print_json({"results": results})
         else:
@@ -1037,8 +1047,11 @@ def cmd_requeue(args) -> int:
     scheduler = _open(args)
     try:
         results = []
-        for job_id in _resolve_ids(scheduler, args.ids):
-            results.append({"id": job_id, "requeued": scheduler.requeue(job_id)})
+        try:
+            for job_id in _resolve_ids(scheduler, args.ids):
+                results.append({"id": job_id, "requeued": scheduler.requeue(job_id)})
+        except RuntimeError as error:
+            return _error(str(error), as_json=args.json)
         summary = _maybe_tick(scheduler, args, force=True)
         if args.json:
             _print_json({"results": results, "tick": summary})

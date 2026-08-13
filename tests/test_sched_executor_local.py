@@ -198,6 +198,11 @@ def test_a_finished_job_can_still_be_launched_again(executor):
     assert "run-two" in log and "run-one" not in log  # the log was reset
 
 
+def test_requeued_attempts_use_distinct_run_directories(executor):
+    assert executor.run_dir(22, 1).endswith("/22")
+    assert executor.run_dir(22, 2).endswith("/22-attempt-2")
+
+
 def test_reaping_kills_a_leftover_process_but_only_the_right_one(executor):
     """The cleanup runs long after the fact, when the pid may belong to anyone."""
     launched = executor.launch(
@@ -224,6 +229,23 @@ def test_reaping_kills_a_leftover_process_but_only_the_right_one(executor):
     assert probe.alive is False
     # Reaping something already gone is a no-op, not an error.
     assert executor.reap(run_dir=launched.run_dir, pid=launched.pid) is False
+
+
+def test_probe_does_not_adopt_a_reused_pid(executor):
+    import subprocess
+    from pathlib import Path
+
+    stranger = subprocess.Popen(["sleep", "30"])
+    run_dir = Path(executor.run_dir(31))
+    run_dir.mkdir(parents=True)
+    (run_dir / "pid").write_text(str(stranger.pid))
+    try:
+        probe = executor.probe([(31, str(run_dir))])
+        assert probe.jobs[31].alive is False
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait()
 
 
 def test_a_missing_workdir_fails_the_job_instead_of_hanging(executor):

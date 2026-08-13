@@ -24,6 +24,10 @@ DEFAULT_JOB_ROOT = ".nvidb/jobs"
 VALID_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+class LaunchRejected(TransportError):
+    """A launch failed before the executor could identify a running process."""
+
+
 @dataclass
 class LaunchResult:
     pid: Optional[int]
@@ -159,11 +163,14 @@ class JobExecutor:
             self._home = home.rstrip("/")
         return self._home
 
-    def run_dir(self, job_id: int) -> str:
+    def run_dir(self, job_id: int, attempt: int = 1) -> str:
         root = self.job_root
         if not root.startswith("/"):
             root = f"{self.home()}/{root}"
-        return f"{root.rstrip('/')}/{int(job_id)}"
+        suffix = str(int(job_id))
+        if int(attempt) > 1:
+            suffix += f"-attempt-{int(attempt)}"
+        return f"{root.rstrip('/')}/{suffix}"
 
     # --- lifecycle --------------------------------------------------------
 
@@ -177,10 +184,16 @@ class JobExecutor:
         env: Optional[Dict[str, str]] = None,
         gpu_ids: Optional[Sequence[int]] = None,
         node_name: Optional[str] = None,
+        attempt: int = 1,
         timeout: float = 60.0,
     ) -> LaunchResult:
         """Start a job detached and return the pid/pgid it reported."""
-        run_dir = self.run_dir(job_id)
+        try:
+            run_dir = self.run_dir(job_id, attempt)
+        except TransportError as error:
+            # Resolving the path happens before the launch command is sent, so
+            # another node may be tried without risking a duplicate process.
+            raise LaunchRejected(str(error)) from error
         script = build_run_script(
             job_id=job_id,
             job_name=job_name,
@@ -206,7 +219,8 @@ class JobExecutor:
                 # recycled pid cannot be mistaken for our own.
                 'nvidb_pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
                 'if [ -n "$nvidb_pid" ] && kill -0 "$nvidb_pid" 2>/dev/null && '
-                'ps -o command= -p "$nvidb_pid" 2>/dev/null | grep -q "$d/run.sh"; then',
+                'ps -o command= -p "$nvidb_pid" 2>/dev/null | '
+                'grep -F -q -- "$d/run.sh"; then',
                 '  echo "NVIDB_ADOPTED=1"',
                 "else",
                 f"  printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || exit 1",
@@ -247,7 +261,7 @@ class JobExecutor:
         isolated = _parse_marker_int(result.stdout, "NVIDB_SETSID=") == 1
         adopted = _parse_marker_int(result.stdout, "NVIDB_ADOPTED=") == 1
         if pid is None:
-            raise TransportError(
+            raise LaunchRejected(
                 f"{self.transport.name}: job {job_id} did not report a pid: "
                 f"{(result.stderr or result.stdout).strip()[:400]}"
             )
@@ -287,7 +301,9 @@ class JobExecutor:
             '  _pgid=$(cat "$_d/pgid" 2>/dev/null | tr -d " \\n\\r")',
             '  _ec=$(cat "$_d/exit_code" 2>/dev/null | tr -d "\\n\\r")',
             "  _alive=0",
-            '  if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then _alive=1; fi',
+            '  if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && '
+            'ps -o command= -p "$_pid" 2>/dev/null | '
+            'grep -F -q -- "$_d/run.sh"; then _alive=1; fi',
             '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive"',
             # The status line is free-form text, so it travels on its own line
             # where only the first two fields need splitting.
@@ -336,13 +352,17 @@ class JobExecutor:
                 f"d={quoted_dir}",
                 f"pid={int(pid)}",
                 'if kill -0 "$pid" 2>/dev/null && '
-                'ps -o command= -p "$pid" 2>/dev/null | grep -q "$d/run.sh"; then',
+                'ps -o command= -p "$pid" 2>/dev/null | '
+                'grep -F -q -- "$d/run.sh"; then',
                 f"  {self._signal_command(pid=pid, pgid=pgid, signal='TERM')}",
                 # The wrapper only runs its EXIT trap once the work it is
                 # waiting on returns, so the escalation has to reach the same
                 # set of processes rather than just the wrapper again.
                 f"  ( sleep {int(grace)}; "
-                f"{self._signal_command(pid=pid, pgid=pgid, signal='KILL')} ) "
+                'if kill -0 "$pid" 2>/dev/null && '
+                'ps -o command= -p "$pid" 2>/dev/null | '
+                'grep -F -q -- "$d/run.sh"; then '
+                f"{self._signal_command(pid=pid, pgid=pgid, signal='KILL')}; fi ) "
                 ">/dev/null 2>&1 &",
                 '  echo "NVIDB_REAPED=1"',
                 "else",
@@ -352,6 +372,17 @@ class JobExecutor:
         )
         result = self.transport.run(script, timeout=20)
         return _parse_marker_int(result.stdout, "NVIDB_REAPED=") == 1
+
+    def terminate(
+        self,
+        *,
+        run_dir: str,
+        pid: Optional[int],
+        pgid: Optional[int] = None,
+        grace: int = 5,
+    ) -> bool:
+        """Stop a live job after verifying that the pid still belongs to it."""
+        return self.reap(run_dir=run_dir, pid=pid, pgid=pgid, grace=grace)
 
     @staticmethod
     def _signal_command(

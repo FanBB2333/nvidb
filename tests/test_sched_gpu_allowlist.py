@@ -171,6 +171,39 @@ def test_existing_job_on_an_excluded_gpu_runs_to_completion(tmp_path):
         conn.close()
 
 
+def test_daemon_style_scheduler_reloads_gpu_allowlists(tmp_path, monkeypatch):
+    cluster = _shared_cluster()
+    current = {"config": cluster.config()}
+    monkeypatch.setattr(
+        "nvidb.sched.scheduler.nvidb_config.load_queue_config",
+        lambda: current["config"],
+    )
+    conn = dbm.open_db(tmp_path / "queue.db")
+    scheduler = Scheduler(
+        conn,
+        settings=dict(SETTINGS),
+        backend_factory=cluster.backend_factory,
+        owner="test",
+    )
+    try:
+        scheduler.sync_nodes_from_config()
+        existing = scheduler.submit("existing", vram="1G")
+        scheduler.tick(force=True)
+        assert dbm.get_job(conn, existing).gpu_ids == [2]
+
+        restricted = cluster.config()
+        restricted["servers"][0]["gpus"] = [0, 1]
+        current["config"] = restricted
+        new = scheduler.submit("new", vram="1G")
+        scheduler.tick(force=True)
+
+        assert dbm.get_job(conn, existing).gpu_ids == [2]
+        assert set(dbm.get_job(conn, new).gpu_ids) <= {0, 1}
+    finally:
+        scheduler.close()
+        conn.close()
+
+
 def test_empty_allowlist_still_permits_cpu_only_jobs(tmp_path):
     cluster = _shared_cluster()
     conn = dbm.open_db(tmp_path / "queue.db")
