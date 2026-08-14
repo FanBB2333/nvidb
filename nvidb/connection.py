@@ -76,7 +76,15 @@ class BaseClient(ABC):
         self.connected = False
         self.last_connect_error = message
         self.last_error_type = error_type
-    
+
+    def ensure_connected(self) -> bool:
+        """Return whether this client can serve a query right now.
+
+        Transports that can break mid-session (SSH) override this to revive
+        themselves; a local client is either usable or was never usable.
+        """
+        return getattr(self, "connected", True) is not False
+
     @abstractmethod
     def connect(self) -> bool:
         """Connect to the client (remote or local)"""
@@ -243,7 +251,9 @@ class BaseClient(ABC):
         - Base table: NVML, with `nvidia-smi -q -x` used only when NVML is unavailable.
         - Advanced table (DCGM profiling): fetched via DCGM python bindings when available.
         """
-        if getattr(self, "connected", True) is False:
+        # A dropped link is revived here rather than reported as "no GPUs":
+        # every refresh tick gets one (rate-limited) chance to reconnect.
+        if not self.ensure_connected():
             error_message = getattr(self, "last_connect_error", None) or "Not connected"
             error_type = getattr(self, "last_error_type", None) or "error"
             return pd.DataFrame(), {"error": error_message, "error_type": error_type}
@@ -482,6 +492,13 @@ class BaseClient(ABC):
             if system_info.get("data_source") == "unsupported":
                 system_info["nvml_error"] = nvml_error
         if stats.empty:
+            # The link can die mid-fetch. Say so, instead of letting one tick
+            # look like a machine that never had an NVIDIA GPU.
+            if getattr(self, "connected", True) is False:
+                return pd.DataFrame(), {
+                    "error": getattr(self, "last_connect_error", None) or "Not connected",
+                    "error_type": getattr(self, "last_error_type", None) or "error",
+                }
             return stats, system_info
 
         def fmt_percent(value) -> str:
@@ -997,6 +1014,16 @@ class BaseClient(ABC):
 
 
 class RemoteClient(BaseClient):
+    # Seconds to wait after the Nth failed reconnect, so an unreachable node
+    # costs one handshake every 15s instead of one on every refresh tick. The
+    # cap doubles as the worst-case delay before a recovered node reappears.
+    RECONNECT_BACKOFF_SECONDS = (2.0, 5.0, 10.0, 15.0)
+    CONNECT_TIMEOUT_SECONDS = 8.0
+    COMMAND_TIMEOUT_SECONDS = 30.0
+    # SSH keepalives turn a silently dropped link into an inactive transport,
+    # so a dead node is detected in seconds instead of blocking on every read.
+    KEEPALIVE_SECONDS = 10
+
     def __init__(self, server: ServerInfo):
         super().__init__()
         self.host = server.host
@@ -1009,6 +1036,11 @@ class RemoteClient(BaseClient):
         self.proxyjump = getattr(server, "proxyjump", None)
         self._proxy = None
         self.client = self._make_ssh_client()
+        # Lock order is always _connect_lock -> _nvml_agent_lock; never take the
+        # connect lock while holding the NVML one.
+        self._connect_lock = threading.RLock()
+        self._reconnect_attempts = 0
+        self._reconnect_after = 0.0
         self._nvml_agent_lock = threading.RLock()
         self._nvml_agent_stdin = None
         self._nvml_agent_stdout = None
@@ -1030,8 +1062,12 @@ class RemoteClient(BaseClient):
                 pass
         self._proxy = None
 
-    def _connect_client(self, **kwargs):
-        """Connect a fresh Paramiko client, optionally through ProxyJump."""
+    def _connect_client(self, *, batch_mode: bool = False, **kwargs):
+        """Connect a fresh Paramiko client, optionally through ProxyJump.
+
+        `batch_mode` forbids the ProxyJump helper from prompting, which matters
+        on the background reconnect path where nothing can answer a prompt.
+        """
         try:
             self.client.close()
         except Exception:
@@ -1039,13 +1075,18 @@ class RemoteClient(BaseClient):
         self._close_proxy()
         self.client = self._make_ssh_client()
 
+        kwargs.setdefault("timeout", self.CONNECT_TIMEOUT_SECONDS)
+        kwargs.setdefault("banner_timeout", self.CONNECT_TIMEOUT_SECONDS)
+        kwargs.setdefault("auth_timeout", self.CONNECT_TIMEOUT_SECONDS)
+
         proxy = None
         try:
             proxy = open_proxyjump_socket(
                 self.proxyjump,
                 self.host,
                 self.port,
-                batch_mode=False,
+                connect_timeout=self.CONNECT_TIMEOUT_SECONDS,
+                batch_mode=batch_mode,
             )
             if proxy is not None:
                 kwargs["sock"] = proxy
@@ -1062,7 +1103,99 @@ class RemoteClient(BaseClient):
                     pass
             raise
         self._proxy = proxy
-    
+        try:
+            transport = self.client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(self.KEEPALIVE_SECONDS)
+        except Exception:
+            pass
+
+    def _transport_alive(self) -> bool:
+        try:
+            transport = self.client.get_transport()
+        except Exception:
+            return False
+        return bool(transport is not None and transport.is_active())
+
+    def _close_link_locked(self):
+        """Drop the SSH session (and the NVML agent riding on it)."""
+        with self._nvml_agent_lock:
+            self._close_nvml_agent_locked()
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self._close_proxy()
+
+    def _mark_link_lost(self, error=None):
+        """Note that the SSH session died so the next tick reconnects.
+
+        A command can also fail while the link is healthy (a missing binary, a
+        non-zero exit); that must not tear down a working connection, so the
+        transport gets the final say.
+        """
+        with self._connect_lock:
+            if self._transport_alive():
+                return
+            self._close_link_locked()
+            reason = (
+                f"{type(error).__name__}: {error}" if error is not None else "connection lost"
+            )
+            logging.warning(msg=f"Lost connection to {self.description}: {reason}")
+            self._set_connect_error(f"Connection lost ({reason}); reconnecting", error_type="connect")
+            # Retry on the very next refresh: the common case - a laptop that
+            # slept, a Wi-Fi hiccup - is over before the user looks back.
+            self._reconnect_attempts = 0
+            self._reconnect_after = 0.0
+
+    def ensure_connected(self) -> bool:
+        """Reconnect a dropped session, at most once per backoff window."""
+        with self._connect_lock:
+            if self._transport_alive():
+                if not self.connected:
+                    self.connected = True
+                    self.last_connect_error = None
+                    self.last_error_type = None
+                return True
+
+            if self.connected:
+                # Nothing raised yet, but the transport is gone.
+                self._mark_link_lost()
+
+            # Credentials the background thread cannot supply will not become
+            # valid by retrying; leave the message on screen instead of looping.
+            if self.last_error_type == "auth":
+                return False
+
+            if time.monotonic() < self._reconnect_after:
+                return False
+            return self._reconnect_locked()
+
+    def _reconnect_locked(self) -> bool:
+        self._close_link_locked()
+        self._reconnect_attempts += 1
+        try:
+            reconnected = self.connect(allow_prompt=False, announce=False)
+        except Exception as error:
+            logging.debug(msg=f"Reconnect to {self.description} failed: {error}")
+            self._set_connect_error(f"{type(error).__name__}: {error}", error_type="connect")
+            reconnected = False
+
+        if reconnected:
+            logging.info(msg=f"Reconnected to {self.host}:{self.port} as {self.username}")
+            self._reconnect_attempts = 0
+            self._reconnect_after = 0.0
+            return True
+
+        index = min(self._reconnect_attempts - 1, len(self.RECONNECT_BACKOFF_SECONDS) - 1)
+        delay = self.RECONNECT_BACKOFF_SECONDS[index]
+        self._reconnect_after = time.monotonic() + delay
+        reason = self.last_connect_error or "Connection failed"
+        if self.last_error_type != "auth":
+            suffix = f"; retrying in {int(delay)}s" if delay else "; retrying"
+            self._set_connect_error(f"{reason}{suffix}", error_type=self.last_error_type or "connect")
+        return False
+
     def __del__(self):
         try:
             with self._nvml_agent_lock:
@@ -1118,8 +1251,15 @@ class RemoteClient(BaseClient):
 
     def query_nvml_snapshot(self) -> dict:
         """Query the persistent remote NVML agent, restarting it once on failure."""
+        if not self.ensure_connected():
+            return {
+                "ok": False,
+                "backend": "ctypes",
+                "error": self.last_connect_error or "Not connected",
+            }
+
+        last_error = None
         with self._nvml_agent_lock:
-            last_error = None
             for _ in range(2):
                 try:
                     channel = self._nvml_agent_channel
@@ -1142,32 +1282,49 @@ class RemoteClient(BaseClient):
                     last_error = error
                     self._close_nvml_agent_locked()
 
-            return {
-                "ok": False,
-                "backend": "ctypes",
-                "error": (
-                    f"{type(last_error).__name__}: {last_error}"
-                    if last_error is not None
-                    else "Remote NVML agent failed"
-                ),
-            }
-    
-    def _authenticate_with_password(self, max_attempts=3, *, prompt_only: bool = False) -> bool:
+        # Outside the NVML lock: marking the link lost takes the connect lock,
+        # and that order must never be reversed.
+        self._mark_link_lost(last_error)
+        return {
+            "ok": False,
+            "backend": "ctypes",
+            "error": (
+                f"{type(last_error).__name__}: {last_error}"
+                if last_error is not None
+                else "Remote NVML agent failed"
+            ),
+        }
+
+    def _authenticate_with_password(
+        self,
+        max_attempts=3,
+        *,
+        prompt_only: bool = False,
+        allow_prompt: bool = True,
+    ) -> bool:
         """Attempt password authentication with retry limit.
-        
+
         Args:
             max_attempts: Maximum number of password attempts (default: 3)
             prompt_only: Do not try any configured password; always prompt (default: False)
-            
+            allow_prompt: Allow asking the user; background reconnects cannot
+                (nothing is reading the terminal) and fail instead.
+
         Returns:
             bool: True if authentication succeeds
-            
+
         """
         for attempt in range(max_attempts):
             try:
                 password = None
                 if not prompt_only and self.password is not None and attempt == 0:
                     password = self.password
+                elif not allow_prompt:
+                    self._set_connect_error(
+                        "Password required; restart nvidb to enter it",
+                        error_type="auth",
+                    )
+                    return False
                 else:
                     remaining = max_attempts - attempt
                     if attempt > 0:
@@ -1176,6 +1333,7 @@ class RemoteClient(BaseClient):
                     password = getpass.getpass(prompt=f"Enter password for {self.username}@{self.host}:{self.port} -> ")
 
                 self._connect_client(
+                    batch_mode=not allow_prompt,
                     hostname=self.host,
                     port=self.port,
                     username=self.username,
@@ -1205,8 +1363,16 @@ class RemoteClient(BaseClient):
         self._set_connect_error("Password incorrect", error_type="auth")
         return False
 
-    def connect(self) -> bool:
-        print(f"Connecting to {self.host}:{self.port} as {self.username}")
+    def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
+        """Open the SSH session.
+
+        `allow_prompt` and `announce` are cleared by the background reconnect,
+        which runs under a live TUI: nothing can answer a prompt and any print
+        would land in the middle of the rendered screen.
+        """
+        if announce:
+            print(f"Connecting to {self.host}:{self.port} as {self.username}")
+        batch_mode = not allow_prompt
         # catch the OSError exception when the host is not reachable
         try:
             identityfile = None
@@ -1216,6 +1382,7 @@ class RemoteClient(BaseClient):
                 # Auto mode: try key-based auth first, then password
                 try:
                     self._connect_client(
+                        batch_mode=batch_mode,
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1231,9 +1398,16 @@ class RemoteClient(BaseClient):
                 except PasswordRequiredException:
                     if not identityfile:
                         logging.error(msg=f"Key requires passphrase on {self.description}, trying password...")
-                        return self._authenticate_with_password()
+                        return self._authenticate_with_password(allow_prompt=allow_prompt)
+                    if not allow_prompt:
+                        self._set_connect_error(
+                            "Key passphrase required; restart nvidb to enter it",
+                            error_type="auth",
+                        )
+                        return False
                     passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
                     self._connect_client(
+                        batch_mode=batch_mode,
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1250,7 +1424,7 @@ class RemoteClient(BaseClient):
                 except AuthenticationException as e:
                     logging.error(msg=f"Key-based authentication failed on {self.description}, trying password...")
                     # Use the new password authentication method with retry limit
-                    return self._authenticate_with_password()
+                    return self._authenticate_with_password(allow_prompt=allow_prompt)
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
                     self._set_connect_error(str(e), error_type="connect")
@@ -1259,6 +1433,7 @@ class RemoteClient(BaseClient):
                 # Key-based authentication only (no password fallback)
                 try:
                     self._connect_client(
+                        batch_mode=batch_mode,
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1275,8 +1450,15 @@ class RemoteClient(BaseClient):
                     if not identityfile:
                         self._set_connect_error("Key requires passphrase; set `identityfile` or use `auth: password`", error_type="auth")
                         return False
+                    if not allow_prompt:
+                        self._set_connect_error(
+                            "Key passphrase required; restart nvidb to enter it",
+                            error_type="auth",
+                        )
+                        return False
                     passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
                     self._connect_client(
+                        batch_mode=batch_mode,
                         hostname=self.host,
                         port=self.port,
                         username=self.username,
@@ -1302,7 +1484,7 @@ class RemoteClient(BaseClient):
                 # Password authentication with retry limit
                 try:
                     # Password mode: try configured password first, then prompt if needed.
-                    return self._authenticate_with_password()
+                    return self._authenticate_with_password(allow_prompt=allow_prompt)
                 except NoValidConnectionsError as e:
                     logging.error(msg=f"Connection failed: {e}")
                     self._set_connect_error(str(e), error_type="connect")
@@ -1321,11 +1503,25 @@ class RemoteClient(BaseClient):
             return False
     
     def execute_command(self, command: str) -> str:
-        """Execute command on remote server"""
-        stdin, stdout, stderr = self.client.exec_command(command=command)
-        result = stdout.read().decode()
+        """Execute command on remote server.
+
+        Raises when the session is down so callers surface a real error instead
+        of an empty reading, and so a dead node costs one bounded reconnect
+        attempt per tick rather than a timeout per command.
+        """
+        if not self.ensure_connected():
+            raise ConnectionError(self.last_connect_error or "Not connected")
+        try:
+            stdin, stdout, stderr = self.client.exec_command(
+                command=command,
+                timeout=self.COMMAND_TIMEOUT_SECONDS,
+            )
+            result = stdout.read().decode()
+        except Exception as error:
+            self._mark_link_lost(error)
+            raise
         return result
-    
+
     def get_client(self) -> SSHClient:
         return self.client
 
@@ -4180,7 +4376,9 @@ class NVClientPool:
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
             if isinstance(system_info, dict) and system_info.get("error"):
                 message = system_info.get("error", "Error")
-                lines.append(f"! {node} ({hostname}): {message}")
+                # A node that dropped off must not read like a node that simply
+                # has no NVIDIA GPU, so it keeps the red marker of a real error.
+                lines.append(colored(f"! {node} ({hostname}): {message}", "red"))
             elif (
                 not errors_only
                 and (not isinstance(stats, pd.DataFrame) or stats.empty)
