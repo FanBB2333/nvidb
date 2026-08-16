@@ -1,6 +1,7 @@
 from typing import Literal, Optional
 from blessed import Terminal
 import logging
+import re
 import sys
 import os
 import subprocess
@@ -1703,8 +1704,11 @@ class NVClientPool:
         self.term = Terminal()
         self.compact = bool(compact)
         self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
-        # Collapsible display state - only first server expanded by default
-        self.expanded_servers = {0}  # Only first server expanded by default
+        # Collapsible display state - every server starts expanded so the
+        # dashboard opens showing the whole cluster; the stacked tables
+        # then scale to whatever rows the terminal has (see
+        # _scale_server_blocks).
+        self.expanded_servers = set(range(len(self.pool)))
         self.selected_server = 0  # Currently selected server for navigation
         self._persist_view_enabled = view_settings is not None
         self._default_expansion_applied = False
@@ -4558,10 +4562,12 @@ class NVClientPool:
         return lines
 
     def _apply_default_expansion(self, raw_stats_by_client, last_update_time):
-        """Expand the first node that actually reports GPUs, once data arrives.
+        """Expand every node that actually reports GPUs, once data arrives.
 
         Without this the local machine stays expanded even when it has no
         NVIDIA GPU (macOS, CPU-only hosts), pushing real nodes off screen.
+        Nodes without GPUs collapse instead, keeping the opening view full
+        of live tables rather than "no data" panels.
         """
         if last_update_time is None or getattr(self, "_default_expansion_applied", False):
             return
@@ -4572,17 +4578,129 @@ class NVClientPool:
             return
 
         raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        expanded = set()
         for idx in range(len(self.pool)):
             stats, _system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
             if isinstance(stats, pd.DataFrame) and not stats.empty:
-                self.expanded_servers = {idx}
-                return
-        self.expanded_servers = set()
+                expanded.add(idx)
+        self.expanded_servers = expanded
 
     @staticmethod
     def _screen_line_count(elements):
         """Count the terminal rows a list of frame elements occupies."""
         return sum(len(str(element).split("\n")) for element in elements)
+
+    _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+    def _scale_server_blocks(self, server_rows, user_memory_by_client, available_rows):
+        """Fit every expanded server block into the terminal at once.
+
+        All servers open expanded, so the stacked tables have to share
+        the rows left under the headers. Blocks keep their natural size
+        while they fit; once they do not, GPU rows are dropped from the
+        tallest block first, and a block whose table frame cannot survive
+        collapses to its header line. Returns {idx: [block lines]} for
+        the servers that stay expanded.
+        """
+        blocks = {}
+        for idx, _selected, is_expanded, _header, _summary, stats_info in server_rows:
+            if not is_expanded:
+                continue
+            block = list(str(stats_info).splitlines())
+            if isinstance(user_memory_by_client, dict):
+                users = user_memory_by_client.get(idx, {}) or {}
+            else:
+                users = {}
+            if users:
+                user_line = (
+                    f"Users: {self._format_user_memory_totals(users, max_users=12)}"
+                )
+                try:
+                    width = os.get_terminal_size().columns
+                except OSError:
+                    width = 80
+                if self.term.length(user_line) > width:
+                    user_line = user_line[: max(0, width - 3)] + "..."
+                block.append(user_line)
+            block.append("")
+            blocks[idx] = block
+
+        available_rows = max(0, available_rows)
+        natural = {idx: len(block) for idx, block in blocks.items()}
+        trimmed_ids = set()
+        while sum(len(block) for block in blocks.values()) > available_rows:
+            tallest = max(blocks, key=lambda idx: len(blocks[idx]))
+            trimmed = self._trim_server_block(blocks[tallest], len(blocks[tallest]) - 1)
+            if trimmed is None:
+                del blocks[tallest]
+                continue
+            blocks[tallest] = trimmed
+            trimmed_ids.add(tallest)
+        for idx in trimmed_ids:
+            if idx not in blocks:
+                continue
+            # The marker counts against the block's natural height, not the
+            # previous trim step, so the number matches what was dropped.
+            hidden = natural[idx] - len(blocks[idx])
+            blocks[idx][-1] = colored(
+                f"  … {hidden} line(s) hidden — enlarge the terminal or press [c]",
+                "dark_grey",
+            )
+        return blocks
+
+    def _trim_server_block(self, lines, keep):
+        """Shorten one expanded block to `keep` lines by dropping GPU rows.
+
+        The table keeps its frame: everything up to the header separator
+        stays, as many data rows as fit follow, and the original bottom
+        border closes it. Returns None when there is no table to shrink
+        or `keep` cannot hold the frame, meaning the caller should
+        collapse the server instead.
+        """
+        if keep >= len(lines):
+            return lines
+        plain = [self._ANSI_ESCAPE_RE.sub("", line) for line in lines]
+        top_index = next(
+            (index for index, text in enumerate(plain) if text.startswith("╭")),
+            None,
+        )
+        if top_index is None:
+            return None
+        separator_index = next(
+            (
+                index
+                for index in range(top_index, len(plain))
+                if plain[index].startswith("├")
+            ),
+            None,
+        )
+        bottom_index = next(
+            (
+                index
+                for index in range(
+                    separator_index + 1 if separator_index is not None else 0,
+                    len(plain),
+                )
+                if plain[index].startswith("╰")
+            ),
+            None,
+        )
+        if separator_index is None or bottom_index is None:
+            return None
+
+        head = lines[: separator_index + 1]
+        bottom = lines[bottom_index]
+        marker_text = f"  … {len(lines) - keep} line(s) hidden — enlarge the terminal or press [c]"
+        marker = colored(marker_text, "dark_grey")
+        # A frame with no data rows left says nothing a collapsed header
+        # cannot, so one row is the minimum an expansion keeps.
+        overhead = len(head) + 3  # bottom border, marker, one data row
+        if keep < overhead:
+            return None
+        rows = lines[separator_index + 1 : bottom_index]
+        kept_rows = keep - overhead + 1
+        trimmed = head + rows[:kept_rows] + [bottom, marker]
+        return trimmed
 
     def _selected_unified_row(self, raw_stats_by_client):
         """Return the currently selected GPU row across filtering and sorting."""
@@ -5964,7 +6082,7 @@ class NVClientPool:
             separator_width = min(80, terminal_width)
         else:
             separator_width = max(20, terminal_width)
-        output_lines.append("-" * separator_width)
+        output_lines.append(colored("─" * separator_width, "dark_grey"))
 
         if bool(getattr(self, "tui_help_visible", False)):
             help_offset = self._screen_line_count(output_lines)
@@ -6084,7 +6202,32 @@ class NVClientPool:
         else:
             widths = None
 
-        for idx, is_selected, is_expanded, header_plain, summary_data, stats_info in server_rows:
+        # All-expanded by default means the stacked tables must share the
+        # terminal: scale them to the rows that remain under the headers
+        # so the whole cluster stays on one screen.
+        available_rows = (
+            (terminal_height - 1)
+            - self._screen_line_count(output_lines)
+            - len(server_rows)
+        )
+        visible_blocks = self._scale_server_blocks(
+            server_rows, user_memory_by_client, available_rows
+        )
+
+        for idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info in server_rows:
+            toggle_disabled = idx in self._toggle_disabled_servers
+            # A server the scaler collapsed still gets its header, just
+            # with the collapsed icon.
+            expand_icon = (
+                "!"
+                if toggle_disabled
+                else ("v" if idx in visible_blocks else ">")
+            )
+            selector = "*" if is_selected else " "
+            header_plain = (
+                f"{selector} {expand_icon} "
+                f"[{idx + 1:{index_width}d}] {self.pool[idx].description}"
+            )
             pad = max_header_width - self.term.length(header_plain)
             header_padded = header_plain + (" " * pad if pad > 0 else "")
 
@@ -6098,19 +6241,10 @@ class NVClientPool:
             self._click_targets[self._screen_line_count(output_lines)] = ("server", idx)
             output_lines.append(f"{header_display}  {summary}")
 
-            # If expanded, print the full stats table (already formatted from get_client_gpus_info)
-            if is_expanded:
-                output_lines.extend(str(stats_info).splitlines())
-                if isinstance(user_memory_by_client, dict):
-                    user_summary = user_memory_by_client.get(idx, {}) or {}
-                else:
-                    user_summary = {}
-                if user_summary:
-                    user_line = f"Users: {self._format_user_memory_totals(user_summary, max_users=12)}"
-                    if self.term.length(user_line) > terminal_width:
-                        user_line = user_line[: max(0, terminal_width - 3)] + "..."
-                    output_lines.append(user_line)
-                output_lines.append("")  # Add spacing after expanded server
+            # The full stats table, already formatted and scaled to fit.
+            block = visible_blocks.get(idx)
+            if block is not None:
+                output_lines.extend(block)
 
         self._write_tui_lines(output_lines)
 

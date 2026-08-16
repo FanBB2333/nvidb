@@ -955,6 +955,16 @@ def test_default_expansion_skips_nodes_without_gpus():
     pool._apply_default_expansion(raw_stats, last_update_time=1)
     assert pool.expanded_servers == {1}
 
+    # Every GPU-bearing node opens expanded, not just the first one.
+    pool.pool.append(SimpleNamespace(description="third-node", host="10.0.0.3", port=22))
+    raw_stats[2] = (
+        pd.DataFrame([_gpu_row(0, "RTX 4090", "10 %", "1024/24576")]),
+        {},
+    )
+    pool._default_expansion_applied = False
+    pool._apply_default_expansion(raw_stats, last_update_time=1)
+    assert pool.expanded_servers == {1, 2}
+
     # Applied once only, and never against a user's own expand/collapse choice.
     pool.expanded_servers = {0}
     pool._apply_default_expansion(raw_stats, last_update_time=1)
@@ -964,6 +974,116 @@ def test_default_expansion_skips_nodes_without_gpus():
     touched._expansion_touched = True
     touched._apply_default_expansion(raw_stats, last_update_time=1)
     assert touched.expanded_servers == {0}
+
+
+def _server_block(pool, gpu_count):
+    """A realistic expanded-server block: description, driver line, table."""
+    rows = [
+        _gpu_row(index, "RTX 4090", "10 %", "1024/24576")
+        for index in range(gpu_count)
+    ]
+    table = pool._format_fixed_width_table(pd.DataFrame(rows), border=True)
+    return f"\nnode description\nDriver: 550.0 | CUDA: 12.4\n{table}"
+
+
+def _server_rows(pool, specs):
+    return [
+        (idx, False, True, f"hdr {idx}", {}, stats_info)
+        for idx, stats_info in enumerate(specs)
+    ]
+
+
+def test_scale_server_blocks_keeps_every_table_when_the_terminal_is_tall():
+    pool = _pool()
+    specs = [_server_block(pool, 6), _server_block(pool, 2)]
+
+    blocks = pool._scale_server_blocks(_server_rows(pool, specs), {}, 100)
+
+    assert set(blocks) == {0, 1}
+    assert blocks[0] == specs[0].splitlines() + [""]
+    assert not any("hidden" in line for line in blocks[0])
+
+
+def test_scale_server_blocks_trims_gpu_rows_but_keeps_the_frame(monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    pool = _pool()
+    specs = [_server_block(pool, 8), _server_block(pool, 2)]
+
+    blocks = pool._scale_server_blocks(_server_rows(pool, specs), {}, 20)
+
+    # Everything still expanded, and the total fits the budget exactly.
+    assert set(blocks) == {0, 1}
+    assert sum(len(block) for block in blocks.values()) <= 20
+    plain = [
+        [_without_ansi(line) for line in block]
+        for block in blocks.values()
+    ]
+    for block in plain:
+        # The rounded frame survives trimming: separator, rows, bottom.
+        assert any(line.startswith("├") for line in block)
+        assert any(line.startswith("╰") for line in block)
+    trimmed = [
+        block
+        for block in plain
+        if any("line(s) hidden" in line for line in block)
+    ]
+    assert trimmed, "the tallest table should say how much it dropped"
+
+
+def test_scale_server_blocks_collapses_servers_when_the_screen_is_tiny():
+    pool = _pool()
+    specs = [_server_block(pool, 8), _server_block(pool, 2)]
+
+    # Too short for even one framed table below the headers.
+    blocks = pool._scale_server_blocks(_server_rows(pool, specs), {}, 3)
+
+    assert blocks == {}
+
+
+def test_nodes_view_fits_the_terminal_with_every_server_expanded(
+    monkeypatch, capsys
+):
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool._default_expansion_applied = True
+    pool.expanded_servers = {0, 1}
+    specs = [_server_block(pool, 8), _server_block(pool, 4)]
+    pool.cached_stats = specs
+    pool.cached_raw_stats = {
+        0: (
+            pd.DataFrame(
+                [
+                    _gpu_row(index, "RTX 4090", "10 %", "1024/24576")
+                    for index in range(8)
+                ]
+            ),
+            {},
+        ),
+        1: (
+            pd.DataFrame(
+                [
+                    _gpu_row(index, "RTX 4090", "10 %", "1024/24576")
+                    for index in range(4)
+                ]
+            ),
+            {},
+        ),
+    }
+    pool._last_update_time = 1
+    pool._last_fetch_duration = 0.1
+    pool._last_fetch_error = None
+    pool._cache_lock = threading.Lock()
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 20)))
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    frame = pool._tui_diff_screen._previous
+    # One screen, no scrolling: the scaled frame fits the 20-line window.
+    assert len(frame) <= 19
+    assert any("line(s) hidden" in _without_ansi(line) for line in frame)
+    # Both server headers stay reachable for clicks.
+    assert {kind for kind, _ in pool._click_targets.values()} == {"server"}
 
 
 def _click(row):
