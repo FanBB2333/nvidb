@@ -181,21 +181,21 @@ def test_grouped_unified_table_uses_node_bands_instead_of_node_columns(monkeypat
     lines = pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     rendered = _without_ansi("\n".join(lines))
 
-    assert "training-node (100.64.0.42) -- 2 GPUs | free 1 | avg 38%" in rendered
+    assert "training-node (100.64.0.42) · 2 GPUs | free 1 | avg 38%" in rendered
     assert "VRAM 23/96G" in rendered
     # Node identity moved into the band, freeing the columns for GPU metrics.
     assert "Hostname/IP" not in rendered
     assert all(
         len(_without_ansi(line)) == 100
         for line in rendered.splitlines()
-        if line.startswith("|")
+        if line.startswith("│")
     )
 
     # Grouping only applies while rows follow node order.
     pool.unified_sort_mode = "utilization"
     flat = _without_ansi("\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1)))
     assert "Hostname/IP" in flat
-    assert "training-node (100.64.0.42) -- 2 GPUs" not in flat
+    assert "training-node (100.64.0.42) · 2 GPUs" not in flat
 
 
 def test_node_band_uses_a_dim_rule_instead_of_a_background_block(monkeypatch):
@@ -207,7 +207,7 @@ def test_node_band_uses_a_dim_rule_instead_of_a_background_block(monkeypatch):
     band = pool._format_section_band("training-node (10.0.0.1)", "2 GPUs | free 1", 60)
 
     assert len(_without_ansi(band)) == 60
-    assert _without_ansi(band).startswith("training-node (10.0.0.1) -- 2 GPUs | free 1 ---")
+    assert _without_ansi(band).startswith("training-node (10.0.0.1) · 2 GPUs | free 1 ───")
     assert "\x1b[36m" in band  # cyan node name
     assert "\x1b[2m" in band  # dim separator and rule
     assert "on_blue" not in band and "\x1b[44m" not in band
@@ -854,9 +854,9 @@ def test_detailed_focus_uses_quiet_highlight_and_solid_dashed_borders(
     ]
 
     assert gpu_plain.startswith("Focus GPU/node")
-    assert any(line.startswith("┌─") for line in gpu_plain.splitlines())
+    assert any(line.startswith("╭─") for line in gpu_plain.splitlines())
     assert any(
-        line.startswith("┌┄ Processes")
+        line.startswith("╭╌ Processes")
         for line in gpu_plain.splitlines()
     )
     assert len(gpu_highlights) == 1
@@ -876,11 +876,11 @@ def test_detailed_focus_uses_quiet_highlight_and_solid_dashed_borders(
 
     assert process_plain.startswith("Focus process")
     assert any(
-        line.startswith("┌┄┄")
+        line.startswith("╭╌╌")
         for line in process_plain.splitlines()
     )
     assert any(
-        line.startswith("┌─ Processes")
+        line.startswith("╭─ Processes")
         for line in process_plain.splitlines()
     )
     assert len(process_highlights) == 1
@@ -910,8 +910,8 @@ def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkey
     )
     plain = _without_ansi(rendered)
 
-    assert "training-node (100.64.0.42) -- 2 GPUs | free 1" in plain
-    assert "█" in plain and "░" in plain
+    assert "training-node (100.64.0.42) · 2 GPUs | free 1" in plain
+    assert "━" in plain and "─" in plain
     assert all(len(line) == 140 for line in plain.splitlines())
 
 

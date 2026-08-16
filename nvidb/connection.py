@@ -38,6 +38,7 @@ from .mouse import (
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .ssh_proxy import open_proxyjump_socket
+from .tui_theme import DiffScreen, frame_bottom, frame_separator, frame_top
 from .utils import (
     xml_to_dict,
     num_from_str,
@@ -2872,7 +2873,7 @@ class NVClientPool:
         pane_focused = (
             getattr(self, "unified_active_pane", "gpu") == "process"
         )
-        border_horizontal = "─" if pane_focused else "┄"
+        border_horizontal = "─" if pane_focused else "╌"
         border_vertical = "│" if pane_focused else "┊"
         label_color = "cyan" if pane_focused else "dark_grey"
         process_line_map = process_line_map if process_line_map is not None else {}
@@ -2888,7 +2889,7 @@ class NVClientPool:
             return text[: limit - 2] + ".."
 
         def panel_rule(label, *, bottom=False):
-            left, right = ("└", "┘") if bottom else ("├", "┤")
+            left, right = ("╰", "╯") if bottom else ("├", "┤")
             if not label:
                 plain = (
                     left
@@ -3049,10 +3050,10 @@ class NVClientPool:
         )
         top_tail = (
             border_horizontal * max(0, width - 2 - len(top_label))
-            + "┐"
+            + "╮"
         )
         lines = [
-            colored("┌", "dark_grey")
+            colored("╭", "dark_grey")
             + colored(
                 top_label,
                 label_color,
@@ -4128,7 +4129,7 @@ class NVClientPool:
         table_width = max(20, terminal_width)
         content_width = max(1, table_width - 4)
         pane_focused = getattr(self, "unified_active_pane", "gpu") == "gpu"
-        border_horizontal = "─" if pane_focused else "┄"
+        border_horizontal = "─" if pane_focused else "╌"
         border_vertical = "│" if pane_focused else "┊"
 
         def clean(value):
@@ -4310,7 +4311,7 @@ class NVClientPool:
             return line + padding
 
         def progress_bar(percent, width=10):
-            """Render a compact block bar; empty when the metric is unknown."""
+            """Render a smooth line bar; empty when the metric is unknown."""
             if percent is None or table_width < 100:
                 return ""
             try:
@@ -4320,7 +4321,7 @@ class NVClientPool:
             filled = int(round(value / 100.0 * width))
             if value > 0 and filled == 0:
                 filled = 1
-            return " [" + "█" * filled + "░" * (width - filled) + "]"
+            return " [" + "━" * filled + "─" * (width - filled) + "]"
 
         def card_rule(left, right):
             return colored(
@@ -4330,9 +4331,9 @@ class NVClientPool:
                 "dark_grey",
             )
 
-        top_border = card_rule("┌", "┐")
+        top_border = card_rule("╭", "╮")
         middle_border = card_rule("├", "┤")
-        bottom_border = card_rule("└", "┘")
+        bottom_border = card_rule("╰", "╯")
 
         def card_line(content):
             return (
@@ -4710,9 +4711,9 @@ class NVClientPool:
             width - 2,
         )
         lines = [
-            colored("┌", "dark_grey")
+            colored("╭", "dark_grey")
             + colored(title, "cyan", attrs=["bold"])
-            + colored("─" * max(0, width - 2 - len(title)) + "┐", "dark_grey")
+            + colored("─" * max(0, width - 2 - len(title)) + "╮", "dark_grey")
         ]
 
         max_entries = max(1, height - 2)
@@ -4746,7 +4747,7 @@ class NVClientPool:
                 + colored(" │", "dark_grey")
             )
 
-        lines.append(colored("└" + "─" * (width - 2) + "┘", "dark_grey"))
+        lines.append(colored("╰" + "─" * (width - 2) + "╯", "dark_grey"))
         return lines
 
     def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
@@ -5004,15 +5005,20 @@ class NVClientPool:
         return lines
 
     def _write_tui_lines(self, output_lines):
-        """Write one complete TUI frame to reduce visible flicker."""
-        screen = (
-            self.term.home
-            + "\n".join(self.term.clear_eol + line for line in output_lines)
-            + "\n"
-            + self.term.clear_eos
-        )
-        sys.stdout.write(screen)
-        sys.stdout.flush()
+        """Paint one TUI frame, rewriting only the rows that changed.
+
+        Whole-screen clears are what made refreshes flicker, especially
+        over SSH; diffing against the previous frame keeps a refresh
+        invisible when nothing moved.
+        """
+        rows = []
+        for line in output_lines:
+            rows.extend(str(line).split("\n"))
+        screen = getattr(self, "_tui_diff_screen", None)
+        if screen is None:
+            screen = DiffScreen(self.term)
+            self._tui_diff_screen = screen
+        screen.paint(rows)
 
     def _format_error_panel(self, message: str, error_type: Optional[str] = None) -> str:
         try:
@@ -5048,7 +5054,7 @@ class NVClientPool:
             return ""
         label = str(label)
         detail = str(detail)
-        separator = " -- "
+        separator = " · "
 
         if len(label) >= width:
             label = label[: width - 2] + ".." if width > 2 else label[:width]
@@ -5071,7 +5077,7 @@ class NVClientPool:
         if tail == 1:
             pieces.append(" ")
         elif tail > 1:
-            pieces.append(" " + colored("-" * (tail - 1), attrs=["dark"]))
+            pieces.append(" " + colored("─" * (tail - 1), attrs=["dark"]))
         return "".join(pieces)
 
     def _format_fixed_width_table(
@@ -5436,23 +5442,27 @@ class NVClientPool:
                 left = colored(left, bar_fg, on_color=fill_bg)
             return left + right
 
-        # Format table header
+        # Format table header. Interior separators are the same hairlines
+        # as the frame, so the table reads as one continuous surface
+        # instead of ASCII art.
+        cell_separator = colored(" │ ", "dark_grey")
         header_parts = []
         for col in selected_columns:
             width = column_widths.get(col, 12)
             col_name = truncate_text(str(column_labels.get(col, col)), width)
             header_parts.append(f"{col_name:^{width}}")
-        header = " | ".join(header_parts)
+        header_plain = " │ ".join(header_parts)
+        header = cell_separator.join(header_parts)
 
         # Format separator line
         separator_parts = []
         for col in selected_columns:
             width = column_widths.get(col, 12)
-            separator_parts.append("-" * width)
-        separator = "-+-".join(separator_parts)
+            separator_parts.append("─" * width)
+        separator = colored("─┼─", "dark_grey").join(separator_parts)
 
         # Format data rows
-        inner_width = len(header)
+        inner_width = len(header_plain)
         data_lines = []
         row_lines = {}
         for row_index, (_, row) in enumerate(df_display.iterrows()):
@@ -5516,17 +5526,25 @@ class NVClientPool:
                 # Center-align all other columns
                 row_parts.append(f"{value:^{width}}")
 
-            data_lines.append(" | ".join(row_parts))
+            data_lines.append(cell_separator.join(row_parts))
 
         result_lines = [header, separator] + data_lines
         data_offset = 2
         if border:
-            top = "+" + "-" * (inner_width + 2) + "+"
-            middle = "+-" + separator + "-+"
+            # A rounded hairline frame instead of ASCII `+--+` art: the
+            # corners flow into the rules and the whole border stays one
+            # dim grey, so the frame reads as a hairline, not a cage.
+            frame_width = inner_width + 4
+            side_l = colored("│ ", "dark_grey")
+            side_r = colored(" │", "dark_grey")
             result_lines = (
-                [top, f"| {header} |", middle]
-                + [f"| {line} |" for line in data_lines]
-                + [top]
+                [
+                    colored(frame_top(frame_width), "dark_grey"),
+                    side_l + header + side_r,
+                    colored(frame_separator(frame_width), "dark_grey"),
+                ]
+                + [side_l + line + side_r for line in data_lines]
+                + [colored(frame_bottom(frame_width), "dark_grey")]
             )
             data_offset = 3
 

@@ -24,6 +24,7 @@ from ..mouse import (
     ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
     MouseSequenceParser,
 )
+from ..tui_theme import DiffScreen, smooth_bar
 from . import db as dbm
 from .model import (
     GpuProcess,
@@ -707,13 +708,6 @@ class QueueTUI:
         bar_width = 20 if width >= 110 else 10
         external = max(0, gpu["external_mem_mb"])
         reserved = max(0, gpu["reserved_mb"])
-        external_cells = int(round(bar_width * min(1.0, external / total)))
-        reserved_cells = (
-            int(round(bar_width * min(1.0, (external + reserved) / total)))
-            - external_cells
-        )
-        reserved_cells = max(0, reserved_cells)
-        free_cells = max(0, bar_width - external_cells - reserved_cells)
 
         # Quiet by default: a healthy number is grey, colour appears only once
         # a value is worth a second look.
@@ -747,13 +741,24 @@ class QueueTUI:
             (pad_display(fit_display(gpu["name"] or "-", name_width), name_width + 1), None),
             (temp_text + " ", temp_style),
             (util_text + " ", util_style),
-            ("▕", "bright_black"),
-            ("█" * external_cells, "yellow"),
-            ("█" * reserved_cells, "cyan"),
-            ("░" * free_cells, "bright_black"),
-            ("▏ ", "bright_black"),
-            (f"free {format_mb(gpu['free_mb']):>6}", free_style),
         ]
+        # One continuous line - heavy where memory is spoken for, dim where
+        # it is free - instead of a stack of block glyphs.
+        segments.extend(
+            smooth_bar(
+                bar_width,
+                (
+                    (min(1.0, external / total), "yellow"),
+                    (min(1.0, reserved / total), "cyan"),
+                ),
+            )
+        )
+        segments.extend(
+            (
+                (" ", "bright_black"),
+                (f"free {format_mb(gpu['free_mb']):>6}", free_style),
+            )
+        )
         # Whole-card occupancy: what is actually on the GPU matters even when
         # none of it came from this queue.
         if width >= 120:
@@ -979,7 +984,7 @@ class QueueTUI:
         job = self.selected_job()
         if job is None:
             return None
-        title = f"─ ▶ JOB {job['id']} DETAIL HIDDEN — Enter to show "
+        title = f"─ ▶ JOB {job['id']} DETAIL HIDDEN · Enter to show "
         return self._style(
             title + "─" * max(0, width - display_width(title)),
             "bright_black",
@@ -1111,15 +1116,17 @@ class QueueTUI:
         for label, action, value, style in controls:
             token = f"[{label}]"
             token_width = display_width(token)
-            needed = 1 + token_width
-            if segments and column + needed > width:
+            # Buttons sit on one line separated by a muted dot, the way
+            # tokscale separates its footer hints.
+            separator = " · " if segments else " "
+            if segments and column + display_width(separator) + token_width > width:
                 finish_line()
-            prefix = " "
-            start = column + display_width(prefix)
+                separator = " "
+            start = column + display_width(separator)
             available = max(1, width - start)
             shown = fit_display(token, available)
             shown_width = display_width(shown)
-            segments.extend(((prefix, None), (shown, style)))
+            segments.extend(((separator, "bright_black"), (shown, style)))
             if shown_width:
                 regions.append(
                     (
@@ -1301,6 +1308,11 @@ class QueueTUI:
         return lines
 
     def render(self, state: Dict[str, Any]) -> str:
+        """The whole frame as one string; tests read this, the loop paints
+        only what changed between frames."""
+        return "\n".join(self._frame_lines(state))
+
+    def _frame_lines(self, state: Dict[str, Any]) -> List[str]:
         width = max(60, self.term.width or 100)
         height = max(20, self.term.height or 30)
         self._click_regions = []
@@ -1310,7 +1322,7 @@ class QueueTUI:
         self._snapshot = snapshot
         if snapshot is None:
             message = state.get("error") or "connecting to nodes…"
-            return self.term.home + self.term.clear + f"\n  {message}\n"
+            return [f"  {message}"]
 
         self.nodes = snapshot["nodes"]
         self.jobs = self._visible_jobs(snapshot)
@@ -1449,11 +1461,7 @@ class QueueTUI:
         self._row_targets = {
             row: target for row, target in self._row_targets.items() if row < len(lines)
         }
-
-        output = [self.term.home + self.term.clear]
-        for line in lines:
-            output.append(self.term.clear_eol + line + "\n")
-        return "".join(output)
+        return lines
 
     # --- input ------------------------------------------------------------
 
@@ -1827,6 +1835,7 @@ class QueueTUI:
     def run(self) -> int:
         term = self.term
         parser = MouseSequenceParser()
+        screen = DiffScreen(term)
         self.worker.start()
         try:
             with term.fullscreen(), term.cbreak(), term.hidden_cursor():
@@ -1839,7 +1848,7 @@ class QueueTUI:
                             job = self.selected_job()
                             if job:
                                 self.worker.set_log_request((job["id"], "stdout"))
-                        print(self.render(state), end="", flush=True)
+                        screen.paint(self._frame_lines(state))
                         key = term.inkey(timeout=0.4)
                         events, keys = parser.feed(key) if key else ([], parser.flush())
                         for event in events:

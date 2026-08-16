@@ -144,9 +144,16 @@ def test_a_saturated_direction_is_red_and_a_quiet_one_is_not(monkeypatch):
     )
 
     row_line = [line for line in rendered.splitlines() if "7.0GB/s" in line][0]
-    cells = row_line.split("|")
-    rx_cell = [cell for cell in cells if "7.0GB/s" in cell][0]
-    tx_cell = [cell for cell in cells if "20MB/s" in cell][0]
+    cells = row_line.split("│")
+
+    def _cell(marker):
+        cell = [cell for cell in cells if marker in cell][0]
+        # The hairline separators carry their own dim-grey codes; they are
+        # chrome, not cell content, so they do not count as cell colour.
+        return cell.replace("\x1b[90m", "").replace("\x1b[0m", "")
+
+    rx_cell = _cell("7.0GB/s")
+    tx_cell = _cell("20MB/s")
 
     assert "\x1b[41m" in rx_cell  # RX fills its cell in red at 95% of the link
     # The quiet direction stays plain instead of borrowing RX's colour.
