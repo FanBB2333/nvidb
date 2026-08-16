@@ -177,8 +177,9 @@ class _Worker(threading.Thread):
         self._scheduler = Scheduler(conn)
         try:
             self._scheduler.sync_nodes_from_config()
-        except Exception:
-            pass
+        except Exception as error:
+            with self.state_lock:
+                self.error = f"cannot sync nodes from config: {error}"
 
         next_refresh = 0.0
         while not self._stop_event.is_set():

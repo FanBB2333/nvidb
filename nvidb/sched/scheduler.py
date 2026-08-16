@@ -215,7 +215,7 @@ class Scheduler:
     # --- backends ---------------------------------------------------------
 
     def _default_backend_factory(self, node: Node) -> NodeBackend:
-        servers = (self.cfg or {}).get("servers") or []
+        servers = self.cfg.get("servers") or []
         server = None
         for candidate in servers:
             if node_name_for_server(candidate) == node.name:
@@ -263,7 +263,7 @@ class Scheduler:
     def _configured_node_names(self) -> Set[str]:
         names = {
             node_name_for_server(server)
-            for server in (self.cfg or {}).get("servers") or []
+            for server in self.cfg.get("servers") or []
         }
         if self.settings.get("include_local"):
             names.add(str(self.settings.get("local_node_name") or "local"))
@@ -288,7 +288,7 @@ class Scheduler:
         """Mirror the queue configuration's server list into the `nodes` table."""
         self._gpu_allowlists = gpu_allowlists(self.cfg)
         names = []
-        for server in (self.cfg or {}).get("servers") or []:
+        for server in self.cfg.get("servers") or []:
             name = node_name_for_server(server)
             dbm.upsert_node(
                 self.conn,

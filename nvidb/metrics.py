@@ -10,8 +10,6 @@ HIDDEN_COLUMN_PREFIX = "_nvidb_"
 
 def visible_columns(df_columns: Iterable[str]) -> list[str]:
     """Drop the renderer-only columns from a GPU table's column list."""
-    if df_columns is None:
-        return []
     return [
         column
         for column in df_columns
@@ -44,8 +42,5 @@ ADVANCED_METRIC_GROUPS: Sequence[tuple[str, Sequence[str]]] = (
 
 
 def present_columns(df_columns: Iterable[str], desired: Sequence[str]) -> list[str]:
-    if df_columns is None:
-        cols = set()
-    else:
-        cols = set(list(df_columns))
+    cols = set(df_columns)
     return [c for c in desired if c in cols]

@@ -35,55 +35,29 @@ try:
 except Exception:  # pragma: no cover
     dash = None
 
-try:
-    from nvidb.metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
-except ImportError:  # pragma: no cover
-    from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
+from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
 
 # Reuse the UI-agnostic data layer from the legacy web module.
-try:
-    from nvidb.web import (
-        _LOG_METRICS,
-        _as_path,
-        _build_log_snapshot_table,
-        _downsample_per_gpu,
-        _format_datetime,
-        _format_duration,
-        _format_gb,
-        _format_mib,
-        _load_server_list,
-        _parse_mib_pair,
-        _parse_percent,
-        _server_summary,
-        _strip_gpu_name,
-        _user_memory_from_df,
-        _user_summary_df,
-        _user_time_share_df,
-        get_db_path,
-        load_session_logs,
-        load_sessions,
-    )
-except ImportError:  # pragma: no cover
-    from .web import (
-        _LOG_METRICS,
-        _as_path,
-        _build_log_snapshot_table,
-        _downsample_per_gpu,
-        _format_datetime,
-        _format_duration,
-        _format_gb,
-        _load_server_list,
-        _parse_mib_pair,
-        _parse_percent,
-        _server_summary,
-        _strip_gpu_name,
-        _user_memory_from_df,
-        _user_summary_df,
-        _user_time_share_df,
-        get_db_path,
-        load_session_logs,
-        load_sessions,
-    )
+from .web import (
+    _LOG_METRICS,
+    _as_path,
+    _build_log_snapshot_table,
+    _downsample_per_gpu,
+    _format_datetime,
+    _format_duration,
+    _format_gb,
+    _load_server_list,
+    _parse_mib_pair,
+    _parse_percent,
+    _server_summary,
+    _strip_gpu_name,
+    _user_memory_from_df,
+    _user_summary_df,
+    _user_time_share_df,
+    get_db_path,
+    load_session_logs,
+    load_sessions,
+)
 
 
 # ---------------------------------------------------------------------------

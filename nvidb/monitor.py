@@ -13,11 +13,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, List, Dict, Any
 import asyncio
 
-try:
-    import pynvml
-    PYNVML_AVAILABLE = True
-except ImportError:
-    PYNVML_AVAILABLE = False
+# pynvml is a hard dependency (connection.py imports it unconditionally),
+# so no availability flag is needed here.
+import pynvml
 
 
 @dataclass
@@ -102,9 +100,6 @@ class GPUMonitor:
     
     def _init_nvml(self) -> bool:
         """Initialize NVML and get GPU handles"""
-        if not PYNVML_AVAILABLE:
-            return False
-        
         try:
             pynvml.nvmlInit()
             gpu_count = pynvml.nvmlDeviceGetCount()

@@ -158,10 +158,15 @@ def make_dcgm_snapshot_command(*, python_exe: str = "python3") -> str:
 
         try:
             group.samples.WatchFields(field_group, 1_000_000, 30.0, 1)
-            system.UpdateAllFields(True)
         except Exception:
             # Some fields (especially profiling) may fail to watch on unsupported GPUs.
             pass
+
+        try:
+            system.UpdateAllFields(True)
+        except Exception as e:
+            print(json.dumps({{"ok": False, "error": "dcgm_update_failed", "detail": str(e)}}))
+            raise SystemExit(0)
 
         try:
             fvc = group.samples.GetLatest(field_group)
