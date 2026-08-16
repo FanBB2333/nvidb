@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -208,6 +209,8 @@ class Scheduler:
         self._gpu_allowlists = gpu_allowlists(self.cfg)
         self._configured_nodes = self._configured_node_names()
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+        self._last_lease_renewal = 0.0
+        self._last_sync_signature = None
         self._backend_factory = backend_factory or self._default_backend_factory
         self._backends: Dict[str, NodeBackend] = {}
         self._lock = threading.RLock()
@@ -285,10 +288,23 @@ class Scheduler:
         self.close()
 
     def sync_nodes_from_config(self) -> List[str]:
-        """Mirror the queue configuration's server list into the `nodes` table."""
+        """Mirror the queue configuration's server list into the `nodes` table.
+
+        Runs once per CLI invocation and again at the head of every tick; when
+        the configuration has not changed since the last mirror, the writes
+        are skipped rather than repeated verbatim.
+        """
         self._gpu_allowlists = gpu_allowlists(self.cfg)
+        servers = self.cfg.get("servers") or []
+        signature = (
+            json.dumps(servers, sort_keys=True),
+            bool(self.settings.get("include_local")),
+            str(self.settings.get("local_node_name") or "local"),
+        )
+        if signature == self._last_sync_signature:
+            return list(self._configured_nodes)
         names = []
-        for server in self.cfg.get("servers") or []:
+        for server in servers:
             name = node_name_for_server(server)
             dbm.upsert_node(
                 self.conn,
@@ -305,6 +321,7 @@ class Scheduler:
             )
             names.append(local_name)
         self._configured_nodes = set(names)
+        self._last_sync_signature = signature
         return names
 
     # --- administration ---------------------------------------------------
@@ -319,10 +336,17 @@ class Scheduler:
         )
 
     def _renew_tick_lease(self) -> None:
+        # Renewals sit at many points in one tick, most inside per-item loops.
+        # One write per third of the TTL keeps the lease held with the same
+        # margin while cutting the write traffic by an order of magnitude.
+        now = time.monotonic()
+        if now - self._last_lease_renewal < self._lease_ttl() / 3:
+            return
         if not dbm.acquire_lock(
             self.conn, TICK_LOCK, self.owner, self._lease_ttl()
         ):
             raise SchedulerLeaseLost("scheduler lease was lost during the tick")
+        self._last_lease_renewal = now
 
     @contextmanager
     def _operation_lease(self, operation: str):
@@ -622,6 +646,7 @@ class Scheduler:
             summary["skipped"] = "locked"
             summary["lock_owner"] = holder["owner"] if holder else None
             return summary
+        self._last_lease_renewal = time.monotonic()
 
         try:
             summary["ran"] = True

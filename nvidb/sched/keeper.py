@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -330,12 +331,27 @@ def _systemd_status() -> tuple:
     return True, pid or None
 
 
+_STATUS_CACHE_TTL = 10.0
+_status_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _reset_status_cache() -> None:
+    """Tests poke the filesystem directly, so they drop the cache explicitly."""
+    _status_cache["at"] = 0.0
+    _status_cache["value"] = None
+
+
 def status() -> Dict[str, Any]:
     """Whether a keeper is installed here and whether it is running.
 
     Shell mode verifies both the pid and the unique token in its command line,
     so a stale pid file cannot mistake an unrelated process for the keeper.
+    The answer costs one or two subprocess spawns and only changes when the
+    user starts or stops the keeper, so it is cached for a few seconds.
     """
+    now = time.monotonic()
+    if _status_cache["value"] is not None and now - _status_cache["at"] < _STATUS_CACHE_TTL:
+        return dict(_status_cache["value"])
     manager_name = manager()
     if manager_name == "systemd":
         running, pid = _systemd_status()
@@ -347,7 +363,7 @@ def status() -> Dict[str, Any]:
         if manager_name == "systemd"
         else str(log_file())
     )
-    return {
+    value = {
         "installed": script_path().exists(),
         "running": running,
         "pid": pid if running else None,
@@ -356,6 +372,9 @@ def status() -> Dict[str, Any]:
         "unit": str(systemd_unit_path()) if manager_name == "systemd" else None,
         "log": log,
     }
+    _status_cache["at"] = now
+    _status_cache["value"] = dict(value)
+    return value
 
 
 def run(action: str, *extra: str) -> subprocess.CompletedProcess:

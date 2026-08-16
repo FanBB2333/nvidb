@@ -204,7 +204,6 @@ class SSHTransport(Transport):
         with self._lock:
             self._close_locked()
 
-    @property
     def run(self, command: str, timeout: Optional[float] = None) -> CommandResult:
         timeout = timeout or DEFAULT_COMMAND_TIMEOUT
         with self._lock:

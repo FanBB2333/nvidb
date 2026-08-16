@@ -340,6 +340,7 @@ class QueueTUI:
         self.detail_pages = 1
         self._detail_job_id: Optional[int] = None
         self.log_offset = 0
+        self._last_log_request: Optional[Tuple[int, str]] = None
         self._log_max_offset = 0
         self._log_page_height = 1
         self.pending_confirm: Optional[Tuple[str, int, float]] = None
@@ -1464,6 +1465,18 @@ class QueueTUI:
         }
         return lines
 
+    def _request_log(self, request: Optional[Tuple[int, str]]) -> None:
+        """Forward a log request to the worker, skipping unchanged ones.
+
+        The render loop re-asserts the current selection every frame; without
+        this memo each frame would take the worker's state lock to say
+        nothing. The worker keeps its own `!=` guard for other callers.
+        """
+        if request == self._last_log_request:
+            return
+        self._last_log_request = request
+        self.worker.set_log_request(request)
+
     # --- input ------------------------------------------------------------
 
     def _move(self, delta: int) -> None:
@@ -1479,7 +1492,7 @@ class QueueTUI:
                 self.pending_confirm = None
                 if self.show_log:
                     job = self.selected_job()
-                    self.worker.set_log_request(
+                    self._request_log(
                         (job["id"], "stdout") if job is not None else None
                     )
 
@@ -1491,7 +1504,7 @@ class QueueTUI:
             self.detail_page = 0
             self.log_offset = 0
         elif self.show_log:
-            self.worker.set_log_request(None)
+            self._request_log(None)
 
     def _toggle_log(self) -> None:
         job = self.selected_job()
@@ -1501,7 +1514,7 @@ class QueueTUI:
         self.show_detail = True
         self.detail_page = 0
         self.log_offset = 0
-        self.worker.set_log_request(
+        self._request_log(
             (job["id"], "stdout") if self.show_log else None
         )
 
@@ -1536,7 +1549,7 @@ class QueueTUI:
             self.pending_confirm = None
             if self.show_log:
                 job = self.selected_job()
-                self.worker.set_log_request(
+                self._request_log(
                     (job["id"], "stdout") if job is not None else None
                 )
         elif current and toggle_current:
@@ -1563,7 +1576,7 @@ class QueueTUI:
                     self.show_log = True
                     self.show_detail = True
                     self.log_offset = 0
-                    self.worker.set_log_request((job_id, "stdout"))
+                    self._request_log((job_id, "stdout"))
                 return True
         return False
 
@@ -1618,7 +1631,7 @@ class QueueTUI:
                 self.jobs = self._visible_jobs(self._snapshot)
             if self.show_log:
                 job = self.selected_job()
-                self.worker.set_log_request(
+                self._request_log(
                     (job["id"], "stdout") if job is not None else None
                 )
         elif action == "sort":
@@ -1848,7 +1861,7 @@ class QueueTUI:
                         if self.show_log and self.show_detail:
                             job = self.selected_job()
                             if job:
-                                self.worker.set_log_request((job["id"], "stdout"))
+                                self._request_log((job["id"], "stdout"))
                         screen.paint(self._frame_lines(state))
                         key = term.inkey(timeout=0.4)
                         events, keys = parser.feed(key) if key else ([], parser.flush())

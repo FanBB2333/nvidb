@@ -14,6 +14,33 @@ from nvidb.sched import keeper as keeper_mod
 from nvidb.sched import remote as remote_mod
 
 
+@pytest.fixture(autouse=True)
+def fresh_keeper_status_cache(monkeypatch):
+    """status() caches for a few seconds in production; tests change the
+    filesystem between calls and must see each change immediately."""
+    monkeypatch.setattr(keeper_mod, "_STATUS_CACHE_TTL", 0.0)
+    keeper_mod._reset_status_cache()
+    yield
+    keeper_mod._reset_status_cache()
+
+
+def test_status_answers_from_cache_within_the_ttl(monkeypatch, nvidb_home):
+    calls = {"n": 0}
+
+    def fake_pid():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(keeper_mod, "_pid", fake_pid)
+    monkeypatch.setattr(keeper_mod, "_STATUS_CACHE_TTL", 60.0)
+
+    first = keeper_mod.status()
+    second = keeper_mod.status()
+
+    assert first == second
+    assert calls["n"] == 1  # the second answer came from the cache
+
+
 @pytest.fixture
 def nvidb_home(isolated_nvidb_config, tmp_path, monkeypatch):
     """An isolated working directory, as `NVIDB_HOME` would give.

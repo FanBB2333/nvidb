@@ -74,6 +74,10 @@ class BaseClient(ABC):
         self.connected = False
         self.last_connect_error = None
         self.last_error_type = None
+        # A host that answered "no DCGM here" stays that way, and core count
+        # never changes; remembering both saves one remote round trip each.
+        self._dcgm_probe_failed = False
+        self._cpu_cores = None
 
     def _set_connect_error(self, message: str, error_type: str = "error"):
         self.connected = False
@@ -508,7 +512,11 @@ class BaseClient(ABC):
                 return "N/A"
             return f"{num:.1f} W" if abs(num - int(num)) > 0.01 else f"{int(num)} W"
 
-        # Fetch advanced profiling metrics via DCGM (optional)
+        # Fetch advanced profiling metrics via DCGM (optional). A host without
+        # DCGM answers the same way on every refresh, so the failure is cached
+        # instead of paying the remote python startup per tick forever.
+        if self._dcgm_probe_failed:
+            return stats, system_info
         try:
             dcgm_cmd = make_dcgm_snapshot_command()
             dcgm_out = self.execute_command(dcgm_cmd)
@@ -608,6 +616,8 @@ class BaseClient(ABC):
                     system_info["advanced_source_detail"] = payload.get("connection") or "N/A"
                     system_info["advanced_metrics"] = adv_df
                     system_info["advanced_supported"] = advanced_supported
+            else:
+                self._dcgm_probe_failed = True
         except Exception:
             # DCGM is optional; ignore failures.
             pass
@@ -635,15 +645,18 @@ class BaseClient(ABC):
         }
 
         try:
-            # Get CPU cores - try Linux first, then macOS
-            cpu_output = self.execute_command("nproc")
-            if cpu_output and cpu_output.strip().isdigit():
-                result["cpu_cores"] = int(cpu_output.strip())
-            else:
-                # Try macOS sysctl
-                cpu_output = self.execute_command("sysctl -n hw.ncpu")
+            # Core count never changes, so ask the host once and remember.
+            if self._cpu_cores is None:
+                cpu_output = self.execute_command("nproc")
                 if cpu_output and cpu_output.strip().isdigit():
-                    result["cpu_cores"] = int(cpu_output.strip())
+                    self._cpu_cores = int(cpu_output.strip())
+                else:
+                    # Try macOS sysctl
+                    cpu_output = self.execute_command("sysctl -n hw.ncpu")
+                    if cpu_output and cpu_output.strip().isdigit():
+                        self._cpu_cores = int(cpu_output.strip())
+            if self._cpu_cores is not None:
+                result["cpu_cores"] = self._cpu_cores
 
             # Get CPU utilization - try Linux first
             cpu_usage_output = self.execute_command(
