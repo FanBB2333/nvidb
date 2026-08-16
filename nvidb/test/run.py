@@ -5,6 +5,7 @@ import argparse
 import shutil
 from pathlib import Path
 from paramiko import SSHConfig
+from ..connection import NVClientPool
 from ..data_modules import ServerListInfo
 from ..logger import run_sqlite_logger
 from .. import config
@@ -936,10 +937,10 @@ def main():
     # Deprecated alias (use `nvidb web` instead)
     log_web_parser = log_subparsers.add_parser('web', help='(deprecated) Use `nvidb web`')
     log_web_parser.add_argument('--db-path', type=str, default=None, help='Database path')
-    log_web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
+    log_web_parser.add_argument('--port', type=int, default=8501, help='Dash server port (default: 8501)')
     web_parser = subparsers.add_parser('web', help='Open web dashboard (Live + Logs)')
     web_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
-    web_parser.add_argument('--port', type=int, default=8501, help='Streamlit port (default: 8501)')
+    web_parser.add_argument('--port', type=int, default=8501, help='Dash server port (default: 8501)')
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
     clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
     # Cluster job queue (`nvidb queue`, `nvidb job ...`)

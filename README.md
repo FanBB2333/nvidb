@@ -837,4 +837,4 @@ Remote info:
 - Thanks to [pandas](https://github.com/pandas-dev/pandas) for parsing and processing GPU stats and log data.
 - Thanks to [blessed](https://github.com/jquast/blessed) for building the interactive terminal UI.
 - Thanks to [termcolor](https://github.com/termcolor/termcolor) for colored terminal output.
-- Thanks to [Streamlit](https://github.com/streamlit/streamlit) for providing the web dashboard framework.
+- Thanks to [Dash](https://github.com/plotly/dash) and [Plotly](https://github.com/plotly/plotly.py) for powering the web dashboard.

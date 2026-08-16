@@ -1,9 +1,10 @@
 # nvidb refactor plan
 
-> ## 0. 执行进度（更新于 2026-08-16）
+> ## 0. 执行进度（更新于 2026-08-17）
 >
-> 工作树干净，所有已完成阶段均已提交，`pytest tests/` 全绿（413 passed）。
-> 原始计划正文保留在下方，行号基于扫描时的树，后续阶段请按符号名定位。
+> 工作树干净，所有已完成阶段均已提交，`pytest tests/` 全绿（455 passed，阶段 3 新增
+> 42 个 webdata 表征测试）。原始计划正文保留在下方，行号基于扫描时的树，后续阶段请按
+> 符号名定位。
 >
 > ### 已完成
 >
@@ -13,42 +14,16 @@
 > | 前置 | `6e285ef` | NODES 视图默认全展开 + 按终端高度自适应缩放（`_scale_server_blocks`） |
 > | 阶段 1 | `a5dde1f` | 零风险删除：~730 行（run.py 调试入口/别名/init 双解析；connection.py 的 nvidbInit、pool 级 execute_command 系列、BaseClient 死方法、双 get_client、swap 死解析；utils.py 损坏查询助手；data_modules.py 的 GPUProcess/GPUInfo + 注释块【使 `import nvidb` 不再经死路径拉起 paramiko+pandas】；sched 的 TransportPool、write_file、purge_alerts、只写不读的 LaunchResult 字段、tick/_terminate/get_meta/purge_jobs/probe 死参数、未使用的 Queue/open_queue API；`build/`、`nvidb.egg-info/`、`nvidb/src/`、example_interactive.py、误导性 print；ruff F401/F841 清扫）。注意：`ServerListInfo.to_dict` 被测试使用，已保留 |
 > | 阶段 2 | `70e59b5` | 不可达兜底：connection.py 145 处 `getattr(self,…)` + 5 处 hasattr → 直接属性访问（唯一真懒加载 `_tui_diff_screen` 保留 getattr；测试 fixture 用 `__new__` 绕过 `__init__` 但已设齐属性，无需改）；connect() 重复 except 合并；`x[:11] if len(x)>11` 等 no-op 化简；键盘监听器崩溃改为记日志；dashboard.py import fallback 收敛；monitor.py `PYNVML_AVAILABLE` 删除；scheduler.py `(self.cfg or {})` → `self.cfg`；队列 TUI 配置同步失败改走 error 通道；metrics.py None 守卫删除；dcgm.py WatchFields/UpdateAllFields 共用 except 拆分 |
+> | 阶段 3 | （待提交，见下） | 删除 web.py 的 Streamlit UI（~1,320 行），保留的 ~660 行数据层改名为 `nvidb/webdata.py`；`dashboard.py` 改从 `.webdata` 导入；折叠其中已证明不可达的 `try/except ImportError` 相对导入 fallback；删 `nvidb/.streamlit/config.toml`；修 `run.py` 两处 "Streamlit port" 帮助文案与 `README.md` 致谢措辞（Streamlit → Dash/Plotly）；为数据层新增 `tests/test_webdata.py`（42 例，覆盖此前零覆盖的解析/格式化/汇总函数）；手动验证 `nvidb web`（Dash 页面 HTTP 200）与 bare `nvidb --once`（真实连接远程节点）均可正常运行。**顺带修复阶段 1/2 引入的两个真实回归**：① `run.py` 顶部误删了 `from ..connection import NVClientPool`（当时以为只有死代码在用，实际上是裸 `nvidb` 默认动作在用，会导致主入口直接 `NameError` 崩溃）；② `monitor.py::_take_snapshot` 在阶段 1 删除局部 `snapshots` 字典构建时漏删了末尾 `return snapshots`，导致 `NameError`，会静默杀死 `@nvidb.monitor` 装饰器的后台采样线程。两者都不在 pytest 覆盖范围内（`nvidb/test/run.py` 的裸命令路径和 `monitor.py` 均无测试），是手动跑 CLI/装饰器验证时发现的 |
 >
-> ### 下一步：阶段 3（已做完依赖分析，可直接执行）
+> ### 下一步：阶段 4（§3.1/§3.3，未开始）
 >
-> 删除 web.py 的 Streamlit UI（~1,320 行），保留 dashboard.py 依赖的 ~660 行数据层。
-> `dash` 在当前环境可导入（`nvidb web` 可手动验证）。已确认的边界：
->
-> **保留**（dashboard.py:41 导入 + 数据层内部依赖）：
-> `get_db_path`、`_as_path`、`load_sessions`、`load_session_logs`、`_parse_percent`、
-> `_parse_mib_pair`、`_parse_temperature_c`、`_MEM_UNIT_TO_MIB`、`_parse_memory_gib`、
-> `_BW_UNIT_TO_MBPS`、`_parse_bandwidth_mbps`、`_parse_power_watts`、`_as_datetime`、
-> `_format_datetime`、`_format_duration`、`_format_gb`、`_format_mib`（`_user_summary_df` 内用）、
-> `_server_summary`、`_strip_gpu_name`、`_user_summary_df`、`_USER_MEM_RE`、
-> `_parse_user_memory_compact`、`_user_memory_from_df`、`_user_time_share_df`、
-> `_build_log_snapshot_table`、`_LOG_METRICS`、`_downsample_per_gpu`、`_load_server_list`。
->
-> **删除**（仅被 Streamlit 侧引用）：`_ensure_streamlit`、`_TEAL_PRIMARY`、
-> `_SIDEBAR_WIDTH_PX`、`_CHART_COLOR_RANGE`、`_apply_streamlit_theme`、`_apply_app_styles`、
-> `_trigger_rerun`、`_maybe_cache_data`、`_autorefresh`、`_center_dataframe`、
-> `_render_gpu_column_checkboxes`、`_render_progress_bar_html`、`_render_gpu_table`、
-> `_GPU_TABLE_COLUMNS`/`_DEFAULT_GPU_TABLE_COLUMNS`、`_get_local_system_info`、`_get_pool`、
-> `_LiveStatsCache`、`_get_live_cache`、`show_live_dashboard`、`_load_sessions_cached`、
-> `_load_session_logs_cached`、`_render_timeseries_chart`、`show_logs_dashboard`、
-> `main`、`run_streamlit_app`。
->
-> 执行步骤：
-> 1. 删上述死侧；按计划改名 `web.py` → `webdata.py`（唯一导入方是 dashboard.py:41），改写模块 docstring；
-> 2. 删 `nvidb/.streamlit/config.toml`；修 `nvidb/test/run.py` 两处 "(deprecated) … Streamlit port" 帮助文案与 `README.md` 约 840 行的 Streamlit 措辞；
-> 3. 删去不再用的 imports（argparse、importlib.util、platform、threading、time 等）；
-> 4. 为数据层补一组廉价表征测试（如 `_server_summary` 固定输入输出、`load_sessions` 空库、`_parse_*`），因为该层原本零覆盖；
-> 5. 手动验证 `nvidb web` 能起（dash 可用）；跑全量 pytest；单独 commit。
+> 共享助手收敛（truncate/display_width/阈值配色/设置合并；`tui_theme` 成为唯一家，
+> `sched/model.py` re-export 保测试；executor.py 的 kill-guard shell 模板四处复制 →
+> 一个模板生成器【正确性风险项，优先】）。
 >
 > ### 其余阶段（按 §9 顺序，未开始）
 >
-> - 阶段 4（§3.1/§3.3）：共享助手收敛（truncate/display_width/阈值配色/设置合并；
->   `tui_theme` 成为唯一家，`sched/model.py` re-export 保测试；executor.py 的
->   kill-guard shell 模板四处复制 → 一个模板生成器【正确性风险项，优先】）。
 > - 阶段 5（§5，性价比最高）：DCGM 失败负缓存、`cpu_cores` 每客户端缓存、
 >   lease 续约节流（ttl/3）、`sync_nodes_from_config` 双跑去重、keeper.status 缓存 ~10s、
 >   `sched/tui.py` 主循环 `set_log_request` 守卫、dashboard 单遍聚合。
@@ -63,13 +38,20 @@
 >
 > ### 本轮执行中的经验（供后续会话参考）
 >
-> - 计划行号已因两次前置 commit 偏移，按符号名定位；
+> - 计划行号已因多次前置 commit 偏移，按符号名定位；
 > - `grep` 验证死符号时不要把定义文件本身从结果里过滤掉（`ServerListInfo.to_dict`
 >   因此误删过一次，已恢复）；
 > - 用 python 脚本按 marker 切块删除时，注意"空行"可能是 4 空格行、装饰器行在
 >   def 之上（`_throughput_kib_per_second` 的 `@staticmethod` 曾被漏掉）；
 > - 测试 fixture `_pool()` 以 `__new__` 构造并手工设 ~60 个属性，凡给
->  NVClientPool 新增 `__init__` 属性，需同步 fixture。
+>  NVClientPool 新增 `__init__` 属性，需同步 fixture；
+> - **`pytest tests/` 全绿不等于没有回归**：`nvidb/test/run.py` 的裸命令默认动作
+>   （`nvidb` 不带子命令）和整个 `monitor.py` 都不在 pytest 覆盖范围内，阶段 1/2 在
+>   这两处各留下一个 `NameError`（删导入删多了 / 删代码删漏了 return 语句），直到
+>   阶段 3 手动跑 `nvidb --once` 和 `@nvidb.monitor` 才暴露。**删除"未使用的导入/变量"
+>   或"死代码分支"后，必须真正跑一次 CLI 默认路径和无测试覆盖的模块，不能只看 pytest
+>   和 ruff 是否通过**——ruff 对前者报的是 F401（看起来人畜无害），对后者完全没报（脚本
+>   里改了函数体，ruff 不知道调用方期望什么返回值）。
 
 Scan date: 2026-08-16, against the current working tree (including the uncommitted
 changes to `connection.py`, `sched/tui.py`, and the new `tui_theme.py`).

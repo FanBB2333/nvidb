@@ -159,9 +159,7 @@ class GPUMonitor:
                     
             except Exception:
                 pass  # Skip failed snapshots
-        
-        return snapshots
-    
+
     def _sampling_loop(self):
         """Background sampling loop"""
         while not self._stop_event.is_set():

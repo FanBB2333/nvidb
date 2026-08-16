@@ -4,7 +4,7 @@ Dash web interface for nvidb (Live GPU + Log viewer).
 Usage:
     nvidb web                 # Web dashboard (Live + Logs)
 
-Replaces the previous Streamlit UI; the data layer in `nvidb.web` is reused.
+Replaces the previous Streamlit UI; the data layer in `nvidb.webdata` is reused.
 """
 
 import json
@@ -37,8 +37,8 @@ except Exception:  # pragma: no cover
 
 from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
 
-# Reuse the UI-agnostic data layer from the legacy web module.
-from .web import (
+# Reuse the UI-agnostic data layer.
+from .webdata import (
     _LOG_METRICS,
     _as_path,
     _build_log_snapshot_table,
