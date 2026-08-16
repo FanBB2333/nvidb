@@ -24,6 +24,7 @@ def _gpu_row(gpu_index, name, utilization, memory, processes="-"):
         "fan": "30 %",
         "util": utilization,
         "temp": "48 C",
+        "link": "4.0x16",
         "rx": "1 KB/s",
         "tx": "2 KB/s",
         "power": "P2 80/200",

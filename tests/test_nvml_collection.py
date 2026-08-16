@@ -15,6 +15,18 @@ NVIDIA_SMI_XML = """<?xml version="1.0" ?>
     <performance_state>P8</performance_state>
     <fan_speed>30 %</fan_speed>
     <pci>
+      <pci_gpu_link_info>
+        <pcie_gen>
+          <max_link_gen>4</max_link_gen>
+          <current_link_gen>1</current_link_gen>
+          <max_device_link_gen>5</max_device_link_gen>
+          <max_host_link_gen>4</max_host_link_gen>
+        </pcie_gen>
+        <link_widths>
+          <max_link_width>16x</max_link_width>
+          <current_link_width>8x</current_link_width>
+        </link_widths>
+      </pci_gpu_link_info>
       <tx_util>1 KB/s</tx_util>
       <rx_util>2 KB/s</rx_util>
     </pci>
@@ -84,6 +96,10 @@ def test_full_gpu_info_uses_nvml_payload_and_native_processes():
                 "memory_util_percent": 7,
                 "pcie_tx_kib_per_s": 100,
                 "pcie_rx_kib_per_s": 200,
+                "pcie_link_gen_current": 4,
+                "pcie_link_width_current": 4,
+                "pcie_link_gen_max": 4,
+                "pcie_link_width_max": 16,
                 "fan_percent": 30,
                 "temperature_c": 51,
                 "performance_state": 2,
@@ -115,6 +131,10 @@ def test_full_gpu_info_uses_nvml_payload_and_native_processes():
     assert stats.iloc[0]["used"] == "3 MiB"
     assert stats.iloc[0]["gpu_util"] == "42 %"
     assert stats.iloc[0]["power_draw"] == "125.50 W"
+    # The link the card runs on now, and the widest one it could ever use.
+    assert stats.iloc[0]["pcie_link_gen_current"] == 4
+    assert stats.iloc[0]["pcie_link_width_current"] == 4
+    assert stats.iloc[0]["pcie_link_width_max"] == 16
 
     processes, user_summary = client.get_process_summary(stats)
     assert processes == [
@@ -209,6 +229,11 @@ def test_full_gpu_info_falls_back_to_nvidia_smi_when_nvml_fails():
     assert system_info["data_source"] == "nvidia-smi"
     assert system_info["fallback_reason"] == "NVMLError: driver unavailable"
     assert system_info["driver_version"] == "550.54.15"
+    # `nvidia-smi -q -x` nests the link under <pci> and suffixes widths with x.
+    assert stats.iloc[0]["pcie_link_gen_current"] == "1"
+    assert stats.iloc[0]["pcie_link_width_current"] == "8x"
+    assert stats.iloc[0]["pcie_link_gen_max"] == "4"
+    assert stats.iloc[0]["pcie_link_width_max"] == "16x"
     assert client.commands.count("nvidia-smi -q -x") == 1
 
 

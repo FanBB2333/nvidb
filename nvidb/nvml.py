@@ -117,6 +117,17 @@ class PynvmlCollector:
                     "gpu_index": index,
                     "name": name,
                     "architecture": _ARCHITECTURE_NAMES.get(architecture),
+                    # The widest, fastest link the card itself supports. It is
+                    # context, not a ceiling: a card in a narrower slot still
+                    # reports its own maximum here.
+                    "pcie_link_gen_max": self._safe(
+                        getattr(pynvml, "nvmlDeviceGetMaxPcieLinkGeneration", None),
+                        handle,
+                    ),
+                    "pcie_link_width_max": self._safe(
+                        getattr(pynvml, "nvmlDeviceGetMaxPcieLinkWidth", None),
+                        handle,
+                    ),
                 }
             )
 
@@ -241,6 +252,19 @@ class PynvmlCollector:
                                 getattr(pynvml, "nvmlDeviceGetPcieThroughput", None),
                                 handle,
                                 getattr(pynvml, "NVML_PCIE_UTIL_RX_BYTES", 1),
+                            ),
+                            # Read every tick, not cached with the slow metrics:
+                            # an idle link drops to gen1 and narrows its width,
+                            # and stale link state would misreport the load.
+                            "pcie_link_gen_current": self._safe(
+                                getattr(
+                                    pynvml, "nvmlDeviceGetCurrPcieLinkGeneration", None
+                                ),
+                                handle,
+                            ),
+                            "pcie_link_width_current": self._safe(
+                                getattr(pynvml, "nvmlDeviceGetCurrPcieLinkWidth", None),
+                                handle,
                             ),
                             "power_usage_mw": self._safe(
                                 getattr(pynvml, "nvmlDeviceGetPowerUsage", None), handle
@@ -479,6 +503,14 @@ REMOTE_NVML_AGENT_SCRIPT = textwrap.dedent(
                             256,
                         ),
                         "architecture": self._architecture(handle),
+                        "pcie_link_gen_max": self._uint_query(
+                            "nvmlDeviceGetMaxPcieLinkGeneration",
+                            handle,
+                        ),
+                        "pcie_link_width_max": self._uint_query(
+                            "nvmlDeviceGetMaxPcieLinkWidth",
+                            handle,
+                        ),
                     }
                 )
             return devices
@@ -683,6 +715,18 @@ REMOTE_NVML_AGENT_SCRIPT = textwrap.dedent(
                         "nvmlDeviceGetPcieThroughput",
                         handle,
                         1,
+                    ),
+                    "pcie_link_gen_max": device["pcie_link_gen_max"],
+                    "pcie_link_width_max": device["pcie_link_width_max"],
+                    # Read every tick: an idle link drops to gen1 and narrows
+                    # its width, so cached link state would misreport the load.
+                    "pcie_link_gen_current": self._uint_query(
+                        "nvmlDeviceGetCurrPcieLinkGeneration",
+                        handle,
+                    ),
+                    "pcie_link_width_current": self._uint_query(
+                        "nvmlDeviceGetCurrPcieLinkWidth",
+                        handle,
                     ),
                     "power_usage_mw": self._uint_query(
                         "nvmlDeviceGetPowerUsage",

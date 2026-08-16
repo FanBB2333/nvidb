@@ -2,6 +2,23 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
+# Columns under this prefix ride along with a GPU table so renderers can read
+# values they do not draw - a PCIe load percentage next to its RX/TX cell, for
+# example. Every view filters them out before listing columns to the user.
+HIDDEN_COLUMN_PREFIX = "_nvidb_"
+
+
+def visible_columns(df_columns: Iterable[str]) -> list[str]:
+    """Drop the renderer-only columns from a GPU table's column list."""
+    if df_columns is None:
+        return []
+    return [
+        column
+        for column in df_columns
+        if not str(column).startswith(HIDDEN_COLUMN_PREFIX)
+    ]
+
+
 # Advanced profiling metrics (DCGM)
 ADVANCED_METRIC_LABELS = {
     "GPU": "GPU",

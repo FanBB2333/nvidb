@@ -35,9 +35,19 @@ except ImportError:  # pragma: no cover
     from . import config
 
 try:
-    from nvidb.metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
+    from nvidb.metrics import (
+        ADVANCED_METRIC_GROUPS,
+        ADVANCED_METRIC_LABELS,
+        present_columns,
+        visible_columns as visible_gpu_columns,
+    )
 except ImportError:  # pragma: no cover
-    from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
+    from .metrics import (
+        ADVANCED_METRIC_GROUPS,
+        ADVANCED_METRIC_LABELS,
+        present_columns,
+        visible_columns as visible_gpu_columns,
+    )
 
 
 def get_db_path():
@@ -674,6 +684,7 @@ _GPU_TABLE_COLUMNS = [
     ("fan", "fan"),
     ("util", "util (GPU%)"),
     ("temp", "temp"),
+    ("link", "PCIe link"),
     ("rx", "rx"),
     ("tx", "tx"),
     ("power", "power"),
@@ -765,7 +776,7 @@ def _render_gpu_table(df: pd.DataFrame, *, visible_columns=None):
         return
 
     table = df.copy()
-    available_cols = list(table.columns)
+    available_cols = visible_gpu_columns(table.columns)
     desired_cols = list(visible_columns) if visible_columns else list(available_cols)
 
     # Remove mem% from desired_cols since we'll merge it with memory[used/total]
@@ -1047,7 +1058,7 @@ def show_live_dashboard(*, include_remote):
                 except Exception:
                     continue
                 if isinstance(table, pd.DataFrame) and not table.empty:
-                    available_columns.update(table.columns)
+                    available_columns.update(visible_gpu_columns(table.columns))
 
         visible_columns = _render_gpu_column_checkboxes(
             available_columns,

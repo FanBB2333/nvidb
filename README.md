@@ -242,6 +242,17 @@ structure and secondary values, cyan for the active focus and normal metrics,
 and yellow/red for warnings. Green is reserved for a running/healthy state.
 The node name comes before the GPU index so the machine is the first thing you
 read.
+PCIe throughput is scored against the link the card is actually running on. The
+`PCIe` column names that link (`4.0x16`, `4.0x4`), and the `RX`/`TX` cells fill
+up with their share of it — green under 40%, yellow past 40%, red past 70%, at
+which point the interconnect is shaping transfers. Detailed cards spell the same
+thing out as `Link 4.0x4 7.34GB/s of 4.0x16` plus a percentage per direction,
+where the trailing `of ...` is the widest link the card itself supports. A card
+wired through a narrower slot or riser reports the narrower link, and a card
+sitting idle reports the reduced generation it drops to for power saving; both
+are the real ceiling for the traffic measured alongside them. SXM boards are
+scored on their host PCIe link, which is what these counters measure — NVLink
+traffic between GPUs is not included.
 The capacity line summarizes available and busy GPUs, average utilization, and
 used/total/free VRAM. Press `s` to cycle between node order, available GPUs
 first, and highest utilization first. A GPU is considered available when its

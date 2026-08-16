@@ -221,6 +221,91 @@ def format_bandwidth(value: str, unit: str) -> str:
     except ValueError:
         return f"{value}{unit}" if unit else value
 
+
+# Usable throughput of one PCIe lane in one direction, in bytes per second,
+# with the link encoding already discounted (8b/10b up to gen2, 128b/130b for
+# gen3-5, PAM4 FLIT for gen6+). PCIe is full duplex, so RX and TX each get the
+# whole figure rather than sharing it.
+PCIE_LANE_BYTES_PER_SECOND = {
+    1: 250_000_000,
+    2: 500_000_000,
+    3: 984_600_000,
+    4: 1_969_200_000,
+    5: 3_938_500_000,
+    6: 7_563_000_000,
+    7: 15_125_000_000,
+}
+
+
+def parse_link_number(value):
+    """Read a PCIe generation or lane count, as NVML or nvidia-smi reports it.
+
+    nvidia-smi spells widths as "16x", NVML returns plain integers, and a
+    driver that cannot answer returns nothing at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return number if number > 0 else None
+    numbers = extract_numbers(str(value))
+    if not numbers:
+        return None
+    try:
+        number = int(float(numbers[0]))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def pcie_link_capacity_kib_per_second(generation, width):
+    """Return one direction's PCIe ceiling in KiB/s, NVML's throughput unit.
+
+    Returns None when the generation or width is unknown, which keeps callers
+    from inventing a load percentage out of a guessed link speed.
+    """
+    generation = parse_link_number(generation)
+    width = parse_link_number(width)
+    if generation is None or width is None:
+        return None
+    per_lane = PCIE_LANE_BYTES_PER_SECOND.get(generation)
+    if per_lane is None:
+        return None
+    return per_lane * width / 1024
+
+
+def format_pcie_link(generation, width) -> str:
+    """Render a link mode the way lspci and nvidia-smi do, e.g. "4.0x16"."""
+    generation = parse_link_number(generation)
+    width = parse_link_number(width)
+    if generation is None or width is None:
+        return "N/A"
+    return f"{generation}.0x{width}"
+
+
+def get_pcie_load_color(percent) -> str:
+    """Colour a PCIe direction by how close it runs to the link ceiling.
+
+    A saturated link stalls transfers, so the warning starts lower than for
+    VRAM: past ~40% the interconnect is already shaping throughput.
+    """
+    if percent is None:
+        return None
+    try:
+        value = float(percent)
+    except (TypeError, ValueError):
+        return None
+    if value >= 70:
+        return 'red'
+    if value >= 40:
+        return 'yellow'
+    if value >= 5:
+        return 'green'
+    return None
+
+
 def xml_to_dict(root):
     # root = ET.fromstring(xml_string)
     child_to_dict = {} 

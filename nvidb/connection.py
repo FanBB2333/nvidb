@@ -25,7 +25,12 @@ from termcolor import colored, cprint
 from . import config as nvidb_config
 from .data_modules import ServerInfo, ServerListInfo
 from .dcgm import make_dcgm_snapshot_command
-from .metrics import ADVANCED_METRIC_GROUPS, present_columns
+from .metrics import (
+    ADVANCED_METRIC_GROUPS,
+    HIDDEN_COLUMN_PREFIX,
+    present_columns,
+    visible_columns,
+)
 from .mouse import (
     DISABLE_SEQUENCE as MOUSE_DISABLE_SEQUENCE,
     ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
@@ -33,7 +38,20 @@ from .mouse import (
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .ssh_proxy import open_proxyjump_socket
-from .utils import xml_to_dict, num_from_str, units_from_str, extract_numbers, extract_value_and_unit, format_bandwidth, get_utilization_color, get_memory_color
+from .utils import (
+    xml_to_dict,
+    num_from_str,
+    units_from_str,
+    extract_numbers,
+    extract_value_and_unit,
+    format_bandwidth,
+    format_pcie_link,
+    get_pcie_load_color,
+    get_utilization_color,
+    get_memory_color,
+    parse_link_number,
+    pcie_link_capacity_kib_per_second,
+)
 
 
 def parse_leading_float(value):
@@ -382,6 +400,10 @@ class BaseClient(ABC):
                         "power_state": power_state,
                         "power_draw": _format_watts(gpu.get("power_usage_mw")),
                         "current_power_limit": _format_watts(gpu.get("power_limit_mw")),
+                        "pcie_link_gen_current": gpu.get("pcie_link_gen_current"),
+                        "pcie_link_width_current": gpu.get("pcie_link_width_current"),
+                        "pcie_link_gen_max": gpu.get("pcie_link_gen_max"),
+                        "pcie_link_width_max": gpu.get("pcie_link_width_max"),
                         "processes": processes,
                     }
                 )
@@ -418,6 +440,18 @@ class BaseClient(ABC):
                     pci = gpu.find("pci")
                     tx_util = safe_get_text(pci, "tx_util", "N/A")
                     rx_util = safe_get_text(pci, "rx_util", "N/A")
+                    # nvidia-smi spells widths as "16x"; parse_link_number copes.
+                    link_info = pci.find("pci_gpu_link_info") if pci is not None else None
+                    link_gen_current = safe_get_text(
+                        link_info, "pcie_gen/current_link_gen", None
+                    )
+                    link_gen_max = safe_get_text(link_info, "pcie_gen/max_link_gen", None)
+                    link_width_current = safe_get_text(
+                        link_info, "link_widths/current_link_width", None
+                    )
+                    link_width_max = safe_get_text(
+                        link_info, "link_widths/max_link_width", None
+                    )
                     fan_speed = safe_get_text(gpu, "fan_speed", "N/A")
 
                     fb_memory_usage = gpu.find("fb_memory_usage")
@@ -466,6 +500,10 @@ class BaseClient(ABC):
                             "power_state": power_state,
                             "power_draw": power_draw,
                             "current_power_limit": current_power_limit,
+                            "pcie_link_gen_current": link_gen_current,
+                            "pcie_link_width_current": link_width_current,
+                            "pcie_link_gen_max": link_gen_max,
+                            "pcie_link_width_max": link_width_max,
                             "processes": processes,
                         }
                     )
@@ -1584,6 +1622,7 @@ class NVClientPool:
         "temp",
         "fan",
         "power",
+        "link",
         "rx",
         "tx",
         "processes",
@@ -1597,6 +1636,7 @@ class NVClientPool:
         "temp": "Temp",
         "fan": "Fan",
         "power": "Power",
+        "link": "PCIe",
         "rx": "RX",
         "tx": "TX",
         "processes": "Processes",
@@ -1790,6 +1830,73 @@ class NVClientPool:
                 result[idx] = {}
         return result
 
+    @staticmethod
+    def _throughput_kib_per_second(value):
+        """Read a formatted PCIe reading back into KiB/s, or None if unknown."""
+        text = str(value if value is not None else "").strip()
+        if not text or text in {"N/A", "-"}:
+            return None
+        amount_text, unit = extract_value_and_unit(text)
+        try:
+            amount = float(amount_text)
+        except (TypeError, ValueError):
+            return None
+        unit = unit.lower()
+        if unit.startswith("mb"):
+            return amount * 1024
+        if unit.startswith("gb"):
+            return amount * 1024 * 1024
+        # Both NVML and `nvidia-smi -q -x` report PCIe throughput in KB/s.
+        return amount
+
+    def _add_pcie_link_columns(self, stats):
+        """Describe each GPU's PCIe link and how hard RX/TX push against it.
+
+        The ceiling is the link the card is running on right now, not the width
+        and generation it could reach in a different slot. NVML's "max" figures
+        describe the card alone: a 3090 Ti wired through an x4 riser still
+        reports a maximum of x16, and dividing by that would hide a saturated
+        link behind a comfortable-looking percentage. The live state is also
+        the honest one at idle, where the link drops to gen1 to save power but
+        the traffic being divided by it is near zero anyway.
+        """
+        links = []
+        maximum_links = []
+        capacities = []
+        rx_percent = []
+        tx_percent = []
+
+        for _, row in stats.iterrows():
+            generation = row.get("pcie_link_gen_current")
+            width = row.get("pcie_link_width_current")
+            gen_max = row.get("pcie_link_gen_max")
+            width_max = row.get("pcie_link_width_max")
+            # A driver that only answers for the ceiling still says something.
+            if parse_link_number(generation) is None or parse_link_number(width) is None:
+                generation, width = gen_max, width_max
+
+            link = format_pcie_link(generation, width)
+            maximum_link = format_pcie_link(gen_max, width_max)
+            links.append(link)
+            maximum_links.append("" if maximum_link in {link, "N/A"} else maximum_link)
+
+            capacity = pcie_link_capacity_kib_per_second(generation, width)
+            capacities.append(
+                format_bandwidth(f"{capacity:.0f}", "KB/s") if capacity else "N/A"
+            )
+            for column, collected in (("rx", rx_percent), ("tx", tx_percent)):
+                measured = self._throughput_kib_per_second(row.get(column))
+                if capacity and measured is not None:
+                    collected.append(max(0.0, min(100.0, measured / capacity * 100)))
+                else:
+                    collected.append(None)
+
+        stats["link"] = links
+        stats[f"{HIDDEN_COLUMN_PREFIX}link_max"] = maximum_links
+        stats[f"{HIDDEN_COLUMN_PREFIX}link_capacity"] = capacities
+        stats[f"{HIDDEN_COLUMN_PREFIX}rx_percent"] = rx_percent
+        stats[f"{HIDDEN_COLUMN_PREFIX}tx_percent"] = tx_percent
+
     def get_client_gpus_info(self, return_raw: bool = False):
         # Set pandas display options for terminal output
         pd.set_option('display.max_columns', None)
@@ -1839,16 +1946,17 @@ class NVClientPool:
             for _, row in stats.iterrows():
                 rx_val, rx_unit = extract_value_and_unit(row['rx_util'])
                 tx_val, tx_unit = extract_value_and_unit(row['tx_util'])
-                
+
                 rx_formatted = format_bandwidth(rx_val, rx_unit)
                 tx_formatted = format_bandwidth(tx_val, tx_unit)
-                
+
                 # Ensure formatted strings don't exceed column width limit
                 rx_list.append(rx_formatted[:11] if len(rx_formatted) > 11 else rx_formatted)
                 tx_list.append(tx_formatted[:11] if len(tx_formatted) > 11 else tx_formatted)
-            
+
             stats['rx'] = rx_list
             stats['tx'] = tx_list
+            self._add_pcie_link_columns(stats)
             stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
             stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
@@ -1919,7 +2027,12 @@ class NVClientPool:
             
             # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
             # but keep the new processes column
-            columns_to_drop = ['product_architecture', 'rx_util', 'tx_util', 'power_state', 'power_draw', 'current_power_limit', 'used', 'total', 'free']
+            columns_to_drop = [
+                'product_architecture', 'rx_util', 'tx_util', 'power_state',
+                'power_draw', 'current_power_limit', 'used', 'total', 'free',
+                'pcie_link_gen_current', 'pcie_link_width_current',
+                'pcie_link_gen_max', 'pcie_link_width_max',
+            ]
             # Only drop columns that exist in the DataFrame
             columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
             stats = stats.drop(columns=columns_to_drop)
@@ -1927,7 +2040,7 @@ class NVClientPool:
             # Reorder columns: move mem_util before memory[used/total] and processes at the end
             if 'processes' in stats.columns:
                 # Define desired column order
-                desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
+                desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'link', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
                 # Only keep columns that exist in stats
                 ordered_columns = [col for col in desired_order if col in stats.columns]
                 # Add any remaining columns that weren't in desired_order
@@ -2058,6 +2171,11 @@ class NVClientPool:
             table["Node"] = node
             table["Hostname"] = hostname
             columns = [column for column in self.UNIFIED_TABLE_COLUMNS if column in table.columns]
+            columns += [
+                column
+                for column in table.columns
+                if str(column).startswith(HIDDEN_COLUMN_PREFIX)
+            ]
             frames.append(table[columns])
 
         if not frames:
@@ -4082,6 +4200,25 @@ class NVClientPool:
                 return "yellow"
             return default
 
+        def link_load_percent(row, direction):
+            value = row.get(f"{HIDDEN_COLUMN_PREFIX}{direction}_percent")
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def link_load(row, direction):
+            percent = link_load_percent(row, direction)
+            # An idle direction already reads as 0 KB/s; a percentage of the
+            # link would only repeat it.
+            if percent is None or percent <= 0:
+                return ""
+            # Rounding a trickle to "0%" would read as "no traffic at all".
+            return " <1%" if percent < 1 else f" {percent:.0f}%"
+
+        def link_load_color(row, direction):
+            return get_pcie_load_color(link_load_percent(row, direction)) or "dark_grey"
+
         def make_field(key, text, minimum, color=None, bold=False):
             return {
                 "key": key,
@@ -4295,19 +4432,42 @@ class NVClientPool:
                     color="dark_grey",
                 ),
             ]
+            # RX/TX read as a bare number unless the link they run over is on
+            # screen too, so the card names the live mode and its per-direction
+            # ceiling, and turns each direction's share of it into a percentage.
+            # The card's own maximum is a separate field so a narrow card drops
+            # it whole instead of slicing it mid-word.
+            link_mode = clean(row.get("link"))
+            link_max = clean(row.get(f"{HIDDEN_COLUMN_PREFIX}link_max"))
+            link_capacity = clean(row.get(f"{HIDDEN_COLUMN_PREFIX}link_capacity"))
+            link_text = f"Link {link_mode}"
+            if link_capacity != "N/A":
+                link_text += f" {link_capacity}"
             auxiliary_fields = [
                 make_field("section", "I/O", 3, color="cyan", bold=True),
                 make_field(
-                    "rx",
-                    f"RX {clean(row.get('rx'))}",
-                    11,
+                    "link",
+                    link_text,
+                    10,
                     color="dark_grey",
+                ),
+            ]
+            if link_max != "N/A":
+                auxiliary_fields.append(
+                    make_field("linkmax", f"of {link_max}", 9, color="dark_grey")
+                )
+            auxiliary_fields += [
+                make_field(
+                    "rx",
+                    f"RX {clean(row.get('rx'))}{link_load(row, 'rx')}",
+                    11,
+                    color=link_load_color(row, "rx"),
                 ),
                 make_field(
                     "tx",
-                    f"TX {clean(row.get('tx'))}",
+                    f"TX {clean(row.get('tx'))}{link_load(row, 'tx')}",
                     11,
-                    color="dark_grey",
+                    color=link_load_color(row, "tx"),
                 ),
                 make_field(
                     "proc",
@@ -4335,8 +4495,8 @@ class NVClientPool:
             )
             auxiliary_line = fit_fields(
                 auxiliary_fields,
-                drop_order=("tx", "rx"),
-                shrink_order=("proc", "rx", "tx"),
+                drop_order=("linkmax", "link", "tx", "rx"),
+                shrink_order=("proc", "link", "rx", "tx"),
             )
             if row_line_map is not None:
                 for offset in range(4):
@@ -4962,6 +5122,7 @@ class NVClientPool:
             'fan': 8,
             'util': 8,
             'mem_util': 8,
+            'link': 9,
             'rx': 10,
             'tx': 10,
             'power': 18,
@@ -4969,7 +5130,7 @@ class NVClientPool:
             'processes': 20  # Add width for processes column
         }
 
-        all_columns = list(df.columns)
+        all_columns = visible_columns(df.columns)
         # "sel" is the selection marker column; it only exists in the unified table,
         # which may drop Node/Hostname when rows are grouped into node blocks.
         is_unified_table = any(
@@ -4987,6 +5148,7 @@ class NVClientPool:
                     "memory[used/total]": 13,
                     "temp": 6,
                     "power": 12,
+                    "link": 7,
                     "processes": 14,
                 }
             )
@@ -5012,7 +5174,10 @@ class NVClientPool:
             "power": 9,
             "rx": 10,
             "tx": 11,
-            "fan": 12,
+            # RX/TX outlive the link label: their bars already show the load,
+            # and the label is worth more than fan speed on a narrow terminal.
+            "link": 12,
+            "fan": 13,
         }
         importance.update(importance_overrides or {})
         if must_keep_columns is not None:
@@ -5214,7 +5379,22 @@ class NVClientPool:
                 return "on_green"
             return None
 
-        def format_bar_cell(text: str, percent: Optional[float], width: int) -> str:
+        def link_bar_bg(percent: Optional[float]) -> Optional[str]:
+            """Colour a PCIe direction against its own saturation thresholds."""
+            color = get_pcie_load_color(percent)
+            return f"on_{color}" if color else None
+
+        def hidden_percent(row_index: int, column: str) -> Optional[float]:
+            """Read a load percentage the collector attached to the row."""
+            name = f"{HIDDEN_COLUMN_PREFIX}{column}"
+            if name not in df.columns:
+                return None
+            try:
+                return float(df.iloc[row_index][name])
+            except (TypeError, ValueError):
+                return None
+
+        def format_bar_cell(text: str, percent: Optional[float], width: int, bar_bg=None) -> str:
             if width <= 0:
                 return ""
             text = truncate_text(text, width)
@@ -5242,7 +5422,7 @@ class NVClientPool:
             # Keep the unfilled portion on the terminal default background.
             # `termcolor`'s "on_grey" maps to ANSI 40 (black), which looks wrong
             # on light/gray terminal themes.
-            fill_bg = mem_bar_bg(p)
+            fill_bg = (bar_bg or mem_bar_bg)(p)
 
             left = "".join(chars[:fill_len])
             right = "".join(chars[fill_len:])
@@ -5322,6 +5502,15 @@ class NVClientPool:
                 if col == "memory[used/total]" and value != "N/A":
                     percent = parse_ratio_percent(raw_value)
                     row_parts.append(format_bar_cell(value, percent, width))
+                    continue
+
+                # RX/TX only mean something next to the link they run over, so
+                # the cell fills up as the traffic approaches the PCIe ceiling.
+                if col in {"rx", "tx"} and value != "N/A":
+                    percent = hidden_percent(row_index, f"{col}_percent")
+                    row_parts.append(
+                        format_bar_cell(value, percent, width, bar_bg=link_bar_bg)
+                    )
                     continue
 
                 # Center-align all other columns
