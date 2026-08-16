@@ -24,8 +24,6 @@ _PARTIAL = re.compile(r"^\x1b(\[(<\d*(;\d*){0,2})?)?$")
 _MAX_BUFFER = 24
 
 BUTTON_LEFT = 0
-BUTTON_MIDDLE = 1
-BUTTON_RIGHT = 2
 BUTTON_WHEEL_UP = 64
 BUTTON_WHEEL_DOWN = 65
 

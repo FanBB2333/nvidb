@@ -44,7 +44,6 @@ class GPUStats:
     memory_start: int = 0
     memory_end: int = 0
     memory_peak: int = 0
-    memory_min: int = 0
     
     # Utilization stats
     utilization_samples: List[int] = field(default_factory=list)
@@ -135,9 +134,8 @@ class GPUMonitor:
                 pass
             self._initialized = False
     
-    def _take_snapshot(self) -> Dict[int, GPUSnapshot]:
+    def _take_snapshot(self) -> None:
         """Take a snapshot of all monitored GPUs"""
-        snapshots = {}
         timestamp = time.time()
         
         for idx, handle in self._handles.items():
@@ -161,12 +159,10 @@ class GPUMonitor:
                     temperature=temperature,
                     power_usage=power
                 )
-                snapshots[idx] = snapshot
-                
                 with self._lock:
                     self._snapshots[idx].append(snapshot)
                     
-            except Exception as e:
+            except Exception:
                 pass  # Skip failed snapshots
         
         return snapshots
@@ -216,7 +212,6 @@ class GPUMonitor:
                 gpu_stats.memory_start = snapshots[0].memory_used
                 gpu_stats.memory_end = snapshots[-1].memory_used
                 gpu_stats.memory_peak = max(s.memory_used for s in snapshots)
-                gpu_stats.memory_min = min(s.memory_used for s in snapshots)
                 
                 gpu_stats.utilization_samples = [s.gpu_utilization for s in snapshots]
                 gpu_stats.temperature_samples = [s.temperature for s in snapshots]

@@ -33,12 +33,9 @@ class LaunchResult:
     pid: Optional[int]
     pgid: Optional[int]
     run_dir: str
-    session_isolated: bool = True
     # True when this launch found the job already running and took it over
     # rather than starting a second copy. See `JobExecutor.launch`.
     adopted: bool = False
-    stdout: str = ""
-    stderr: str = ""
 
 
 @dataclass
@@ -271,19 +268,10 @@ class JobExecutor:
             # shell, so the caller only ever gets a pgid it is safe to kill.
             pgid=pgid if (isolated and pgid is not None) else None,
             run_dir=run_dir,
-            session_isolated=isolated,
             adopted=adopted,
-            stdout=result.stdout,
-            stderr=result.stderr,
         )
 
-    def probe(
-        self,
-        specs: Iterable,
-        *,
-        want_process_table: bool = True,
-        timeout: float = 30.0,
-    ) -> NodeProbe:
+    def probe(self, specs: Iterable, *, timeout: float = 30.0) -> NodeProbe:
         """Check many jobs, plus the pid→pgid table, in one round trip.
 
         `specs` is an iterable of `(job_id, run_dir)`. The process table lets the
@@ -291,8 +279,6 @@ class JobExecutor:
         someone else's work.
         """
         specs = [(int(job_id), run_dir) for job_id, run_dir in specs if run_dir]
-        if not specs and not want_process_table:
-            return NodeProbe()
 
         lines = [
             "nvidb_probe() {",
@@ -314,9 +300,8 @@ class JobExecutor:
         ]
         for job_id, run_dir in specs:
             lines.append(f"nvidb_probe {job_id} {shlex.quote(run_dir)}")
-        if want_process_table:
-            lines.append(f"echo {PS_MARKER}")
-            lines.append("ps -eo pid=,pgid= 2>/dev/null || true")
+        lines.append(f"echo {PS_MARKER}")
+        lines.append("ps -eo pid=,pgid= 2>/dev/null || true")
 
         result = self.transport.run("\n".join(lines), timeout=timeout)
         return parse_probe_output(result.stdout)

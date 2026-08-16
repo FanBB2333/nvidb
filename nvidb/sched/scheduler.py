@@ -592,7 +592,7 @@ class Scheduler:
 
     # --- the tick ---------------------------------------------------------
 
-    def tick(self, *, force: bool = False, dispatch: bool = True) -> Dict[str, Any]:
+    def tick(self, *, force: bool = False) -> Dict[str, Any]:
         """Bring the queue up to date once. Safe to call from anywhere."""
         from .model import age_seconds
 
@@ -663,9 +663,8 @@ class Scheduler:
 
             self._renew_tick_lease()
             self._enforce_timeouts(summary)
-            if dispatch:
-                self._renew_tick_lease()
-                self._dispatch(summary)
+            self._renew_tick_lease()
+            self._dispatch(summary)
             dbm.set_meta(self.conn, "last_tick_at", utcnow())
         finally:
             dbm.release_lock(self.conn, TICK_LOCK, self.owner)
@@ -684,7 +683,6 @@ class Scheduler:
         self._renew_tick_lease()
         probe = backend.executor.probe(
             [(job.id, job.run_dir) for job in running if job.run_dir],
-            want_process_table=True,
             timeout=float(self.settings["probe_timeout"]),
         )
         self._renew_tick_lease()
@@ -1020,13 +1018,12 @@ class Scheduler:
                 {"id": alert_id, "kind": kind, "title": title, "job_id": job_id}
             )
 
-    def _terminate(self, backend: NodeBackend, job: Job, grace: int = 5) -> None:
+    def _terminate(self, backend: NodeBackend, job: Job) -> None:
         """Stop the process only if its pid still belongs to this job."""
         backend.executor.terminate(
             run_dir=job.run_dir,
             pid=job.remote_pid,
             pgid=job.remote_pgid,
-            grace=grace,
         )
 
     # --- capacity accounting ----------------------------------------------

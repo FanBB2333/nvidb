@@ -1,4 +1,5 @@
-import pandas as pd
+import sqlite3
+
 import logging
 import time
 import threading
@@ -6,7 +7,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from .connection import NVClientPool
-from .data_modules import ServerListInfo
 from . import config
 
 
@@ -35,7 +35,6 @@ class NVLoggerSQLite:
     
     def _init_database(self):
         """Initialize SQLite database with required tables."""
-        import sqlite3
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -80,7 +79,6 @@ class NVLoggerSQLite:
     
     def _start_session(self):
         """Create a new logging session and return its ID."""
-        import sqlite3
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -104,7 +102,6 @@ class NVLoggerSQLite:
         if self.session_id is None:
             return
         
-        import sqlite3
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -122,7 +119,6 @@ class NVLoggerSQLite:
         if not self.data_buffer:
             return
         
-        import sqlite3
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -201,13 +197,7 @@ class NVLoggerSQLite:
         try:
             for client in self.client_pool.pool:
                 try:
-                    result = client.get_full_gpu_info()
-                    
-                    if isinstance(result, tuple) and len(result) == 2:
-                        stats_df, system_info = result
-                    else:
-                        stats_df = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
-                        system_info = {}
+                    stats_df, _system_info = client.get_full_gpu_info()
                     
                     if not stats_df.empty:
                         self._buffer_client_data(client, stats_df, timestamp)

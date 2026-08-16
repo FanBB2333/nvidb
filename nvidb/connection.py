@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Optional
 from blessed import Terminal
 import logging
 import re
@@ -13,16 +13,13 @@ import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from collections import deque
-from io import StringIO
 import threading
 
-import pynvml
 import paramiko
 from paramiko import AuthenticationException
-from paramiko.client import SSHClient, AutoAddPolicy
 from paramiko.ssh_exception import NoValidConnectionsError, PasswordRequiredException
 import pandas as pd
-from termcolor import colored, cprint
+from termcolor import colored
 from . import config as nvidb_config
 from .data_modules import ServerInfo, ServerListInfo
 from .dcgm import make_dcgm_snapshot_command
@@ -41,8 +38,6 @@ from .nvml import PynvmlCollector, make_nvml_agent_command
 from .ssh_proxy import open_proxyjump_socket
 from .tui_theme import DiffScreen, frame_bottom, frame_separator, frame_top
 from .utils import (
-    xml_to_dict,
-    num_from_str,
     units_from_str,
     extract_numbers,
     extract_value_and_unit,
@@ -50,7 +45,6 @@ from .utils import (
     format_pcie_link,
     get_pcie_load_color,
     get_utilization_color,
-    get_memory_color,
     parse_link_number,
     pcie_link_capacity_kib_per_second,
 )
@@ -67,17 +61,6 @@ def parse_leading_float(value):
         return float(numbers[0])
     except (TypeError, ValueError):
         return None
-
-
-def nvidbInit():
-    pynvml.nvmlInit()
-    gpu_count = pynvml.nvmlDeviceGetCount()
-    for i in range(gpu_count):
-        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-        name = pynvml.nvmlDeviceGetName(handle)
-        temperature = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-        print("GPU", i, "Name:", name)
-        print("GPU", i, "Temperature:", temperature, "C")
 
 
 class BaseClient(ABC):
@@ -114,31 +97,6 @@ class BaseClient(ABC):
     def execute_command(self, command: str) -> str:
         """Execute a command and return the output"""
         pass
-
-    def query_nvml_snapshot(self) -> dict:
-        """Query one NVML snapshot on the target using a short-lived helper."""
-        output = self.execute_command(make_nvml_agent_command(once=True))
-        if not isinstance(output, str):
-            return {
-                "ok": False,
-                "backend": "ctypes",
-                "error": "NVML helper returned no output",
-            }
-        for line in reversed(output.splitlines()):
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                return payload
-        return {
-            "ok": False,
-            "backend": "ctypes",
-            "error": "NVML helper returned invalid JSON",
-        }
 
     def _chunked(self, items, chunk_size: int):
         for i in range(0, len(items), chunk_size):
@@ -236,35 +194,6 @@ class BaseClient(ABC):
                 return details
         return {}
 
-    def test(self):
-        """Test connection with ls command"""
-        try:
-            result = self.execute_command('ls')
-            logging.info(msg=f"Test result: {result}")
-            return result
-        except Exception as e:
-            logging.error(msg=f"Test command failed: {e}")
-            return ""
-    
-    def get_os_info(self) -> str:
-        """Get operating system information"""
-        try:
-            result = self.execute_command('uname -a')
-            return result
-        except Exception as e:
-            logging.error(msg=f"Failed to get OS info: {e}")
-            return ""
-    
-    def get_gpu_stats(self, command='nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv') -> pd.DataFrame:
-        """Get GPU statistics in CSV format"""
-        try:
-            result = self.execute_command(command)
-            stats = pd.read_csv(StringIO(result), header=0)
-            return stats
-        except Exception as e:
-            logging.error(msg=f"Failed to get GPU stats: {e}")
-            return pd.DataFrame()
-    
     def get_full_gpu_info(self):
         """Get GPU information (base + optional advanced profiling).
 
@@ -808,14 +737,6 @@ class BaseClient(ABC):
                 # Get swap info on macOS
                 swap_output = self.execute_command("sysctl -n vm.swapusage")
                 if swap_output:
-                    # Format: "total = 2048.00M  used = 1024.00M  free = 1024.00M"
-                    for part in swap_output.split():
-                        if part.endswith("M"):
-                            try:
-                                value = float(part[:-1])
-                                # Determine which field based on position
-                            except ValueError:
-                                pass
                     # Parse more carefully
                     parts = swap_output.split()
                     for i, part in enumerate(parts):
@@ -837,10 +758,6 @@ class BaseClient(ABC):
 
         return result
 
-    def get_client(self):
-        """Return the client object"""
-        return self
-    
     def get_process_summary(self, gpu_stats=None, detailed: bool = False):
         """Get detailed GPU processes information with user summary.
 
@@ -1004,41 +921,6 @@ class BaseClient(ABC):
         except Exception as e:
             logging.error(msg=f"Failed to get process summary: {e}")
             return [], {}
-    
-    def format_process_summary_xml(self):
-        """Format process summary as XML similar to nvidia-smi output"""
-        processes, user_summary = self.get_process_summary()
-        
-        if not processes:
-            return ""
-        
-        xml_output = []
-        xml_output.append("        <processes>")
-        
-        for process in processes:
-            xml_output.append("            <process_info>")
-            xml_output.append(f"                <gpu_instance_id>{process['gpu_instance_id']}</gpu_instance_id>")
-            xml_output.append(f"                <compute_instance_id>{process['compute_instance_id']}</compute_instance_id>")
-            xml_output.append(f"                <pid>{process['pid']}</pid>")
-            xml_output.append(f"                <type>{process['type']}</type>")
-            xml_output.append(f"                <process_name>{process['process_name']}</process_name>")
-            xml_output.append(f"                <used_memory>{process['used_memory']}</used_memory>")
-            xml_output.append(f"                <username>{process['username']}</username>")
-            xml_output.append("            </process_info>")
-        
-        xml_output.append("        </processes>")
-        
-        # Add user memory summary
-        if user_summary:
-            xml_output.append("        <user_memory_summary>")
-            for username, total_memory in user_summary.items():
-                xml_output.append("            <user_info>")
-                xml_output.append(f"                <username>{username}</username>")
-                xml_output.append(f"                <total_memory>{total_memory} MiB</total_memory>")
-                xml_output.append("            </user_info>")
-            xml_output.append("        </user_memory_summary>")
-        
-        return "\n".join(xml_output)
     
     def format_user_memory_compact(self, user_summary):
         """Format user memory summary in compact format like 'qbs(23082M) gdm(4M)' sorted by memory usage desc"""
@@ -1387,7 +1269,7 @@ class RemoteClient(BaseClient):
                 logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
                 return True
                     
-            except AuthenticationException as e:
+            except AuthenticationException:
                 if attempt == max_attempts - 1:
                     logging.error(
                         msg=f"Password authentication failed after {max_attempts} attempts on {self.description}"
@@ -1461,7 +1343,7 @@ class RemoteClient(BaseClient):
                     self.last_error_type = None
                     logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
                     return True
-                except AuthenticationException as e:
+                except AuthenticationException:
                     logging.error(msg=f"Key-based authentication failed on {self.description}, trying password...")
                     # Use the new password authentication method with retry limit
                     return self._authenticate_with_password(allow_prompt=allow_prompt)
@@ -1562,8 +1444,6 @@ class RemoteClient(BaseClient):
             raise
         return result
 
-    def get_client(self) -> SSHClient:
-        return self.client
 
 
 class LocalClient(BaseClient):
@@ -1603,9 +1483,6 @@ class LocalClient(BaseClient):
                 logging.debug(msg=f"Command '{command}' execution failed with return code {result.returncode}")
                 return ""
             return result.stdout
-        except subprocess.CalledProcessError as e:
-            logging.debug(msg=f"Command '{command}' execution failed: {e}")
-            return ""
         except Exception as e:
             logging.debug(msg=f"Unexpected error executing command: {e}")
             return ""
@@ -1781,60 +1658,6 @@ class NVClientPool:
                 if hasattr(client, "_set_connect_error"):
                     client._set_connect_error(str(e), error_type="connect")
 
-    def test(self):
-        pass
-    
-    def execute_command(self, command):
-        for idx, client in enumerate(self.pool):
-            # cprint(f"Output on {client.description}", 'yellow')
-            # logging.info(msg=f"Executing command on {client.description}")
-            result = client.execute_command(command)
-            logging.info(msg=colored(f"{client.description}", 'yellow'))
-            print(colored(f"{client.description}", 'yellow'))
-            print(result)
-    
-    def execute_command_parse(self, command, type: Literal['csv', 'xml', 'json']='xml'):
-        for idx, client in enumerate(self.pool):
-            result = client.execute_command(command)
-            logging.info(msg=colored(f"{client.description}", 'yellow'))
-            # if result is the instance of dict
-            if isinstance(result, dict):
-                pass
-            elif isinstance(result, str):
-                if 'xml' == type:
-                    result = xml_to_dict(result)
-                elif 'csv' == type:
-                    result = pd.read_csv(filepath_or_buffer=result, header=0)
-                elif 'json' == type:
-                    result = json.loads(result)
-                else:
-                    logging.error(msg=f"Unsupported type: {type}")
-            else:
-                logging.error(msg=f"Unsupported result type: {type(result)}")
-        return result
-
-    def get_all_system_stats(self) -> dict:
-        """Get system statistics for all clients in the pool.
-
-        Returns:
-            dict: Mapping of client index to system stats dict.
-                  Each system stats dict contains:
-                  - cpu_cores: Number of CPU cores
-                  - cpu_percent: Total CPU utilization percentage
-                  - mem_used_gb: Used memory in GB
-                  - mem_total_gb: Total memory in GB
-                  - swap_used_gb: Used swap in GB
-                  - swap_total_gb: Total swap in GB
-        """
-        result = {}
-        for idx, client in enumerate(self.pool):
-            try:
-                result[idx] = client.get_system_stats()
-            except Exception as e:
-                logging.warning(f"Failed to get system stats for {client.description}: {e}")
-                result[idx] = {}
-        return result
-
     @staticmethod
     def _throughput_kib_per_second(value):
         """Read a formatted PCIe reading back into KiB/s, or None if unknown."""
@@ -1917,15 +1740,7 @@ class NVClientPool:
         # is only collected while that panel is on screen.
         want_process_details = self._process_panel_visible()
         for idx, client in enumerate(self.pool):
-            result = client.get_full_gpu_info()
-            
-            # Handle the tuple return from get_full_gpu_info
-            if isinstance(result, tuple) and len(result) == 2:
-                stats, system_info = result
-            else:
-                # Fallback for backward compatibility
-                stats = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
-                system_info = {}
+            stats, system_info = client.get_full_gpu_info()
 
             # Fetch system stats (CPU, memory, swap) and merge into system_info
             if not (isinstance(system_info, dict) and system_info.get("error")):
@@ -5862,13 +5677,11 @@ class NVClientPool:
             idle_digits = widths.get("idle_digits", len(str(idle_count)))
             util_digits = widths.get("util_digits", len(str(avg_util)))
             mem_width = widths.get("mem_width", len(str(mem_display)))
-            cpu_cores_digits = widths.get("cpu_cores_digits", len(str(cpu_cores)))
         else:
             gpu_digits = len(str(gpu_count))
             idle_digits = len(str(idle_count))
             util_digits = len(str(avg_util))
             mem_width = len(str(mem_display))
-            cpu_cores_digits = len(str(cpu_cores))
 
         gpu_part = f"{gpu_count:>{gpu_digits}} GPUs"
         idle_part = f"{idle_count:>{idle_digits}} idle"
@@ -6197,7 +6010,6 @@ class NVClientPool:
                 "idle_digits": max(len(str(s["idle_count"])) for s in non_empty_summaries),
                 "util_digits": max(len(str(s["avg_util"])) for s in non_empty_summaries),
                 "mem_width": max(len(str(s["mem_display"])) for s in non_empty_summaries),
-                "cpu_cores_digits": max(len(str(s.get("cpu_cores", 0))) for s in non_empty_summaries),
             }
         else:
             widths = None

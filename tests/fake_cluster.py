@@ -205,7 +205,7 @@ class FakeExecutor:
         self.node.logs[run_dir] = f"$ {command}\n"
         return LaunchResult(pid=pid, pgid=pid, run_dir=run_dir)
 
-    def probe(self, specs, want_process_table=True, timeout=None) -> NodeProbe:
+    def probe(self, specs, timeout=None) -> NodeProbe:
         if not self.node.online:
             raise TransportError(f"{self.node.name}: unreachable")
         probe = NodeProbe()
@@ -221,8 +221,7 @@ class FakeExecutor:
                 alive=record["alive"],
                 progress=record.get("progress"),
             )
-        if want_process_table:
-            probe.process_groups = self.node.process_groups()
+        probe.process_groups = self.node.process_groups()
         return probe
 
     def kill(self, *, pid, pgid, signal="TERM"):

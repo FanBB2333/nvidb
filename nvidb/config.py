@@ -41,11 +41,6 @@ def get_db_path():
     """Get the default path to the SQLite database."""
     return WORKING_DIR / 'gpu_log.db'
 
-def ensure_working_dir():
-    """Ensure the working directory exists."""
-    WORKING_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def get_queue_config_path():
     """Path of the queue's own config file, overridable for tests and sandboxes."""
     override = os.environ.get('NVIDB_QUEUE_CONFIG')

@@ -7,12 +7,11 @@ not reuse `RemoteClient`, which is built for a human sitting at a terminal.
 """
 from __future__ import annotations
 
-import base64
 import shlex
 import subprocess
 import threading
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional
 
 from ..ssh_proxy import open_proxyjump_socket
 
@@ -25,10 +24,6 @@ class CommandResult:
     exit_status: int
     stdout: str
     stderr: str
-
-    @property
-    def ok(self) -> bool:
-        return self.exit_status == 0
 
 
 class TransportError(RuntimeError):
@@ -48,26 +43,6 @@ class Transport:
 
     # --- shared helpers ---------------------------------------------------
 
-    def write_file(self, path: str, content: str, *, mode: Optional[str] = None) -> None:
-        """Create a remote file from a local string.
-
-        The payload travels base64-encoded so arbitrary job commands - quotes,
-        newlines, `$`, non-ASCII - survive the trip through a shell.
-        """
-        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        quoted = shlex.quote(path)
-        script = (
-            f"mkdir -p {shlex.quote(_dirname(path))} && "
-            f"printf '%s' {shlex.quote(encoded)} | base64 -d > {quoted}"
-        )
-        if mode:
-            script += f" && chmod {mode} {quoted}"
-        result = self.run(script)
-        if not result.ok:
-            raise TransportError(
-                f"Failed to write {path} on {self.name}: {result.stderr.strip() or result.stdout.strip()}"
-            )
-
     def read_file(self, path: str, *, tail_lines: Optional[int] = None) -> str:
         """Read a remote file, optionally only its last N lines."""
         quoted = shlex.quote(path)
@@ -76,12 +51,6 @@ class Transport:
         else:
             command = f"cat {quoted} 2>/dev/null || true"
         return self.run(command).stdout
-
-
-def _dirname(path: str) -> str:
-    if "/" not in path:
-        return "."
-    return path.rsplit("/", 1)[0] or "/"
 
 
 class LocalTransport(Transport):
@@ -236,15 +205,6 @@ class SSHTransport(Transport):
             self._close_locked()
 
     @property
-    def connected(self) -> bool:
-        client = self._client
-        if client is None:
-            return False
-        transport = client.get_transport()
-        return bool(transport is not None and transport.is_active())
-
-    # --- execution --------------------------------------------------------
-
     def run(self, command: str, timeout: Optional[float] = None) -> CommandResult:
         timeout = timeout or DEFAULT_COMMAND_TIMEOUT
         with self._lock:
@@ -271,40 +231,3 @@ class SSHTransport(Transport):
             )
 
 
-class TransportPool:
-    """Keeps one transport per node alive for the lifetime of a process.
-
-    A long-lived client such as the TUI pays the SSH handshake once; a one-shot
-    CLI call pays it once per invocation and then exits.
-    """
-
-    def __init__(self):
-        self._transports: Dict[str, Transport] = {}
-        self._lock = threading.RLock()
-
-    def get(self, node_name: str, factory) -> Transport:
-        with self._lock:
-            transport = self._transports.get(node_name)
-            if transport is None:
-                transport = factory()
-                self._transports[node_name] = transport
-            return transport
-
-    def drop(self, node_name: str) -> None:
-        with self._lock:
-            transport = self._transports.pop(node_name, None)
-        if transport is not None:
-            try:
-                transport.close()
-            except Exception:
-                pass
-
-    def close(self) -> None:
-        with self._lock:
-            transports = list(self._transports.values())
-            self._transports.clear()
-        for transport in transports:
-            try:
-                transport.close()
-            except Exception:
-                pass

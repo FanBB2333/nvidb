@@ -149,7 +149,3 @@ class DiffScreen:
         if out:
             self._write("".join(out))
             sys.stdout.flush()
-
-    def reset(self) -> None:
-        self._previous = []
-        self._previous_width = 0

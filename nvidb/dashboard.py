@@ -8,7 +8,6 @@ Replaces the previous Streamlit UI; the data layer in `nvidb.web` is reused.
 """
 
 import json
-import math
 import threading
 import time
 from collections import deque
@@ -35,11 +34,6 @@ try:
     import plotly.graph_objects as go
 except Exception:  # pragma: no cover
     dash = None
-
-try:
-    from nvidb import config
-except ImportError:  # pragma: no cover
-    from . import config
 
 try:
     from nvidb.metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
@@ -78,7 +72,6 @@ except ImportError:  # pragma: no cover
         _format_datetime,
         _format_duration,
         _format_gb,
-        _format_mib,
         _load_server_list,
         _parse_mib_pair,
         _parse_percent,

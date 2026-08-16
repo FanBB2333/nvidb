@@ -35,31 +35,8 @@ ACTIVE_JOB_STATES = frozenset({"pending", "running"})
 TERMINAL_JOB_STATES = frozenset(
     {"completed", "failed", "cancelled", "timeout", "lost"}
 )
-SUCCESS_JOB_STATES = frozenset({"completed"})
-
-NODE_STATES = ("up", "down", "drain", "unknown")
-
 # Event kinds written to the append-only `events` table. Clients that were not
 # running when something happened replay this stream to catch up.
-EVENT_KINDS = (
-    "job_submitted",
-    "job_started",
-    "job_finished",
-    "job_cancelled",
-    "job_requeued",
-    # A person changed where the job sits in the dispatch order.
-    "job_priority",
-    "job_failed",
-    "job_lost",
-    "job_timeout",
-    # A process that outlived the job record - killed once its node answered.
-    "job_reaped",
-    "node_up",
-    "node_down",
-    "tick",
-)
-
-
 def utcnow() -> str:
     """Current time as a timezone-aware ISO-8601 string (the storage format)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")

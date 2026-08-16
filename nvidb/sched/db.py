@@ -316,9 +316,9 @@ def transaction(conn: sqlite3.Connection):
 
 # --- meta ------------------------------------------------------------------
 
-def get_meta(conn: sqlite3.Connection, key: str, default=None):
+def get_meta(conn: sqlite3.Connection, key: str):
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row else default
+    return row["value"] if row else None
 
 
 def set_meta(conn: sqlite3.Connection, key: str, value) -> None:
@@ -527,15 +527,6 @@ def mark_alerts_delivered(conn: sqlite3.Connection, ids: Sequence[int]) -> None:
             (utcnow(), *[int(i) for i in ids]),
         )
 
-
-def purge_alerts(conn: sqlite3.Connection, *, acknowledged_only: bool = True) -> int:
-    where = "WHERE acknowledged_at IS NOT NULL" if acknowledged_only else ""
-    with transaction(conn):
-        cursor = conn.execute(f"DELETE FROM alerts {where}")
-        return int(cursor.rowcount or 0)
-
-
-# --- nodes and GPUs --------------------------------------------------------
 
 def upsert_node(
     conn: sqlite3.Connection,
@@ -857,7 +848,6 @@ def purge_jobs(
     conn: sqlite3.Connection,
     *,
     states: Optional[Iterable[str]] = None,
-    before_id: Optional[int] = None,
 ) -> int:
     """Delete unreferenced terminal jobs. Active jobs are never removed."""
     states = list(states) if states else sorted(TERMINAL_JOB_STATES)
@@ -866,9 +856,6 @@ def purge_jobs(
         return 0
     clauses = [f"state IN ({', '.join('?' for _ in states)})"]
     params: List[Any] = list(states)
-    if before_id is not None:
-        clauses.append("id < ?")
-        params.append(int(before_id))
     with transaction(conn):
         # A pending/running job still needs its completed prerequisites to
         # exist so dependency checks remain meaningful. Keep those rows until

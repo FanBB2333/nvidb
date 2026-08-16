@@ -3,16 +3,12 @@ import getpass
 import logging
 import argparse
 import shutil
-import re
 from pathlib import Path
 from paramiko import SSHConfig
-from ..connection import RemoteClient, NVClientPool
-from ..data_modules import ServerInfo, ServerListInfo
+from ..data_modules import ServerListInfo
 from ..logger import run_sqlite_logger
 from .. import config
 
-
-cli: RemoteClient = None
 
 def _warn_if_deprecated_config_keys(servers):
     for server in servers or []:
@@ -245,21 +241,8 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
 
 def init(config_path=None):
     config_path = config_path or config.get_config_path()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    global test_server, cli
-    # config_path = 'nvidb/test/config.yml'
     Path(config_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, 'r') as f:
-        cfg = yaml.load(f, Loader=yaml.FullLoader)
-    # test_server = ServerInfo(**config['servers'][0])
-    # server_list = ServerList.from_dict(config['servers'])
-    server_list: ServerListInfo = ServerListInfo.from_yaml(config_path)
-    cli = RemoteClient(server_list[0])
-    return server_list
-
-
-_format_servers_yaml = config.format_servers_yaml
-_format_config_yaml = config.format_config_yaml
+    return ServerListInfo.from_yaml(config_path)
 
 
 def _write_config_yaml(config_path: Path, cfg: dict):
@@ -338,19 +321,7 @@ def interactive_add_server(config_path=None):
     
     # Password (optional)
     password = None
-    
-    # Create the server info
-    server_info = ServerInfo(
-        host=host,
-        port=port,
-        username=username,
-        description=nickname,
-        identityfile=identityfile,
-        password=password,
-        auth=auth,
-        proxyjump=proxyjump,
-    )
-    
+
     # Display summary
     print("\n" + "-" * 50)
     print("Server Configuration Summary:")
@@ -928,27 +899,6 @@ def show_log_info(session_id=None, db_path=None):
         print(f"\nError analyzing session: {e}")
 
 
-def test_connection():
-    cli.connect()
-
-def test_get_os_info():
-    logging.info(msg=cli.get_os_info())
-
-def test_get_gpu_stats():
-    # s = cli.get_gpu_stats(command="nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv")
-    s = cli.get_gpu_stats()
-    logging.info(msg=s)
-
-def test_get_all_stats(server_list):
-    pool = NVClientPool(server_list)
-    pool.print_refresh()
-    # pool.execute_command(command='nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv')
-    # pool.execute_command(command='nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.memory,utilization.gpu --format=csv,nounits')
-    # pool.execute_command(command='nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.memory,utilization.gpu,memory.used,memory.total,power.draw --format=csv')
-    # pool.execute_command(command='gpustat')
-    # pool.execute_command_parse('nvidia-smi -q -x', type='xml')
-    
-    
 def main():
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
@@ -967,10 +917,10 @@ def main():
     subparsers = parser.add_subparsers(dest='command')
     ls_parser = subparsers.add_parser('ls', help='List configured servers')
     ls_parser.add_argument('--detail', action='store_true', help='Show detailed server information')
-    add_parser = subparsers.add_parser('add', help='Add a server interactively')
+    subparsers.add_parser('add', help='Add a server interactively')
     import_parser = subparsers.add_parser('import', help='Import servers from SSH config')
     import_parser.add_argument('path', nargs='?', default=None, help='Path to SSH config (default: ~/.ssh/config)')
-    info_parser = subparsers.add_parser('info', help='Show configuration info')
+    subparsers.add_parser('info', help='Show configuration info')
     log_parser = subparsers.add_parser('log', help='Log GPU stats to SQLite database')
     # Also accept `--remote` after the subcommand (e.g. `nvidb log --remote`)
     log_parser.add_argument('--remote', action='store_true', default=argparse.SUPPRESS, help='Use remote servers')
@@ -1066,6 +1016,4 @@ def main():
 
 if __name__ == "__main__":
     # python -m nvidb.test.run
-    print("Running test")
     main()
-    print("Test complete")
