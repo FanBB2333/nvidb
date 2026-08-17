@@ -7174,6 +7174,13 @@ class NVClientPool:
         cbreak_ctx.__enter__()
         self._start_mouse_reporting()
 
+        # Background threads (auto-reconnect, etc.) call logging.error/warning/info
+        # directly, which write straight to the console. Any such line printed
+        # while print_stats is doing cursor-positioned diff rendering corrupts the
+        # screen. Each node's own error is already rendered in-frame via
+        # _format_error_panel, so muting the console logger here loses nothing.
+        logging.disable(logging.CRITICAL)
+
         try:
             # Start keyboard listener thread (uses cbreak mode from main thread)
             keyboard_thread = threading.Thread(target=self._keyboard_listener, args=(cbreak_ctx,), daemon=True)
@@ -7202,6 +7209,7 @@ class NVClientPool:
         finally:
             self.quit_flag.set()  # Ensure thread exits
             self._stop_mouse_reporting()
+            logging.disable(logging.NOTSET)
             # Explicitly exit cbreak mode to restore terminal state
             try:
                 cbreak_ctx.__exit__(None, None, None)

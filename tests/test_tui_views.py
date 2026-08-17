@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import threading
@@ -2070,3 +2071,27 @@ def test_v_and_d_keys_switch_views_and_disable_node_navigation_in_unified_view()
     assert pool._handle_keypress("j") is True
     assert pool.selected_server == 1
     assert pool.refresh_needed.is_set()
+
+
+def test_print_refresh_mutes_console_logging_while_it_owns_the_screen(monkeypatch):
+    # Background threads (auto-reconnect, etc.) call logging.error/warning/info
+    # directly. A raw log line printed while print_stats does cursor-positioned
+    # diff rendering corrupts the screen, so print_refresh must silence the
+    # console logger for as long as it owns the terminal, and restore it after.
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool.mouse_enabled = False
+    pool.quit_flag.set()  # exit right after the first draw
+
+    seen_disabled_during_draw = []
+
+    def fake_print_stats(use_cache=True):
+        seen_disabled_during_draw.append(not logging.getLogger().isEnabledFor(logging.ERROR))
+
+    monkeypatch.setattr(pool, "print_stats", fake_print_stats)
+
+    assert logging.getLogger().isEnabledFor(logging.ERROR)
+    pool.print_refresh()
+    assert logging.getLogger().isEnabledFor(logging.ERROR)
+
+    assert seen_disabled_during_draw == [True]
