@@ -36,7 +36,7 @@ from .mouse import (
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .ssh_proxy import open_proxyjump_socket
-from .tui_theme import DiffScreen, frame_bottom, frame_separator, frame_top
+from .tui_theme import DiffScreen, fit, frame_bottom, frame_separator, frame_top
 from .utils import (
     units_from_str,
     extract_numbers,
@@ -4406,15 +4406,19 @@ class NVClientPool:
 
     _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
-    def _scale_server_blocks(self, server_rows, user_memory_by_client, available_rows):
+    def _scale_server_blocks(
+        self, server_rows, user_memory_by_client, available_rows, *, keep_expanded=None
+    ):
         """Fit every expanded server block into the terminal at once.
 
         All servers open expanded, so the stacked tables have to share
         the rows left under the headers. Blocks keep their natural size
         while they fit; once they do not, GPU rows are dropped from the
         tallest block first, and a block whose table frame cannot survive
-        collapses to its header line. Returns {idx: [block lines]} for
-        the servers that stay expanded.
+        collapses to its header line. The selected server is the last to
+        shrink and the last to collapse, so pressing Enter on it always
+        shows or hides its table when the window can hold one at all.
+        Returns {idx: [block lines]} for the servers that stay expanded.
         """
         blocks = {}
         for idx, _selected, is_expanded, _header, _summary, stats_info in server_rows:
@@ -4443,7 +4447,10 @@ class NVClientPool:
         natural = {idx: len(block) for idx, block in blocks.items()}
         trimmed_ids = set()
         while sum(len(block) for block in blocks.values()) > available_rows:
-            tallest = max(blocks, key=lambda idx: len(blocks[idx]))
+            candidates = [idx for idx in blocks if idx != keep_expanded]
+            if not candidates:
+                candidates = list(blocks)
+            tallest = max(candidates, key=lambda idx: len(blocks[idx]))
             trimmed = self._trim_server_block(blocks[tallest], len(blocks[tallest]) - 1)
             if trimmed is None:
                 del blocks[tallest]
@@ -5608,8 +5615,34 @@ class NVClientPool:
             "data_source": data_source,
         }
 
-    def _format_server_summary(self, summary_data, widths=None) -> str:
-        """Format summary string; if widths provided, columns are aligned."""
+    def _format_server_summary(self, summary_data, widths=None, *, compact=False) -> str:
+        """Format summary string; if widths provided, columns are aligned.
+
+        `compact` renders the plain short form for narrow terminals, where
+        the aligned form would push a server header past the terminal edge.
+        """
+        if compact:
+            if not summary_data:
+                return "no data"
+            status = (
+                summary_data.get("status")
+                if isinstance(summary_data, dict)
+                else None
+            )
+            if status == "loading":
+                return "loading…"
+            if status == "error":
+                message = " ".join(str(summary_data.get("message", "Error")).split())
+                return f"err: {message or 'error'}"
+            if status == "empty":
+                return "no data"
+            if summary_data.get("no_gpu"):
+                source = summary_data.get("data_source")
+                return "unsupported" if source == "unsupported" else "no GPU"
+            return (
+                f"{summary_data['gpu_count']}G · {summary_data['avg_util']}% · "
+                f"{summary_data['mem_display']}"
+            )
         if not summary_data:
             return "No GPU data available"
         if isinstance(summary_data, dict) and summary_data.get("status") == "loading":
@@ -5768,7 +5801,9 @@ class NVClientPool:
             last_fetch_error = self._last_fetch_error
 
         if stats_list is None:
-            stats_list = ["Loading..."] * len(self.pool)
+            # The header summary already says "Loading..."; a block under it
+            # would only repeat the same word twice per server.
+            stats_list = [""] * len(self.pool)
         if not isinstance(raw_stats_by_client, dict):
             raw_stats_by_client = {}
 
@@ -5813,6 +5848,10 @@ class NVClientPool:
             terminal_height = 24
 
         display_mode = self.display_mode
+        # Narrow windows get their own chrome. Every line the frame builds
+        # itself is sized to fit one terminal row, so the terminal never
+        # soft-wraps a server header into the next line.
+        compact_layout = terminal_width < 72
         if display_mode == self.DISPLAY_MODE_UNIFIED:
             detailed = self.unified_detailed
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
@@ -5844,15 +5883,7 @@ class NVClientPool:
                     process_sort_mode
                 ]
                 process_sort_arrow = (
-                    "▼"
-                    if bool(
-                        getattr(
-                            self,
-                            "unified_process_sort_descending",
-                            process_sort_mode != "command",
-                        )
-                    )
-                    else "▲"
+                    "▼" if self.unified_process_sort_descending else "▲"
                 )
                 process_filter = str(
                     self.unified_process_filter or ""
@@ -5868,12 +5899,19 @@ class NVClientPool:
                     f"[+/-]Rows [←]GPU [j/k]Select [i/T/K]Signal "
                     f"[t]History [p]{process_action} [q]"
                 )
+                if compact_layout:
+                    controls = (
+                        f"? · /{find_label} · o sort · j/k sel · "
+                        f"t hist · p · q"
+                    )
             else:
                 controls = (
                     f"[?]Help [Enter/→]Proc [j/k]GPU [p]{process_action} "
                     f"[d]{detail_action} [s]{sort_label} [f]{filter_label} "
                     f"[q] [g]{group_label} [u]{unsupported_label} [v]Nodes"
                 )
+                if compact_layout:
+                    controls = f"? · ⏎ proc · j/k GPU · d view · q quit"
             if len(controls) > terminal_width:
                 controls = controls[: max(0, terminal_width - 3)] + "..."
         else:
@@ -5882,13 +5920,22 @@ class NVClientPool:
                 "[?] Help  [v] Unified view  [j/k] Select  "
                 "[Enter] Toggle  [a/c] Expand/Collapse  [q] Quit"
             )
+            if compact_layout:
+                controls = "? help · v view · j/k sel · ⏎ exp · q quit"
         if bool(self.tui_help_visible):
             controls = "[? / Esc / q] Close help"
-        output_lines.append(
-            f"Time: {current_time} | Updated: {update_display}{fetch_display} | "
-            f"{server_label}: {server_count} | View: {view_label}{warn_display}"
-        )
-        output_lines.append(controls)
+        if compact_layout:
+            title_line = (
+                f"nvidb · {server_count} {server_label.lower()} · {current_time}"
+                + (" · refresh failed" if last_fetch_error else "")
+            )
+        else:
+            title_line = (
+                f"Time: {current_time} | Updated: {update_display}{fetch_display} | "
+                f"{server_label}: {server_count} | View: {view_label}{warn_display}"
+            )
+        output_lines.append(fit(title_line, terminal_width))
+        output_lines.append(fit(controls, terminal_width))
 
         if self.compact:
             separator_width = min(80, terminal_width)
@@ -6022,7 +6069,10 @@ class NVClientPool:
             - len(server_rows)
         )
         visible_blocks = self._scale_server_blocks(
-            server_rows, user_memory_by_client, available_rows
+            server_rows,
+            user_memory_by_client,
+            available_rows,
+            keep_expanded=self.selected_server,
         )
 
         for idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info in server_rows:
@@ -6035,22 +6085,44 @@ class NVClientPool:
                 else ("v" if idx in visible_blocks else ">")
             )
             selector = "*" if is_selected else " "
-            header_plain = (
-                f"{selector} {expand_icon} "
-                f"[{idx + 1:{index_width}d}] {self.pool[idx].description}"
+            summary = self._format_server_summary(
+                summary_data, widths=widths, compact=compact_layout
             )
-            pad = max_header_width - self.term.length(header_plain)
-            header_padded = header_plain + (" " * pad if pad > 0 else "")
-
-            if is_selected:
-                header_display = self.term.reverse + header_padded + self.term.normal
+            # A server header is exactly one terminal line. The description
+            # gives ground to the summary when both cannot fit, so the
+            # terminal never soft-wraps the row and shears the click map.
+            summary_room = terminal_width - 2 - len(self._ANSI_ESCAPE_RE.sub("", summary))
+            if compact_layout:
+                prefix = f"{selector} {expand_icon} {idx + 1} "
+                description = fit(
+                    self.pool[idx].description,
+                    max(1, summary_room - len(prefix)),
+                )
+                header_display = (
+                    self.term.reverse + prefix + description + self.term.normal
+                    if is_selected
+                    else prefix + description
+                )
             else:
-                header_display = header_padded
-
-            # Header with summary on same line (summary aligned)
-            summary = self._format_server_summary(summary_data, widths=widths)
+                header_plain = (
+                    f"{selector} {expand_icon} "
+                    f"[{idx + 1:{index_width}d}] {self.pool[idx].description}"
+                )
+                pad = max_header_width - self.term.length(header_plain)
+                header_padded = header_plain + (" " * pad if pad > 0 else "")
+                header_padded = header_padded[: max(1, summary_room)]
+                header_display = (
+                    self.term.reverse + header_padded + self.term.normal
+                    if is_selected
+                    else header_padded
+                )
+            row = f"{header_display}  {summary}"
+            if len(self._ANSI_ESCAPE_RE.sub("", row)) > terminal_width:
+                # A pathologically long error message is the one input that
+                # can still overflow; dropping its colour beats wrapping.
+                row = fit(self._ANSI_ESCAPE_RE.sub("", row), terminal_width)
             self._click_targets[self._screen_line_count(output_lines)] = ("server", idx)
-            output_lines.append(f"{header_display}  {summary}")
+            output_lines.append(row)
 
             # The full stats table, already formatted and scaled to fit.
             block = visible_blocks.get(idx)

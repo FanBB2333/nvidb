@@ -1040,6 +1040,20 @@ def test_scale_server_blocks_collapses_servers_when_the_screen_is_tiny():
     assert blocks == {}
 
 
+def test_the_selected_server_is_the_last_to_collapse():
+    pool = _pool()
+    specs = [_server_block(pool, 8), _server_block(pool, 8), _server_block(pool, 8)]
+
+    # Room for exactly one minimum block: the selected server keeps it,
+    # so Enter on it always has a visible effect.
+    blocks = pool._scale_server_blocks(
+        _server_rows(pool, specs), {}, 10, keep_expanded=1
+    )
+
+    assert set(blocks) == {1}
+    assert any("line(s) hidden" in _without_ansi(line) for line in blocks[1])
+
+
 def test_nodes_view_fits_the_terminal_with_every_server_expanded(
     monkeypatch, capsys
 ):
@@ -1084,6 +1098,74 @@ def test_nodes_view_fits_the_terminal_with_every_server_expanded(
     assert any("line(s) hidden" in _without_ansi(line) for line in frame)
     # Both server headers stay reachable for clicks.
     assert {kind for kind, _ in pool._click_targets.values()} == {"server"}
+
+
+def _nodes_pool(cached_stats, raw_stats, *, updated=1):
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool._default_expansion_applied = True
+    pool.expanded_servers = {0, 1}
+    pool.cached_stats = cached_stats
+    pool.cached_raw_stats = raw_stats
+    pool._last_update_time = updated
+    pool._last_fetch_duration = 0.1
+    pool._last_fetch_error = None
+    pool._cache_lock = threading.Lock()
+    return pool
+
+
+def _raw_stats_for(gpu_counts):
+    return {
+        idx: (
+            pd.DataFrame(
+                [
+                    _gpu_row(index, "RTX 4090", "10 %", "1024/24576")
+                    for index in range(count)
+                ]
+            ),
+            {},
+        )
+        for idx, count in enumerate(gpu_counts)
+    }
+
+
+def test_narrow_windows_never_wrap_a_server_row(monkeypatch, capsys):
+    # The blocks format to the live terminal width, so narrow it first.
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((58, 30)))
+    pool = _pool()
+    pool.pool[1].description = "training-node-with-a-very-long-name"
+    pool = _nodes_pool(
+        [_server_block(pool, 2) for _ in range(2)], _raw_stats_for([2, 2])
+    )
+    pool.pool[1].description = "training-node-with-a-very-long-name"
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    frame = pool._tui_diff_screen._previous
+    plain = [_without_ansi(line) for line in frame]
+    assert all(len(line) <= 58 for line in plain), max(map(len, plain))
+    # Compact chrome: short title and hint line instead of the wide ones.
+    assert plain[0].startswith("nvidb · 2 servers ·")
+    assert "v view" in plain[1] and "⏎ exp" in plain[1]
+    assert "[v] Unified view" not in plain[1]
+    # The long description yields to the summary instead of wrapping.
+    header = next(line for line in plain if "training-node" in line)
+    assert header.count("training-node") == 1
+    assert "…" in header
+
+
+def test_loading_is_said_once_per_server(monkeypatch, capsys):
+    pool = _nodes_pool(None, _raw_stats_for([0, 0]), updated=None)
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 30)))
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    frame = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    # Once per server, in the header summary - not again in a block below.
+    assert sum("Loading..." in line for line in frame) == len(pool.pool)
+    assert not any(line.strip() == "Loading..." for line in frame[3:])
 
 
 def _click(row):
