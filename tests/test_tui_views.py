@@ -983,7 +983,7 @@ def _server_block(pool, gpu_count):
         for index in range(gpu_count)
     ]
     table = pool._format_fixed_width_table(pd.DataFrame(rows), border=True)
-    return f"\nnode description\nDriver: 550.0 | CUDA: 12.4\n{table}"
+    return f"Driver: 550.0 | CUDA: 12.4\n{table}"
 
 
 def _server_rows(pool, specs):
@@ -1095,7 +1095,12 @@ def test_nodes_view_fits_the_terminal_with_every_server_expanded(
     frame = pool._tui_diff_screen._previous
     # One screen, no scrolling: the scaled frame fits the 20-line window.
     assert len(frame) <= 19
-    assert any("line(s) hidden" in _without_ansi(line) for line in frame)
+    plain = [_without_ansi(line) for line in frame]
+    # The block no longer repeats the server's name, so the selected
+    # server's full 8-GPU table fits exactly; the other one collapses.
+    assert any(line.lstrip().startswith("│   7 ") for line in plain)
+    assert any(line.lstrip().startswith("> [2] ") for line in plain)
+    assert not any(line.strip() == "node description" for line in plain)
     # Both server headers stay reachable for clicks.
     assert {kind for kind, _ in pool._click_targets.values()} == {"server"}
 

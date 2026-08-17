@@ -1904,7 +1904,7 @@ class NVClientPool:
                     system_info.get("error", "Error"),
                     error_type=system_info.get("error_type"),
                 )
-                formatted_stats.append(f"\n{colored(client.description, 'yellow')}\n{error_panel}")
+                formatted_stats.append(error_panel)
                 continue
 
             formatted_table = self._format_fixed_width_table(stats, border=True)
@@ -1959,7 +1959,7 @@ class NVClientPool:
                     advanced_block = ""
 
             formatted_stats.append(
-                f"\n{colored(client.description, 'yellow')}\n{system_info_header}{formatted_table}{advanced_block}"
+                f"{system_info_header}{formatted_table}{advanced_block}"
             )
         if return_raw:
             return formatted_stats, raw_stats_by_client
