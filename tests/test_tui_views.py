@@ -1088,19 +1088,21 @@ def test_nodes_view_fits_the_terminal_with_every_server_expanded(
     pool._last_fetch_duration = 0.1
     pool._last_fetch_error = None
     pool._cache_lock = threading.Lock()
-    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 20)))
+    # +3 over the tight 20-line case: the panel border (top+bottom) and the
+    # divider between the two servers each cost one row.
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 23)))
 
     pool.print_stats(use_cache=True)
     capsys.readouterr()
 
     frame = pool._tui_diff_screen._previous
-    # One screen, no scrolling: the scaled frame fits the 20-line window.
-    assert len(frame) <= 19
+    # One screen, no scrolling: the scaled frame fits the 23-line window.
+    assert len(frame) <= 22
     plain = [_without_ansi(line) for line in frame]
     # The block no longer repeats the server's name, so the selected
     # server's full 8-GPU table fits exactly; the other one collapses.
-    assert any(line.lstrip().startswith("│   7 ") for line in plain)
-    assert any(line.lstrip().startswith("> [2] ") for line in plain)
+    assert any("│   7 " in line for line in plain)
+    assert any("> [2] " in line for line in plain)
     assert not any(line.strip() == "node description" for line in plain)
     # Both server headers stay reachable for clicks.
     assert {kind for kind, _ in pool._click_targets.values()} == {"server"}

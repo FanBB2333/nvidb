@@ -36,7 +36,14 @@ from .mouse import (
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .ssh_proxy import open_proxyjump_socket
-from .tui_theme import DiffScreen, fit, frame_bottom, frame_separator, frame_top
+from .tui_theme import (
+    DiffScreen,
+    display_width,
+    fit,
+    frame_bottom,
+    frame_separator,
+    frame_top,
+)
 from .utils import (
     units_from_str,
     extract_numbers,
@@ -1500,6 +1507,13 @@ class LocalClient(BaseClient):
 class NVClientPool:
     DISPLAY_MODE_NODES = "nodes"
     DISPLAY_MODE_UNIFIED = "unified"
+    # "│ " + " │": the outer panel border's own side padding, reserved out of
+    # the content width so nothing sits flush against the frame.
+    _PANEL_BORDER_MARGIN = 4
+    # A content line equal to this exact string becomes a full-width tee
+    # separator ("├───┤") when the panel border is drawn, instead of being
+    # padded and sided like ordinary text.
+    _PANEL_SEPARATOR = "\x00__nvidb_panel_separator__\x00"
     UNIFIED_TABLE_COLUMNS = (
         "Node",
         "Hostname",
@@ -1896,6 +1910,14 @@ class NVClientPool:
             "process_details_by_client": process_details_by_client,
         }
         # reformat the str into a single string with fixed width formatting
+        # These blocks only ever appear inside the per-node view's panel
+        # border, so they reserve its margin up front - narrow terminals
+        # drop the border (see `compact_layout`) and so reserve nothing.
+        try:
+            _fetch_width = os.get_terminal_size().columns
+        except OSError:
+            _fetch_width = 80
+        panel_margin = 0 if _fetch_width < 72 else self._PANEL_BORDER_MARGIN
         formatted_stats = []
         for client, (stats, system_info) in zip(self.pool, stats_str):
             # Create formatted table display (or error panel)
@@ -1903,11 +1925,14 @@ class NVClientPool:
                 error_panel = self._format_error_panel(
                     system_info.get("error", "Error"),
                     error_type=system_info.get("error_type"),
+                    outer_margin=panel_margin,
                 )
                 formatted_stats.append(error_panel)
                 continue
 
-            formatted_table = self._format_fixed_width_table(stats, border=True)
+            formatted_table = self._format_fixed_width_table(
+                stats, border=True, outer_margin=panel_margin
+            )
 
             system_info_header = ""
             if system_info:
@@ -1951,7 +1976,9 @@ class NVClientPool:
                         if len(cols_present) < 2:
                             continue
                         sub_df = advanced_df[cols_present].copy()
-                        sub_table = self._format_fixed_width_table(sub_df, border=True)
+                        sub_table = self._format_fixed_width_table(
+                            sub_df, border=True, outer_margin=panel_margin
+                        )
                         sub_blocks.append(f"{title}\n{sub_table}")
 
                     advanced_block = "\n" + "\n".join(sub_blocks)
@@ -5024,11 +5051,43 @@ class NVClientPool:
             self._tui_diff_screen = screen
         screen.paint(rows)
 
-    def _format_error_panel(self, message: str, error_type: Optional[str] = None) -> str:
+    def _wrap_panel_border(self, lines, content_width):
+        """Enclose already-built content lines in a rounded panel border.
+
+        Every line is assumed to already fit `content_width` (the render
+        loop narrowed itself to that width up front); this only pads and
+        sides them. A line equal to `_PANEL_SEPARATOR` becomes a full-width
+        tee rule instead, so an inter-server divider connects cleanly to
+        the frame's own corners rather than nesting inside a second pair
+        of side bars.
+        """
+        frame_width = content_width + self._PANEL_BORDER_MARGIN
+        side_l = colored("│ ", "dark_grey")
+        side_r = colored(" │", "dark_grey")
+        wrapped = [colored(frame_top(frame_width), "dark_grey")]
+        for line in lines:
+            if line == self._PANEL_SEPARATOR:
+                wrapped.append(colored(frame_separator(frame_width), "dark_grey"))
+                continue
+            visible = display_width(self._ANSI_ESCAPE_RE.sub("", line))
+            pad = max(0, content_width - visible)
+            wrapped.append(side_l + line + (" " * pad) + side_r)
+        wrapped.append(colored(frame_bottom(frame_width), "dark_grey"))
+        return wrapped
+
+    def _format_error_panel(
+        self,
+        message: str,
+        error_type: Optional[str] = None,
+        *,
+        outer_margin: int = 0,
+    ) -> str:
         try:
             width = os.get_terminal_size().columns
         except OSError:
             width = 80
+        if outer_margin:
+            width = max(20, width - outer_margin)
 
         if error_type == "auth" and str(message).strip() == "Password incorrect":
             title = "Password incorrect"
@@ -5098,6 +5157,7 @@ class NVClientPool:
         fixed_width_columns=(),
         section_headers=None,
         row_line_map=None,
+        outer_margin: int = 0,
     ):
         """Format fixed-width table display.
 
@@ -5106,7 +5166,9 @@ class NVClientPool:
         survive on narrow terminals, left-aligned and space-absorbing columns,
         plus `section_headers` (row index -> banner text) for grouped views.
         `row_line_map` is filled in with line offset -> data row index so callers
-        can turn a mouse click into a row.
+        can turn a mouse click into a row. `outer_margin` shrinks the table to
+        leave room for a caller-drawn frame around it (e.g. the per-node view's
+        panel border) instead of using the terminal's full width.
         """
         if df.empty:
             return "No GPU data available"
@@ -5121,6 +5183,8 @@ class NVClientPool:
             terminal_width = os.get_terminal_size().columns
         except OSError:
             terminal_width = 120  # Default width
+        if outer_margin:
+            terminal_width = max(20, terminal_width - outer_margin)
         
         # Define minimum width for each column
         min_widths = {
@@ -5943,6 +6007,19 @@ class NVClientPool:
         # itself is sized to fit one terminal row, so the terminal never
         # soft-wraps a server header into the next line.
         compact_layout = terminal_width < 72
+        # The per-node view gets an outer panel border when there is room
+        # for one; the unified table has its own border already and stays
+        # as-is. Reserving the margin here - before any chrome line below
+        # is built - means every width computation downstream (title,
+        # controls, the server rows) narrows automatically instead of
+        # needing its own adjustment.
+        show_panel_border = (
+            display_mode != self.DISPLAY_MODE_UNIFIED
+            and not compact_layout
+            and not bool(self.tui_help_visible)
+        )
+        if show_panel_border:
+            terminal_width -= self._PANEL_BORDER_MARGIN
         if display_mode == self.DISPLAY_MODE_UNIFIED:
             detailed = self.unified_detailed
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
@@ -6016,8 +6093,14 @@ class NVClientPool:
         if bool(self.tui_help_visible):
             controls = "[? / Esc / q] Close help"
         if compact_layout:
+            plain_title = (
+                f"nvidb · {server_count} {server_label.lower()} · {current_time}"
+                + (" · refresh failed" if last_fetch_error else "")
+            )
             title_line = (
-                colored("nvidb", "green", attrs=["bold"])
+                fit(plain_title, terminal_width)
+                if len(plain_title) > terminal_width
+                else colored("nvidb", "green", attrs=["bold"])
                 + colored(" · ", "dark_grey")
                 + colored(f"{server_count}", "magenta")
                 + f" {server_label.lower()}"
@@ -6026,8 +6109,14 @@ class NVClientPool:
                 + (colored(" · refresh failed", "red") if last_fetch_error else "")
             )
         else:
+            plain_title = (
+                f"Time: {current_time} | Updated: {update_display}{fetch_display} | "
+                f"{server_label}: {server_count} | View: {view_label}{warn_display}"
+            )
             title_line = (
-                "Time: " + colored(current_time, "cyan")
+                fit(plain_title, terminal_width)
+                if len(plain_title) > terminal_width
+                else "Time: " + colored(current_time, "cyan")
                 + " | Updated: " + colored(f"{update_display}{fetch_display}", "cyan")
                 + " | " + f"{server_label}: " + colored(str(server_count), "magenta")
                 + " | View: " + colored(view_label, "green")
@@ -6181,11 +6270,19 @@ class NVClientPool:
         # All-expanded by default means the stacked tables must share the
         # terminal: scale them to the rows that remain under the headers
         # so the whole cluster stays on one screen.
+        border_rows = 2 if show_panel_border else 0
+        separator_count = max(0, len(server_rows) - 1) if show_panel_border else 0
         available_rows = (
             (terminal_height - 1)
             - self._screen_line_count(output_lines)
             - len(server_rows)
+            - border_rows
         )
+        # Dividers between servers are dropped first when the terminal is
+        # short, so a tight window still favours GPU data over rules.
+        show_separators = separator_count > 0 and available_rows - separator_count >= 0
+        if show_separators:
+            available_rows -= separator_count
         visible_blocks = self._scale_server_blocks(
             server_rows,
             user_memory_by_client,
@@ -6193,7 +6290,7 @@ class NVClientPool:
             keep_expanded=self.selected_server,
         )
 
-        for idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info in server_rows:
+        for position, (idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info) in enumerate(server_rows):
             toggle_disabled = idx in self._toggle_disabled_servers
             # A server the scaler collapsed still gets its header, just
             # with the collapsed icon.
@@ -6293,6 +6390,15 @@ class NVClientPool:
             block = visible_blocks.get(idx)
             if block is not None:
                 output_lines.extend(block)
+
+            if show_separators and position < len(server_rows) - 1:
+                output_lines.append(self._PANEL_SEPARATOR)
+
+        if show_panel_border:
+            output_lines = self._wrap_panel_border(output_lines, terminal_width)
+            self._click_targets = {
+                row + 1: target for row, target in self._click_targets.items()
+            }
 
         self._write_tui_lines(output_lines)
 
