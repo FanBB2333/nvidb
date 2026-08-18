@@ -113,27 +113,26 @@ def node_name_for_server(server: dict) -> str:
 
 
 def gpu_allowlists(cfg: Optional[dict]) -> Dict[str, Set[int]]:
-    """Per-node GPU allowlists from the server config's optional `gpus:` key.
+    """Per-node GPU allowlists from the server config's optional `gpu_ids:` key.
 
-    A server entry may restrict scheduling to specific GPU indices:
+    A server entry may hand the queue only some of its cards:
 
         servers:
           - nickname: "shared-box"
-            gpus: [0, 1]   # never dispatch queue jobs onto the other cards
+            gpu_ids: [0, 1]   # never dispatch queue jobs onto the other cards
 
     Nodes without the key are unrestricted. Jobs already running on an
     excluded GPU are untouched; the mask only affects new placements.
     """
     out: Dict[str, Set[int]] = {}
     for server in (cfg or {}).get("servers") or []:
-        gpus = server.get("gpus")
-        if gpus is None:
-            continue
         node_name = node_name_for_server(server)
-        normalized = nvidb_config.normalize_gpu_indices(
-            gpus, label=f"server {node_name!r} gpus"
+        normalized = nvidb_config.server_gpu_ids(
+            server, context=f"server {node_name!r}"
         )
-        out[node_name] = set(normalized or [])
+        if normalized is None:
+            continue
+        out[node_name] = set(normalized)
     return out
 
 
@@ -1534,6 +1533,26 @@ class Scheduler:
 
     # --- reads ------------------------------------------------------------
 
+    def _node_view(self, node: Node, headroom: int) -> Dict[str, Any]:
+        """One node as reported to the UIs, masked by its GPU allowlist.
+
+        A host may hand the queue only some of its cards; the rest are
+        somebody else's business and would only be noise on screen. The
+        inventory kept in the database stays complete either way - the
+        mask is a view, not a deletion - and a card excluded after a job
+        of ours landed on it stays visible until that job is gone.
+        """
+        view = node.to_dict(headroom)
+        mask = self._gpu_allowlists.get(node.name)
+        if mask is None:
+            return view
+        view["gpus"] = [
+            gpu
+            for gpu in view.get("gpus") or []
+            if gpu.get("index") in mask or gpu.get("queue_jobs")
+        ]
+        return view
+
     def snapshot(self, *, include_ignored: bool = False) -> Dict[str, Any]:
         """A single JSON-friendly view of the whole queue, for other tools."""
         headroom = int(self.settings["headroom_mb"])
@@ -1558,7 +1577,7 @@ class Scheduler:
                 "placement": self.settings.get("placement"),
             },
             "counts": dbm.job_counts(self.conn),
-            "nodes": [node.to_dict(headroom) for node in nodes],
+            "nodes": [self._node_view(node, headroom) for node in nodes],
             "jobs": [job.to_dict() for job in jobs],
             "recent": [job.to_dict() for job in recent_terminal],
             "alerts": dbm.list_alerts(self.conn, open_only=True, limit=20),

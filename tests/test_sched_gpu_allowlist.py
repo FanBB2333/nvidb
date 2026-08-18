@@ -71,21 +71,73 @@ def test_gpu_allowlists_reject_invalid_values(value):
         gpu_allowlists(cfg)
 
 
-def test_monitor_config_accepts_and_preserves_the_allowlist():
+@pytest.mark.parametrize("key", ["gpu_ids", "gpus"])
+def test_monitor_config_accepts_and_preserves_the_allowlist(key):
     raw = [
         {
             "hostname": "gpu.example.com",
             "port": 22,
             "username": "alice",
             "nickname": "shared-box",
-            "gpus": [0, 1],
+            key: [0, 1],
         }
     ]
     servers = ServerListInfo.from_dict(raw)
 
-    assert servers[0].gpus == [0, 1]
-    assert servers.to_dict()[0]["gpus"] == [0, 1]
-    assert "    gpus: [0, 1]" in config.format_servers_yaml(servers.to_dict())
+    assert servers[0].gpu_ids == [0, 1]
+    # Either spelling goes in; the canonical one comes back out, so a
+    # rewritten config.yml does not carry both keys.
+    assert servers.to_dict()[0]["gpu_ids"] == [0, 1]
+    assert "gpus" not in servers.to_dict()[0]
+    assert "    gpu_ids: [0, 1]" in config.format_servers_yaml(servers.to_dict())
+
+
+def test_the_snapshot_shows_only_the_gpus_the_queue_was_given(masked_scheduler):
+    scheduler, _cluster = masked_scheduler
+    scheduler.tick(force=True)
+
+    node = next(
+        item for item in scheduler.snapshot()["nodes"] if item["name"] == "shared-box"
+    )
+    # Masked away on screen, but still numbered by the host: GPU2 is gone,
+    # GPU0/1 keep their own indices rather than being renumbered.
+    assert [gpu["index"] for gpu in node["gpus"]] == [0, 1]
+
+
+def test_an_excluded_gpu_stays_visible_while_it_runs_our_job(tmp_path):
+    cluster = _shared_cluster()
+    conn = dbm.open_db(tmp_path / "queue.db")
+    unrestricted = _scheduler(conn, cluster)
+    try:
+        unrestricted.sync_nodes_from_config()
+        job_id = unrestricted.submit("existing", vram="1G")
+        unrestricted.tick(force=True)
+        assert dbm.get_job(conn, job_id).gpu_ids == [2]
+    finally:
+        unrestricted.close()
+
+    restricted = _scheduler(conn, cluster, [0, 1])
+    try:
+        restricted.tick(force=True)
+        node = next(
+            item
+            for item in restricted.snapshot()["nodes"]
+            if item["name"] == "shared-box"
+        )
+        # Hiding GPU2 here would hide a running job of ours with it.
+        assert [gpu["index"] for gpu in node["gpus"]] == [0, 1, 2]
+
+        cluster["shared-box"].finish_job(job_id)
+        restricted.tick(force=True)
+        node = next(
+            item
+            for item in restricted.snapshot()["nodes"]
+            if item["name"] == "shared-box"
+        )
+        assert [gpu["index"] for gpu in node["gpus"]] == [0, 1]
+    finally:
+        restricted.close()
+        conn.close()
 
 
 @pytest.fixture

@@ -1176,6 +1176,51 @@ def test_loading_is_said_once_per_server(monkeypatch, capsys):
     assert not any(line.strip() == "Loading..." for line in frame[3:])
 
 
+def _allowlist_frame(gpu_count):
+    rows = []
+    for index in range(gpu_count):
+        row = _gpu_row(index, "RTX 4090", "10 %", "1024/24576")
+        row["gpu_index"] = row.pop("GPU")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_gpu_allowlist_hides_other_cards_and_keeps_their_numbers():
+    from types import SimpleNamespace
+
+    pool = _pool()
+    stats = _allowlist_frame(4)
+    advanced = pd.DataFrame([{"GPU": index, "sm_active": 0.5} for index in range(4)])
+    info = {"attached_gpus": "4", "advanced_metrics": advanced}
+
+    filtered, filtered_info = pool._apply_gpu_allowlist(
+        SimpleNamespace(gpu_ids=[2]), stats, info
+    )
+
+    assert list(filtered["gpu_index"]) == [2]
+    # The host's own numbering survives, in the cells and in the row labels
+    # the per-process lookups join on.
+    assert list(filtered.index) == [2]
+    assert list(filtered_info["advanced_metrics"]["GPU"]) == [2]
+    # The driver said four; the header must describe what is on screen.
+    assert filtered_info["attached_gpus"] == "1"
+
+
+def test_a_server_without_an_allowlist_keeps_every_gpu():
+    from types import SimpleNamespace
+
+    pool = _pool()
+    stats = _allowlist_frame(4)
+    info = {"attached_gpus": "4"}
+
+    filtered, filtered_info = pool._apply_gpu_allowlist(
+        SimpleNamespace(gpu_ids=None), stats, info
+    )
+
+    assert list(filtered["gpu_index"]) == [0, 1, 2, 3]
+    assert filtered_info["attached_gpus"] == "4"
+
+
 def _many_server_pool(count, *, expanded=(), selected=0):
     from types import SimpleNamespace
 

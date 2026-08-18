@@ -133,7 +133,7 @@ def _dq(value) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def normalize_gpu_indices(value, *, label="gpus"):
+def normalize_gpu_indices(value, *, label="gpu_ids"):
     """Validate and normalize an optional GPU-index allowlist."""
     if value is None:
         return None
@@ -149,6 +149,31 @@ def normalize_gpu_indices(value, *, label="gpus"):
             normalized.append(index)
             seen.add(index)
     return normalized
+
+
+def server_gpu_ids(server, *, context=""):
+    """The GPU-index allowlist of one server entry, or None when unrestricted.
+
+    A server may hand nvidb only some of its cards:
+
+        servers:
+          - nickname: "shared-box"
+            gpu_ids: [2]   # ignore every other GPU on this host
+
+    Listed indices are the host's own NVML indices and keep those numbers
+    everywhere nvidb shows them, so GPU 2 stays "GPU 2" rather than being
+    renumbered to 0. `gpus:` is accepted as an alias for older configs.
+    `context` prefixes the error message so a bad value names its server.
+    """
+    if not isinstance(server, dict):
+        return None
+    value = server.get("gpu_ids")
+    key = "gpu_ids"
+    if value is None:
+        value = server.get("gpus")
+        key = "gpus"
+    # The message names the key the user actually wrote, not the canonical one.
+    return normalize_gpu_indices(value, label=f"{context} {key}".strip())
 
 
 def format_servers_yaml(servers) -> str:
@@ -193,9 +218,9 @@ def format_servers_yaml(servers) -> str:
         if proxyjump:
             lines.append(f"    proxyjump: {_dq(proxyjump)}")
 
-        gpus = normalize_gpu_indices(server.get("gpus"))
-        if gpus is not None:
-            lines.append(f"    gpus: {json.dumps(gpus)}")
+        gpu_ids = server_gpu_ids(server)
+        if gpu_ids is not None:
+            lines.append(f"    gpu_ids: {json.dumps(gpu_ids)}")
 
     return "\n".join(lines) + "\n"
 

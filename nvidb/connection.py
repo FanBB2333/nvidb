@@ -57,6 +57,14 @@ from .utils import (
 )
 
 
+def _as_gpu_index(value):
+    """Read a GPU index out of a table cell, or None when it is not one."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_leading_float(value):
     """Return the first numeric component of a text field, or None."""
     if value is None:
@@ -78,6 +86,8 @@ class BaseClient(ABC):
         self.port = None
         self.username = None
         self.description = None
+        # GPU indices nvidb was handed on this host; None means all of them.
+        self.gpu_ids = None
         self.connected = False
         self.last_connect_error = None
         self.last_error_type = None
@@ -976,6 +986,7 @@ class RemoteClient(BaseClient):
         self.password = server.password
         self.identityfile = getattr(server, "identityfile", None)
         self.proxyjump = getattr(server, "proxyjump", None)
+        self.gpu_ids = getattr(server, "gpu_ids", None)
         self._proxy = None
         self.client = self._make_ssh_client()
         # Lock order is always _connect_lock -> _nvml_agent_lock; never take the
@@ -1751,6 +1762,46 @@ class NVClientPool:
         stats[f"{HIDDEN_COLUMN_PREFIX}rx_percent"] = rx_percent
         stats[f"{HIDDEN_COLUMN_PREFIX}tx_percent"] = tx_percent
 
+    @staticmethod
+    def _apply_gpu_allowlist(client, stats, system_info):
+        """Drop the GPUs a server did not hand to nvidb.
+
+        Filtering here - before any column is derived - keeps every later
+        per-row list the same length as the table. Row labels are left
+        alone on purpose: they carry the host's own GPU index, which is
+        what the process lookups join on and what the UI must keep
+        showing, so a host that lends out only GPU 2 still calls it 2.
+        """
+        allowed = getattr(client, "gpu_ids", None)
+        if allowed is None:
+            return stats, system_info
+
+        allowed = set(allowed)
+
+        def keep(frame):
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                return frame
+            for column in ("gpu_index", "GPU"):
+                if column in frame.columns:
+                    return frame[
+                        frame[column].map(
+                            lambda value: _as_gpu_index(value) in allowed
+                        )
+                    ]
+            return frame
+
+        stats = keep(stats)
+        if isinstance(system_info, dict):
+            system_info = dict(system_info)
+            advanced = system_info.get("advanced_metrics")
+            if isinstance(advanced, pd.DataFrame):
+                system_info["advanced_metrics"] = keep(advanced)
+            # The header count must describe what is on screen, not what
+            # the driver reported.
+            if isinstance(stats, pd.DataFrame):
+                system_info["attached_gpus"] = str(len(stats))
+        return stats, system_info
+
     def get_client_gpus_info(self, return_raw: bool = False):
         # Set pandas display options for terminal output
         pd.set_option('display.max_columns', None)
@@ -1767,6 +1818,7 @@ class NVClientPool:
         want_process_details = self._process_panel_visible()
         for idx, client in enumerate(self.pool):
             stats, system_info = client.get_full_gpu_info()
+            stats, system_info = self._apply_gpu_allowlist(client, stats, system_info)
 
             # Fetch system stats (CPU, memory, swap) and merge into system_info
             if not (isinstance(system_info, dict) and system_info.get("error")):
