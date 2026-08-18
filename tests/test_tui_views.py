@@ -1958,6 +1958,11 @@ def test_view_changes_are_persisted_to_config(monkeypatch):
         "nvidb.connection.nvidb_config.save_view_settings",
         lambda settings: saved.append(settings) or True,
     )
+    # Keep the test hermetic: never read the developer's real config.yml.
+    monkeypatch.setattr(
+        "nvidb.connection.nvidb_config.load_view_settings",
+        lambda *a, **k: {"theme": "classic"},
+    )
 
     assert pool._handle_keypress("v") is True
     assert pool._handle_keypress("d") is True
@@ -1974,6 +1979,9 @@ def test_view_changes_are_persisted_to_config(monkeypatch):
         "group_by_node": False,
         "hide_unsupported": True,
         "mouse": True,
+        # Carried over from the stored settings: this TUI does not manage
+        # the theme but must not clobber the queue TUI's choice.
+        "theme": "classic",
     }
     pool._unified_gpu_count = 4
     saved.clear()

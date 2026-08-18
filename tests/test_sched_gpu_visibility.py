@@ -433,8 +433,11 @@ def test_the_tui_lists_unmanaged_processes_by_default(tui):
         [_proc(11, 6000, "ollama", "root"), _proc(12, 4000, "python train.py", job_id=3, job_name="train")]
     )
     output = _render(tui, state)
-    assert "ollama" in output
-    assert "unmanaged" in output
+    # The compact view names the foreign process on the node's ext line.
+    ext_line = next(
+        line for line in output.splitlines() if line.lstrip().startswith("ext ")
+    )
+    assert "ollama" in ext_line and "root" in ext_line
     # The queue's own job is already visible in the job table below.
     assert "job 3 train" not in output
 
@@ -460,6 +463,12 @@ def test_pressing_p_cycles_to_every_process_then_to_none(tui):
 
 
 def test_the_tui_says_when_a_cards_split_is_inferred(tui):
+    # The compact grid tags the cell; the full explanation lives one press
+    # of p away, so a permanently blind card does not cost a line forever.
+    output = _render(tui, _tui_state([], attribution="blind", external=8000))
+    assert "·blind" in output
+
+    tui.proc_view = "all"
     output = _render(tui, _tui_state([], attribution="blind", external=8000))
     assert "reports no per-process memory" in output
 
@@ -470,6 +479,7 @@ def test_the_tui_names_the_job_behind_blind_memory(tui):
         attribution="blind",
         external=8000,
     )
+    tui.proc_view = "all"
     output = _render(tui, state)
     assert "job 32 sweep" in output
 

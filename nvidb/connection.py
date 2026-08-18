@@ -6527,7 +6527,11 @@ class NVClientPool:
         if not self._persist_view_enabled:
             return
         try:
-            nvidb_config.save_view_settings(self._current_view_settings())
+            # Merge over what is stored: settings this TUI does not manage
+            # (the queue TUI's theme choice) must survive the write.
+            settings = nvidb_config.load_view_settings()
+            settings.update(self._current_view_settings())
+            nvidb_config.save_view_settings(settings)
         except Exception as error:
             logging.debug(msg=f"Failed to persist view settings: {error}")
 

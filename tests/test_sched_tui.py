@@ -201,11 +201,72 @@ def _mouse_at(output, text, *, button=0, occurrence=0):
 def test_the_screen_shows_nodes_capacity_and_jobs():
     output = _render(_tui())
     assert "big-node" in output and "small-node" in output
-    assert "RTX PRO 5000" in output
-    assert "free" in output and "ext" in output
+    # The GPU model lives on the node header now, once per node.
+    assert "1× RTX PRO 5000" in output
+    # The grid cell keeps the free amount and names the foreign processes.
+    assert "free" in output and "·2p" in output
     assert "python train.py" in output
     # The keybinding footer is always reachable.
     assert "q quit" in output
+
+
+def test_gpus_share_lines_instead_of_taking_one_each():
+    snapshot = _snapshot()
+    snapshot["nodes"][0]["gpus"] = [
+        _gpu(index, name="RTX PRO 5000", total=73415) for index in range(4)
+    ]
+    tui = _tui(width=150)
+    output = _plain(tui.render(_state(snapshot)))
+    gpu_rows = [line for line in output.splitlines() if "G0 " in line or "G3 " in line]
+    # Four GPUs at 150 columns fit on a single grid line.
+    assert any("G0 " in line and "G3 " in line for line in gpu_rows)
+
+
+def test_external_processes_collapse_to_one_summary_line():
+    snapshot = _snapshot()
+    snapshot["nodes"][0]["gpus"] = [
+        _gpu(
+            0,
+            total=73415,
+            used=69000,
+            external=69000,
+            procs=3,
+            processes=[
+                _proc(100, 40000, "python train.py", "alice"),
+                _proc(101, 20000, "python infer.py", "bob"),
+                _proc(102, 5000, "jupyter", "carol"),
+                _proc(103, 4000, "python small.py", "dave"),
+            ],
+        )
+    ]
+    output = _plain(_tui().render(_state(snapshot)))
+    ext_lines = [line for line in output.splitlines() if line.lstrip().startswith("ext ")]
+    assert len(ext_lines) == 1
+    # Biggest foreign process first, overflow counted instead of listed.
+    assert "alice" in ext_lines[0] and "39.1G" in ext_lines[0]
+    assert "+1 more" in ext_lines[0]
+
+
+def test_procs_all_still_lists_every_process_line():
+    snapshot = _snapshot()
+    snapshot["nodes"][0]["gpus"] = [
+        _gpu(
+            0,
+            total=73415,
+            used=69000,
+            external=69000,
+            procs=2,
+            processes=[
+                _proc(100, 40000, "python train.py", "alice"),
+                _proc(101, 20000, "python infer.py", "bob"),
+            ],
+        )
+    ]
+    tui = _tui()
+    tui.proc_view = "all"
+    output = _plain(tui.render(_state(snapshot)))
+    assert "alice" in output and "bob" in output
+    assert "unmanaged" in output
 
 
 def test_capacity_reflects_foreign_usage():
@@ -419,6 +480,29 @@ def test_the_filter_cycles_through_the_useful_views():
     _press(tui, "f")  # finished
     _render(tui, _state(snapshot))
     assert {job["id"] for job in tui.jobs} == {3}
+
+
+def test_T_cycles_the_theme_and_persists_it(monkeypatch):
+    from nvidb.sched import tui as tui_module
+
+    saved = {}
+    monkeypatch.setattr(
+        tui_module.nvidb_config, "load_view_settings", lambda *a, **k: {"mouse": True}
+    )
+    monkeypatch.setattr(
+        tui_module.nvidb_config,
+        "save_view_settings",
+        lambda settings, *a, **k: saved.update(settings) or True,
+    )
+    tui = _tui()
+    _render(tui)
+    assert tui.theme == "classic"
+    _press(tui, "T")
+    assert tui.theme == "muted"
+    assert saved["theme"] == "muted"
+    assert "T theme:muted" in _render(tui)
+    _press(tui, "T")
+    assert tui.theme == "classic"
 
 
 def test_q_quits_and_other_keys_do_not():

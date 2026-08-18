@@ -25,12 +25,16 @@ DEFAULT_VIEW_SETTINGS = {
     "group_by_node": True,
     "hide_unsupported": True,
     "mouse": True,
+    # Colour theme shared by the TUIs: "classic" is the monitor's plain
+    # high-contrast ANSI palette, "muted" the queue TUI's softer tones.
+    "theme": "classic",
 }
 
 VIEW_SETTING_CHOICES = {
     "mode": ("nodes", "unified"),
     "sort": ("node", "available", "utilization"),
     "filter": ("all", "available", "busy", "errors"),
+    "theme": ("classic", "muted"),
 }
 
 def get_config_path():

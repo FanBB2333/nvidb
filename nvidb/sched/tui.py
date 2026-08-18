@@ -49,18 +49,23 @@ FILTER_STATES = {
     "finished": ("completed", "failed", "cancelled", "timeout", "lost"),
 }
 
-# Muted tokscale-style palette. Call sites keep semantic ANSI names; this maps
-# them to softer absolute tones so ordinary data stays calm and saturated
-# colour is left meaning "look at this". blessed degrades each name to the
-# nearest colour the terminal actually has.
-PALETTE = {
-    "green": "mediumseagreen",
-    "yellow": "darkkhaki",
-    "red": "indianred",
-    "cyan": "cadetblue",
-    "magenta": "rosybrown",
-    "bright_blue": "steelblue",
+# Call sites use semantic ANSI names; a theme maps them to concrete tones and
+# blessed degrades each to the nearest colour the terminal actually has.
+# "classic" is the plain high-contrast palette the nvidb monitor TUI uses and
+# is the default; "muted" keeps the softer tokscale tones this TUI shipped
+# with, where saturated colour is reserved to mean "look at this".
+THEMES = {
+    "classic": {},
+    "muted": {
+        "green": "mediumseagreen",
+        "yellow": "darkkhaki",
+        "red": "indianred",
+        "cyan": "cadetblue",
+        "magenta": "rosybrown",
+        "bright_blue": "steelblue",
+    },
 }
+THEME_ORDER = tuple(THEMES)
 
 # The selection band: a grey clearly lighter than a dark terminal background,
 # so the cursor is findable at a glance yet still reads as a tint, not a bar.
@@ -318,10 +323,12 @@ class QueueTUI:
         refresh: float = 3.0,
         *,
         mouse_enabled: bool = True,
+        theme: str = "classic",
     ):
         self.term = Terminal()
         self.worker = _Worker(db_path=db_path, refresh=refresh)
         self.mouse_enabled = bool(mouse_enabled)
+        self.theme = theme if theme in THEMES else "classic"
         self._mouse_reporting = False
         self.focus = "jobs"  # jobs | nodes
         self.job_index = 0
@@ -435,10 +442,14 @@ class QueueTUI:
 
     # --- rendering --------------------------------------------------------
 
+    @property
+    def _palette(self) -> Dict[str, str]:
+        return THEMES.get(self.theme, THEMES["classic"])
+
     def _style(self, text: str, style: Optional[str]) -> str:
         if not style:
             return text
-        formatter = getattr(self.term, PALETTE.get(style, style), None)
+        formatter = getattr(self.term, self._palette.get(style, style), None)
         return formatter(text) if callable(formatter) else text
 
     def _fit(self, text: str, width: int) -> str:
@@ -533,7 +544,7 @@ class QueueTUI:
         for part, (_text, style) in zip(plain_parts, segments):
             if not part:
                 continue
-            fg = PALETTE.get(style, style) if style else None
+            fg = self._palette.get(style, style) if style else None
             attr = f"{fg}_on_{SELECTION_BG}" if fg else f"on_{SELECTION_BG}"
             formatter = getattr(self.term, attr, None)
             out.append(formatter(part) if callable(formatter) else part)
@@ -648,34 +659,70 @@ class QueueTUI:
             )
         return lines
 
+    @staticmethod
+    def _node_health_dot(node: Dict[str, Any]) -> Tuple[str, str]:
+        """One glanceable dot per node: can this node take a job right now?
+
+        Green = up with free VRAM somewhere, yellow = up but full (or
+        drained), red = down, hollow = no GPU data yet.
+        """
+        if node["state"] == "down":
+            return ("●", "red")
+        if not node["enabled"] or node["state"] == "drain":
+            return ("●", "yellow")
+        gpus = node.get("gpus") or []
+        if not gpus:
+            return ("◌", "bright_black")
+        if any(gpu.get("free_mb", 0) >= 1024 for gpu in gpus):
+            return ("●", "green")
+        return ("●", "yellow")
+
     def _node_lines(self, width: int) -> List[str]:
         self._node_line_targets = {}
         lines = [self._style("─ NODES " + "─" * max(0, width - 8), "bright_black")]
         for position, node in enumerate(self.nodes):
             node_start = len(lines)
             selected = self.focus == "nodes" and position == self.node_index
-            marker = "›" if selected else " "
+            marker = "❯" if selected else " "
             state = node["state"]
             # An up node is the normal case and stays quiet; only trouble
             # (down, drain) earns colour.
             state_style = {"down": "red", "drain": "yellow"}.get(
                 state, "bright_black"
             )
-            label = node["name"]
-            detail = f"{node['hostname'] or ''}"
             if not node["enabled"]:
                 state = "drain"
                 state_style = "yellow"
-            head = f"{marker} {label}"
+            dot, dot_style = self._node_health_dot(node)
+            # The GPU model moves up here from the per-GPU rows: nodes are
+            # almost always homogeneous, so saying it once frees the grid
+            # cells below to show nothing but occupancy.
+            models = []
+            for gpu in node.get("gpus") or []:
+                name = gpu.get("name") or "-"
+                if name not in models:
+                    models.append(name)
+            model_text = (
+                f" · {len(node.get('gpus') or [])}× {'/'.join(models)}"
+                if models
+                else ""
+            )
+            detail = f"{node['hostname'] or ''}"
             tail = f"{detail}  "
+            head_width = (
+                2 + 2 + display_width(node["name"]) + display_width(model_text)
+            )
             gap = max(
                 1,
-                width - display_width(head) - display_width(tail) - len(state) - 1,
+                width - head_width - display_width(tail) - len(state) - 1,
             )
             lines.append(
                 self._compose(
                     [
-                        (head, "bold"),
+                        (f"{marker} ", "cyan"),
+                        (f"{dot} ", dot_style),
+                        (node["name"], "bold"),
+                        (model_text, "bright_black"),
                         (" " * gap, None),
                         (tail, "bright_black"),
                         (state, state_style),
@@ -693,12 +740,126 @@ class QueueTUI:
                     self._node_line_targets[line_index] = position
                 continue
 
-            for gpu in node["gpus"]:
-                lines.append(self._compose(self._gpu_segments(gpu, width), width))
-                lines.extend(self._gpu_process_lines(gpu, width))
+            if self.proc_view == "all":
+                # The full drill-down: one line per GPU, one per process.
+                for gpu in node["gpus"]:
+                    lines.append(self._compose(self._gpu_segments(gpu, width), width))
+                    lines.extend(self._gpu_process_lines(gpu, width))
+            else:
+                # The default: GPUs flow into a grid, several per line, so
+                # the node pane stays a couple of rows and the job table
+                # keeps the screen.
+                lines.extend(self._gpu_grid_lines(node["gpus"], width))
+                if self.proc_view == "summary":
+                    lines.extend(self._node_external_summary(node, width))
             for line_index in range(node_start, len(lines)):
                 self._node_line_targets[line_index] = position
         return lines
+
+    # Plain columns one grid cell occupies: "G0 " + 10-column bar +
+    # " free " + 6-column amount + " " + 6-column tag.
+    _GPU_CELL_WIDTH = 3 + 10 + 6 + 6 + 1 + 6
+    _GPU_CELL_GAP = 3
+
+    def _gpu_cell_segments(
+        self, gpu: Dict[str, Any]
+    ) -> List[Tuple[str, Optional[str]]]:
+        """One GPU as a fixed-width grid cell: index, occupancy bar, free.
+
+        The bar keeps the pane's one legend - foreign memory (yellow),
+        queue reservations (cyan), free (dim) - and the tag names why a
+        card is interesting: external processes, queue jobs, or a driver
+        that cannot attribute memory at all.
+        """
+        total = max(1, gpu["mem_total_mb"])
+        external = max(0, gpu["external_mem_mb"])
+        reserved = max(0, gpu["reserved_mb"])
+        free_style = (
+            None if gpu["free_mb"] >= 4096
+            else "yellow" if gpu["free_mb"] >= 1024
+            else "red"
+        )
+        if gpu.get("attribution") == "blind":
+            tag, tag_style = "·blind", "yellow"
+        elif gpu.get("external_procs"):
+            tag, tag_style = f"·{gpu['external_procs']}p", "yellow"
+        elif gpu.get("queue_jobs"):
+            tag, tag_style = f"·{gpu['queue_jobs']}j", "cyan"
+        else:
+            tag, tag_style = "", None
+        index_label = f"G{gpu['index']}"
+        segments: List[Tuple[str, Optional[str]]] = [
+            (f"{index_label:<3}", "bright_black"),
+        ]
+        segments.extend(
+            smooth_bar(
+                10,
+                (
+                    (min(1.0, external / total), "yellow"),
+                    (min(1.0, reserved / total), "cyan"),
+                ),
+            )
+        )
+        segments.append((" free ", "bright_black"))
+        segments.append((f"{format_mb(gpu['free_mb']):>6}", free_style))
+        segments.append((f" {tag:<6}", tag_style))
+        return segments
+
+    def _gpu_grid_lines(self, gpus: List[Dict[str, Any]], width: int) -> List[str]:
+        """Lay the node's GPUs out several to a line instead of one each."""
+        if not gpus:
+            return []
+        indent = 4
+        per_row = max(
+            1,
+            (width - indent + self._GPU_CELL_GAP)
+            // (self._GPU_CELL_WIDTH + self._GPU_CELL_GAP),
+        )
+        lines = []
+        for start in range(0, len(gpus), per_row):
+            segments: List[Tuple[str, Optional[str]]] = [(" " * indent, None)]
+            for offset, gpu in enumerate(gpus[start : start + per_row]):
+                if offset:
+                    segments.append((" " * self._GPU_CELL_GAP, None))
+                segments.extend(self._gpu_cell_segments(gpu))
+            lines.append(self._compose(segments, width))
+        return lines
+
+    def _node_external_summary(self, node: Dict[str, Any], width: int) -> List[str]:
+        """The card's foreign occupants on one line, biggest first.
+
+        These processes are why a queued job is waiting, so they stay
+        visible by default - but as a single summary line per node, not a
+        line each.
+        """
+        entries = []
+        multi_gpu = len(node.get("gpus") or []) > 1
+        for gpu in node.get("gpus") or []:
+            if gpu.get("attribution") == "blind":
+                continue
+            for process in gpu.get("processes") or []:
+                entry = GpuProcess.from_dict(process)
+                if entry.managed:
+                    continue
+                entries.append((entry.mem_mb or 0, gpu["index"], entry))
+        if not entries:
+            return []
+        entries.sort(key=lambda item: (-item[0], item[1]))
+        segments: List[Tuple[str, Optional[str]]] = [("    ext ", "bright_black")]
+        shown = entries[:PROC_SUMMARY_LIMIT + 1]
+        for index, (mem_mb, gpu_index, entry) in enumerate(shown):
+            if index:
+                segments.append((" · ", "bright_black"))
+            if multi_gpu:
+                segments.append((f"G{gpu_index} ", "bright_black"))
+            segments.append((f"{entry.username or '-'} ", None))
+            segments.append((format_mb(mem_mb), "yellow"))
+            segments.append(
+                (f" {fit_display(entry.name or str(entry.pid), 18)}", "bright_black")
+            )
+        if len(entries) > len(shown):
+            segments.append((f" · +{len(entries) - len(shown)} more", "bright_black"))
+        return [self._compose(segments, width)]
 
     def _gpu_segments(
         self, gpu: Dict[str, Any], width: int
@@ -1258,6 +1419,12 @@ class QueueTUI:
                     None,
                     "bright_black",
                 ),
+                (
+                    f"T theme:{self.theme}",
+                    "theme",
+                    None,
+                    "bright_black",
+                ),
             ]
         )
         alerts = (state.get("snapshot") or {}).get("alerts") or []
@@ -1295,7 +1462,8 @@ class QueueTUI:
             ("t", "Force a scheduler tick now"),
             ("a", "Toggle automatic ticking"),
             ("f", "Cycle the job filter"),
-            ("p", "GPU processes: unmanaged only / all / none"),
+            ("p", "GPU detail: compact / full per-process view / bars only"),
+        ("T", "Switch colour theme (classic / muted)"),
             ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
             ("Mouse click", "Select rows, activate [buttons], sort by a column header"),
@@ -1359,10 +1527,13 @@ class QueueTUI:
                 for row in range(help_start, help_end + 1):
                     self._row_targets[row] = ("close_help", None)
         else:
-            # Process listings can make the node pane arbitrarily tall, and the
-            # job table is what this screen is for, so cap it at half the height.
+            # The job table is what this screen is for, so the node pane is
+            # capped: a third of the height for the compact grid, half when
+            # the user asked for the full per-process drill-down.
             node_lines = self._node_lines(width)
-            node_budget = max(6, usable // 2)
+            node_budget = max(
+                6, usable // 2 if self.proc_view == "all" else usable // 3
+            )
             if len(node_lines) > node_budget:
                 hidden = len(node_lines) - node_budget + 1
                 node_lines = node_lines[: node_budget - 1]
@@ -1676,6 +1847,18 @@ class QueueTUI:
             self.proc_view = PROC_VIEWS[
                 (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
             ]
+        elif action == "theme":
+            self.theme = THEME_ORDER[
+                (THEME_ORDER.index(self.theme) + 1) % len(THEME_ORDER)
+            ]
+            # Persist over what is stored so the monitor TUI's own view
+            # settings survive the write.
+            try:
+                settings = nvidb_config.load_view_settings()
+                settings["theme"] = self.theme
+                nvidb_config.save_view_settings(settings)
+            except Exception:
+                pass
         elif action == "tick":
             self.worker.post("tick")
         elif action == "auto":
@@ -1809,6 +1992,8 @@ class QueueTUI:
             self._activate("move", 1)
         elif text == "p":
             self._activate("procs")
+        elif text == "T":
+            self._activate("theme")
         elif text == "t":
             self._activate("tick")
         elif text == "a":
@@ -1894,9 +2079,10 @@ def run_tui(db_path=None, refresh: float = 3.0) -> int:
 
     # Log records written straight to the terminal would scribble over the UI.
     quiet_transport_logging()
-    mouse_enabled = nvidb_config.load_view_settings()["mouse"]
+    view_settings = nvidb_config.load_view_settings()
     return QueueTUI(
         db_path=db_path,
         refresh=refresh,
-        mouse_enabled=mouse_enabled,
+        mouse_enabled=view_settings["mouse"],
+        theme=view_settings.get("theme", "classic"),
     ).run()
