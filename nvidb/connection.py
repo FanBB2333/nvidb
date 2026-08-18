@@ -43,6 +43,7 @@ from .tui_theme import (
     frame_bottom,
     frame_separator,
     frame_top,
+    meter,
 )
 from .utils import (
     units_from_str,
@@ -78,6 +79,82 @@ def parse_leading_float(value):
         return None
 
 
+class _ConnectProgress:
+    """A single self-rewriting line reporting the startup connect sweep.
+
+    Disabled unless stdout is a terminal, so piped and redirected runs
+    keep the plain log output a script would parse. While it is enabled
+    it owns its line: anything that needs to prompt calls
+    `pause_connect_progress()` first so the question is not drawn over.
+    """
+
+    _BAR_WIDTH = 18
+
+    def __init__(self, total, stream=None):
+        self.total = max(0, int(total))
+        self.stream = stream if stream is not None else sys.stdout
+        self.enabled = bool(self.total) and bool(
+            getattr(self.stream, "isatty", lambda: False)()
+        )
+        self.done = 0
+        self.failed = 0
+        self._painted = False
+
+    def _write(self, text):
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except Exception:
+            # A closed or broken stdout must not take the whole run down.
+            self.enabled = False
+
+    def clear(self):
+        """Wipe the meter's line, leaving the cursor at its start."""
+        if self.enabled and self._painted:
+            self._write("\r\x1b[K")
+            self._painted = False
+
+    def show(self, label):
+        """Redraw the meter while `label` is being connected."""
+        if not self.enabled:
+            return
+        bar = meter(self.done, self.total, self._BAR_WIDTH)
+        line = (
+            colored("  nvidb ", "green", attrs=["bold"])
+            + colored(bar, "cyan")
+            + colored(f"  {self.done}/{self.total}  ", "dark_grey")
+            + fit(str(label), 40)
+        )
+        self._write("\r\x1b[K" + line)
+        self._painted = True
+
+    def mark(self, ok):
+        self.done += 1
+        if not ok:
+            self.failed += 1
+
+    def finish(self):
+        """Clear the line: the UI is about to paint over this row."""
+        self.clear()
+
+
+# Set while connect_all is drawing, so an interactive prompt raised from
+# deep inside a client can take the line back before asking.
+_active_connect_progress = None
+
+
+def pause_connect_progress():
+    """Wipe the startup meter so a prompt owns the line it was using."""
+    if _active_connect_progress is not None:
+        _active_connect_progress.clear()
+
+
+def _prompt_secret(prompt):
+    """Ask for a password or passphrase without the meter overwriting it."""
+    pause_connect_progress()
+    return getpass.getpass(prompt=prompt)
+
+
 class BaseClient(ABC):
     """Base class for both RemoteClient and LocalClient with common functionality"""
     
@@ -110,8 +187,13 @@ class BaseClient(ABC):
         return self.connected is not False
 
     @abstractmethod
-    def connect(self) -> bool:
-        """Connect to the client (remote or local)"""
+    def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
+        """Connect to the client (remote or local).
+
+        `announce` is cleared by callers that own the terminal line - the
+        startup progress meter, the background reconnect - so nothing is
+        printed over what they are drawing.
+        """
         pass
     
     @abstractmethod
@@ -1157,7 +1239,10 @@ class RemoteClient(BaseClient):
             pass
         try:
             self.client.close()
-            logging.info(msg=f"Connection to {self.host}:{self.port} closed.")
+            # Debug, not info: `__del__` runs at interpreter shutdown, so at
+            # info level every node dropped a line onto the user's shell
+            # prompt after the UI had already gone.
+            logging.debug(msg=f"Connection to {self.host}:{self.port} closed.")
         except Exception:
             pass
         self._close_proxy()
@@ -1282,8 +1367,9 @@ class RemoteClient(BaseClient):
                     remaining = max_attempts - attempt
                     if attempt > 0:
                         logging.warning(msg=f"Authentication failed. {remaining} attempt(s) remaining.")
+                        pause_connect_progress()
                         print(f"  ⚠ Authentication failed. {remaining} attempt(s) remaining.")
-                    password = getpass.getpass(prompt=f"Enter password for {self.username}@{self.host}:{self.port} -> ")
+                    password = _prompt_secret(f"Enter password for {self.username}@{self.host}:{self.port} -> ")
 
                 self._connect_client(
                     batch_mode=not allow_prompt,
@@ -1324,7 +1410,11 @@ class RemoteClient(BaseClient):
         would land in the middle of the rendered screen.
         """
         if announce:
-            print(f"Connecting to {self.host}:{self.port} as {self.username}")
+            # A log line, not a print: the startup meter draws its own
+            # status, and a bare print would land in the middle of it.
+            logging.info(
+                msg=f"Connecting to {self.host}:{self.port} as {self.username}"
+            )
         batch_mode = not allow_prompt
         # catch the OSError exception when the host is not reachable
         try:
@@ -1358,7 +1448,7 @@ class RemoteClient(BaseClient):
                             error_type="auth",
                         )
                         return False
-                    passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
+                    passphrase = _prompt_secret(f"Enter passphrase for key {identityfile} -> ")
                     self._connect_client(
                         batch_mode=batch_mode,
                         hostname=self.host,
@@ -1409,7 +1499,7 @@ class RemoteClient(BaseClient):
                             error_type="auth",
                         )
                         return False
-                    passphrase = getpass.getpass(prompt=f"Enter passphrase for key {identityfile} -> ")
+                    passphrase = _prompt_secret(f"Enter passphrase for key {identityfile} -> ")
                     self._connect_client(
                         batch_mode=batch_mode,
                         hostname=self.host,
@@ -1491,10 +1581,9 @@ class LocalClient(BaseClient):
     def query_nvml_snapshot(self) -> dict:
         return self._nvml_collector.collect()
         
-    def connect(self) -> bool:
+    def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
         """Local connection is always successful"""
         logging.info(msg=f"Connected to local machine as {self.username}")
-        print(f"Connected to local machine as {self.username}")
         self.connected = True
         self.last_connect_error = None
         self.last_error_type = None
@@ -1610,7 +1699,10 @@ class NVClientPool:
         self.pool = [LocalClient()]
         if server_list is not None:
             self.pool += [RemoteClient(server) for server in server_list]
-        logging.info(msg=f"Initialized pool with {len(self.pool)} clients.")
+        # Debug, not info: the connect meter counts the same nodes a moment
+        # later, so at info level this only put a bare log line on screen
+        # ahead of it.
+        logging.debug(msg=f"Initialized pool with {len(self.pool)} clients.")
         self.connect_all()
         self.term = Terminal()
         self.compact = bool(compact)
@@ -1687,13 +1779,41 @@ class NVClientPool:
         self._toggle_disabled_servers = set()
     
     def connect_all(self):
-        for client in self.pool:
-            try:
-                client.connect()
-            except Exception as e:
-                logging.error(msg=f"Failed to connect to {getattr(client, 'description', 'unknown')}: {e}")
-                if hasattr(client, "_set_connect_error"):
-                    client._set_connect_error(str(e), error_type="connect")
+        """Open every client's session behind one self-rewriting line.
+
+        Paramiko logs a banner and an auth line per host and each client
+        announced itself as well, so starting up scrolled a dozen lines
+        of transport chatter past before the first frame drew. A meter
+        says the same thing in one line and leaves the screen clean.
+        Only when stdout is a terminal: piped or redirected runs keep
+        their plain log output, which is what a script would parse.
+        """
+        global _active_connect_progress
+
+        progress = _ConnectProgress(len(self.pool))
+        # Paramiko's INFO lines would land on top of the meter. Whether a
+        # node came up is reported by the meter and, in full, by the node's
+        # own error panel once the UI opens.
+        if progress.enabled:
+            logging.disable(logging.CRITICAL)
+            _active_connect_progress = progress
+        try:
+            for client in self.pool:
+                label = str(getattr(client, "description", "") or "node")
+                progress.show(label)
+                try:
+                    connected = client.connect(announce=False)
+                except Exception as e:
+                    logging.error(msg=f"Failed to connect to {label}: {e}")
+                    if hasattr(client, "_set_connect_error"):
+                        client._set_connect_error(str(e), error_type="connect")
+                    connected = False
+                progress.mark(bool(connected))
+        finally:
+            if progress.enabled:
+                logging.disable(logging.NOTSET)
+            _active_connect_progress = None
+            progress.finish()
 
     @staticmethod
     def _throughput_kib_per_second(value):

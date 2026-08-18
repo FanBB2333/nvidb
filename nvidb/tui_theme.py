@@ -112,6 +112,21 @@ def smooth_bar(
     return segments
 
 
+def meter(done: int, total: int, width: int = 18) -> str:
+    """`━━━━━━━───────────` - a plain progress bar of fixed width.
+
+    Same glyphs as the load bars elsewhere, so a filled meter reads as
+    one continuous line rather than a row of blocks.
+    """
+    width = max(1, width)
+    total = max(0, total)
+    done = max(0, min(done, total))
+    filled = int(round(width * done / total)) if total else 0
+    if done and filled == 0:
+        filled = 1
+    return BAR_FILL * filled + BAR_EMPTY * (width - filled)
+
+
 class DiffScreen:
     """Paints only the rows that changed since the previous frame.
 
