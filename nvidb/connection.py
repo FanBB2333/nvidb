@@ -4573,19 +4573,14 @@ class NVClientPool:
     # columns wide of its visible width.
     _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\([0-9A-Za-z]")
 
-    def _scale_server_blocks(
-        self, server_rows, user_memory_by_client, available_rows, *, keep_expanded=None
-    ):
-        """Fit every expanded server block into the terminal at once.
+    def _build_server_blocks(self, server_rows, user_memory_by_client):
+        """Render each expanded server's block at its natural height.
 
-        All servers open expanded, so the stacked tables have to share
-        the rows left under the headers. Blocks keep their natural size
-        while they fit; once they do not, GPU rows are dropped from the
-        tallest block first, and a block whose table frame cannot survive
-        collapses to its header line. The selected server is the last to
-        shrink and the last to collapse, so pressing Enter on it always
-        shows or hides its table when the window can hold one at all.
-        Returns {idx: [block lines]} for the servers that stay expanded.
+        Nothing is dropped here to make room for another server: the
+        caller scrolls its viewport instead. That keeps every GPU a node
+        reports on screen, and means what one server shows never depends
+        on how many others are expanded or on where the cursor sits.
+        Returns {idx: [block lines]} for the expanded servers.
         """
         blocks = {}
         for idx, _selected, is_expanded, _header, _summary, stats_info in server_rows:
@@ -4609,34 +4604,6 @@ class NVClientPool:
                 block.append(colored(user_line, "dark_grey"))
             block.append("")
             blocks[idx] = block
-
-        available_rows = max(0, available_rows)
-        natural = {idx: len(block) for idx, block in blocks.items()}
-        trimmed_ids = set()
-        while sum(len(block) for block in blocks.values()) > available_rows:
-            candidates = [idx for idx in blocks if idx != keep_expanded]
-            if not candidates:
-                candidates = list(blocks)
-            tallest = max(candidates, key=lambda idx: len(blocks[idx]))
-            trimmed = self._trim_server_block(blocks[tallest], len(blocks[tallest]) - 1)
-            if trimmed is None:
-                del blocks[tallest]
-                continue
-            blocks[tallest] = trimmed
-            trimmed_ids.add(tallest)
-        for idx in trimmed_ids:
-            if idx not in blocks:
-                continue
-            # The marker counts against the block's natural height, not the
-            # previous trim step, so the number matches what was dropped.
-            hidden = natural[idx] - len(blocks[idx])
-            blocks[idx][-1] = colored(
-                fit(
-                    f"  … {hidden} line(s) hidden — enlarge the terminal or press [c]",
-                    self._marker_width(),
-                ),
-                "dark_grey",
-            )
         return blocks
 
     @staticmethod
@@ -6478,52 +6445,33 @@ class NVClientPool:
         else:
             widths = None
 
-        # All-expanded by default means the stacked tables must share the
-        # terminal: scale them to the rows that remain under the headers
-        # so the whole cluster stays on one screen.
+        # Every expanded server keeps its whole table. Making the stacked
+        # blocks share the window used to mean dropping GPU rows from the
+        # tallest one, which hid real cards and - because the selection was
+        # exempt from the trimming - made the layout shift as the cursor
+        # moved. The viewport below scrolls instead.
         border_rows = 2 if show_panel_border else 0
-        separator_count = max(0, len(server_rows) - 1) if show_panel_border else 0
-        available_rows = (
+        # Dividers between servers are decoration; a window too short to
+        # hold them spends the rows on GPU data instead.
+        rows_for_body = (
             (terminal_height - 1)
             - self._screen_line_count(output_lines)
-            - len(server_rows)
             - border_rows
         )
-        # Dividers between servers are dropped first when the terminal is
-        # short, so a tight window still favours GPU data over rules.
-        show_separators = separator_count > 0 and available_rows - separator_count >= 0
-        if show_separators:
-            available_rows -= separator_count
-        if available_rows <= 0:
-            # The window cannot even hold every header: the viewport below
-            # will scroll the list, so instead of collapsing every table,
-            # focus on the selection - only its table survives, budgeted to
-            # the visible region minus its header and the two indicators.
-            visible_blocks = self._scale_server_blocks(
-                [row for row in server_rows if row[0] == self.selected_server],
-                user_memory_by_client,
-                max(
-                    0,
-                    (terminal_height - 1)
-                    - self._screen_line_count(output_lines)
-                    - border_rows
-                    - 3,
-                ),
-                keep_expanded=self.selected_server,
-            )
-        else:
-            visible_blocks = self._scale_server_blocks(
-                server_rows,
-                user_memory_by_client,
-                available_rows,
-                keep_expanded=self.selected_server,
-            )
+        show_separators = (
+            len(server_rows) > 1
+            and show_panel_border
+            and rows_for_body - (len(server_rows) - 1) >= len(server_rows)
+        )
+        visible_blocks = self._build_server_blocks(
+            server_rows, user_memory_by_client
+        )
 
         sections = []
         for idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info in server_rows:
             toggle_disabled = idx in self._toggle_disabled_servers
-            # A server the scaler collapsed still gets its header, just
-            # with the collapsed icon.
+            # The icon reports what the user chose, nothing else: the
+            # layout no longer collapses servers on its own.
             expand_icon = (
                 "!"
                 if toggle_disabled
@@ -6605,15 +6553,15 @@ class NVClientPool:
                 # can still overflow; dropping its colour beats wrapping.
                 row = fit(self._ANSI_ESCAPE_RE.sub("", row), terminal_width)
 
-            # One section per server: its header plus the scaled table.
+            # One section per server: its header plus its whole table.
             section_lines = [row]
             block = visible_blocks.get(idx)
             if block is not None:
                 section_lines.extend(block)
             sections.append((idx, section_lines))
 
-        # The viewport: when even the scaled sections outgrow the window
-        # (many servers, a short terminal), show a window of servers that
+        # The viewport: when the sections outgrow the window (many
+        # servers, a short terminal), show a window of servers that
         # follows the selection. An indicator line at each edge counts what
         # is scrolled out, so nothing can fall off the screen unnoticed.
         region_height = max(
@@ -6622,6 +6570,43 @@ class NVClientPool:
             - self._screen_line_count(output_lines)
             - border_rows,
         )
+        # One server taller than the entire region is the only case where
+        # rows still have to go: there is nowhere to scroll them to. Only
+        # that server's own table is shortened, and it always says by how
+        # much - a silently clipped table is what makes a card look like
+        # it vanished. Trimming always starts from the untouched section
+        # so the dropped-line count stays honest across both passes.
+        natural_sections = [(idx, list(lines)) for idx, lines in sections]
+
+        def fit_section(position, budget):
+            idx, lines = natural_sections[position]
+            budget = max(1, budget)
+            if len(lines) <= budget:
+                sections[position] = (idx, lines)
+                return
+            if budget == 1:
+                # Only the server's own row fits; its summary still says
+                # how many GPUs are down there.
+                sections[position] = (idx, [lines[0]])
+                return
+            trimmed = self._trim_server_block(lines[1:], budget - 1)
+            if trimmed is None:
+                # Not even one data row survives under the header; saying
+                # so beats painting a headless slice of the table.
+                trimmed = [
+                    colored(
+                        fit(
+                            "  … table hidden — enlarge the terminal or press [c]",
+                            self._marker_width(),
+                        ),
+                        "dark_grey",
+                    )
+                ]
+            sections[position] = (idx, [lines[0]] + trimmed)
+
+        for position in range(len(sections)):
+            fit_section(position, region_height)
+
         selected_pos = (
             max(0, min(self.selected_server, len(sections) - 1)) if sections else 0
         )
@@ -6631,6 +6616,14 @@ class NVClientPool:
             1 if show_separators else 0,
             selected_pos,
         )
+        # How many rows the edge indicators claim is only known once the
+        # window has landed. When a single oversized section fills it, that
+        # section is re-trimmed against what is actually left.
+        indicators = (1 if view_start > 0 else 0) + (
+            1 if view_end < len(sections) else 0
+        )
+        if indicators and view_end - view_start == 1:
+            fit_section(view_start, region_height - indicators)
         self._nodes_view_start = view_start
 
         if view_start > 0:

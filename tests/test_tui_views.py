@@ -2,6 +2,8 @@ import logging
 import os
 import re
 import threading
+
+import pytest
 from types import SimpleNamespace
 
 import pandas as pd
@@ -994,65 +996,54 @@ def _server_rows(pool, specs):
     ]
 
 
-def test_scale_server_blocks_keeps_every_table_when_the_terminal_is_tall():
+def test_server_blocks_are_built_at_their_natural_height():
     pool = _pool()
     specs = [_server_block(pool, 6), _server_block(pool, 2)]
 
-    blocks = pool._scale_server_blocks(_server_rows(pool, specs), {}, 100)
+    blocks = pool._build_server_blocks(_server_rows(pool, specs), {})
 
     assert set(blocks) == {0, 1}
     assert blocks[0] == specs[0].splitlines() + [""]
     assert not any("hidden" in line for line in blocks[0])
 
 
-def test_scale_server_blocks_trims_gpu_rows_but_keeps_the_frame(monkeypatch):
-    monkeypatch.setenv("FORCE_COLOR", "1")
+def test_a_crowded_screen_never_drops_a_gpu_row_from_a_block():
     pool = _pool()
-    specs = [_server_block(pool, 8), _server_block(pool, 2)]
-
-    blocks = pool._scale_server_blocks(_server_rows(pool, specs), {}, 20)
-
-    # Everything still expanded, and the total fits the budget exactly.
-    assert set(blocks) == {0, 1}
-    assert sum(len(block) for block in blocks.values()) <= 20
-    plain = [
-        [_without_ansi(line) for line in block]
-        for block in blocks.values()
-    ]
-    for block in plain:
-        # The rounded frame survives trimming: separator, rows, bottom.
-        assert any(line.startswith("├") for line in block)
-        assert any(line.startswith("╰") for line in block)
-    trimmed = [
-        block
-        for block in plain
-        if any("line(s) hidden" in line for line in block)
-    ]
-    assert trimmed, "the tallest table should say how much it dropped"
-
-
-def test_scale_server_blocks_collapses_servers_when_the_screen_is_tiny():
-    pool = _pool()
-    specs = [_server_block(pool, 8), _server_block(pool, 2)]
-
-    # Too short for even one framed table below the headers.
-    blocks = pool._scale_server_blocks(_server_rows(pool, specs), {}, 3)
-
-    assert blocks == {}
-
-
-def test_the_selected_server_is_the_last_to_collapse():
-    pool = _pool()
+    # Far more GPU rows than any terminal would hold: blocks are still
+    # whole, because the viewport scrolls rather than trimming tables.
     specs = [_server_block(pool, 8), _server_block(pool, 8), _server_block(pool, 8)]
 
-    # Room for exactly one minimum block: the selected server keeps it,
-    # so Enter on it always has a visible effect.
-    blocks = pool._scale_server_blocks(
-        _server_rows(pool, specs), {}, 10, keep_expanded=1
-    )
+    blocks = pool._build_server_blocks(_server_rows(pool, specs), {})
 
-    assert set(blocks) == {1}
-    assert any("line(s) hidden" in _without_ansi(line) for line in blocks[1])
+    assert set(blocks) == {0, 1, 2}
+    for index, block in blocks.items():
+        assert block == specs[index].splitlines() + [""]
+        assert not any("hidden" in _without_ansi(line) for line in block)
+
+
+def test_what_a_server_shows_does_not_depend_on_the_cursor(monkeypatch, capsys):
+    # Room for two of the three servers, so the list must scroll.
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 24)))
+    base = _pool()
+
+    for selected in (0, 1, 2):
+        pool = _many_server_pool(3, expanded={0, 1, 2}, selected=selected)
+        pool.cached_stats = [_server_block(base, 2) for _ in range(3)]
+        pool.print_stats(use_cache=True)
+        capsys.readouterr()
+        plain = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+
+        shown = [line for line in plain if "▾ [" in line]
+        gpu_rows = [
+            line for line in plain if line.lstrip().startswith("│") and "RTX" in line
+        ]
+        # Every server on screen is expanded with both of its GPUs, wherever
+        # the cursor happens to be, and nothing was trimmed to fit.
+        assert len(gpu_rows) == 2 * len(shown), selected
+        assert not any("line(s) hidden" in line for line in plain), selected
+        # The selection scrolls the window instead of collapsing a server.
+        assert any("more server(s)" in line for line in plain), selected
+        assert any(f"[{selected + 1}]" in line for line in shown), selected
 
 
 def test_nodes_view_fits_the_terminal_with_every_server_expanded(
@@ -1088,21 +1079,22 @@ def test_nodes_view_fits_the_terminal_with_every_server_expanded(
     pool._last_fetch_duration = 0.1
     pool._last_fetch_error = None
     pool._cache_lock = threading.Lock()
-    # +3 over the tight 20-line case: the panel border (top+bottom) and the
-    # divider between the two servers each cost one row.
+    # Tall enough for the 8-GPU table plus chrome, but not for both
+    # servers at once: the second one scrolls rather than being trimmed.
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 23)))
 
     pool.print_stats(use_cache=True)
     capsys.readouterr()
 
     frame = pool._tui_diff_screen._previous
-    # One screen, no scrolling: the scaled frame fits the 23-line window.
+    # One screen, no scrolling past the bottom: the frame fits the window.
     assert len(frame) <= 22
     plain = [_without_ansi(line) for line in frame]
-    # The block no longer repeats the server's name, so the selected
-    # server's full 8-GPU table fits exactly; the other one collapses.
+    # The selected server's table is whole - GPU 7 included, no "hidden".
     assert any("│   7 " in line for line in plain)
-    assert any("▸ [2] " in line for line in plain)
+    assert not any("line(s) hidden" in line for line in plain)
+    # What does not fit is scrolled, and counted where it went.
+    assert any("more server(s) below" in line for line in plain)
     assert not any(line.strip() == "node description" for line in plain)
     # Both server headers stay reachable for clicks.
     assert {kind for kind, _ in pool._click_targets.values()} == {"server"}
@@ -1264,6 +1256,47 @@ def test_scroll_window_follows_the_selection(monkeypatch, capsys):
         plain = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
         assert len(plain) <= 11
         assert any(f"[{selected + 1:2d}]" in line for line in plain), selected
+
+
+def _table_row_counts(plain):
+    """GPU data rows per rendered table: the lines between ├ and ╰."""
+    counts, inside, current = [], False, 0
+    for line in plain:
+        text = line.strip().strip("│").strip()
+        if text.startswith("├"):
+            inside, current = True, 0
+        elif text.startswith("╰"):
+            if inside:
+                counts.append(current)
+            inside = False
+        elif inside and text:
+            current += 1
+    return counts
+
+
+@pytest.mark.parametrize("height", [12, 14, 16, 20, 24, 30, 50])
+def test_a_table_is_never_silently_short_of_gpus(monkeypatch, capsys, height):
+    """A card must never just disappear from a table.
+
+    Whatever the window can hold, a rendered table either lists every GPU
+    of its node or says how many rows it dropped - the failure this guards
+    against is a four-GPU node quietly showing three.
+    """
+    monkeypatch.setattr(
+        os, "get_terminal_size", lambda: os.terminal_size((72, height))
+    )
+    base = _pool()
+    pool = _many_server_pool(2, expanded={0, 1}, selected=0)
+    pool.cached_stats = [_server_block(base, 4) for _ in range(2)]
+    pool.cached_raw_stats = _raw_stats_for([4, 4])
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    plain = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    said_so = any("hidden" in line for line in plain)
+    for count in _table_row_counts(plain):
+        assert count == 4 or said_so, (height, count, plain)
 
 
 def test_a_tight_window_still_shows_the_selected_servers_table(
