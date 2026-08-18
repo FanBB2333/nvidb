@@ -17,15 +17,11 @@ class ServerInfo:
     auth: Literal['password', 'key', 'auto'] = 'auto'
     proxyjump: Optional[str] = None
     # Only these GPU indices are nvidb's to watch and schedule onto; None
-    # means the whole host. `gpus` is the older spelling of the same key.
+    # means the whole host.
     gpu_ids: Optional[List[int]] = None
-    gpus: Optional[List[int]] = None
 
     def __post_init__(self):
-        if self.gpu_ids is None:
-            self.gpu_ids = self.gpus
         self.gpu_ids = normalize_gpu_indices(self.gpu_ids)
-        self.gpus = self.gpu_ids
         if self.description is None:
             self.description = f'{self.username}@{self.host}:{self.port}'
 
@@ -57,8 +53,6 @@ class ServerListInfo:
             data = asdict(server)
             data["hostname"] = data.pop("host", None)
             data["nickname"] = data.pop("description", None)
-            # `gpus` is only an input alias; one canonical key goes back out.
-            data.pop("gpus", None)
             for key in [k for k, v in data.items() if v is None]:
                 data.pop(key, None)
             servers.append(data)

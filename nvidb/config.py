@@ -152,9 +152,10 @@ def normalize_gpu_indices(value, *, label="gpu_ids"):
 
 
 def server_gpu_ids(server, *, context=""):
-    """The GPU-index allowlist of one server entry, or None when unrestricted.
+    """Which of a server's GPUs nvidb uses, or None for all of them.
 
-    A server may hand nvidb only some of its cards:
+    One key decides this everywhere - the monitor's tables and the
+    queue's placements alike:
 
         servers:
           - nickname: "shared-box"
@@ -162,18 +163,14 @@ def server_gpu_ids(server, *, context=""):
 
     Listed indices are the host's own NVML indices and keep those numbers
     everywhere nvidb shows them, so GPU 2 stays "GPU 2" rather than being
-    renumbered to 0. `gpus:` is accepted as an alias for older configs.
-    `context` prefixes the error message so a bad value names its server.
+    renumbered to 0. `context` prefixes the error message so a bad value
+    names its server.
     """
     if not isinstance(server, dict):
         return None
-    value = server.get("gpu_ids")
-    key = "gpu_ids"
-    if value is None:
-        value = server.get("gpus")
-        key = "gpus"
-    # The message names the key the user actually wrote, not the canonical one.
-    return normalize_gpu_indices(value, label=f"{context} {key}".strip())
+    return normalize_gpu_indices(
+        server.get("gpu_ids"), label=f"{context} gpu_ids".strip()
+    )
 
 
 def format_servers_yaml(servers) -> str:

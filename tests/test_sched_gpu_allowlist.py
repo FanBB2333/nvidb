@@ -1,4 +1,4 @@
-"""A server entry's `gpus:` key restricts which cards the queue may hand out."""
+"""A server entry's `gpu_ids:` key picks which of its cards nvidb uses."""
 import os
 import sys
 
@@ -43,7 +43,7 @@ def _shared_cluster():
 def _scheduler(conn, cluster, gpu_indices=None):
     cfg = cluster.config()
     if gpu_indices is not None:
-        cfg["servers"][0]["gpus"] = gpu_indices
+        cfg["servers"][0]["gpu_ids"] = gpu_indices
     return Scheduler(
         conn,
         cfg=cfg,
@@ -56,7 +56,7 @@ def _scheduler(conn, cluster, gpu_indices=None):
 def test_gpu_allowlists_reads_only_entries_with_the_key():
     cfg = {
         "servers": [
-            {"nickname": "masked", "gpus": [0, 1, 1]},
+            {"nickname": "masked", "gpu_ids": [0, 1, 1]},
             {"nickname": "open"},
         ]
     }
@@ -66,29 +66,25 @@ def test_gpu_allowlists_reads_only_entries_with_the_key():
 
 @pytest.mark.parametrize("value", ["0,1", 0, [True], [-1], [0, 1.5]])
 def test_gpu_allowlists_reject_invalid_values(value):
-    cfg = {"servers": [{"nickname": "masked", "gpus": value}]}
-    with pytest.raises(ValueError, match="server 'masked' gpus"):
+    cfg = {"servers": [{"nickname": "masked", "gpu_ids": value}]}
+    with pytest.raises(ValueError, match="server 'masked' gpu_ids"):
         gpu_allowlists(cfg)
 
 
-@pytest.mark.parametrize("key", ["gpu_ids", "gpus"])
-def test_monitor_config_accepts_and_preserves_the_allowlist(key):
+def test_monitor_config_accepts_and_preserves_the_allowlist():
     raw = [
         {
             "hostname": "gpu.example.com",
             "port": 22,
             "username": "alice",
             "nickname": "shared-box",
-            key: [0, 1],
+            "gpu_ids": [0, 1],
         }
     ]
     servers = ServerListInfo.from_dict(raw)
 
     assert servers[0].gpu_ids == [0, 1]
-    # Either spelling goes in; the canonical one comes back out, so a
-    # rewritten config.yml does not carry both keys.
     assert servers.to_dict()[0]["gpu_ids"] == [0, 1]
-    assert "gpus" not in servers.to_dict()[0]
     assert "    gpu_ids: [0, 1]" in config.format_servers_yaml(servers.to_dict())
 
 
@@ -244,7 +240,7 @@ def test_daemon_style_scheduler_reloads_gpu_allowlists(tmp_path, monkeypatch):
         assert dbm.get_job(conn, existing).gpu_ids == [2]
 
         restricted = cluster.config()
-        restricted["servers"][0]["gpus"] = [0, 1]
+        restricted["servers"][0]["gpu_ids"] = [0, 1]
         current["config"] = restricted
         new = scheduler.submit("new", vram="1G")
         scheduler.tick(force=True)
