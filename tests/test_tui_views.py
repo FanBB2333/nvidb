@@ -1176,6 +1176,70 @@ def test_loading_is_said_once_per_server(monkeypatch, capsys):
     assert not any(line.strip() == "Loading..." for line in frame[3:])
 
 
+def _many_server_pool(count, *, expanded=(), selected=0):
+    from types import SimpleNamespace
+
+    pool = _nodes_pool([None] * count, _raw_stats_for([2] * count))
+    while len(pool.pool) < count:
+        pool.pool.append(
+            SimpleNamespace(
+                description=f"node-{len(pool.pool)}", host="10.0.0.9", port=22
+            )
+        )
+    pool.expanded_servers = set(expanded)
+    pool.selected_server = selected
+    return pool
+
+
+def test_many_servers_scroll_instead_of_falling_off(monkeypatch, capsys):
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 12)))
+    pool = _many_server_pool(10, selected=9)
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    frame = pool._tui_diff_screen._previous
+    plain = [_without_ansi(line) for line in frame]
+    # The frame fits the window, the selection is visible, and the servers
+    # scrolled out are counted instead of silently dropped.
+    assert len(frame) <= 11
+    assert any("[10]" in line for line in plain)
+    assert any("more server(s) above" in line for line in plain)
+
+
+def test_scroll_window_follows_the_selection(monkeypatch, capsys):
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 12)))
+    pool = _many_server_pool(10)
+
+    # Walking the selection down and back up keeps every server reachable.
+    for selected in list(range(10)) + [4, 0]:
+        pool.selected_server = selected
+        pool.print_stats(use_cache=True)
+        capsys.readouterr()
+        plain = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+        assert len(plain) <= 11
+        assert any(f"[{selected + 1:2d}]" in line for line in plain), selected
+
+
+def test_a_tight_window_still_shows_the_selected_servers_table(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((110, 16)))
+    base = _pool()
+    pool = _many_server_pool(10, expanded={5}, selected=5)
+    pool.cached_stats = [_server_block(base, 2) for _ in range(10)]
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    plain = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    assert len(plain) <= 15
+    # Headers alone would overflow this window; the selection keeps its
+    # table anyway (trimmed), instead of every table collapsing.
+    assert any("[ 6]" in line for line in plain)
+    assert any("RTX 4090" in line for line in plain)
+
+
 def _click(row):
     return MouseEvent(button=0, column=4, row=row, pressed=True)
 

@@ -1610,6 +1610,9 @@ class NVClientPool:
         # _scale_server_blocks).
         self.expanded_servers = set(range(len(self.pool)))
         self.selected_server = 0  # Currently selected server for navigation
+        # First server section shown by the nodes-view viewport when the
+        # list is taller than the terminal (see _nodes_viewport).
+        self._nodes_view_start = 0
         self._persist_view_enabled = view_settings is not None
         self._default_expansion_applied = False
         self._expansion_touched = False
@@ -1910,6 +1913,18 @@ class NVClientPool:
             "process_details_by_client": process_details_by_client,
         }
         # reformat the str into a single string with fixed width formatting
+        formatted_stats = self._format_client_blocks(stats_str)
+        if return_raw:
+            return formatted_stats, raw_stats_by_client
+        return formatted_stats
+
+    def _format_client_blocks(self, stats_str):
+        """Render each client's (stats, system_info) pair into its TUI block.
+
+        Kept separate from the fetch so print_stats can re-run it from the
+        cached raw stats when the terminal is resized between refreshes -
+        the blocks are laid out for one specific width.
+        """
         # These blocks only ever appear inside the per-node view's panel
         # border, so they reserve its margin up front - narrow terminals
         # drop the border (see `compact_layout`) and so reserve nothing.
@@ -1917,6 +1932,7 @@ class NVClientPool:
             _fetch_width = os.get_terminal_size().columns
         except OSError:
             _fetch_width = 80
+        self._blocks_formatted_width = _fetch_width
         panel_margin = 0 if _fetch_width < 72 else self._PANEL_BORDER_MARGIN
         formatted_stats = []
         for client, (stats, system_info) in zip(self.pool, stats_str):
@@ -1994,8 +2010,6 @@ class NVClientPool:
             formatted_stats.append(
                 f"{system_info_header}{formatted_table}{advanced_block}"
             )
-        if return_raw:
-            return formatted_stats, raw_stats_by_client
         return formatted_stats
 
     def _client_table_identity(self, client_index):
@@ -4565,10 +4579,21 @@ class NVClientPool:
             # previous trim step, so the number matches what was dropped.
             hidden = natural[idx] - len(blocks[idx])
             blocks[idx][-1] = colored(
-                f"  … {hidden} line(s) hidden — enlarge the terminal or press [c]",
+                fit(
+                    f"  … {hidden} line(s) hidden — enlarge the terminal or press [c]",
+                    self._marker_width(),
+                ),
                 "dark_grey",
             )
         return blocks
+
+    @staticmethod
+    def _marker_width():
+        """Columns a full-width helper line may use inside a block."""
+        try:
+            return max(10, os.get_terminal_size().columns)
+        except OSError:
+            return 80
 
     def _trim_server_block(self, lines, keep):
         """Shorten one expanded block to `keep` lines by dropping GPU rows.
@@ -4612,7 +4637,10 @@ class NVClientPool:
 
         head = lines[: separator_index + 1]
         bottom = lines[bottom_index]
-        marker_text = f"  … {len(lines) - keep} line(s) hidden — enlarge the terminal or press [c]"
+        marker_text = fit(
+            f"  … {len(lines) - keep} line(s) hidden — enlarge the terminal or press [c]",
+            self._marker_width(),
+        )
         marker = colored(marker_text, "dark_grey")
         # A frame with no data rows left says nothing a collapsed header
         # cannot, so one row is the minimum an expansion keeps.
@@ -6057,6 +6085,25 @@ class NVClientPool:
             stats_list = [""] * len(self.pool)
         if not isinstance(raw_stats_by_client, dict):
             raw_stats_by_client = {}
+        elif stats_list and raw_stats_by_client:
+            # Responsive relayout: the cached blocks were formatted for the
+            # width the terminal had at fetch time. If the window has been
+            # resized since, re-render them from the raw stats now instead
+            # of painting tables that no longer fit (or waste) the width.
+            try:
+                current_width = os.get_terminal_size().columns
+            except OSError:
+                current_width = 80
+            if getattr(self, "_blocks_formatted_width", None) != current_width:
+                try:
+                    stats_list = self._format_client_blocks(
+                        [
+                            raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+                            for idx in range(len(self.pool))
+                        ]
+                    )
+                except Exception as error:
+                    logging.debug(msg=f"Block relayout after resize failed: {error}")
 
         self._apply_default_expansion(raw_stats_by_client, last_update_time)
 
@@ -6112,6 +6159,9 @@ class NVClientPool:
         show_panel_border = (
             display_mode != self.DISPLAY_MODE_UNIFIED
             and not compact_layout
+            # A very short window cannot spare two rows for decoration:
+            # data completeness beats the frame.
+            and terminal_height >= 14
             and not bool(self.tui_help_visible)
         )
         if show_panel_border:
@@ -6239,11 +6289,14 @@ class NVClientPool:
 
         output_lines.append(_colorize_controls(fit(controls, terminal_width)))
 
-        if self.compact:
-            separator_width = min(80, terminal_width)
-        else:
-            separator_width = max(20, terminal_width)
-        output_lines.append(colored("─" * separator_width, "dark_grey"))
+        # The rule under the chrome is decoration; a very short window
+        # spends the row on data instead.
+        if terminal_height >= 12:
+            if self.compact:
+                separator_width = min(80, terminal_width)
+            else:
+                separator_width = max(20, terminal_width)
+            output_lines.append(colored("─" * separator_width, "dark_grey"))
 
         if bool(self.tui_help_visible):
             help_offset = self._screen_line_count(output_lines)
@@ -6389,14 +6442,33 @@ class NVClientPool:
         show_separators = separator_count > 0 and available_rows - separator_count >= 0
         if show_separators:
             available_rows -= separator_count
-        visible_blocks = self._scale_server_blocks(
-            server_rows,
-            user_memory_by_client,
-            available_rows,
-            keep_expanded=self.selected_server,
-        )
+        if available_rows <= 0:
+            # The window cannot even hold every header: the viewport below
+            # will scroll the list, so instead of collapsing every table,
+            # focus on the selection - only its table survives, budgeted to
+            # the visible region minus its header and the two indicators.
+            visible_blocks = self._scale_server_blocks(
+                [row for row in server_rows if row[0] == self.selected_server],
+                user_memory_by_client,
+                max(
+                    0,
+                    (terminal_height - 1)
+                    - self._screen_line_count(output_lines)
+                    - border_rows
+                    - 3,
+                ),
+                keep_expanded=self.selected_server,
+            )
+        else:
+            visible_blocks = self._scale_server_blocks(
+                server_rows,
+                user_memory_by_client,
+                available_rows,
+                keep_expanded=self.selected_server,
+            )
 
-        for position, (idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info) in enumerate(server_rows):
+        sections = []
+        for idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info in server_rows:
             toggle_disabled = idx in self._toggle_disabled_servers
             # A server the scaler collapsed still gets its header, just
             # with the collapsed icon.
@@ -6480,16 +6552,62 @@ class NVClientPool:
                 # A pathologically long error message is the one input that
                 # can still overflow; dropping its colour beats wrapping.
                 row = fit(self._ANSI_ESCAPE_RE.sub("", row), terminal_width)
-            self._click_targets[self._screen_line_count(output_lines)] = ("server", idx)
-            output_lines.append(row)
 
-            # The full stats table, already formatted and scaled to fit.
+            # One section per server: its header plus the scaled table.
+            section_lines = [row]
             block = visible_blocks.get(idx)
             if block is not None:
-                output_lines.extend(block)
+                section_lines.extend(block)
+            sections.append((idx, section_lines))
 
-            if show_separators and position < len(server_rows) - 1:
+        # The viewport: when even the scaled sections outgrow the window
+        # (many servers, a short terminal), show a window of servers that
+        # follows the selection. An indicator line at each edge counts what
+        # is scrolled out, so nothing can fall off the screen unnoticed.
+        region_height = max(
+            1,
+            (terminal_height - 1)
+            - self._screen_line_count(output_lines)
+            - border_rows,
+        )
+        selected_pos = (
+            max(0, min(self.selected_server, len(sections) - 1)) if sections else 0
+        )
+        view_start, view_end = self._nodes_viewport(
+            [len(lines) for _idx, lines in sections],
+            region_height,
+            1 if show_separators else 0,
+            selected_pos,
+        )
+        self._nodes_view_start = view_start
+
+        if view_start > 0:
+            # Clicking an indicator selects the nearest hidden server,
+            # which scrolls the window toward it.
+            self._click_targets[self._screen_line_count(output_lines)] = (
+                "server",
+                sections[view_start - 1][0],
+            )
+            output_lines.append(
+                colored(f"  … {view_start} more server(s) above", "dark_grey")
+            )
+        for position in range(view_start, view_end):
+            idx, section_lines = sections[position]
+            if position > view_start and show_separators:
                 output_lines.append(self._PANEL_SEPARATOR)
+            self._click_targets[self._screen_line_count(output_lines)] = ("server", idx)
+            output_lines.extend(section_lines)
+        if view_end < len(sections):
+            self._click_targets[self._screen_line_count(output_lines)] = (
+                "server",
+                sections[view_end][0],
+            )
+            output_lines.append(
+                colored(
+                    f"  … {len(sections) - view_end} more server(s) below",
+                    "dark_grey",
+                )
+            )
 
         if show_panel_border:
             output_lines = self._wrap_panel_border(output_lines, terminal_width)
@@ -6498,6 +6616,51 @@ class NVClientPool:
             }
 
         self._write_tui_lines(output_lines)
+
+    def _nodes_viewport(self, heights, region_height, sep_cost, selected_pos):
+        """Pick the window of server sections that fits the terminal.
+
+        Every server must stay reachable no matter how short the window
+        is: the viewport follows the selection, and the caller draws one
+        indicator line per edge naming how many servers are scrolled out.
+        Returns (start, end) section positions; end is exclusive.
+        """
+        count = len(heights)
+        if count == 0:
+            return 0, 0
+
+        def total_from(start):
+            return sum(heights[start:]) + sep_cost * max(0, count - start - 1)
+
+        if total_from(0) <= region_height:
+            return 0, count
+
+        def end_for(start):
+            rows = region_height - (1 if start > 0 else 0)
+            if total_from(start) <= rows:
+                return count
+            rows -= 1  # the bottom indicator line
+            used = 0
+            end = start
+            while end < count:
+                need = heights[end] + (sep_cost if end > start else 0)
+                if used + need > rows:
+                    break
+                used += need
+                end += 1
+            # A section taller than the whole window still gets shown (the
+            # painter clips its tail) rather than vanishing entirely.
+            return max(end, start + 1)
+
+        start = max(
+            0,
+            min(getattr(self, "_nodes_view_start", 0), count - 1, selected_pos),
+        )
+        end = end_for(start)
+        while selected_pos >= end and start < selected_pos:
+            start += 1
+            end = end_for(start)
+        return start, end
 
     def _request_ui_refresh(self):
         self.ui_only_refresh = True
