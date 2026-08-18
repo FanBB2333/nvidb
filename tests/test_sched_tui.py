@@ -203,8 +203,9 @@ def test_the_screen_shows_nodes_capacity_and_jobs():
     assert "big-node" in output and "small-node" in output
     # The GPU model lives on the node header now, once per node.
     assert "1× RTX PRO 5000" in output
-    # The grid cell keeps the free amount and names the foreign processes.
-    assert "free" in output and "·2p" in output
+    # The grid cell shows used/total VRAM and the running job's id.
+    assert "67.4G/71.7G" in output
+    assert "#1" in output
     assert "python train.py" in output
     # The keybinding footer is always reachable.
     assert "q quit" in output
@@ -271,8 +272,8 @@ def test_procs_all_still_lists_every_process_line():
 
 def test_capacity_reflects_foreign_usage():
     output = _render(_tui())
-    # 73415 total - 69000 foreign - 512 headroom, rendered compactly.
-    assert "3.8G" in output
+    # The 69000MB of foreign memory shows up as the card's used total.
+    assert "67.4G/71.7G" in output
 
 
 def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
@@ -280,7 +281,8 @@ def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
     snapshot["nodes"][1]["gpus"] = [_gpu(used=8000, external=0, reserved=8192,
                                          attribution="blind", jobs=1)]
     output = _render(_tui(), _state(snapshot))
-    assert "·blind" in output
+    # A `~` before the used amount marks the split as inferred.
+    assert "~7.8G/24.0G" in output
 
 
 def test_progress_replaces_the_command_in_the_job_row():

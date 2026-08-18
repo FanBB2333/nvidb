@@ -463,10 +463,11 @@ def test_pressing_p_cycles_to_every_process_then_to_none(tui):
 
 
 def test_the_tui_says_when_a_cards_split_is_inferred(tui):
-    # The compact grid tags the cell; the full explanation lives one press
-    # of p away, so a permanently blind card does not cost a line forever.
+    # The compact cell marks the used amount as approximate; the full
+    # explanation lives one press of p away, so a permanently blind card
+    # does not cost a line forever.
     output = _render(tui, _tui_state([], attribution="blind", external=8000))
-    assert "·blind" in output
+    assert "~9.8G/24.0G" in output
 
     tui.proc_view = "all"
     output = _render(tui, _tui_state([], attribution="blind", external=8000))

@@ -749,44 +749,56 @@ class QueueTUI:
                 # The default: GPUs flow into a grid, several per line, so
                 # the node pane stays a couple of rows and the job table
                 # keeps the screen.
-                lines.extend(self._gpu_grid_lines(node["gpus"], width))
+                lines.extend(self._gpu_grid_lines(node, width))
                 if self.proc_view == "summary":
                     lines.extend(self._node_external_summary(node, width))
             for line_index in range(node_start, len(lines)):
                 self._node_line_targets[line_index] = position
         return lines
 
-    # Plain columns one grid cell occupies: "G0 " + 10-column bar +
-    # " free " + 6-column amount + " " + 6-column tag.
-    _GPU_CELL_WIDTH = 3 + 10 + 6 + 6 + 1 + 6
+    # Plain columns one grid cell occupies: "G0 " + 10-column bar + " " +
+    # 6-column used + "/" + 6-column total + " " + 5-column job ids.
+    _GPU_CELL_WIDTH = 3 + 10 + 1 + 6 + 1 + 6 + 1 + 5
     _GPU_CELL_GAP = 3
 
+    def _running_job_ids_by_gpu(self, node: Dict[str, Any]) -> Dict[int, List[int]]:
+        """Which queue jobs are running on each of this node's GPUs."""
+        running: Dict[int, List[int]] = {}
+        jobs = (self._snapshot or {}).get("jobs") or []
+        for job in jobs:
+            if job.get("state") != "running" or job.get("node") != node["name"]:
+                continue
+            for gpu_index in job.get("gpu_ids") or []:
+                running.setdefault(gpu_index, []).append(job["id"])
+        return running
+
     def _gpu_cell_segments(
-        self, gpu: Dict[str, Any]
+        self, gpu: Dict[str, Any], running_ids: List[int]
     ) -> List[Tuple[str, Optional[str]]]:
-        """One GPU as a fixed-width grid cell: index, occupancy bar, free.
+        """One GPU as a fixed-width grid cell: index, bar, used/total, jobs.
 
         The bar keeps the pane's one legend - foreign memory (yellow),
-        queue reservations (cyan), free (dim) - and the tag names why a
-        card is interesting: external processes, queue jobs, or a driver
-        that cannot attribute memory at all.
+        queue reservations (cyan), free (dim). The used amount carries the
+        scarcity colour, a `~` before it means the split is inferred (a
+        blind driver), and the tail names the queue jobs running here.
         """
         total = max(1, gpu["mem_total_mb"])
         external = max(0, gpu["external_mem_mb"])
         reserved = max(0, gpu["reserved_mb"])
-        free_style = (
+        used_style = (
             None if gpu["free_mb"] >= 4096
             else "yellow" if gpu["free_mb"] >= 1024
             else "red"
         )
+        used_text = format_mb(gpu["mem_used_mb"])
         if gpu.get("attribution") == "blind":
-            tag, tag_style = "·blind", "yellow"
-        elif gpu.get("external_procs"):
-            tag, tag_style = f"·{gpu['external_procs']}p", "yellow"
-        elif gpu.get("queue_jobs"):
-            tag, tag_style = f"·{gpu['queue_jobs']}j", "cyan"
-        else:
-            tag, tag_style = "", None
+            used_text = "~" + used_text
+            used_style = used_style or "yellow"
+        ids_text = ""
+        if running_ids:
+            ids_text = "#" + ",".join(str(job_id) for job_id in running_ids)
+            if display_width(ids_text) > 5:
+                ids_text = f"#{running_ids[0]}+{len(running_ids) - 1}"
         index_label = f"G{gpu['index']}"
         segments: List[Tuple[str, Optional[str]]] = [
             (f"{index_label:<3}", "bright_black"),
@@ -800,15 +812,20 @@ class QueueTUI:
                 ),
             )
         )
-        segments.append((" free ", "bright_black"))
-        segments.append((f"{format_mb(gpu['free_mb']):>6}", free_style))
-        segments.append((f" {tag:<6}", tag_style))
+        segments.append((" ", None))
+        segments.append((f"{used_text:>6}", used_style))
+        segments.append(("/", "bright_black"))
+        segments.append((f"{format_mb(gpu['mem_total_mb']):<6}", "bright_black"))
+        segments.append((" ", None))
+        segments.append((f"{fit_display(ids_text, 5):<5}", "cyan"))
         return segments
 
-    def _gpu_grid_lines(self, gpus: List[Dict[str, Any]], width: int) -> List[str]:
+    def _gpu_grid_lines(self, node: Dict[str, Any], width: int) -> List[str]:
         """Lay the node's GPUs out several to a line instead of one each."""
+        gpus = node.get("gpus") or []
         if not gpus:
             return []
+        running = self._running_job_ids_by_gpu(node)
         indent = 4
         per_row = max(
             1,
@@ -821,7 +838,9 @@ class QueueTUI:
             for offset, gpu in enumerate(gpus[start : start + per_row]):
                 if offset:
                     segments.append((" " * self._GPU_CELL_GAP, None))
-                segments.extend(self._gpu_cell_segments(gpu))
+                segments.extend(
+                    self._gpu_cell_segments(gpu, running.get(gpu["index"], []))
+                )
             lines.append(self._compose(segments, width))
         return lines
 
@@ -1469,6 +1488,7 @@ class QueueTUI:
             ("Mouse click", "Select rows, activate [buttons], sort by a column header"),
             ("Mouse wheel", "Move in nodes/jobs; page detail or log text"),
             ("GPU bar", "amber: others' memory · teal: queue reservations · dim: free"),
+        ("GPU cell", "used/total VRAM · #id: running jobs · ~: split inferred (blind)"),
             ("q", "Quit"),
         ]
         lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
