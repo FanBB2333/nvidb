@@ -147,8 +147,8 @@ def test_unified_table_keeps_identity_and_core_metrics_on_narrow_terminals(monke
 
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
 
-    assert "Unified GPU table | GPUs: 2 | Nodes with GPU: 2/2" in rendered
-    assert "Capacity: avail 0/2 | busy 1 | avg 42%" in rendered
+    assert "Unified GPU table · GPUs 2 · Nodes with GPU 2/2" in rendered
+    assert "Capacity: avail 0/2 · busy 1 · avg 42%" in rendered
     assert "Node" in rendered
     assert "Hostname/IP" in rendered
     assert "GPU" in rendered
@@ -182,7 +182,7 @@ def test_grouped_unified_table_uses_node_bands_instead_of_node_columns(monkeypat
     lines = pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     rendered = _without_ansi("\n".join(lines))
 
-    assert "training-node (100.64.0.42) · 2 GPUs | free 1 | avg 38%" in rendered
+    assert "training-node (100.64.0.42) · 2 GPUs · free 1 · avg 38%" in rendered
     assert "VRAM 23/96G" in rendered
     # Node identity moved into the band, freeing the columns for GPU metrics.
     assert "Hostname/IP" not in rendered
@@ -262,7 +262,7 @@ def test_unified_view_reports_nodes_without_gpu_rows():
 
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
 
-    assert "Nodes with GPU: 1/2" in rendered
+    assert "Nodes with GPU 1/2" in rendered
     assert "! training-node (100.64.0.42): Connection timed out" in rendered
 
 
@@ -380,7 +380,7 @@ def test_unified_filter_modes_and_error_view():
         ),
     }
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
-    assert "GPUs: 0/0" in rendered
+    assert "GPUs 0/0" in rendered
     assert "Error filter: GPU rows hidden" in rendered
     assert "Connection timed out" in rendered
     assert "Local" not in "\n".join(
@@ -765,7 +765,7 @@ def test_detailed_view_uses_readable_cards_on_narrow_terminals(monkeypatch):
         if _without_ansi(line).startswith(("│", "┊"))
     ]
 
-    assert "Focus GPU/node | Detailed | GPUs: 3" in rendered
+    assert "Focus GPU/node · Detailed · GPUs 3" in rendered
     assert len(content_lines) == 12
     assert all(len(_without_ansi(line)) == 80 for line in detailed_lines)
     assert "training-node (100.64.0.42) -- 2 GPUs" not in _without_ansi(rendered)
@@ -1102,7 +1102,7 @@ def test_nodes_view_fits_the_terminal_with_every_server_expanded(
     # The block no longer repeats the server's name, so the selected
     # server's full 8-GPU table fits exactly; the other one collapses.
     assert any("│   7 " in line for line in plain)
-    assert any("> [2] " in line for line in plain)
+    assert any("▸ [2] " in line for line in plain)
     assert not any(line.strip() == "node description" for line in plain)
     # Both server headers stay reachable for clicks.
     assert {kind for kind, _ in pool._click_targets.values()} == {"server"}

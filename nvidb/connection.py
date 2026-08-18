@@ -1951,16 +1951,22 @@ class NVClientPool:
                     if system_info.get("advanced_supported") is True:
                         adv_detail = system_info.get("advanced_source_detail")
                         if adv_detail and adv_detail not in {"N/A", "-", ""}:
-                            advanced_display = f" | Advanced: {adv_source} ({adv_detail})"
+                            advanced_display = f" · Advanced {adv_source} ({adv_detail})"
                         else:
-                            advanced_display = f" | Advanced: {adv_source}"
+                            advanced_display = f" · Advanced {adv_source}"
                     else:
-                        advanced_display = f" | Advanced: {adv_source} (profiling unavailable)"
+                        advanced_display = f" · Advanced {adv_source} (profiling unavailable)"
+                # Static facts, dimmed whole: the eye should land on the
+                # GPU rows below, not on the driver version.
                 system_info_header = (
-                    f"Driver: {system_info.get('driver_version', 'N/A')} | "
-                    f"CUDA: {system_info.get('cuda_version', 'N/A')} | "
-                    f"GPUs: {system_info.get('attached_gpus', '0')} | "
-                    f"Source: {source_display}{advanced_display}\n"
+                    colored(
+                        f"Driver {system_info.get('driver_version', 'N/A')} · "
+                        f"CUDA {system_info.get('cuda_version', 'N/A')} · "
+                        f"GPUs {system_info.get('attached_gpus', '0')} · "
+                        f"Source {source_display}{advanced_display}",
+                        "dark_grey",
+                    )
+                    + "\n"
                 )
 
             advanced_block = ""
@@ -2220,7 +2226,7 @@ class NVClientPool:
                 return "yellow"
             return "green"
 
-        sep = colored(" | ", "dark_grey")
+        sep = colored(" · ", "dark_grey")
         if total_mib > 0 and terminal_width >= 100:
             memory_percent = used_mib / total_mib * 100
             plain_summary = (
@@ -2328,7 +2334,7 @@ class NVClientPool:
         ]
         if total_mib > 0:
             parts.append(f"VRAM {used_mib / 1024:.0f}/{total_mib / 1024:.0f}G")
-        return f"{node} ({hostname})", " | ".join(parts)
+        return f"{node} ({hostname})", " · ".join(parts)
 
     def _unified_section_headers(self, visible_table, scope_table):
         """Map visible row index -> node band text for the grouped views."""
@@ -4496,7 +4502,10 @@ class NVClientPool:
         """Count the terminal rows a list of frame elements occupies."""
         return sum(len(str(element).split("\n")) for element in elements)
 
-    _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+    # Also matches the ``ESC ( B`` charset reset blessed's term.normal
+    # emits; missing it made every styled selected row measure two
+    # columns wide of its visible width.
+    _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\([0-9A-Za-z]")
 
     def _scale_server_blocks(
         self, server_rows, user_memory_by_client, available_rows, *, keep_expanded=None
@@ -4531,7 +4540,7 @@ class NVClientPool:
                     width = 80
                 if self.term.length(user_line) > width:
                     user_line = user_line[: max(0, width - 3)] + "..."
-                block.append(user_line)
+                block.append(colored(user_line, "dark_grey"))
             block.append("")
             blocks[idx] = block
 
@@ -4844,7 +4853,7 @@ class NVClientPool:
                     0,
                     "sel",
                     [
-                        ">" if index == selected_row else " "
+                        "❯" if index == selected_row else " "
                         for index in range(len(display_table))
                     ],
                 )
@@ -4867,7 +4876,7 @@ class NVClientPool:
             if selected_row is not None and not table.empty
             else None
         )
-        page_suffix = f" | {page_status}" if page_status else ""
+        page_suffix = f" · {page_status}" if page_status else ""
         gpu_count_display = str(len(source_table))
         if filter_mode != "all":
             gpu_count_display = f"{len(filtered_table)}/{len(source_table)}"
@@ -4883,24 +4892,24 @@ class NVClientPool:
             focus_prefix = "F:GPU" if gpu_pane_focused else "F:PROC"
             compact_page = page_status.removeprefix("Rows ")
             title_line = (
-                f"{focus_prefix} | D | G:{gpu_count_display} | "
+                f"{focus_prefix} · D · G:{gpu_count_display} · "
                 f"N:{node_count}/{len(self.pool)}"
-                + (f" | {compact_page}" if compact_page else "")
+                + (f" · {compact_page}" if compact_page else "")
             )
         elif detailed and terminal_width < 100:
             title_line = (
-                f"{focus_prefix} | Detailed | GPUs: {gpu_count_display} | "
-                f"Nodes: {node_count}/{len(self.pool)}{page_suffix}"
+                f"{focus_prefix} · Detailed · GPUs {gpu_count_display} · "
+                f"Nodes {node_count}/{len(self.pool)}{page_suffix}"
             )
         else:
             title_with_focus = (
-                f"{focus_prefix} | {title}"
+                f"{focus_prefix} · {title}"
                 if detailed
                 else title
             )
             title_line = (
-                f"{title_with_focus} | GPUs: {gpu_count_display} | "
-                f"Nodes with GPU: {node_count}/{len(self.pool)}{page_suffix}"
+                f"{title_with_focus} · GPUs {gpu_count_display} · "
+                f"Nodes with GPU {node_count}/{len(self.pool)}{page_suffix}"
             )
         if len(title_line) > terminal_width:
             title_line = (
@@ -5594,6 +5603,26 @@ class NVClientPool:
                     )
                     continue
 
+                if col == "temp":
+                    degrees = parse_percent(raw_value)
+                    cell = f"{value:^{width}}"
+                    if degrees is not None:
+                        if degrees >= 80:
+                            cell = colored(cell, "red", attrs=["bold"])
+                        elif degrees >= 65:
+                            cell = colored(cell, "yellow")
+                        else:
+                            # A cool GPU needs no attention; keep it quiet.
+                            cell = colored(cell, "dark_grey")
+                    row_parts.append(cell)
+                    continue
+
+                # Absent readings recede to a dim dash instead of shouting
+                # N/A across every unsupported column.
+                if value in {"N/A", "-"}:
+                    row_parts.append(colored(f"{'–':^{width}}", "dark_grey"))
+                    continue
+
                 # Center-align all other columns
                 row_parts.append(f"{value:^{width}}")
 
@@ -5648,6 +5677,7 @@ class NVClientPool:
                 "avg_util": 0,
                 "util_color": None,
                 "mem_display": "N/A",
+                "mem_percent": None,
                 "no_gpu": True,
                 # System stats
                 "cpu_cores": sys_stats.get("cpu_cores", 0),
@@ -5737,6 +5767,11 @@ class NVClientPool:
             "avg_util": avg_util,
             "util_color": util_color,
             "mem_display": mem_display,
+            "mem_percent": (
+                total_mem_used_mib / total_mem_total_mib * 100
+                if total_mem_total_mib > 0
+                else None
+            ),
             # System stats
             "cpu_cores": sys_stats.get("cpu_cores", 0),
             "cpu_percent": sys_stats.get("cpu_percent", 0.0),
@@ -5752,23 +5787,52 @@ class NVClientPool:
         """Expand icon colour: green = open, red = blocked, dim = closed."""
         if toggle_disabled:
             return "red"
-        if expand_icon == "v":
+        if expand_icon == "▾":
             return "green"
         return "dark_grey"
 
     @staticmethod
-    def _server_status_color(summary_data):
-        """Server-name colour mirrors the summary's own health colour."""
+    def _server_health_dot(summary_data):
+        """One glanceable dot per server: is there a free GPU here or not?
+
+        Green = at least one idle GPU, yellow = all GPUs busy, red = the
+        node errored, hollow/dim = still loading or nothing to report.
+        """
         if not isinstance(summary_data, dict):
-            return None
+            return ("●", "dark_grey")
         status = summary_data.get("status")
         if status == "error":
-            return "red"
-        if status in ("loading", "empty"):
-            return "dark_grey"
-        if summary_data.get("no_gpu"):
-            return "dark_grey"
-        return summary_data.get("util_color")
+            return ("●", "red")
+        if status == "loading":
+            return ("◌", "dark_grey")
+        if status == "empty" or summary_data.get("no_gpu"):
+            return ("●", "dark_grey")
+        if summary_data.get("idle_count", 0) > 0:
+            return ("●", "green")
+        return ("●", "yellow")
+
+    @staticmethod
+    def _mini_bar(percent, color, width=6):
+        """A small inline load bar for the server summary row.
+
+        The same smooth one-line style the tables use, shrunk to fit a
+        header: filled part in the metric's own threshold colour, the
+        rest a dim rule. Unknown readings render as an all-dim rule so
+        columns still line up across servers.
+        """
+        try:
+            value = max(0.0, min(100.0, float(percent)))
+        except (TypeError, ValueError):
+            return colored("─" * width, "dark_grey")
+        filled = int(round(value / 100.0 * width))
+        if value > 0 and filled == 0:
+            filled = 1
+        bar = ""
+        if filled > 0:
+            bar += colored("━" * filled, color or "green")
+        if width - filled > 0:
+            bar += colored("─" * (width - filled), "dark_grey")
+        return bar
 
     def _format_server_summary(self, summary_data, widths=None, *, compact=False) -> str:
         """Format summary string; if widths provided, columns are aligned.
@@ -5778,30 +5842,33 @@ class NVClientPool:
         """
         if compact:
             if not summary_data:
-                return "no data"
+                return colored("no data", "dark_grey")
             status = (
                 summary_data.get("status")
                 if isinstance(summary_data, dict)
                 else None
             )
             if status == "loading":
-                return "loading…"
+                return colored("loading…", "dark_grey")
             if status == "error":
                 message = " ".join(str(summary_data.get("message", "Error")).split())
-                return f"err: {message or 'error'}"
+                return colored(f"err: {message or 'error'}", "red")
             if status == "empty":
-                return "no data"
+                return colored("no data", "dark_grey")
             if summary_data.get("no_gpu"):
                 source = summary_data.get("data_source")
-                return "unsupported" if source == "unsupported" else "no GPU"
+                return colored(
+                    "unsupported" if source == "unsupported" else "no GPU",
+                    "dark_grey",
+                )
             return (
                 f"{summary_data['gpu_count']}G · {summary_data['avg_util']}% · "
                 f"{summary_data['mem_display']}"
             )
         if not summary_data:
-            return "No GPU data available"
+            return colored("No GPU data available", "dark_grey")
         if isinstance(summary_data, dict) and summary_data.get("status") == "loading":
-            return "Loading..."
+            return colored("Loading...", "dark_grey")
         if isinstance(summary_data, dict) and summary_data.get("status") == "error":
             message = summary_data.get("message", "Error")
             error_type = summary_data.get("error_type")
@@ -5809,7 +5876,7 @@ class NVClientPool:
                 return colored("Password incorrect", "red", attrs=["bold"])
             return colored(message, "red", attrs=["bold"])
         if isinstance(summary_data, dict) and summary_data.get("status") == "empty":
-            return "No GPU data available"
+            return colored("No GPU data available", "dark_grey")
 
         gpu_count = summary_data["gpu_count"]
         idle_count = summary_data["idle_count"]
@@ -5837,27 +5904,35 @@ class NVClientPool:
             else:
                 cpu_color = "green"
             cpu_util_str = colored(f"{cpu_percent_int:>3}%", cpu_color)
-            cpu_part = f"CPU: {cpu_util_str}({cpu_cores}C)"
+            cpu_part = colored("CPU ", "dark_grey") + f"{cpu_util_str}({cpu_cores}C)"
         else:
             cpu_part = ""
 
         # Memory: used/total with swap in brackets
         if mem_total_gb > 0:
             if swap_total_gb > 0:
-                mem_sys_part = f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G(Swap:{swap_used_gb:.1f}/{swap_total_gb:.0f}G)"
+                mem_sys_part = (
+                    colored("Mem ", "dark_grey")
+                    + f"{mem_used_gb:.0f}/{mem_total_gb:.0f}G"
+                    + f"(Swap {swap_used_gb:.1f}/{swap_total_gb:.0f}G)"
+                )
             else:
-                mem_sys_part = f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G"
+                mem_sys_part = (
+                    colored("Mem ", "dark_grey")
+                    + f"{mem_used_gb:.0f}/{mem_total_gb:.0f}G"
+                )
         else:
             mem_sys_part = ""
+
+        sep = colored(" · ", "dark_grey")
 
         # Handle no GPU case - only show system stats
         if no_gpu:
             source = summary_data.get("data_source") or "unknown"
             label = "Unsupported" if source == "unsupported" else "No GPU"
             sys_parts = [p for p in [cpu_part, mem_sys_part] if p]
-            if sys_parts:
-                return f"{label} | src:{source} | " + " | ".join(sys_parts)
-            return f"{label} | src:{source}"
+            pieces = [colored(label, "dark_grey"), colored(f"src:{source}", "dark_grey")]
+            return sep.join(pieces + sys_parts)
 
         if widths:
             gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
@@ -5871,22 +5946,43 @@ class NVClientPool:
             mem_width = len(str(mem_display))
 
         gpu_part = f"{gpu_count:>{gpu_digits}} GPUs"
-        idle_part = f"{idle_count:>{idle_digits}} idle"
+        # The idle count is what someone scanning for a free card reads
+        # first: green while there is one, dim once the node is full.
+        idle_part = colored(
+            f"{idle_count:>{idle_digits}} idle",
+            "green" if idle_count > 0 else "dark_grey",
+        )
         util_plain = f"{avg_util:>{util_digits}}%"
-        util_part = colored(util_plain, util_color) if util_color else util_plain
-        mem_part = f"{str(mem_display):>{mem_width}}"
+        util_part = (
+            (colored(util_plain, util_color) if util_color else util_plain)
+            + " "
+            + self._mini_bar(avg_util, util_color)
+        )
+        mem_percent = summary_data.get("mem_percent")
+        if mem_percent is None:
+            mem_color = None
+        elif mem_percent >= 90:
+            mem_color = "red"
+        elif mem_percent >= 75:
+            mem_color = "yellow"
+        else:
+            mem_color = "green"
+        mem_part = (
+            f"{str(mem_display):>{mem_width}} "
+            + self._mini_bar(mem_percent, mem_color)
+        )
 
         # Build the summary string
-        parts = [f"{gpu_part} | {idle_part} | {util_part} avg | {mem_part}"]
+        parts = [sep.join([gpu_part, idle_part, util_part, mem_part])]
         sys_parts = [p for p in [cpu_part, mem_sys_part] if p]
         if sys_parts:
-            parts.append(" | ".join(sys_parts))
+            parts.append(sep.join(sys_parts))
 
         source = summary_data.get("data_source")
         if source:
-            parts.append(f"src:{source}")
+            parts.append(colored(f"src:{source}", "dark_grey"))
 
-        return " | ".join(parts)
+        return sep.join(parts)
 
     def _format_user_memory_totals(self, user_summary: dict, *, max_users: int = 10) -> str:
         """Format per-user total VRAM usage (MiB) as a compact single-line string."""
@@ -5989,7 +6085,7 @@ class NVClientPool:
         fetch_display = ""
         if isinstance(last_fetch_duration, (int, float)):
             fetch_display = f" ({last_fetch_duration:.1f}s)"
-        warn_display = " | WARN: refresh failed" if last_fetch_error else ""
+        warn_display = " · WARN: refresh failed" if last_fetch_error else ""
 
         output_lines = []
         server_count = len(self.pool)
@@ -6109,17 +6205,23 @@ class NVClientPool:
                 + (colored(" · refresh failed", "red") if last_fetch_error else "")
             )
         else:
+            title_sep = colored(" · ", "dark_grey")
             plain_title = (
-                f"Time: {current_time} | Updated: {update_display}{fetch_display} | "
-                f"{server_label}: {server_count} | View: {view_label}{warn_display}"
+                f"Time {current_time} · Updated {update_display}{fetch_display} · "
+                f"{server_label} {server_count} · View {view_label}{warn_display}"
             )
             title_line = (
                 fit(plain_title, terminal_width)
                 if len(plain_title) > terminal_width
-                else "Time: " + colored(current_time, "cyan")
-                + " | Updated: " + colored(f"{update_display}{fetch_display}", "cyan")
-                + " | " + f"{server_label}: " + colored(str(server_count), "magenta")
-                + " | View: " + colored(view_label, "green")
+                else colored("Time ", "dark_grey") + colored(current_time, "cyan")
+                + title_sep
+                + colored("Updated ", "dark_grey")
+                + colored(f"{update_display}{fetch_display}", "cyan")
+                + title_sep
+                + colored(f"{server_label} ", "dark_grey")
+                + colored(str(server_count), "magenta")
+                + title_sep
+                + colored("View ", "dark_grey") + colored(view_label, "green")
                 + (colored(warn_display, "red") if warn_display else "")
             )
         output_lines.append(title_line)
@@ -6246,9 +6348,13 @@ class NVClientPool:
             if toggle_disabled:
                 expand_icon = "!"
             else:
-                expand_icon = "v" if is_expanded else ">"
-            selector = "*" if is_selected else " "
-            header_plain = f"{selector} {expand_icon} [{idx + 1:{index_width}d}] {client.description}"
+                expand_icon = "▾" if is_expanded else "▸"
+            selector = "❯" if is_selected else " "
+            dot, _dot_color = self._server_health_dot(summary_data)
+            header_plain = (
+                f"{selector} {expand_icon} [{idx + 1:{index_width}d}] "
+                f"{dot} {client.description}"
+            )
 
             header_width = self.term.length(header_plain)
             max_header_width = max(max_header_width, header_width)
@@ -6297,9 +6403,10 @@ class NVClientPool:
             expand_icon = (
                 "!"
                 if toggle_disabled
-                else ("v" if idx in visible_blocks else ">")
+                else ("▾" if idx in visible_blocks else "▸")
             )
-            selector = "*" if is_selected else " "
+            selector = "❯" if is_selected else " "
+            dot, dot_color = self._server_health_dot(summary_data)
             summary = self._format_server_summary(
                 summary_data, widths=widths, compact=compact_layout
             )
@@ -6313,11 +6420,8 @@ class NVClientPool:
             icon_color = None if is_selected else self._server_icon_color(
                 expand_icon, toggle_disabled
             )
-            status_color = None if is_selected else self._server_status_color(
-                summary_data
-            )
             if compact_layout:
-                prefix = f"{selector} {expand_icon} {idx + 1} "
+                prefix = f"{selector} {expand_icon} {idx + 1} {dot} "
                 description = fit(
                     self.pool[idx].description,
                     max(1, summary_room - len(prefix)),
@@ -6330,18 +6434,15 @@ class NVClientPool:
                     icon_display = (
                         colored(expand_icon, icon_color) if icon_color else expand_icon
                     )
-                    description_display = (
-                        colored(description, status_color, attrs=["bold"])
-                        if status_color
-                        else description
-                    )
                     header_display = (
-                        f"{selector} {icon_display} {idx + 1} {description_display}"
+                        f"{selector} {icon_display} {idx + 1} "
+                        f"{colored(dot, dot_color)} "
+                        + colored(description, attrs=["bold"])
                     )
             else:
                 header_plain = (
                     f"{selector} {expand_icon} "
-                    f"[{idx + 1:{index_width}d}] {self.pool[idx].description}"
+                    f"[{idx + 1:{index_width}d}] {dot} {self.pool[idx].description}"
                 )
                 pad = max_header_width - self.term.length(header_plain)
                 header_padded = header_plain + (" " * pad if pad > 0 else "")
@@ -6351,14 +6452,13 @@ class NVClientPool:
                         self.term.reverse + header_padded + self.term.normal
                     )
                 else:
-                    # The icon and index prefix are a handful of ASCII
+                    # The icon, index, and dot prefix are a handful of
                     # characters, always shorter than summary_room in
                     # practice (this branch only runs at width >= 72); the
-                    # rest (description + trailing pad) takes the status
-                    # colour as one block so a mid-word cut never splits
-                    # an ANSI code.
+                    # rest (description + trailing pad) is bolded as one
+                    # block so a mid-word cut never splits an ANSI code.
                     prefix_plain = (
-                        f"{selector} {expand_icon} [{idx + 1:{index_width}d}] "
+                        f"{selector} {expand_icon} [{idx + 1:{index_width}d}] {dot} "
                     )
                     if len(header_padded) >= len(prefix_plain):
                         rest = header_padded[len(prefix_plain):]
@@ -6367,14 +6467,11 @@ class NVClientPool:
                             if icon_color
                             else expand_icon
                         )
-                        rest_display = (
-                            colored(rest, status_color, attrs=["bold"])
-                            if status_color
-                            else rest
-                        )
                         header_display = (
                             f"{selector} {icon_display} "
-                            f"[{idx + 1:{index_width}d}] {rest_display}"
+                            f"[{idx + 1:{index_width}d}] "
+                            f"{colored(dot, dot_color)} "
+                            + colored(rest, attrs=["bold"])
                         )
                     else:
                         header_display = header_padded
