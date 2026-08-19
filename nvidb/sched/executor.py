@@ -47,6 +47,7 @@ class JobProbe:
     pgid: Optional[int] = None
     exit_code: Optional[int] = None
     alive: bool = False
+    started_epoch: Optional[int] = None
     finished_epoch: Optional[int] = None
     progress: Optional[str] = None
 
@@ -89,6 +90,10 @@ def build_run_script(
         'mkdir -p "$NVIDB_JOB_DIR"',
         'echo $$ > "$NVIDB_JOB_DIR/pid"',
         'ps -o pgid= -p $$ 2>/dev/null | tr -d " \\n" > "$NVIDB_JOB_DIR/pgid" || true',
+        # The job records when it began, so a client that was not watching can
+        # still report an honest runtime. Without it, a job that started and
+        # finished between two passes looks as though it took no time at all.
+        'date +%s > "$NVIDB_JOB_DIR/started" 2>/dev/null || true',
         "nvidb_finish() {",
         "  nvidb_rc=$?",
         # The wall-clock finish time is recorded here rather than inferred from
@@ -286,15 +291,16 @@ class JobExecutor:
             '  _pid=$(cat "$_d/pid" 2>/dev/null | tr -d " \\n\\r")',
             '  _pgid=$(cat "$_d/pgid" 2>/dev/null | tr -d " \\n\\r")',
             '  _ec=$(cat "$_d/exit_code" 2>/dev/null | tr -d "\\n\\r")',
+            '  _st=$(cat "$_d/started" 2>/dev/null | tr -d " \\n\\r")',
             "  _alive=0",
             '  if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && '
             'ps -o command= -p "$_pid" 2>/dev/null | '
             'grep -F -q -- "$_d/run.sh"; then _alive=1; fi',
-            '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive"',
+            '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive|$_st"',
             # The status line is free-form text, so it travels on its own line
             # where only the first two fields need splitting.
-            '  _st=$(tail -n 1 "$_d/status" 2>/dev/null | tr -d "\\n\\r")',
-            '  if [ -n "$_st" ]; then echo "STAT|$_id|$_st"; fi',
+            '  _line=$(tail -n 1 "$_d/status" 2>/dev/null | tr -d "\\n\\r")',
+            '  if [ -n "$_line" ]; then echo "STAT|$_id|$_line"; fi',
             "}",
             f"echo {PROBE_MARKER}",
         ]
@@ -464,6 +470,8 @@ def parse_probe_output(text: str) -> NodeProbe:
                 pgid=_maybe_int(parts[3]),
                 exit_code=_maybe_int(status_parts[0]) if status_parts else None,
                 alive=parts[5] == "1",
+                # Written by run.sh, and absent from jobs started before it was.
+                started_epoch=_maybe_int(parts[6]) if len(parts) > 6 else None,
                 finished_epoch=_maybe_int(status_parts[1]) if len(status_parts) > 1 else None,
                 # Section order puts JOB before STAT, but do not lose a status
                 # line if that ever changes.

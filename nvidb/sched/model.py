@@ -408,6 +408,12 @@ class Lane:
     # How many of this lane's jobs may run at once. One is the point of a lane;
     # raising it turns the lane back into a pool that happens to be ordered.
     concurrency: int = 1
+    # Whether a resident runner on the node starts this lane's jobs. With it
+    # off, the lane still runs in order, but only advances when some client
+    # happens to run a scheduler pass.
+    runner: bool = True
+    runner_state: Optional[Dict[str, Any]] = None
+    runner_seen_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -420,9 +426,19 @@ class Lane:
             gpu_ids=_csv_ints(data.get("gpu_ids")),
             paused=bool(data.get("paused", 0)),
             concurrency=int(data.get("concurrency") or 1),
+            runner=bool(data.get("runner", 1)),
+            runner_state=_json_loads(data.get("runner_state"), None),
+            runner_seen_at=data.get("runner_seen_at"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
         )
+
+    def runner_up(self, *, stale_after: float = 120.0) -> bool:
+        """Whether a runner was seen alive recently enough to be believed."""
+        if not self.runner_state or not self.runner_seen_at:
+            return False
+        age = age_seconds(self.runner_seen_at)
+        return age is not None and age <= stale_after
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -431,6 +447,10 @@ class Lane:
             "gpu_ids": self.gpu_ids,
             "paused": self.paused,
             "concurrency": self.concurrency,
+            "runner": self.runner,
+            "runner_up": self.runner_up(),
+            "runner_state": self.runner_state,
+            "runner_seen_at": self.runner_seen_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

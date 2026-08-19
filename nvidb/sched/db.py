@@ -121,6 +121,13 @@ CREATE TABLE IF NOT EXISTS lanes (
     gpu_ids     TEXT NOT NULL DEFAULT '',
     paused      INTEGER NOT NULL DEFAULT 0,
     concurrency INTEGER NOT NULL DEFAULT 1,
+    -- Whether this lane's jobs are started by a resident runner on the node
+    -- rather than by whichever client happens to run a scheduler pass.
+    runner      INTEGER NOT NULL DEFAULT 1,
+    -- The runner's last published state, and when it was read. Cached so the
+    -- UIs can say what a lane is doing without a round trip of their own.
+    runner_state TEXT,
+    runner_seen_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -275,6 +282,11 @@ _ADDED_COLUMNS = {
         "held_reason": "TEXT",
         "lane": "TEXT",
         "lane_seq": "INTEGER",
+    },
+    "lanes": {
+        "runner": "INTEGER NOT NULL DEFAULT 1",
+        "runner_state": "TEXT",
+        "runner_seen_at": "TEXT",
     },
 }
 
@@ -774,8 +786,13 @@ def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:
         return
     if "gpu_ids" in fields and isinstance(fields["gpu_ids"], (list, tuple)):
         fields["gpu_ids"] = ",".join(str(int(i)) for i in fields["gpu_ids"])
-    if "paused" in fields:
-        fields["paused"] = 1 if fields["paused"] else 0
+    for flag in ("paused", "runner"):
+        if flag in fields:
+            fields[flag] = 1 if fields[flag] else 0
+    if "runner_state" in fields and not isinstance(
+        fields["runner_state"], (str, type(None))
+    ):
+        fields["runner_state"] = json.dumps(fields["runner_state"], ensure_ascii=False)
     fields["updated_at"] = utcnow()
     assignments = ", ".join(f"{key} = ?" for key in fields)
     with transaction(conn):

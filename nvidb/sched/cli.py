@@ -779,10 +779,22 @@ def _render_lanes(lanes: Sequence[Dict[str, Any]]) -> str:
         queued = lane["queued"]
         state = "paused" if lane["paused"] else lane["node_state"]
         head = queued[0] if queued else None
+        if not lane["runner"]:
+            runner = "off"
+        elif lane["runner_up"]:
+            runner = "up"
+        elif (running or queued) and lane["node_state"] == "up":
+            # Only worth calling out where a runner could be up: on a node that
+            # is down it is the node that needs attention, and the BLOCKED
+            # column already says so.
+            runner = "DOWN"
+        else:
+            runner = "-"
         rows.append(
             [
                 lane["name"],
                 state,
+                runner,
                 str(len(running)),
                 str(len(queued)),
                 _short(running[0]["name"] or str(running[0]["id"]), 22)
@@ -793,15 +805,24 @@ def _render_lanes(lanes: Sequence[Dict[str, Any]]) -> str:
             ]
         )
     return _table(
-        rows, ["LANE", "STATE", "RUN", "QUEUED", "NOW", "NEXT", "BLOCKED"], indent=""
+        rows,
+        ["LANE", "STATE", "RUNNER", "RUN", "QUEUED", "NOW", "NEXT", "BLOCKED"],
+        indent="",
     )
 
 
 def _render_lane_detail(lane: Dict[str, Any]) -> str:
+    if not lane["runner"]:
+        runner = "runner off"
+    elif lane["runner_up"]:
+        runner = "runner up"
+    else:
+        runner = "no runner"
     lines = [
         f"LANE {lane['name']}  [{'paused' if lane['paused'] else lane['node_state']}]"
         f"  node={lane['node']} gpu={','.join(str(i) for i in lane['gpu_ids'])}"
-        + (f" concurrency={lane['concurrency']}" if lane["concurrency"] != 1 else "")
+        f"  {runner}"
+        + (f"  concurrency={lane['concurrency']}" if lane["concurrency"] != 1 else "")
     ]
     if lane["blocked"]:
         lines.append(f"  blocked: {lane['blocked']}")
@@ -962,6 +983,87 @@ def cmd_lane_skip(args) -> int:
         else:
             print(f"job {outcome['skipped']} moved to the back of {outcome['lane']}")
         return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_runner(args) -> int:
+    """Inspect or control the resident process that drives one lane."""
+    scheduler = _open(args)
+    try:
+        action = getattr(args, "runner_action", None) or "status"
+        try:
+            if action == "status":
+                _refresh(scheduler, args)
+                lane = scheduler.resolve_lane(args.lane)
+                view = scheduler.lane_view(lane)
+                if args.json:
+                    _print_json(
+                        {
+                            "lane": lane.name,
+                            "enabled": lane.runner,
+                            "up": lane.runner_up(),
+                            "seen": lane.runner_seen_at,
+                            "state": lane.runner_state,
+                            "blocked": view["blocked"],
+                        }
+                    )
+                else:
+                    if not lane.runner:
+                        print(f"lane {lane.name}: runner disabled")
+                    elif lane.runner_up():
+                        state = lane.runner_state or {}
+                        current = ", ".join(
+                            str(item.get("job_id")) for item in state.get("current") or []
+                        )
+                        print(
+                            f"lane {lane.name}: runner up (pid {state.get('pid', '?')}, "
+                            f"seen {_age(lane.runner_seen_at)})"
+                        )
+                        print(f"  running  {current or '-'}")
+                        print(
+                            "  staged   "
+                            + (
+                                ", ".join(str(i) for i in state.get("queued") or [])
+                                or "-"
+                            )
+                        )
+                    else:
+                        print(f"lane {lane.name}: no runner (it starts when work is queued)")
+                return 0 if lane.runner_up() or not lane.runner else 1
+
+            if action in ("on", "off"):
+                lane = scheduler.set_lane_runner(args.lane, action == "on")
+                summary = _maybe_tick(scheduler, args, force=True) if action == "on" else {}
+                if args.json:
+                    _print_json({"ok": True, "lane": lane.to_dict(), "tick": summary})
+                else:
+                    print(
+                        f"lane {lane.name}: runner "
+                        + ("enabled" if lane.runner else "disabled")
+                    )
+                return 0
+
+            outcome = scheduler.stop_lane_runner(args.lane, hard=args.hard)
+            if action == "restart":
+                summary = _maybe_tick(scheduler, args, force=True)
+                if args.json:
+                    _print_json({"ok": True, **outcome, "tick": summary})
+                else:
+                    print(f"lane {outcome['lane']}: runner restarted")
+                return 0
+            if args.json:
+                _print_json({"ok": True, **outcome})
+            else:
+                print(
+                    f"lane {outcome['lane']}: runner asked to stop"
+                    + ("" if args.hard else " once its current job finishes")
+                )
+            return 0
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        except Exception as error:  # a node that will not answer is not a crash
+            return _error(f"{type(error).__name__}: {error}", as_json=args.json)
     finally:
         scheduler.close()
 
@@ -1797,6 +1899,30 @@ def register_parsers(subparsers) -> None:
     _add_common(lane_skip)
     lane_skip.add_argument("--no-tick", action="store_true")
     lane_skip.set_defaults(func=cmd_lane_skip)
+
+    lane_runner = lane_sub.add_parser(
+        "runner",
+        help="The resident process on the node that starts this lane's jobs",
+        description=(
+            "With a runner, the lane starts its next job the moment the "
+            "previous one exits, with no client involved. Stopping or "
+            "restarting the runner never touches the job it started."
+        ),
+    )
+    _add_common(lane_runner)
+    _add_refresh_flags(lane_runner)
+    lane_runner.add_argument(
+        "runner_action",
+        nargs="?",
+        default="status",
+        choices=["status", "on", "off", "stop", "restart"],
+    )
+    lane_runner.add_argument(
+        "--hard",
+        action="store_true",
+        help="Stop the runner now instead of after its current job",
+    )
+    lane_runner.set_defaults(func=cmd_lane_runner)
 
     lane_concurrency = lane_sub.add_parser(
         "concurrency",

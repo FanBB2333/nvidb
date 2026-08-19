@@ -145,6 +145,38 @@ def test_probe_output_parses_both_sections():
     assert probe.process_groups[4400] == 4321
 
 
+def test_a_job_reports_the_moment_it_started():
+    """Written by the job itself, so a run nobody watched still has an
+    honest duration instead of appearing to have taken no time."""
+    probe = parse_probe_output(
+        "NVIDB_PROBE_V1\n"
+        "JOB|7|4321|4321||1|1753600000\n"
+        "JOB|8|5555|5550|0 1753612345|0|1753600000\n"
+    )
+    assert probe.jobs[7].started_epoch == 1753600000
+    assert probe.jobs[8].started_epoch == 1753600000
+    assert probe.jobs[8].finished_epoch == 1753612345
+
+
+def test_a_probe_line_from_before_start_times_still_parses():
+    """Jobs launched by an older version have no `started` file, and their
+    lines are one field shorter. They must not be dropped."""
+    probe = parse_probe_output("NVIDB_PROBE_V1\nJOB|7|4321|4321||1\n")
+    assert probe.jobs[7].alive is True
+    assert probe.jobs[7].started_epoch is None
+
+
+def test_the_run_script_records_when_it_started():
+    script = build_run_script(
+        job_id=1,
+        job_name="x",
+        command="true",
+        run_dir="/tmp/x",
+        workdir=None,
+    )
+    assert 'date +%s > "$NVIDB_JOB_DIR/started"' in script
+
+
 # --- storage ---------------------------------------------------------------
 
 def test_lock_is_exclusive_until_its_lease_expires(tmp_path):

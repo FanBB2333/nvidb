@@ -15,6 +15,7 @@ One tick performs three passes:
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -28,7 +29,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from .. import config as nvidb_config
 from . import db as dbm
 from . import keeper as keeper_mod
-from .executor import JobExecutor, LaunchRejected, NodeProbe
+from . import runner_agent
+from .executor import JobExecutor, LaunchRejected, NodeProbe, build_run_script
 from .model import (
     GpuProcess,
     Job,
@@ -80,6 +82,18 @@ DEFAULT_SETTINGS = {
     # "local" reads as "wherever I happen to be". Changing it later strands jobs
     # recorded against the old name, so it is a set-it-once value.
     "local_node_name": "local",
+    # --- lane runners ---
+    # Where a node keeps its lane spools, relative to the remote $HOME.
+    "lane_spool_root": ".nvidb/lanes",
+    # How many of a lane's jobs are handed to its runner in advance. One means
+    # everything behind the running job stays a local record, so reordering it
+    # never touches the node; raising it lets a lane keep going for longer
+    # without a client, at the cost of a round trip to reorder that far ahead.
+    "lane_lookahead": 1,
+    # How often a runner looks at its own spool and at the job it started.
+    "lane_poll_interval": 3,
+    # How long a runner stays resident with nothing to run before exiting.
+    "lane_idle_exit": 900,
 }
 
 
@@ -147,6 +161,44 @@ class NodeBackend:
         self.transport = transport
         self.executor = JobExecutor(transport, job_root=job_root)
         self.probe_timeout = probe_timeout
+
+    def lane_sync(
+        self,
+        *,
+        lane_name: str,
+        specs: Sequence[dict],
+        spool_root: str,
+        interval: float,
+        idle_exit: float,
+        want_runner: bool,
+        timeout: float,
+    ) -> Optional[dict]:
+        """Stage a lane's next jobs, keep its runner up, and read its state.
+
+        One round trip for all three: a lane that cost three would spend more
+        on coordination than the scheduling it takes over.
+        """
+        command = runner_agent.build_sync_command(
+            lane_name=lane_name,
+            spool_root=spool_root,
+            specs=list(specs),
+            interval=interval,
+            idle_exit=idle_exit,
+            want_runner=want_runner,
+        )
+        result = self.transport.run(command, timeout=timeout)
+        return runner_agent.parse_state(result.stdout)
+
+    def lane_stop(
+        self, *, lane_name: str, spool_root: str, hard: bool = False, timeout: float = 20.0
+    ) -> None:
+        """Ask a lane's runner to exit, without touching the job it started."""
+        self.transport.run(
+            runner_agent.build_stop_command(
+                lane_name=lane_name, spool_root=spool_root, hard=hard
+            ),
+            timeout=timeout,
+        )
 
     def probe_gpus(self) -> dict:
         """Run the bundled NVML agent once and return its JSON payload.
@@ -760,6 +812,8 @@ class Scheduler:
             blocked = f"node {lane.node} is {node.state}"
         elif queued and queued[0].is_held:
             blocked = f"job {queued[0].id} is held: {queued[0].held_reason}"
+        elif lane.runner and queued and not lane.runner_up():
+            blocked = "waiting for a runner on the node"
 
         return {
             **lane.to_dict(),
@@ -1030,6 +1084,10 @@ class Scheduler:
                         self._terminate(self.backend(node), job)
                     except TransportError:
                         orphan_reason = "cancelled while unreachable"
+            elif job.state == "pending" and job.lane:
+                # It may already be staged with the lane's runner, which would
+                # otherwise start a job that has just been called off.
+                self.withdraw_lane_job(job)
             with dbm.transaction(self.conn):
                 if orphan_reason:
                     self._remember_orphan(job, reason=orphan_reason)
@@ -1162,9 +1220,25 @@ class Scheduler:
 
     # --- pass 1: refresh --------------------------------------------------
 
+    def _staged_jobs(self, node: Node) -> List[Job]:
+        """Lane jobs handed to a runner on this node that have not started yet.
+
+        They are still pending, but they already own a run directory, so the
+        node can be asked about them the same way it is asked about running
+        work - which is the only way to notice one that came and went between
+        two passes.
+        """
+        return [
+            job
+            for lane in dbm.get_lanes(self.conn, node.name)
+            for job in dbm.lane_jobs(self.conn, lane.name, states=["pending"])
+            if job.run_dir
+        ]
+
     def _refresh_node(self, node: Node, summary: Dict[str, Any]) -> bool:
         backend = self.backend(node)
         running = dbm.live_jobs(self.conn, node.name)
+        staged = self._staged_jobs(node)
 
         # An unreachable node raises out of here and is marked down by tick().
         # Getting past both calls proves the node answers commands, even when
@@ -1172,18 +1246,36 @@ class Scheduler:
         payload = backend.probe_gpus()
         self._renew_tick_lease()
         probe = backend.executor.probe(
-            [(job.id, job.run_dir) for job in running if job.run_dir],
+            [
+                (job.id, job.run_dir)
+                for job in running + staged
+                if job.run_dir
+            ],
             timeout=float(self.settings["probe_timeout"]),
         )
         self._renew_tick_lease()
 
         self._reconcile_jobs(node, backend, running, probe, summary)
+        self._reconcile_staged(node, backend, staged, probe, summary)
         self._reap_orphans(node, backend, summary)
 
+        gpus = self._build_gpu_states(
+            node, payload, probe, dbm.live_jobs(self.conn, node.name)
+        )
+        dbm.replace_node_gpus(self.conn, node.name, gpus)
+        self._ensure_lanes(node, gpus)
+
+        # The lane runners are driven once the node's capacity is on record,
+        # because staging a job asks whether its lane could ever hold it.
+        self._sync_lane_runners(dbm.get_node(self.conn, node.name) or node, summary)
+        self._renew_tick_lease()
+
+        # Anything the runners have just started is this queue's own memory, so
+        # capacity is written again rather than left crediting it to work
+        # nobody submitted.
         still_running = dbm.live_jobs(self.conn, node.name)
         gpus = self._build_gpu_states(node, payload, probe, still_running)
         dbm.replace_node_gpus(self.conn, node.name, gpus)
-        self._ensure_lanes(node, gpus)
 
         error = None if payload.get("ok") else str(payload.get("error") or "")[:300]
         previous = dbm.set_node_state(
@@ -1389,6 +1481,124 @@ class Scheduler:
                     summary=summary,
                 )
                 summary["finished"].append({"id": job.id, "state": "lost"})
+
+    def _reconcile_staged(
+        self,
+        node: Node,
+        backend: NodeBackend,
+        staged: List[Job],
+        probe: NodeProbe,
+        summary: Dict[str, Any],
+    ) -> None:
+        """Settle lane jobs whose runner started them without anyone watching.
+
+        A job handed to a runner can start and finish inside one tick, so it
+        is never seen running. Its run directory is durable though, so the exit
+        code is still there to be read - and reading it is what stops the job
+        being staged, run, and staged again for ever.
+
+        A staged job that simply has not started yet looks like a job with no
+        process and no exit code. That is the normal case here and means
+        nothing is wrong, which is why this cannot share the running-job path:
+        there, the same observation means the process vanished.
+        """
+        for job in staged:
+            self._renew_tick_lease()
+            observed = probe.jobs.get(job.id)
+            if observed is None:
+                continue
+
+            if observed.finished:
+                exit_code = observed.exit_code
+                state = "completed" if exit_code == 0 else "failed"
+                result = None
+                try:
+                    result = backend.executor.read_result(job.run_dir)
+                except TransportError:
+                    pass
+                detail = None
+                last_error = None
+                if state == "failed":
+                    detail = self._failure_detail(backend, job)
+                    reason = (detail or "").strip().splitlines()
+                    last_error = f"exit code {exit_code}"
+                    if reason:
+                        last_error += f": {reason[-1][:200]}"
+                finished_at = _epoch_to_iso(observed.finished_epoch) or utcnow()
+                # The job stamped its own start, so a run that happened while
+                # nobody was watching still reports the time it really took.
+                started_at = (
+                    job.started_at
+                    or _epoch_to_iso(observed.started_epoch)
+                    or finished_at
+                )
+                with dbm.transaction(self.conn):
+                    dbm.update_job(
+                        self.conn,
+                        job.id,
+                        state=state,
+                        node=node.name,
+                        exit_code=exit_code,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        result=result,
+                        last_error=last_error,
+                        attempt=job.attempt + 1,
+                        progress=observed.progress or job.progress,
+                    )
+                    dbm.add_event(
+                        self.conn,
+                        "job_finished",
+                        job_id=job.id,
+                        node=node.name,
+                        message=f"{state} (exit {exit_code})",
+                        data={"exit_code": exit_code, "state": state, "runner": True},
+                    )
+                if state == "failed":
+                    self._raise_alert(
+                        "job_failed",
+                        f"{job.name or 'job'} failed with exit code {exit_code}",
+                        job_id=job.id,
+                        node=node.name,
+                        detail=detail,
+                        summary=summary,
+                    )
+                summary["finished"].append(
+                    {"id": job.id, "state": state, "exit_code": exit_code}
+                )
+                continue
+
+            if observed.alive:
+                # It started between the last pass and this one.
+                with dbm.transaction(self.conn):
+                    dbm.update_job(
+                        self.conn,
+                        job.id,
+                        state="running",
+                        node=node.name,
+                        gpu_ids=self._lane_gpu_ids(job),
+                        remote_pid=observed.pid,
+                        remote_pgid=observed.pgid,
+                        started_at=_epoch_to_iso(observed.started_epoch) or utcnow(),
+                        heartbeat_at=utcnow(),
+                        attempt=job.attempt + 1,
+                        progress=observed.progress,
+                    )
+                    dbm.add_event(
+                        self.conn,
+                        "job_started",
+                        job_id=job.id,
+                        node=node.name,
+                        message=f"pid {observed.pid} (lane {job.lane})",
+                        data={"pid": observed.pid, "lane": job.lane, "runner": True},
+                    )
+                summary["dispatched"].append(
+                    {"id": job.id, "node": node.name, "lane": job.lane, "runner": True}
+                )
+
+    def _lane_gpu_ids(self, job: Job) -> List[int]:
+        lane = dbm.get_lane(self.conn, job.lane) if job.lane else None
+        return list(lane.gpu_ids) if lane else []
 
     def _remember_orphan(self, job: Job, *, reason: str) -> None:
         """Record a process this queue closed the books on but could not kill."""
@@ -1848,6 +2058,338 @@ class Scheduler:
                 summary=summary,
             )
 
+    # --- lane runners -----------------------------------------------------
+
+    def _lane_specs(
+        self,
+        lane: Lane,
+        limit: int,
+        *,
+        inventory: Optional[List[Node]] = None,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> List[dict]:
+        """The work to hand a lane's runner: its next few jobs, in order.
+
+        Only the head of the lane is staged, so everything behind it stays a
+        local record that can be reordered without touching the node. The
+        window exists at all so the runner can start the next job the instant
+        the current one exits, rather than waiting for a client to notice.
+        """
+        specs: List[dict] = []
+        headroom = int(self.settings["headroom_mb"])
+        for job in dbm.lane_jobs(self.conn, lane.name, states=["pending"]):
+            if len(specs) >= max(1, limit):
+                break
+            if inventory is not None and summary is not None:
+                blocked = self._gate(job, inventory, headroom, summary)
+                if blocked == "impossible":
+                    # Just failed and out of the queue; the lane carries on.
+                    continue
+                if blocked:
+                    # Head-of-line: a lane runs in order, so nothing behind a
+                    # job that cannot start yet may be staged past it.
+                    break
+            else:
+                ready, hold_reason = self._dependencies_ready(job)
+                if hold_reason or not ready:
+                    break
+            attempt = job.attempt + 1
+            run_dir = self._lane_run_dir(lane, job, attempt)
+            if run_dir is None:
+                break
+            if job.run_dir != run_dir:
+                # Recorded before the job can possibly start. A job that runs
+                # and exits between two ticks is never seen in the runner's
+                # `current`, so this is what lets the next probe find its exit
+                # code instead of staging the job again for ever.
+                dbm.update_job(self.conn, job.id, run_dir=run_dir)
+            specs.append(
+                {
+                    "job_id": job.id,
+                    "lane": lane.name,
+                    "seq": job.lane_seq or job.id,
+                    "run_dir": run_dir,
+                    "gpu_ids": list(lane.gpu_ids),
+                    "vram_mb": int(job.vram_mb or 0),
+                    "max_runtime_s": job.max_runtime_s,
+                    "concurrency": max(1, int(lane.concurrency)),
+                    "attempt": attempt,
+                    "script_b64": base64.b64encode(
+                        build_run_script(
+                            job_id=job.id,
+                            job_name=job.name,
+                            command=job.command,
+                            run_dir=run_dir,
+                            workdir=job.workdir,
+                            env=job.env,
+                            gpu_ids=lane.gpu_ids,
+                            node_name=lane.node,
+                        ).encode("utf-8")
+                    ).decode("ascii"),
+                }
+            )
+        return specs
+
+    def _lane_run_dir(self, lane: Lane, job: Job, attempt: int) -> Optional[str]:
+        node = dbm.get_node(self.conn, lane.node)
+        if node is None:
+            return None
+        try:
+            return self.backend(node).executor.run_dir(job.id, attempt)
+        except TransportError:
+            return None
+
+    def _sync_lane_runners(self, node: Node, summary: Dict[str, Any]) -> None:
+        """Keep each of this node's runner lanes stocked, alive and observed."""
+        backend = self.backend(node)
+        spool_root = str(self.settings.get("lane_spool_root") or runner_agent.DEFAULT_SPOOL_ROOT)
+        lookahead = max(1, int(self.settings.get("lane_lookahead") or 1))
+
+        # A lane job is pinned to this node's cards, so the node itself is the
+        # whole inventory the gate needs to judge it against.
+        inventory = [node] if node.gpus else []
+
+        for lane in dbm.get_lanes(self.conn, node.name):
+            self._renew_tick_lease()
+            if not lane.runner:
+                continue
+            # Never stage less than the lane may run at once, or a lane allowed
+            # two jobs would sit with one because only one was ever handed over.
+            window = max(lookahead, int(lane.concurrency or 1))
+            specs = (
+                []
+                if lane.paused
+                else self._lane_specs(
+                    lane, window, inventory=inventory, summary=summary
+                )
+            )
+            busy = bool(dbm.lane_jobs(self.conn, lane.name, states=["running"]))
+            # A lane with nothing to run needs no resident process. The runner
+            # also times itself out, so this only decides when one starts.
+            want_runner = bool(specs or busy)
+            # Still talk to a lane that has work but is staging none of it -
+            # a paused lane, or one whose head is held - or a spec left over
+            # from before would sit on the node waiting to be run.
+            if (
+                not want_runner
+                and not lane.runner_state
+                and not dbm.lane_jobs(self.conn, lane.name)
+            ):
+                continue
+
+            try:
+                state = backend.lane_sync(
+                    lane_name=lane.name,
+                    specs=specs,
+                    spool_root=spool_root,
+                    interval=float(
+                        self.settings.get("lane_poll_interval")
+                        or runner_agent.DEFAULT_INTERVAL
+                    ),
+                    idle_exit=float(
+                        self.settings.get("lane_idle_exit")
+                        or runner_agent.DEFAULT_IDLE_EXIT
+                    ),
+                    want_runner=want_runner,
+                    timeout=float(self.settings["launch_timeout"]),
+                )
+            except TransportError as error:
+                summary["errors"].append({"lane": lane.name, "error": str(error)})
+                continue
+            self._renew_tick_lease()
+            dbm.update_lane(
+                self.conn,
+                lane.name,
+                runner_state=state,
+                runner_seen_at=utcnow() if state else None,
+            )
+            if state:
+                self._adopt_runner_state(lane, node, state, summary)
+
+    def _adopt_runner_state(
+        self,
+        lane: Lane,
+        node: Node,
+        state: dict,
+        summary: Dict[str, Any],
+    ) -> None:
+        """Record what the runner started, and stop what it should not have.
+
+        The runner decides *when* a staged job begins; the database is still
+        where a job's state lives, so every start it reports is written back
+        here before anything else reasons about the queue.
+        """
+        for entry in state.get("current") or []:
+            job_id = entry.get("job_id")
+            if job_id is None:
+                continue
+            job = dbm.get_job(self.conn, int(job_id))
+            if job is None:
+                continue
+
+            if job.is_terminal:
+                # Cancelled or timed out after it was staged, and the runner
+                # claimed it before the withdrawal landed. Stop it now rather
+                # than leaving work nobody is tracking on the card.
+                self._stop_unwanted(node, job, entry, summary)
+                continue
+            if job.state == "running":
+                continue
+
+            started = _epoch_to_iso(entry.get("started_at")) or utcnow()
+            with dbm.transaction(self.conn):
+                dbm.update_job(
+                    self.conn,
+                    job.id,
+                    state="running",
+                    node=lane.node,
+                    gpu_ids=list(lane.gpu_ids),
+                    remote_pid=entry.get("pid"),
+                    remote_pgid=entry.get("pid"),
+                    run_dir=entry.get("run_dir"),
+                    started_at=started,
+                    heartbeat_at=utcnow(),
+                    attempt=job.attempt + 1,
+                    last_error=None,
+                )
+                dbm.add_event(
+                    self.conn,
+                    "job_started",
+                    job_id=job.id,
+                    node=lane.node,
+                    message=(
+                        f"pid {entry.get('pid')} on GPU "
+                        f"{','.join(str(i) for i in lane.gpu_ids) or '-'} "
+                        f"(lane {lane.name})"
+                    ),
+                    data={
+                        "pid": entry.get("pid"),
+                        "gpu_ids": list(lane.gpu_ids),
+                        "lane": lane.name,
+                        "vram_mb": job.vram_mb,
+                        "runner": True,
+                    },
+                )
+            summary["dispatched"].append(
+                {
+                    "id": job.id,
+                    "node": lane.node,
+                    "gpu_ids": list(lane.gpu_ids),
+                    "lane": lane.name,
+                    "runner": True,
+                }
+            )
+
+    def _stop_unwanted(
+        self, node: Node, job: Job, entry: dict, summary: Dict[str, Any]
+    ) -> None:
+        """Kill a job the runner started after its record was already closed."""
+        run_dir = entry.get("run_dir") or job.run_dir
+        pid = entry.get("pid")
+        if not run_dir or not pid:
+            return
+        try:
+            killed = self.backend(node).executor.reap(
+                run_dir=run_dir, pid=int(pid), pgid=int(pid)
+            )
+        except TransportError:
+            dbm.add_orphan(
+                self.conn,
+                node=node.name,
+                job_id=job.id,
+                run_dir=run_dir,
+                pid=int(pid),
+                pgid=int(pid),
+                reason=f"started by the lane runner after being {job.state}",
+            )
+            return
+        if killed:
+            dbm.add_event(
+                self.conn,
+                "job_reaped",
+                job_id=job.id,
+                node=node.name,
+                message=f"lane runner had already started this {job.state} job",
+            )
+            summary.setdefault("reaped", []).append(
+                {"job": job.id, "node": node.name, "pid": pid}
+            )
+
+    def withdraw_lane_job(self, job: Job) -> None:
+        """Take a staged job back from its lane's runner, best effort.
+
+        Called when a queued lane job is cancelled. The next sync would drop
+        the spec anyway; doing it now closes the window in which the runner
+        starts a job that has just been called off.
+        """
+        if not job.lane:
+            return
+        lane = dbm.get_lane(self.conn, job.lane)
+        if lane is None or not lane.runner:
+            return
+        node = dbm.get_node(self.conn, lane.node)
+        if node is None:
+            return
+        lookahead = max(1, int(self.settings.get("lane_lookahead") or 1))
+        specs = [
+            spec
+            for spec in self._lane_specs(lane, lookahead)
+            if spec["job_id"] != job.id
+        ]
+        try:
+            self.backend(node).lane_sync(
+                lane_name=lane.name,
+                specs=specs,
+                spool_root=str(
+                    self.settings.get("lane_spool_root")
+                    or runner_agent.DEFAULT_SPOOL_ROOT
+                ),
+                interval=float(
+                    self.settings.get("lane_poll_interval")
+                    or runner_agent.DEFAULT_INTERVAL
+                ),
+                idle_exit=float(
+                    self.settings.get("lane_idle_exit")
+                    or runner_agent.DEFAULT_IDLE_EXIT
+                ),
+                want_runner=True,
+                timeout=float(self.settings["launch_timeout"]),
+            )
+        except TransportError:
+            pass  # the next tick's sync withdraws it
+
+    def stop_lane_runner(self, lane: str, *, hard: bool = False) -> Dict[str, Any]:
+        """Ask a lane's runner to exit. The job it is running is left alone."""
+        target = self.resolve_lane(lane)
+        node = dbm.get_node(self.conn, target.node)
+        if node is None:
+            raise ValueError(f"Node {target.node!r} is not configured")
+        self.backend(node).lane_stop(
+            lane_name=target.name,
+            spool_root=str(
+                self.settings.get("lane_spool_root") or runner_agent.DEFAULT_SPOOL_ROOT
+            ),
+            hard=hard,
+            timeout=float(self.settings["probe_timeout"]),
+        )
+        dbm.update_lane(self.conn, target.name, runner_state=None, runner_seen_at=None)
+        return {"lane": target.name, "stopped": True, "hard": hard}
+
+    def set_lane_runner(self, lane: str, enabled: bool) -> Lane:
+        """Choose whether a resident process on the node drives this lane.
+
+        Turning it off leaves the lane working - the order is kept either way -
+        but it then only advances when a client runs a scheduler pass.
+        """
+        target = self.resolve_lane(lane)
+        dbm.update_lane(self.conn, target.name, runner=enabled)
+        if not enabled:
+            try:
+                self.stop_lane_runner(target.name)
+            except (TransportError, ValueError):
+                pass  # it times itself out with nothing staged
+        return dbm.get_lane(self.conn, target.name)
+
     # --- lane dispatch ----------------------------------------------------
 
     def _dispatch_lanes(
@@ -1880,6 +2422,10 @@ class Scheduler:
             self._renew_tick_lease()
             lane = self._lane_for(lane_name)
             if lane is None or lane.paused:
+                continue
+            if lane.runner:
+                # A resident runner owns this lane's starts. Launching from
+                # here too would race it into running the same job twice.
                 continue
             node = nodes_by_name.get(lane.node)
             if node is None:

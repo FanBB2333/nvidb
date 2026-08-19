@@ -154,6 +154,26 @@ its card is full of work the queue did not start, the whole lane waits and
 `blocked` in `nvidb queue lanes --json` says which it is. That is deliberate:
 the printed order is a promise about what runs next.
 
+### The lane runner
+
+Each active lane is driven by an nvidb process living on the node itself, which
+starts every job as its own child. That is why a lane starts its next job the
+instant the previous one exits, instead of waiting for someone to run a
+scheduler pass — a job that ends at 03:00 does not leave the card idle.
+
+It looks after itself: it is started when a lane has work, adopts jobs already
+running if it is restarted, and exits once the lane has been idle for a while.
+You should not normally need to touch it. When a lane is not moving and you
+want to know whether the node's side is alive:
+
+```bash
+nvidb queue lane box406:0 runner --json     # up? what is it running? what is staged?
+nvidb queue lane box406:0 runner restart    # never touches the job it started
+```
+
+Only the head of the lane is handed to the runner; everything behind it stays a
+local record, which is why reordering is instant and works offline.
+
 ## Reporting progress from inside a job
 
 A job can publish a status line by writing `$NVIDB_STATUS_FILE`; only the last

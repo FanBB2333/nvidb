@@ -140,6 +140,33 @@ class FakeNode:
             ],
         }
 
+    def start_lane_job(self, spec: dict) -> dict:
+        """Start a job the way the node's lane runner would: as its own child.
+
+        Records it exactly as a scheduler-launched job, so everything else the
+        fake cluster can do to a job - finish it, let it take VRAM, make it
+        vanish - works the same whichever started it.
+        """
+        pid = self._allocate_pid()
+        self.jobs[spec["job_id"]] = {
+            "pid": pid,
+            "pgid": pid,
+            "gpu_pid": self._allocate_pid(),
+            "exit_code": None,
+            "alive": True,
+            "run_dir": spec["run_dir"],
+            "gpu_ids": list(spec.get("gpu_ids") or []),
+            "command": spec.get("command", ""),
+            "progress": None,
+        }
+        self.logs[spec["run_dir"]] = ""
+        return {
+            "job_id": spec["job_id"],
+            "pid": pid,
+            "run_dir": spec["run_dir"],
+            "started_at": None,
+        }
+
     def process_groups(self) -> Dict[int, int]:
         table: Dict[int, int] = {}
         for record in self.jobs.values():
@@ -171,6 +198,12 @@ class FakeExecutor:
     def __init__(self, node: FakeNode):
         self.node = node
 
+    def run_dir(self, job_id, attempt: int = 1) -> str:
+        if not self.node.online:
+            raise TransportError(f"{self.node.name}: unreachable")
+        suffix = str(job_id) if int(attempt) <= 1 else f"{job_id}-attempt-{attempt}"
+        return f"/fake/{self.node.name}/jobs/{suffix}"
+
     def launch(
         self,
         *,
@@ -189,8 +222,7 @@ class FakeExecutor:
         if self.node.launch_error:
             raise LaunchRejected(self.node.launch_error)
         pid = self.node._allocate_pid()
-        suffix = str(job_id) if int(attempt) <= 1 else f"{job_id}-attempt-{attempt}"
-        run_dir = f"/fake/{self.node.name}/jobs/{suffix}"
+        run_dir = self.run_dir(job_id, attempt)
         self.node.jobs[job_id] = {
             "pid": pid,
             "pgid": pid,
@@ -274,17 +306,136 @@ class FakeExecutor:
         self.node.logs.pop(run_dir, None)
 
 
+class FakeLaneRunner:
+    """The resident lane runner, as a node sees it.
+
+    Models the behaviour the scheduler depends on rather than the shell that
+    delivers it: specs are staged and withdrawn, the head one is claimed and
+    started as soon as there is room, and the runner reports what it did. The
+    shell that carries this is covered separately by the command-builder tests.
+    """
+
+    def __init__(self, node: FakeNode):
+        self.node = node
+        self.lanes: Dict[str, dict] = {}
+        # Every sync the controller performed, so tests can assert on what was
+        # staged rather than only on the outcome.
+        self.syncs: List[tuple] = []
+
+    def _lane(self, lane_name: str) -> dict:
+        return self.lanes.setdefault(
+            lane_name, {"queued": [], "current": [], "finished": [], "up": False}
+        )
+
+    def sync(self, lane_name: str, specs, want_runner: bool):
+        lane = self._lane(lane_name)
+        self.syncs.append((lane_name, [spec["job_id"] for spec in specs], want_runner))
+
+        # A claimed spec is gone from the staging area, so withdrawing it is
+        # not possible - which is exactly how the real rename-based claim
+        # keeps the controller and the runner from both acting on one job.
+        claimed = {entry["job_id"] for entry in lane["current"]}
+        lane["queued"] = [spec for spec in specs if spec["job_id"] not in claimed]
+
+        if not want_runner:
+            lane["queued"] = []
+            if not lane["current"]:
+                lane["up"] = False
+                return None
+        else:
+            lane["up"] = True
+
+        self._advance(lane_name)
+        return self._state(lane_name)
+
+    def poll(self, lane_name: str):
+        """One turn of the runner's own loop, with no controller involved."""
+        self._advance(lane_name)
+        return self._state(lane_name)
+
+    def stop(self, lane_name: str, hard: bool = False) -> None:
+        lane = self._lane(lane_name)
+        lane["queued"] = []
+        if hard or not lane["current"]:
+            lane["up"] = False
+
+    def _free_mb(self, gpu_ids) -> int:
+        free = []
+        for index in gpu_ids:
+            gpu = self.node.gpus[index]
+            free.append(gpu.total_mb - gpu.used_mb())
+        return min(free) if free else 0
+
+    def _advance(self, lane_name: str) -> None:
+        lane = self.lanes[lane_name]
+        still = []
+        for entry in lane["current"]:
+            record = self.node.jobs.get(entry["job_id"])
+            if record is not None and record["alive"]:
+                still.append(entry)
+            else:
+                lane["finished"].append(
+                    {
+                        "job_id": entry["job_id"],
+                        "exit_code": (record or {}).get("exit_code"),
+                    }
+                )
+        lane["current"] = still
+
+        while lane["queued"]:
+            spec = lane["queued"][0]
+            concurrency = max(1, int(spec.get("concurrency") or 1))
+            if len(lane["current"]) >= concurrency:
+                break
+            needed = int(spec.get("vram_mb") or 0)
+            if needed and self._free_mb(spec.get("gpu_ids") or []) < needed:
+                break  # the card filled up with work the queue did not start
+            lane["queued"].pop(0)
+            lane["current"].append(self.node.start_lane_job(spec))
+
+    def _state(self, lane_name: str) -> dict:
+        lane = self.lanes[lane_name]
+        return {
+            "lane": lane_name,
+            "pid": 99000,
+            "current": list(lane["current"]),
+            "queued": [spec["job_id"] for spec in lane["queued"]],
+            "finished": list(lane["finished"]),
+        }
+
+
 class FakeBackend:
     def __init__(self, node: FakeNode):
         self.name = node.name
         self.node = node
         self.transport = FakeTransport(node)
         self.executor = FakeExecutor(node)
+        self.runner = FakeLaneRunner(node)
 
     def probe_gpus(self) -> dict:
         if not self.node.online:
             raise TransportError(f"{self.name}: unreachable")
         return self.node.nvml_payload()
+
+    def lane_sync(
+        self,
+        *,
+        lane_name,
+        specs,
+        spool_root=None,
+        interval=None,
+        idle_exit=None,
+        want_runner=True,
+        timeout=None,
+    ):
+        if not self.node.online:
+            raise TransportError(f"{self.name}: unreachable")
+        return self.runner.sync(lane_name, list(specs), want_runner)
+
+    def lane_stop(self, *, lane_name, spool_root=None, hard=False, timeout=None):
+        if not self.node.online:
+            raise TransportError(f"{self.name}: unreachable")
+        self.runner.stop(lane_name, hard=hard)
 
     def close(self) -> None:
         pass
