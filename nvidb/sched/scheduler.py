@@ -358,7 +358,7 @@ class Scheduler:
         if signature == self._last_sync_signature:
             return list(self._configured_nodes)
         names = []
-        for server in servers:
+        for position, server in enumerate(servers):
             name = node_name_for_server(server)
             dbm.upsert_node(
                 self.conn,
@@ -366,12 +366,18 @@ class Scheduler:
                 hostname=server.get("hostname") or server.get("host"),
                 port=int(server.get("port") or 22),
                 username=server.get("username"),
+                sort_order=position,
             )
             names.append(name)
         if self.settings.get("include_local"):
             local_name = str(self.settings.get("local_node_name") or "local")
             dbm.upsert_node(
-                self.conn, local_name, hostname="localhost", port=0, username=None
+                self.conn,
+                local_name,
+                hostname="localhost",
+                port=0,
+                username=None,
+                sort_order=len(servers),
             )
             names.append(local_name)
         self._configured_nodes = set(names)

@@ -25,6 +25,20 @@ from nvidb.sched.scheduler import Scheduler  # noqa: E402
 
 # --- fixtures --------------------------------------------------------------
 
+SETTINGS = {
+    "headroom_mb": 512,
+    "max_jobs_per_gpu": 4,
+    "probe_timeout": 5,
+    "launch_timeout": 5,
+    "tick_min_interval": 0,
+    "lock_ttl": 60,
+    "job_root": ".nvidb/jobs",
+    "default_vram": "0",
+    "placement": "spread",
+    "include_local": False,
+}
+
+
 @pytest.fixture
 def cluster():
     """Two single-GPU machines shaped like the real ones: 72G busy, 24G free."""
@@ -39,18 +53,7 @@ def scheduler(tmp_path, cluster):
     sched = Scheduler(
         conn,
         cfg=cluster.config(),
-        settings={
-            "headroom_mb": 512,
-            "max_jobs_per_gpu": 4,
-            "probe_timeout": 5,
-            "launch_timeout": 5,
-            "tick_min_interval": 0,
-            "lock_ttl": 60,
-            "job_root": ".nvidb/jobs",
-            "default_vram": "0",
-            "placement": "spread",
-            "include_local": False,
-        },
+        settings=dict(SETTINGS),
         backend_factory=cluster.backend_factory,
         owner="test",
     )
@@ -281,6 +284,54 @@ def test_purge_keeps_dependencies_of_active_jobs(tmp_path):
 
         dbm.update_job(conn, dependent, state="cancelled")
         assert dbm.purge_jobs(conn) == 2
+    finally:
+        conn.close()
+
+
+# --- display order ----------------------------------------------------------
+
+def test_nodes_list_in_config_order_not_alphabetically(tmp_path):
+    """Every node listing matches the monitor TUI, which shows servers in the
+    order config.yml declares them."""
+    cluster = FakeCluster(
+        FakeNode("zeta-node", [FakeGpu(0, "RTX 3090 Ti", 24564)]),
+        FakeNode("alpha-node", [FakeGpu(0, "RTX 3090 Ti", 24564)]),
+    )
+    conn = dbm.open_db(tmp_path / "queue.db")
+    sched = Scheduler(
+        conn,
+        cfg=cluster.config(),
+        settings=dict(SETTINGS),
+        backend_factory=cluster.backend_factory,
+        owner="test",
+    )
+    try:
+        sched.sync_nodes_from_config()
+        assert [node.name for node in dbm.get_nodes(conn)] == [
+            "zeta-node",
+            "alpha-node",
+        ]
+        assert [node["name"] for node in sched.snapshot()["nodes"]] == [
+            "zeta-node",
+            "alpha-node",
+        ]
+    finally:
+        sched.close()
+        conn.close()
+
+
+def test_a_node_config_never_mentioned_lists_last(tmp_path):
+    conn = dbm.open_db(tmp_path / "queue.db")
+    try:
+        dbm.upsert_node(conn, "adhoc-node", hostname="10.0.0.9")
+        dbm.upsert_node(conn, "zeta-node", hostname="10.0.0.1", sort_order=0)
+        # An upsert that says nothing about position must not erase the one
+        # the config sync stored.
+        dbm.upsert_node(conn, "zeta-node", hostname="10.0.0.2")
+        assert [node.name for node in dbm.get_nodes(conn)] == [
+            "zeta-node",
+            "adhoc-node",
+        ]
     finally:
         conn.close()
 

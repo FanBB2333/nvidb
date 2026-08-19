@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     last_seen  TEXT,
     last_error TEXT,
     gpu_count  INTEGER DEFAULT 0,
-    probed_at  TEXT
+    probed_at  TEXT,
+    -- Position in config.yml's server list, so every listing shows nodes in
+    -- the same order as the monitor TUI instead of alphabetically.
+    sort_order INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS gpus (
@@ -267,6 +270,7 @@ def open_db(path=None) -> sqlite3.Connection:
 _ADDED_COLUMNS = {
     "nodes": {
         "ignored": "INTEGER NOT NULL DEFAULT 0",
+        "sort_order": "INTEGER",
     },
     "gpus": {
         "attribution": "TEXT DEFAULT 'processes'",
@@ -584,14 +588,21 @@ def upsert_node(
     hostname: Optional[str] = None,
     port: Optional[int] = None,
     username: Optional[str] = None,
+    sort_order: Optional[int] = None,
 ) -> None:
-    """Register a node from config.yml without disturbing its runtime state."""
+    """Register a node from config.yml without disturbing its runtime state.
+
+    `sort_order` is the node's position in the config's server list; None
+    leaves any stored position alone.
+    """
     with transaction(conn):
         conn.execute(
-            "INSERT INTO nodes(name, hostname, port, username) VALUES(?, ?, ?, ?) "
+            "INSERT INTO nodes(name, hostname, port, username, sort_order) "
+            "VALUES(?, ?, ?, ?, ?) "
             "ON CONFLICT(name) DO UPDATE SET hostname=excluded.hostname, "
-            "port=excluded.port, username=excluded.username",
-            (name, hostname, port or 22, username),
+            "port=excluded.port, username=excluded.username, "
+            "sort_order=COALESCE(excluded.sort_order, nodes.sort_order)",
+            (name, hostname, port or 22, username, sort_order),
         )
 
 
@@ -685,6 +696,11 @@ def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict])
         )
 
 
+# Nodes everywhere list in the order config.yml declares them, matching the
+# monitor TUI; nodes no config mentions (dropped, or made by hand) go last.
+_NODE_ORDER = "ORDER BY sort_order IS NULL, sort_order, name"
+
+
 def get_nodes(
     conn: sqlite3.Connection,
     *,
@@ -693,7 +709,7 @@ def get_nodes(
 ) -> List[Node]:
     where = "" if include_ignored else "WHERE ignored = 0"
     nodes = [Node.from_row(row) for row in conn.execute(
-        f"SELECT * FROM nodes {where} ORDER BY name"
+        f"SELECT * FROM nodes {where} {_NODE_ORDER}"
     ).fetchall()]
     if with_gpus:
         by_name = {node.name: node for node in nodes}
@@ -772,13 +788,32 @@ def get_lane(conn: sqlite3.Connection, name: str) -> Optional[Lane]:
 
 
 def get_lanes(conn: sqlite3.Connection, node: Optional[str] = None) -> List[Lane]:
+    """All lanes, grouped by node in config.yml order, then by GPU index.
+
+    Sorted in Python rather than SQL because the GPU part of a lane name is
+    numeric: "box:10" belongs after "box:2", not before it.
+    """
     if node:
         rows = conn.execute(
-            "SELECT * FROM lanes WHERE node = ? ORDER BY name", (node,)
+            "SELECT * FROM lanes WHERE node = ?", (node,)
         ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM lanes ORDER BY name").fetchall()
-    return [Lane.from_row(row) for row in rows]
+        rows = conn.execute("SELECT * FROM lanes").fetchall()
+    lanes = [Lane.from_row(row) for row in rows]
+    positions = {
+        row["name"]: index
+        for index, row in enumerate(
+            conn.execute(f"SELECT name FROM nodes {_NODE_ORDER}")
+        )
+    }
+    lanes.sort(
+        key=lambda lane: (
+            positions.get(lane.node, len(positions)),
+            lane.gpu_ids,
+            lane.name,
+        )
+    )
+    return lanes
 
 
 def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:

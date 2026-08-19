@@ -153,3 +153,16 @@ def test_a_node_row_written_before_ignoring_existed_still_loads(legacy_db):
         assert node.enabled is True
     finally:
         conn.close()
+
+
+def test_nodes_without_a_stored_position_still_list_by_name(legacy_db):
+    """An upgraded database has no sort_order yet; until a config sync fills
+    it in, listings fall back to the old alphabetical order."""
+    conn = dbm.open_db(legacy_db)
+    try:
+        conn.execute("INSERT INTO nodes(name) VALUES('zeta')")
+        conn.execute("INSERT INTO nodes(name) VALUES('alpha')")
+        conn.commit()
+        assert [node.name for node in dbm.get_nodes(conn)] == ["alpha", "zeta"]
+    finally:
+        conn.close()

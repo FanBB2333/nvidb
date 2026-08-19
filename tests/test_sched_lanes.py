@@ -93,6 +93,49 @@ def test_every_schedulable_gpu_gets_a_lane(scheduler):
     assert names == {"big-node:0", "small-node:0"}
 
 
+def test_lanes_list_in_config_order_then_by_gpu(tmp_path):
+    """The lanes listing mirrors the node listing: nodes as config.yml orders
+    them, and one node's lanes numerically, so box:10 follows box:2."""
+    cluster = FakeCluster(
+        FakeNode(
+            "zeta-node",
+            [FakeGpu(index, "RTX 3090 Ti", 24564) for index in (0, 2, 10)],
+        ),
+        FakeNode("alpha-node", [FakeGpu(0, "RTX 3090 Ti", 24564)]),
+    )
+    conn = dbm.open_db(tmp_path / "queue.db")
+    sched = Scheduler(
+        conn,
+        cfg=cluster.config(),
+        settings={
+            "headroom_mb": 512,
+            "max_jobs_per_gpu": 4,
+            "probe_timeout": 5,
+            "launch_timeout": 5,
+            "tick_min_interval": 0,
+            "lock_ttl": 60,
+            "job_root": ".nvidb/jobs",
+            "default_vram": "0",
+            "placement": "spread",
+            "include_local": False,
+        },
+        backend_factory=cluster.backend_factory,
+        owner="test",
+    )
+    try:
+        sched.sync_nodes_from_config()
+        sched.tick(force=True)
+        assert [lane.name for lane in dbm.get_lanes(conn)] == [
+            "zeta-node:0",
+            "zeta-node:2",
+            "zeta-node:10",
+            "alpha-node:0",
+        ]
+    finally:
+        sched.close()
+        conn.close()
+
+
 def test_discovery_does_not_disturb_a_lane_a_person_configured(scheduler):
     scheduler.tick(force=True)
     scheduler.set_lane_paused("small-node:0", True)
