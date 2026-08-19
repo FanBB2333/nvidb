@@ -248,6 +248,61 @@ def test_external_processes_collapse_to_one_summary_line():
     assert "+1 more" in ext_lines[0]
 
 
+def test_a_node_compresses_to_a_single_line_when_the_width_allows():
+    """Name, model, GPU occupancy, hostname and state all share one line, so
+    a fullscreen terminal is not mostly blank to the right of each node."""
+    output = _render(_tui())
+    line = next(line for line in output.splitlines() if "big-node" in line)
+    assert "1× RTX PRO 5000" in line
+    assert "G0 " in line and "67.4G/71.7G" in line
+    assert "10.0.0.1" in line and line.rstrip().endswith("up")
+
+
+def test_a_thin_rule_separates_node_rows():
+    output = _render(_tui())
+    lines = output.splitlines()
+    first = next(i for i, line in enumerate(lines) if "big-node" in line)
+    second = next(i for i, line in enumerate(lines) if "small-node" in line)
+    assert any("┄┄┄" in lines[i] for i in range(first + 1, second))
+
+
+def test_the_external_summary_joins_the_node_line_when_it_fits():
+    snapshot = _snapshot()
+    snapshot["nodes"][0]["gpus"] = [
+        _gpu(
+            0,
+            name="RTX PRO 5000",
+            total=73415,
+            used=40000,
+            external=40000,
+            procs=1,
+            processes=[_proc(100, 40000, "python train.py", "alice")],
+        )
+    ]
+    output = _plain(_tui().render(_state(snapshot)))
+    line = next(line for line in output.splitlines() if "big-node" in line)
+    assert "ext " in line and "alice" in line
+    # Everything moved inline, so no stacked ext line remains.
+    assert not any(
+        line.lstrip().startswith("ext ") for line in output.splitlines()
+    )
+
+
+def test_a_narrow_screen_stacks_the_node_back_into_a_grid():
+    snapshot = _snapshot()
+    snapshot["nodes"][0]["gpus"] = [
+        _gpu(index, name="RTX PRO 5000", total=73415) for index in range(3)
+    ]
+    tui = _tui(width=100)
+    output = _plain(tui.render(_state(snapshot)))
+    lines = output.splitlines()
+    header = next(line for line in lines if "big-node" in line)
+    # Three cells plus the head cannot share 100 columns, so the node falls
+    # back to the stacked layout: header line, grid lines below.
+    assert "G0 " not in header
+    assert any(line.startswith("    G0 ") for line in lines)
+
+
 def test_procs_all_still_lists_every_process_line():
     snapshot = _snapshot()
     snapshot["nodes"][0]["gpus"] = [

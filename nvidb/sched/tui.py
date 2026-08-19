@@ -693,80 +693,133 @@ class QueueTUI:
         self._node_line_targets = {}
         lines = [self._style("─ NODES " + "─" * max(0, width - 8), "bright_black")]
         for position, node in enumerate(self.nodes):
+            if position:
+                # Node rows are single lines now, so a thin rule is what keeps
+                # neighbouring nodes from reading as one list.
+                lines.append(self._style("┄" * width, "bright_black"))
             node_start = len(lines)
             selected = self.focus == "nodes" and position == self.node_index
-            marker = "❯" if selected else " "
-            state = node["state"]
-            # An up node is the normal case and stays quiet; only trouble
-            # (down, drain) earns colour.
-            state_style = {"down": "red", "drain": "yellow"}.get(
-                state, "bright_black"
-            )
-            if not node["enabled"]:
-                state = "drain"
-                state_style = "yellow"
-            dot, dot_style = self._node_health_dot(node)
-            # The GPU model moves up here from the per-GPU rows: nodes are
-            # almost always homogeneous, so saying it once frees the grid
-            # cells below to show nothing but occupancy.
-            models = []
-            for gpu in node.get("gpus") or []:
-                name = gpu.get("name") or "-"
-                if name not in models:
-                    models.append(name)
-            model_text = (
-                f" · {len(node.get('gpus') or [])}× {'/'.join(models)}"
-                if models
-                else ""
-            )
-            detail = f"{node['hostname'] or ''}"
-            tail = f"{detail}  "
-            head_width = (
-                2 + 2 + display_width(node["name"]) + display_width(model_text)
-            )
-            gap = max(
-                1,
-                width - head_width - display_width(tail) - len(state) - 1,
-            )
-            lines.append(
-                self._compose(
-                    [
-                        (f"{marker} ", "cyan"),
-                        (f"{dot} ", dot_style),
-                        (node["name"], "bold"),
-                        (model_text, "bright_black"),
-                        (" " * gap, None),
-                        (tail, "bright_black"),
-                        (state, state_style),
-                    ],
-                    width,
-                    highlight=selected,
-                )
-            )
-
-            if state == "down" and node.get("last_error"):
-                lines.append(
-                    self._style(self._fit(f"    ! {node['last_error']}", width), "red")
-                )
-                for line_index in range(node_start, len(lines)):
-                    self._node_line_targets[line_index] = position
-                continue
-
-            if self.proc_view == "all":
-                # The full drill-down: one line per GPU, one per process.
-                for gpu in node["gpus"]:
-                    lines.append(self._compose(self._gpu_segments(gpu, width), width))
-                    lines.extend(self._gpu_process_lines(gpu, width))
-            else:
-                # The default: GPUs flow into a grid, several per line, so
-                # the node pane stays a couple of rows and the job table
-                # keeps the screen.
-                lines.extend(self._gpu_grid_lines(node, width))
-                if self.proc_view == "summary":
-                    lines.extend(self._node_external_summary(node, width))
+            lines.extend(self._node_block(node, width, selected))
             for line_index in range(node_start, len(lines)):
                 self._node_line_targets[line_index] = position
         return lines
+
+    @staticmethod
+    def _segments_width(segments) -> int:
+        return sum(display_width(text) for text, _style in segments)
+
+    def _node_one_line(
+        self, head, middle_groups, tail, width: int, *, highlight: bool
+    ) -> Optional[str]:
+        """Everything about one node on a single line, or None if the width
+        cannot take it — the caller then falls back to stacked lines."""
+        segments = list(head)
+        for group in middle_groups:
+            segments.append(("  ", None))
+            segments.extend(group)
+        gap = width - self._segments_width(segments) - self._segments_width(tail)
+        if gap < 2:
+            return None
+        segments.append((" " * gap, None))
+        segments.extend(tail)
+        return self._compose(segments, width, highlight=highlight)
+
+    def _node_header_line(self, head, tail, width: int, *, highlight: bool) -> str:
+        """The stacked layout's first line: name left, hostname and state
+        right, truncating rather than refusing when the width is tight."""
+        gap = max(
+            1, width - self._segments_width(head) - self._segments_width(tail)
+        )
+        return self._compose(
+            [*head, (" " * gap, None), *tail], width, highlight=highlight
+        )
+
+    def _node_block(self, node: Dict[str, Any], width: int, selected: bool) -> List[str]:
+        state = node["state"]
+        # An up node is the normal case and stays quiet; only trouble
+        # (down, drain) earns colour.
+        state_style = {"down": "red", "drain": "yellow"}.get(state, "bright_black")
+        if not node["enabled"]:
+            state = "drain"
+            state_style = "yellow"
+        dot, dot_style = self._node_health_dot(node)
+        # The GPU model lives on the node line: nodes are almost always
+        # homogeneous, so saying it once frees the grid cells to show nothing
+        # but occupancy.
+        models = []
+        for gpu in node.get("gpus") or []:
+            name = gpu.get("name") or "-"
+            if name not in models:
+                models.append(name)
+        model_text = (
+            f" · {len(node.get('gpus') or [])}× {'/'.join(models)}"
+            if models
+            else ""
+        )
+        marker = "❯" if selected else " "
+        head = [
+            (f"{marker} ", "cyan"),
+            (f"{dot} ", dot_style),
+            (node["name"], "bold"),
+            (model_text, "bright_black"),
+        ]
+        tail = [
+            (f"{node['hostname'] or ''}  ", "bright_black"),
+            (state, state_style),
+        ]
+
+        if state == "down" and node.get("last_error"):
+            error = [(f"! {node['last_error']}", "red")]
+            line = self._node_one_line(
+                head, [error], tail, width, highlight=selected
+            )
+            if line is not None:
+                return [line]
+            return [
+                self._node_header_line(head, tail, width, highlight=selected),
+                self._style(self._fit(f"    ! {node['last_error']}", width), "red"),
+            ]
+
+        if self.proc_view == "all":
+            # The full drill-down: one line per GPU, one per process.
+            block = [self._node_header_line(head, tail, width, highlight=selected)]
+            for gpu in node["gpus"]:
+                block.append(self._compose(self._gpu_segments(gpu, width), width))
+                block.extend(self._gpu_process_lines(gpu, width))
+            return block
+
+        running = self._running_job_ids_by_gpu(node)
+        cells = [
+            self._gpu_cell_segments(
+                gpu, running.get(gpu["index"], []), fixed_width=False
+            )
+            for gpu in node.get("gpus") or []
+        ]
+        ext = (
+            self._external_summary_segments(node)
+            if self.proc_view == "summary"
+            else []
+        )
+        # Squeeze the whole node onto one line, shedding parts only as the
+        # width forces it: first the foreign-process summary drops to its own
+        # line, then the GPU cells fall back to the stacked grid.
+        if ext:
+            line = self._node_one_line(
+                head, cells + [ext], tail, width, highlight=selected
+            )
+            if line is not None:
+                return [line]
+        line = self._node_one_line(head, cells, tail, width, highlight=selected)
+        if line is not None:
+            block = [line]
+            if ext:
+                block.append(self._compose([("    ", None), *ext], width))
+            return block
+        block = [self._node_header_line(head, tail, width, highlight=selected)]
+        block.extend(self._gpu_grid_lines(node, width))
+        if ext:
+            block.append(self._compose([("    ", None), *ext], width))
+        return block
 
     # Plain columns one grid cell occupies: "G0 " + 10-column bar + " " +
     # 6-column used + "/" + 6-column total + " " + 5-column job ids.
@@ -785,14 +838,22 @@ class QueueTUI:
         return running
 
     def _gpu_cell_segments(
-        self, gpu: Dict[str, Any], running_ids: List[int]
+        self,
+        gpu: Dict[str, Any],
+        running_ids: List[int],
+        *,
+        fixed_width: bool = True,
     ) -> List[Tuple[str, Optional[str]]]:
-        """One GPU as a fixed-width grid cell: index, bar, used/total, jobs.
+        """One GPU as a grid cell: index, bar, used/total, jobs.
 
         The bar keeps the pane's one legend - foreign memory (yellow),
         queue reservations (cyan), free (dim). The used amount carries the
         scarcity colour, a `~` before it means the split is inferred (a
         blind driver), and the tail names the queue jobs running here.
+
+        Fixed-width cells line up under each other in the stacked grid;
+        inline on a single node row there is nothing to line up with, so
+        `fixed_width=False` drops the padding instead of carrying it.
         """
         total = max(1, gpu["mem_total_mb"])
         external = max(0, gpu["external_mem_mb"])
@@ -825,11 +886,19 @@ class QueueTUI:
             )
         )
         segments.append((" ", None))
-        segments.append((f"{used_text:>6}", used_style))
-        segments.append(("/", "bright_black"))
-        segments.append((f"{format_mb(gpu['mem_total_mb']):<6}", "bright_black"))
-        segments.append((" ", None))
-        segments.append((f"{fit_display(ids_text, 5):<5}", "cyan"))
+        if fixed_width:
+            segments.append((f"{used_text:>6}", used_style))
+            segments.append(("/", "bright_black"))
+            segments.append((f"{format_mb(gpu['mem_total_mb']):<6}", "bright_black"))
+            segments.append((" ", None))
+            segments.append((f"{fit_display(ids_text, 5):<5}", "cyan"))
+        else:
+            segments.append((used_text, used_style))
+            segments.append(("/", "bright_black"))
+            segments.append((format_mb(gpu["mem_total_mb"]), "bright_black"))
+            if ids_text:
+                segments.append((" ", None))
+                segments.append((ids_text, "cyan"))
         return segments
 
     def _gpu_grid_lines(self, node: Dict[str, Any], width: int) -> List[str]:
@@ -856,12 +925,15 @@ class QueueTUI:
             lines.append(self._compose(segments, width))
         return lines
 
-    def _node_external_summary(self, node: Dict[str, Any], width: int) -> List[str]:
-        """The card's foreign occupants on one line, biggest first.
+    def _external_summary_segments(
+        self, node: Dict[str, Any]
+    ) -> List[Tuple[str, Optional[str]]]:
+        """The card's foreign occupants as one run of segments, biggest first.
 
         These processes are why a queued job is waiting, so they stay
-        visible by default - but as a single summary line per node, not a
-        line each.
+        visible by default - inline on the node's line when it fits, on a
+        single summary line below it otherwise. Empty when there is nothing
+        foreign to report.
         """
         entries = []
         multi_gpu = len(node.get("gpus") or []) > 1
@@ -876,7 +948,7 @@ class QueueTUI:
         if not entries:
             return []
         entries.sort(key=lambda item: (-item[0], item[1]))
-        segments: List[Tuple[str, Optional[str]]] = [("    ext ", "bright_black")]
+        segments: List[Tuple[str, Optional[str]]] = [("ext ", "bright_black")]
         shown = entries[:PROC_SUMMARY_LIMIT + 1]
         for index, (mem_mb, gpu_index, entry) in enumerate(shown):
             if index:
@@ -890,7 +962,7 @@ class QueueTUI:
             )
         if len(entries) > len(shown):
             segments.append((f" · +{len(entries) - len(shown)} more", "bright_black"))
-        return [self._compose(segments, width)]
+        return segments
 
     def _gpu_segments(
         self, gpu: Dict[str, Any], width: int

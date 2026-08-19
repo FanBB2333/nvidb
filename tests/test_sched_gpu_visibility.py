@@ -433,10 +433,9 @@ def test_the_tui_lists_unmanaged_processes_by_default(tui):
         [_proc(11, 6000, "ollama", "root"), _proc(12, 4000, "python train.py", job_id=3, job_name="train")]
     )
     output = _render(tui, state)
-    # The compact view names the foreign process on the node's ext line.
-    ext_line = next(
-        line for line in output.splitlines() if line.lstrip().startswith("ext ")
-    )
+    # The compact view names the foreign process in the node's ext summary,
+    # which sits inline on the node's own line when the width allows.
+    ext_line = next(line for line in output.splitlines() if "ext " in line)
     assert "ollama" in ext_line and "root" in ext_line
     # The queue's own job is already visible in the job table below.
     assert "job 3 train" not in output
