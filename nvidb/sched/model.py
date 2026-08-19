@@ -207,6 +207,9 @@ class Job:
     vram_mb: int = 0
     node_constraint: Optional[str] = None
     depends_on: List[int] = field(default_factory=list)
+    # Dependencies that only have to *finish*, whatever they finished as.
+    # `depends_on` waits for success; this waits for the outcome to be known.
+    depends_any: List[int] = field(default_factory=list)
     max_runtime_s: Optional[int] = None
     submitter: Optional[str] = None
     tags: List[str] = field(default_factory=list)
@@ -231,6 +234,10 @@ class Job:
     # The job's own status line, published by writing $NVIDB_STATUS_FILE.
     progress: Optional[str] = None
     progress_at: Optional[str] = None
+    # Why this pending job is parked rather than waiting for room. A dependency
+    # that ended badly holds its dependents instead of failing them, so one
+    # cancelled job can never take a whole chain down with it.
+    held_reason: Optional[str] = None
 
     @classmethod
     def from_row(cls, row) -> "Job":
@@ -247,6 +254,7 @@ class Job:
             vram_mb=int(data.get("vram_mb") or 0),
             node_constraint=data.get("node_constraint"),
             depends_on=_csv_ints(data.get("depends_on")),
+            depends_any=_csv_ints(data.get("depends_any")),
             max_runtime_s=data.get("max_runtime_s"),
             submitter=data.get("submitter"),
             tags=_json_loads(data.get("tags"), []) or [],
@@ -269,11 +277,22 @@ class Job:
             notes=data.get("notes"),
             progress=data.get("progress"),
             progress_at=data.get("progress_at"),
+            held_reason=data.get("held_reason"),
         )
 
     @property
     def is_terminal(self) -> bool:
         return self.state in TERMINAL_JOB_STATES
+
+    @property
+    def is_held(self) -> bool:
+        """Parked by a dependency that will never be satisfied on its own."""
+        return bool(self.held_reason) and self.state == "pending"
+
+    @property
+    def display_state(self) -> str:
+        """What to call this job on screen; `held` is a pending job that is stuck."""
+        return "held" if self.is_held else self.state
 
     def elapsed_seconds(self, now: Optional[datetime] = None) -> Optional[float]:
         """Wall-clock runtime: since start for live jobs, start→finish once done."""
@@ -301,6 +320,7 @@ class Job:
             "vram_mb": self.vram_mb,
             "node_constraint": self.node_constraint,
             "depends_on": self.depends_on,
+            "depends_any": self.depends_any,
             "max_runtime_s": self.max_runtime_s,
             "submitter": self.submitter,
             "tags": self.tags,
@@ -322,6 +342,8 @@ class Job:
             "notes": self.notes,
             "progress": self.progress,
             "progress_at": self.progress_at,
+            "held_reason": self.held_reason,
+            "held": self.is_held,
         }
 
 

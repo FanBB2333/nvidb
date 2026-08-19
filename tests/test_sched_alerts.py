@@ -199,7 +199,22 @@ def test_a_dead_dependency_raises_an_alert(scheduler, cluster):
 
     kinds = _kinds(scheduler)
     assert "job_failed" in kinds
-    assert "dependency_failed" in kinds
+    # The dependent is held for a decision, not failed along with it.
+    assert "job_held" in kinds
+
+
+def test_a_held_job_is_only_announced_once(scheduler, cluster):
+    """A hold lasts until someone acts on it, and every tick in between
+    must not re-raise it - the queue is polled every few seconds."""
+    scheduler.tick(force=True)
+    first = scheduler.submit("stage1", vram="1G", node="small-node")
+    scheduler.submit("stage2", vram="1G", node="small-node", depends_on=[first])
+    scheduler.tick(force=True)
+    cluster["small-node"].finish_job(first, exit_code=1)
+    for _ in range(4):
+        scheduler.tick(force=True)
+
+    assert _kinds(scheduler).count("job_held") == 1
 
 
 def test_a_cancelled_job_is_not_an_alert(scheduler, cluster):

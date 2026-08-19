@@ -392,6 +392,7 @@ class Scheduler:
         priority: int = 0,
         node: Optional[str] = None,
         depends_on: Optional[Sequence[int]] = None,
+        depends_any: Optional[Sequence[int]] = None,
         max_runtime_s: Optional[int] = None,
         submitter: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
@@ -420,8 +421,9 @@ class Scheduler:
                 )
 
         depends_on = [int(x) for x in (depends_on or [])]
+        depends_any = [int(x) for x in (depends_any or [])]
         with dbm.transaction(self.conn):
-            for dep in depends_on:
+            for dep in depends_on + depends_any:
                 if dbm.get_job(self.conn, dep) is None:
                     raise ValueError(f"Dependency job {dep} does not exist")
 
@@ -436,6 +438,7 @@ class Scheduler:
                 priority=int(priority),
                 node_constraint=resolved_node,
                 depends_on=depends_on,
+                depends_any=depends_any,
                 max_runtime_s=max_runtime_s,
                 submitter=submitter,
                 tags=list(tags or []),
@@ -455,6 +458,152 @@ class Scheduler:
                 },
             )
         return job_id
+
+    # --- dependencies -----------------------------------------------------
+
+    def _dead_dependencies(self, job: Job) -> List[Job]:
+        """Prerequisites of `job` that ended in a way it can never wait out.
+
+        Only `depends_on` can produce these: `depends_any` is satisfied by any
+        outcome, so a failure there is simply the answer it was waiting for.
+        """
+        dead = []
+        for dep_id in job.depends_on:
+            dep = dbm.get_job(self.conn, dep_id)
+            if dep is None or (dep.is_terminal and dep.state != "completed"):
+                dead.append(dep or Job(id=dep_id, name="", command="", state="missing"))
+        return dead
+
+    def edit_dependencies(
+        self,
+        job_id: int,
+        *,
+        add: Optional[Sequence[int]] = None,
+        drop: Optional[Sequence[int]] = None,
+        add_any: Optional[Sequence[int]] = None,
+        drop_any: Optional[Sequence[int]] = None,
+    ) -> Job:
+        """Rewire what a job waits for, so a dead chain can be reattached.
+
+        Editing is what turns a held job back into a runnable one without
+        resubmitting it, which is the whole point of holding rather than
+        failing: the job, its notes and its queue position all survive.
+        """
+        with dbm.transaction(self.conn):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None:
+                raise ValueError(f"Job {job_id} not found")
+            if job.is_terminal:
+                raise ValueError(
+                    f"Job {job_id} already finished as {job.state}; "
+                    "its dependencies no longer decide anything"
+                )
+
+            wanted = {
+                "depends_on": (list(job.depends_on), add or [], drop or []),
+                "depends_any": (list(job.depends_any), add_any or [], drop_any or []),
+            }
+            resolved: Dict[str, List[int]] = {}
+            for column, (current, additions, removals) in wanted.items():
+                values = list(current)
+                for dep in (int(x) for x in removals):
+                    while dep in values:
+                        values.remove(dep)
+                for dep in (int(x) for x in additions):
+                    if dep == job_id:
+                        raise ValueError("A job cannot depend on itself")
+                    if dbm.get_job(self.conn, dep) is None:
+                        raise ValueError(f"Dependency job {dep} does not exist")
+                    if self._would_cycle(job_id, dep):
+                        raise ValueError(
+                            f"Job {dep} already waits on job {job_id}; "
+                            "that dependency would deadlock both"
+                        )
+                    if dep not in values:
+                        values.append(dep)
+                resolved[column] = values
+
+            updates: Dict[str, Any] = {}
+            for column, values in resolved.items():
+                if values != getattr(job, column):
+                    updates[column] = values
+            if not updates:
+                return job
+
+            # Whatever the hold was about, the answer has changed. The next
+            # dispatch decides afresh instead of inheriting a stale reason.
+            if job.held_reason:
+                updates["held_reason"] = None
+            dbm.update_job(self.conn, job_id, **updates)
+            dbm.add_event(
+                self.conn,
+                "job_dependencies",
+                job_id=job_id,
+                message=(
+                    "after="
+                    + (",".join(str(i) for i in resolved["depends_on"]) or "-")
+                    + " after-any="
+                    + (",".join(str(i) for i in resolved["depends_any"]) or "-")
+                ),
+            )
+            return dbm.get_job(self.conn, job_id)
+
+    def _would_cycle(self, job_id: int, new_dependency: int) -> bool:
+        """True when `new_dependency` already waits, directly or not, on `job_id`."""
+        seen: Set[int] = set()
+        stack = [int(new_dependency)]
+        while stack:
+            current = stack.pop()
+            if current == job_id:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            dep = dbm.get_job(self.conn, current)
+            if dep is None:
+                continue
+            stack.extend(dep.depends_on)
+            stack.extend(dep.depends_any)
+        return False
+
+    def release(self, job_id: int) -> Dict[str, Any]:
+        """Let a held job run by forgetting the prerequisites that died.
+
+        The dead entries are dropped rather than merely ignored, so the release
+        survives the next dispatch instead of being re-decided every tick.
+        """
+        with dbm.transaction(self.conn):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None:
+                raise ValueError(f"Job {job_id} not found")
+            if job.is_terminal:
+                return {
+                    "released": False,
+                    "reason": f"job {job_id} already finished as {job.state}",
+                    "dropped": [],
+                }
+            dead = self._dead_dependencies(job)
+            dropped = [dep.id for dep in dead]
+            if not dropped and not job.held_reason:
+                return {
+                    "released": False,
+                    "reason": f"job {job_id} is not held",
+                    "dropped": [],
+                }
+            updates: Dict[str, Any] = {"held_reason": None}
+            if dropped:
+                updates["depends_on"] = [
+                    dep for dep in job.depends_on if dep not in dropped
+                ]
+            dbm.update_job(self.conn, job_id, **updates)
+            message = (
+                "released; dropped dependency "
+                + ", ".join(str(dep) for dep in dropped)
+                if dropped
+                else "released"
+            )
+            dbm.add_event(self.conn, "job_released", job_id=job_id, message=message)
+            return {"released": True, "reason": message, "dropped": dropped}
 
     def set_notes(
         self, job_id: int, text: Optional[str], *, append: bool = False
@@ -602,6 +751,7 @@ class Scheduler:
                     heartbeat_at=None,
                     gpu_mem_mb=None,
                     last_error=None,
+                    held_reason=None,
                     attempt=job.attempt,
                     # The annotation survives a re-run; the previous attempt's
                     # status line does not.
@@ -1243,25 +1393,11 @@ class Scheduler:
                 )
                 continue
 
-            ready, problem = self._dependencies_ready(job)
-            if problem:
-                dbm.update_job(
-                    self.conn,
-                    job.id,
-                    state="failed",
-                    finished_at=utcnow(),
-                    last_error=problem,
-                )
-                dbm.add_event(
-                    self.conn, "job_failed", job_id=job.id, message=problem
-                )
-                self._raise_alert(
-                    "dependency_failed",
-                    f"{job.name or 'job'} will never run: {problem}",
-                    job_id=job.id,
-                    summary=summary,
-                )
+            ready, hold_reason = self._dependencies_ready(job)
+            if hold_reason:
+                self._hold(job, hold_reason, summary)
                 continue
+            self._unhold(job)
             if not ready:
                 continue
 
@@ -1410,7 +1546,14 @@ class Scheduler:
         return None
 
     def _dependencies_ready(self, job: Job) -> Tuple[bool, Optional[str]]:
-        """Return (ready, fatal_problem). A failed dependency fails the job."""
+        """Return (ready, hold_reason).
+
+        A dependency that ended badly *holds* the job rather than failing it.
+        Cancelling one job used to fail everything queued behind it, which
+        destroyed the queue position, the notes and the submission of every
+        job in the chain over a decision that only concerned the first one.
+        Holding keeps all of that and asks a person what they meant.
+        """
         for dep_id in job.depends_on:
             dep = dbm.get_job(self.conn, dep_id)
             if dep is None:
@@ -1420,7 +1563,52 @@ class Scheduler:
             if dep.is_terminal:
                 return False, f"dependency {dep_id} ended as {dep.state}"
             return False, None
+        for dep_id in job.depends_any:
+            dep = dbm.get_job(self.conn, dep_id)
+            if dep is None:
+                return False, f"dependency {dep_id} no longer exists"
+            # This form waits for an outcome, not for a good one.
+            if dep.is_terminal:
+                continue
+            return False, None
         return True, None
+
+    def _hold(self, job: Job, reason: str, summary: Dict[str, Any]) -> None:
+        """Park a pending job and say so once, not once per tick."""
+        if job.held_reason == reason:
+            return
+        with dbm.transaction(self.conn):
+            dbm.update_job(self.conn, job.id, held_reason=reason)
+            dbm.add_event(
+                self.conn, "job_held", job_id=job.id, message=reason
+            )
+            self._raise_alert(
+                "job_held",
+                f"{job.name or 'job'} is waiting for a decision: {reason}",
+                severity="warning",
+                job_id=job.id,
+                detail=(
+                    f"Job {job.id} stays queued and keeps its place.\n"
+                    f"  nvidb job release {job.id}          run it without that dependency\n"
+                    f"  nvidb job edit {job.id} --add-after NEW --drop-after OLD\n"
+                    f"  nvidb job cancel {job.id}           drop it instead"
+                ),
+                summary=summary,
+            )
+        summary.setdefault("held", []).append({"id": job.id, "reason": reason})
+
+    def _unhold(self, job: Job) -> None:
+        """Clear a hold whose cause went away (a dependency was re-run and passed)."""
+        if not job.held_reason:
+            return
+        with dbm.transaction(self.conn):
+            dbm.update_job(self.conn, job.id, held_reason=None)
+            dbm.add_event(
+                self.conn,
+                "job_unheld",
+                job_id=job.id,
+                message="dependencies are satisfiable again",
+            )
 
     def _find_placement(
         self,
@@ -1577,6 +1765,10 @@ class Scheduler:
                 "placement": self.settings.get("placement"),
             },
             "counts": dbm.job_counts(self.conn),
+            # Pending jobs that will not move until someone decides what they
+            # should have waited for. They are counted as pending above, so
+            # they need saying separately or they read as ordinary queueing.
+            "held": [job.to_dict() for job in dbm.held_jobs(self.conn)],
             "nodes": [self._node_view(node, headroom) for node in nodes],
             "jobs": [job.to_dict() for job in jobs],
             "recent": [job.to_dict() for job in recent_terminal],

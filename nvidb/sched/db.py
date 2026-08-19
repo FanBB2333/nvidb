@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     vram_mb         INTEGER NOT NULL DEFAULT 0,
     node_constraint TEXT,
     depends_on      TEXT,
+    -- Dependencies that only have to finish, whatever they finished as.
+    depends_any     TEXT,
     max_runtime_s   INTEGER,
     submitter       TEXT,
     tags            TEXT,
@@ -98,7 +100,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- status line can never overwrite a human's annotation.
     notes           TEXT,
     progress        TEXT,
-    progress_at     TEXT
+    progress_at     TEXT,
+    -- Set while a dependency that ended badly parks this job. It stays pending
+    -- and keeps its place; a person decides whether to release or drop it.
+    held_reason     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
@@ -248,6 +253,8 @@ _ADDED_COLUMNS = {
         "notes": "TEXT",
         "progress": "TEXT",
         "progress_at": "TEXT",
+        "depends_any": "TEXT",
+        "held_reason": "TEXT",
     },
 }
 
@@ -704,6 +711,7 @@ def insert_job(conn: sqlite3.Connection, **fields) -> int:
         "vram_mb": int(fields.get("vram_mb") or 0),
         "node_constraint": fields.get("node_constraint"),
         "depends_on": ",".join(str(x) for x in (fields.get("depends_on") or [])) or None,
+        "depends_any": ",".join(str(x) for x in (fields.get("depends_any") or [])) or None,
         "max_runtime_s": fields.get("max_runtime_s"),
         "submitter": fields.get("submitter"),
         "tags": json.dumps(fields.get("tags") or [], ensure_ascii=False),
@@ -727,6 +735,9 @@ def update_job(conn: sqlite3.Connection, job_id: int, **fields) -> None:
         return
     if "gpu_ids" in fields and isinstance(fields["gpu_ids"], (list, tuple)):
         fields["gpu_ids"] = ",".join(str(x) for x in fields["gpu_ids"])
+    for key in ("depends_on", "depends_any"):
+        if key in fields and isinstance(fields[key], (list, tuple)):
+            fields[key] = ",".join(str(x) for x in fields[key]) or None
     if "result" in fields and not isinstance(fields["result"], (str, type(None))):
         fields["result"] = json.dumps(fields["result"], ensure_ascii=False)
     if "env" in fields and isinstance(fields["env"], dict):
@@ -775,6 +786,31 @@ def pending_jobs(conn: sqlite3.Connection) -> List[Job]:
     """Pending jobs in dispatch order: highest priority first, then FIFO."""
     rows = conn.execute(
         "SELECT * FROM jobs WHERE state = 'pending' ORDER BY priority DESC, id ASC"
+    ).fetchall()
+    return [Job.from_row(row) for row in rows]
+
+
+def dependents_of(conn: sqlite3.Connection, job_id: int) -> List[Job]:
+    """Unfinished jobs that are waiting on this one, either way of waiting.
+
+    Used to say what a cancellation is about to park, before it happens.
+    """
+    job_id = int(job_id)
+    out = []
+    for row in conn.execute(
+        "SELECT * FROM jobs WHERE state IN ('pending', 'running') "
+        "AND (depends_on IS NOT NULL OR depends_any IS NOT NULL) ORDER BY id"
+    ):
+        job = Job.from_row(row)
+        if job_id in job.depends_on or job_id in job.depends_any:
+            out.append(job)
+    return out
+
+
+def held_jobs(conn: sqlite3.Connection) -> List[Job]:
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE state = 'pending' AND held_reason IS NOT NULL "
+        "ORDER BY id"
     ).fetchall()
     return [Job.from_row(row) for row in rows]
 
@@ -862,14 +898,16 @@ def purge_jobs(
         # the dependent itself becomes terminal.
         protected = set()
         for row in conn.execute(
-            "SELECT depends_on FROM jobs "
-            "WHERE state IN ('pending', 'running') AND depends_on IS NOT NULL"
+            "SELECT depends_on, depends_any FROM jobs "
+            "WHERE state IN ('pending', 'running') "
+            "AND (depends_on IS NOT NULL OR depends_any IS NOT NULL)"
         ):
-            protected.update(
-                int(value)
-                for value in (row["depends_on"] or "").split(",")
-                if value.strip()
-            )
+            for column in ("depends_on", "depends_any"):
+                protected.update(
+                    int(value)
+                    for value in (row[column] or "").split(",")
+                    if value.strip()
+                )
         if protected:
             placeholders = ", ".join("?" for _ in protected)
             clauses.append(f"id NOT IN ({placeholders})")

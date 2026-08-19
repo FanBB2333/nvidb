@@ -663,7 +663,13 @@ def test_a_dependent_job_waits_for_its_dependency(scheduler, cluster):
     assert dbm.get_job(scheduler.conn, second).state == "running"
 
 
-def test_a_failed_dependency_fails_the_dependent_job(scheduler, cluster):
+def test_a_failed_dependency_holds_the_dependent_job(scheduler, cluster):
+    """A dead prerequisite parks its dependents; it never fails them.
+
+    Failing them would destroy the queue position, the notes and the
+    submission of every job behind the first one, over a decision that
+    only concerned the first one.
+    """
     scheduler.tick(force=True)
     first = scheduler.submit("stage1", vram="1G", node="small-node")
     second = scheduler.submit("stage2", vram="1G", node="small-node", depends_on=[first])
@@ -672,8 +678,114 @@ def test_a_failed_dependency_fails_the_dependent_job(scheduler, cluster):
     scheduler.tick(force=True)
 
     job = dbm.get_job(scheduler.conn, second)
-    assert job.state == "failed"
-    assert "dependency" in (job.last_error or "")
+    assert job.state == "pending"
+    assert job.is_held
+    assert "ended as failed" in (job.held_reason or "")
+
+
+def test_cancelling_one_job_does_not_take_the_chain_down(scheduler, cluster):
+    """The whole point: cancelling the head holds the tail rather than
+    destroying it, and the tail runs once it is released."""
+    scheduler.tick(force=True)
+    chain = [scheduler.submit("stage1", vram="1G", node="small-node")]
+    for index in range(2, 5):
+        chain.append(
+            scheduler.submit(
+                f"stage{index}",
+                vram="1G",
+                node="small-node",
+                depends_on=[chain[-1]],
+            )
+        )
+    scheduler.tick(force=True)
+    scheduler.cancel(chain[0])
+    scheduler.tick(force=True)
+
+    states = [dbm.get_job(scheduler.conn, job_id).state for job_id in chain]
+    assert states == ["cancelled", "pending", "pending", "pending"]
+    # Only the job that named the cancelled one is held; the rest are simply
+    # still waiting for their own upstream, which has not finished either.
+    assert dbm.get_job(scheduler.conn, chain[1]).is_held
+    assert not dbm.get_job(scheduler.conn, chain[2]).is_held
+
+    scheduler.release(chain[1])
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, chain[1]).state == "running"
+
+
+def test_a_hold_clears_itself_when_the_dependency_is_re_run(scheduler, cluster):
+    scheduler.tick(force=True)
+    first = scheduler.submit("stage1", vram="1G", node="small-node")
+    second = scheduler.submit("stage2", vram="1G", node="small-node", depends_on=[first])
+    scheduler.tick(force=True)
+    cluster["small-node"].finish_job(first, exit_code=1)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, second).is_held
+
+    scheduler.requeue(first)
+    scheduler.tick(force=True)
+    cluster["small-node"].finish_job(first, exit_code=0)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, second)
+    assert job.held_reason is None
+    assert job.state == "running"
+
+
+def test_after_any_waits_for_an_outcome_not_a_good_one(scheduler, cluster):
+    scheduler.tick(force=True)
+    first = scheduler.submit("stage1", vram="1G", node="small-node")
+    second = scheduler.submit("stage2", vram="1G", node="small-node", depends_any=[first])
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, second).state == "pending"
+
+    cluster["small-node"].finish_job(first, exit_code=1)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, second)
+    assert job.state == "running"
+    assert not job.is_held
+
+
+def test_editing_dependencies_reattaches_a_held_job(scheduler, cluster):
+    scheduler.tick(force=True)
+    first = scheduler.submit("stage1", vram="1G", node="small-node")
+    second = scheduler.submit("stage2", vram="1G", node="small-node", depends_on=[first])
+    scheduler.tick(force=True)
+    scheduler.cancel(first)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, second).is_held
+
+    replacement = scheduler.submit("stage1-again", vram="1G", node="small-node")
+    scheduler.edit_dependencies(second, add=[replacement], drop=[first])
+    job = dbm.get_job(scheduler.conn, second)
+    assert job.depends_on == [replacement]
+    assert job.held_reason is None
+
+    scheduler.tick(force=True)
+    cluster["small-node"].finish_job(replacement, exit_code=0)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, second).state == "running"
+
+
+def test_a_dependency_edit_refuses_to_build_a_cycle(scheduler):
+    first = scheduler.submit("a")
+    second = scheduler.submit("b", depends_on=[first])
+    with pytest.raises(ValueError, match="deadlock"):
+        scheduler.edit_dependencies(first, add=[second])
+
+
+def test_a_job_cannot_be_made_to_depend_on_itself(scheduler):
+    job_id = scheduler.submit("a")
+    with pytest.raises(ValueError, match="itself"):
+        scheduler.edit_dependencies(job_id, add=[job_id])
+
+
+def test_releasing_a_job_that_is_not_held_changes_nothing(scheduler):
+    job_id = scheduler.submit("a")
+    outcome = scheduler.release(job_id)
+    assert outcome["released"] is False
+    assert dbm.get_job(scheduler.conn, job_id).depends_on == []
 
 
 def test_submitting_an_unknown_dependency_is_rejected(scheduler):

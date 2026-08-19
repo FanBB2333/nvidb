@@ -283,7 +283,10 @@ def _job_row(job: Dict[str, Any], *, extra: Sequence[str] = ()) -> List[str]:
     used = format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-"
     row = [
         str(job["id"]),
-        job["state"],
+        # A held job is pending in the database but stuck in practice, and
+        # calling it "pending" is how someone waits for a job that will never
+        # start on its own.
+        "held" if job.get("held") else job["state"],
         _short(job["name"] or "-", 20),
         job["node"] or (job["node_constraint"] or "-"),
         gpu,
@@ -303,16 +306,26 @@ def _job_table(jobs: Sequence[Dict[str, Any]], indent: str = "  ") -> str:
     Most rows have neither, and always reserving the width would squeeze the
     command out of a normal terminal.
     """
-    optional = {"progress": "PROGRESS", "notes": "NOTE"}
+    optional = {"held_reason": "HELD BY", "progress": "PROGRESS", "notes": "NOTE"}
     extra = [key for key in optional if any(job.get(key) for job in jobs)]
     headers = JOB_HEADERS + [optional[key] for key in extra]
     return _table([_job_row(job, extra=extra) for job in jobs], headers, indent=indent)
 
 
 def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
-    counts = snapshot["counts"]
+    counts = dict(snapshot["counts"])
+    held = snapshot.get("held") or []
+    if held:
+        # Held jobs are stored as pending; counting them in both places would
+        # overstate what the queue is actually going to get to.
+        counts["pending"] = max(0, counts.get("pending", 0) - len(held))
+        counts["held"] = len(held)
     summary = " · ".join(
-        f"{state} {counts[state]}" for state in STATE_ORDER if counts.get(state)
+        f"{state} {counts[state]}"
+        for state in ["running", "pending", "held"] + [
+            state for state in STATE_ORDER if state in TERMINAL_JOB_STATES
+        ]
+        if counts.get(state)
     ) or "empty"
     lock = snapshot.get("tick_lock") or {}
     header = (
@@ -351,7 +364,8 @@ def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
 def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
     data = job.to_dict()
     lines = [
-        f"JOB {job.id}  {job.state}" + (f"  (exit {job.exit_code})" if job.exit_code is not None else ""),
+        f"JOB {job.id}  {job.display_state}"
+        + (f"  (exit {job.exit_code})" if job.exit_code is not None else ""),
         f"  name        {job.name or '-'}",
         f"  command     {job.command}",
         f"  workdir     {job.workdir or '-'}",
@@ -370,8 +384,19 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
         lines.append(f"  progress    {job.progress}   (reported {_age(job.progress_at)})")
     if job.notes:
         lines.append(f"  note        {job.notes}")
+    if job.held_reason:
+        lines.append(f"  held        {job.held_reason}")
+        lines.append(
+            f"              release it with `nvidb job release {job.id}`, or "
+            f"repoint it with `nvidb job edit {job.id} --add-after ID`"
+        )
     if job.depends_on:
         lines.append(f"  depends_on  {','.join(str(i) for i in job.depends_on)}")
+    if job.depends_any:
+        lines.append(
+            f"  after_any   {','.join(str(i) for i in job.depends_any)}"
+            "   (any outcome counts)"
+        )
     if job.tags:
         lines.append(f"  tags        {','.join(job.tags)}")
     if job.env:
@@ -836,6 +861,7 @@ def cmd_submit(args) -> int:
                 priority=args.priority,
                 node=args.node,
                 depends_on=_resolve_ids(scheduler, args.after or []),
+                depends_any=_resolve_ids(scheduler, args.after_any or []),
                 max_runtime_s=args.timeout,
                 submitter=args.submitter or _default_submitter(),
                 tags=args.tag or [],
@@ -876,15 +902,18 @@ def cmd_list(args) -> int:
         states = args.state or None
         if args.active:
             states = ["pending", "running"]
-        jobs = dbm.list_jobs(
-            scheduler.conn,
-            states=states,
-            node=dbm.resolve_node_name(scheduler.conn, args.node) if args.node else None,
-            limit=args.number,
-            newest_first=bool(args.number),
-        )
-        if args.number:
-            jobs = list(reversed(jobs))
+        if getattr(args, "held", False):
+            jobs = dbm.held_jobs(scheduler.conn)
+        else:
+            jobs = dbm.list_jobs(
+                scheduler.conn,
+                states=states,
+                node=dbm.resolve_node_name(scheduler.conn, args.node) if args.node else None,
+                limit=args.number,
+                newest_first=bool(args.number),
+            )
+            if args.number:
+                jobs = list(reversed(jobs))
         if args.json:
             _print_json({"jobs": [job.to_dict() for job in jobs]})
         else:
@@ -1026,8 +1055,18 @@ def cmd_cancel(args) -> int:
         results = []
         try:
             for job_id in _resolve_ids(scheduler, args.ids):
+                # Read the dependents first: once the job is cancelled its
+                # dependents are held, and the point of saying so is to name
+                # what this command is about to stop.
+                waiting = [
+                    dependent.id
+                    for dependent in dbm.dependents_of(scheduler.conn, job_id)
+                    if job_id in dependent.depends_on
+                ]
                 ok = scheduler.cancel(job_id)
-                results.append({"id": job_id, "cancelled": ok})
+                results.append(
+                    {"id": job_id, "cancelled": ok, "holds": waiting if ok else []}
+                )
         except RuntimeError as error:
             return _error(str(error), as_json=args.json)
         if args.json:
@@ -1038,6 +1077,70 @@ def cmd_cancel(args) -> int:
                     f"job {item['id']}: "
                     + ("cancelled" if item["cancelled"] else "not cancellable")
                 )
+                if item["holds"]:
+                    ids = ", ".join(str(i) for i in item["holds"])
+                    print(
+                        f"  job(s) {ids} were waiting for it and are now held. "
+                        "They keep their place in the queue; release or repoint "
+                        f"them with `nvidb job release {item['holds'][0]}` or "
+                        f"`nvidb job edit {item['holds'][0]} --add-after ID`."
+                    )
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_release(args) -> int:
+    """Let held jobs run by forgetting the prerequisites that died."""
+    scheduler = _open(args)
+    try:
+        results = []
+        try:
+            for job_id in _resolve_ids(scheduler, args.ids):
+                results.append({"id": job_id, **scheduler.release(job_id)})
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        summary = _maybe_tick(scheduler, args, force=True)
+        if args.json:
+            _print_json({"results": results, "tick": summary})
+        else:
+            for item in results:
+                print(f"job {item['id']}: {item['reason']}")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_edit(args) -> int:
+    """Rewire a job's dependencies without resubmitting it."""
+    scheduler = _open(args)
+    try:
+        changes = {
+            "add": _resolve_ids(scheduler, args.add_after or []),
+            "drop": _resolve_ids(scheduler, args.drop_after or []),
+            "add_any": _resolve_ids(scheduler, args.add_after_any or []),
+            "drop_any": _resolve_ids(scheduler, args.drop_after_any or []),
+        }
+        if not any(changes.values()):
+            return _error(
+                "nothing to change (pass --add-after, --drop-after, "
+                "--add-after-any or --drop-after-any)",
+                as_json=args.json,
+            )
+        try:
+            job = scheduler.edit_dependencies(args.id, **changes)
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
+        summary = _maybe_tick(scheduler, args, force=True)
+        job = dbm.get_job(scheduler.conn, args.id) or job
+        if args.json:
+            _print_json({"ok": True, "job": job.to_dict(), "tick": summary})
+        else:
+            after = ",".join(str(i) for i in job.depends_on) or "-"
+            after_any = ",".join(str(i) for i in job.depends_any) or "-"
+            print(f"job {job.id} ({job.display_state}): after={after} after-any={after_any}")
+            if job.held_reason:
+                print(f"  still held: {job.held_reason}")
         return 0
     finally:
         scheduler.close()
@@ -1449,7 +1552,9 @@ def register_parsers(subparsers) -> None:
     submit.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     submit.add_argument("--priority", type=int, default=0, help="Higher runs first")
     submit.add_argument("--after", action="append", default=[], metavar="ID",
-                        help="Run only after these jobs complete")
+                        help="Run only after these jobs complete successfully")
+    submit.add_argument("--after-any", action="append", default=[], metavar="ID",
+                        help="Run once these jobs finish, whatever the outcome")
     submit.add_argument("--timeout", type=int, default=None, metavar="SECONDS",
                         help="Kill the job after this long")
     submit.add_argument("--retries", type=int, default=0, help="Retries if the process vanishes")
@@ -1472,6 +1577,11 @@ def register_parsers(subparsers) -> None:
     _add_common(listing)
     listing.add_argument("--state", action="append", choices=list(JOB_STATES), default=[])
     listing.add_argument("--active", action="store_true", help="Only pending and running")
+    listing.add_argument(
+        "--held",
+        action="store_true",
+        help="Only jobs parked by a dependency that ended badly",
+    )
     listing.add_argument("--node", default=None)
     listing.add_argument("-n", "--number", type=int, default=None, help="Show the newest N")
     _add_refresh_flags(listing)
@@ -1505,6 +1615,40 @@ def register_parsers(subparsers) -> None:
     _add_common(cancel)
     cancel.add_argument("ids", nargs="+")
     cancel.set_defaults(func=cmd_cancel)
+
+    release = job_sub.add_parser(
+        "release",
+        help="Run a held job without the dependency that died",
+        description=(
+            "A job whose prerequisite was cancelled or failed is held, not "
+            "failed: it keeps its place and its notes. Releasing it drops the "
+            "dead prerequisites so it can be scheduled."
+        ),
+    )
+    _add_common(release)
+    release.add_argument("ids", nargs="+")
+    release.add_argument("--no-tick", action="store_true")
+    release.set_defaults(func=cmd_release)
+
+    edit = job_sub.add_parser(
+        "edit",
+        help="Change what a job waits for",
+        description=(
+            "Repoint a queued job at different prerequisites, which is how a "
+            "held job is reattached to a re-run of the chain it was waiting on."
+        ),
+    )
+    _add_common(edit)
+    edit.add_argument("id", type=int)
+    edit.add_argument("--add-after", action="append", default=[], metavar="ID",
+                      help="Also wait for this job to complete successfully")
+    edit.add_argument("--drop-after", action="append", default=[], metavar="ID",
+                      help="Stop waiting for this job")
+    edit.add_argument("--add-after-any", action="append", default=[], metavar="ID",
+                      help="Also wait for this job to finish, whatever the outcome")
+    edit.add_argument("--drop-after-any", action="append", default=[], metavar="ID")
+    edit.add_argument("--no-tick", action="store_true")
+    edit.set_defaults(func=cmd_edit)
 
     requeue = job_sub.add_parser("requeue", help="Re-queue finished jobs")
     _add_common(requeue)

@@ -91,7 +91,7 @@ def test_the_skill_names_the_real_alert_kinds():
         "job_failed",
         "job_lost",
         "job_timeout",
-        "dependency_failed",
+        "job_held",
         "launch_failed",
         "node_down",
         "job_retried",

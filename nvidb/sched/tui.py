@@ -74,6 +74,9 @@ SELECTION_BG = "gray27"
 STATE_STYLE = {
     "running": "green",
     "pending": "yellow",
+    # Held jobs are pending in the database but waiting on a person, so they
+    # get the colour of something that needs attention rather than of a queue.
+    "held": "magenta",
     "completed": "cyan",
     "failed": "red",
     "timeout": "red",
@@ -86,12 +89,21 @@ STATE_STYLE = {
 STATE_BADGE = {
     "running": "● run",
     "pending": "· pend",
+    "held": "⏸ held",
     "completed": "✓ done",
     "failed": "✗ fail",
     "cancelled": "⊘ canc",
     "timeout": "! tout",
     "lost": "? lost",
 }
+
+
+def display_state(job: Dict[str, Any]) -> str:
+    """What to call a job on screen. A held job is pending but stuck, and
+    drawing it as plain `pending` is how someone waits for a job that will
+    never start until they act."""
+    return "held" if job.get("held") else job["state"]
+
 
 # "queue" is the order the scheduler will actually dispatch in - running
 # first, then pending by (priority DESC, id ASC) - which is what makes the
@@ -1026,7 +1038,7 @@ class QueueTUI:
         """tokscale-style colouring: each column keeps one colour, and rows
         that are already finished fade out so the live ones carry the eye."""
         if column == "ST":
-            return STATE_STYLE.get(job["state"])
+            return STATE_STYLE.get(display_state(job))
         if job["state"] not in ("pending", "running"):
             if column == "RC" and job.get("exit_code"):
                 return "red"
@@ -1107,7 +1119,7 @@ class QueueTUI:
             job = self.jobs[position]
             values = {
                 "ID": str(job["id"]),
-                "ST": STATE_BADGE.get(job["state"], job["state"]),
+                "ST": STATE_BADGE.get(display_state(job), display_state(job)),
                 "PRI": str(job.get("priority") or 0),
                 "NAME": job["name"] or "-",
                 "NODE": job["node"] or job["node_constraint"] or "-",
@@ -1217,7 +1229,7 @@ class QueueTUI:
         content: List[str] = []
         pieces = [
             f"name {job['name'] or '-'}",
-            f"state {job['state']}",
+            f"state {display_state(job)}",
             f"request gpus={job['gpus']} vram={format_mb(job['vram_mb'])}",
             f"node {job['node'] or job['node_constraint'] or 'any'}",
             f"pid {job['remote_pid'] or '-'}",
@@ -1234,6 +1246,15 @@ class QueueTUI:
                     " ".join(job["progress"].split()),
                     width,
                     style="cyan",
+                )
+            )
+        if job.get("held_reason"):
+            content.extend(
+                self._field_lines(
+                    "held",
+                    f"{job['held_reason']} — nvidb job release {job['id']}",
+                    width,
+                    style="magenta",
                 )
             )
         if job.get("notes"):

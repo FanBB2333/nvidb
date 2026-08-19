@@ -66,9 +66,13 @@ Key options:
 - `--note "..."` — **write one.** Say what the job is for and what would make it
   a success. Another session, or the user in a week, reads this to understand
   why the job exists. `--name` is a label; the note is the explanation.
-- `--after 12,13` — run only after those jobs complete. This is how to build a
-  pipeline and then exit: the ordering lives in the database, not in your
-  session. If a dependency fails, the dependent job fails rather than hanging.
+- `--after 12,13` — run only after those jobs complete **successfully**. This is
+  how to build a pipeline and then exit: the ordering lives in the database, not
+  in your session. If a dependency ends any other way — failed, cancelled, timed
+  out — the dependent is **held**, not failed: it stays pending, keeps its place
+  and its note, and waits for a person. Nothing cascades.
+- `--after-any 12` — run once job 12 *finishes*, whatever the outcome. Use this
+  when the next step should look at the wreckage rather than skip it.
 - `--timeout SECONDS` — kill a job that overruns.
 - `--retries N` — restart if the process vanishes (node reboot, OOM killer).
   Do not use it for jobs that are not safe to run twice.
@@ -140,8 +144,9 @@ not.
 
 Failures become **alerts** in the queue, classified by what happened:
 `job_failed` (non-zero exit), `job_lost` (process vanished), `job_timeout`,
-`dependency_failed`, `job_unschedulable` (no GPU in the cluster could ever hold
-it), `launch_failed`, `node_down`, `job_retried`.
+`job_held` (a prerequisite ended badly, so this job is parked for a decision),
+`job_unschedulable` (no GPU in the cluster could ever hold it), `launch_failed`,
+`node_down`, `job_retried`.
 
 ```bash
 nvidb queue alerts --json            # what needs attention
@@ -155,6 +160,25 @@ cheap health check to run before reporting to the user.
 A failed job carries the tail of its stderr, so `nvidb job show 12 --json` gives
 you the traceback without another SSH round trip. Diagnose from that first;
 only fetch more with `nvidb job logs` if you need earlier output.
+
+### Held jobs
+
+A job whose prerequisite was cancelled, failed or timed out is **held**: still
+pending, still in place, going nowhere until someone decides what it should have
+waited for. `nvidb job ls --held` lists them and `nvidb job show` explains each
+one. Three ways out, and the right one depends on what the user meant:
+
+```bash
+nvidb job release 1418                              # run it without the dead prerequisite
+nvidb job edit 1418 --drop-after 1404 --add-after 1415   # reattach it to the re-run
+nvidb job cancel 1418                               # it is genuinely moot now
+```
+
+Prefer `edit` over resubmitting. Resubmitting loses the note, the queue position
+and the original submitter; editing keeps all three. Never release a job whose
+prerequisite produced the input it reads — releasing it makes it run against
+missing or stale data. Check what it consumes first, and when it is not obvious,
+ask the user rather than guessing.
 
 **Do not acknowledge an alert the user has not seen.** Acknowledging is the
 user's signal that they have dealt with it. Report the failure, and only ack
