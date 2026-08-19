@@ -107,6 +107,53 @@ badly, and **2** when `--timeout` ran out with work still going. Two is not a
 failure: the job is still running and can be waited on again. Do not report a
 timeout to the user as a failed job.
 
+## Lanes: running a sequence on one GPU
+
+A **lane** is one GPU and the order it runs its jobs in, stored in the database.
+Use a lane whenever several jobs must run one after another on the same card —
+a sweep, a set of arms, anything where the second job would otherwise fight the
+first for memory. It is named `<node>:<gpu>`, and prefix matching works.
+
+```bash
+nvidb queue lanes --json                    # every GPU: what it runs now, what is next
+nvidb queue lane box406:0 --json            # one lane's queue, in running order
+nvidb job submit --lane box406:0 --vram 20G -n arm-a "bash run.sh"
+```
+
+Submitting to a lane appends to it. The lane runs its jobs strictly in order,
+one at a time, starting the next the moment the previous one exits.
+
+**Prefer a lane over an `--after` chain for same-GPU sequencing.** A chain says
+"B must succeed after A"; a lane says "this card runs A then B". They differ when
+something goes wrong: cancelling a job in a lane just lets the next one start,
+while cancelling a link in a chain holds everything behind it for a decision.
+Keep `--after` for genuine data dependencies, especially across machines.
+
+Reordering is a local database write, so it is instant and works while the node
+is unreachable or busy:
+
+```bash
+nvidb queue lane box406:0 move 1419 --to head     # run this one next
+nvidb queue lane box406:0 move 1419 --before 1417
+nvidb queue lane box406:0 swap 1417 1419
+nvidb queue lane box406:0 skip                    # send the next job to the back
+nvidb queue lane box406:0 assign 1421 --at head   # move a job into this lane
+nvidb queue lane box406:0 pause                   # stop starting new jobs here
+nvidb queue lane box406:0 resume
+```
+
+Positions are 1-based over the *queued* jobs, so `--to 1` means "next to run".
+A running job cannot be reordered — cancel it if it must stop.
+
+`pause` never touches what is already running: the lane finishes its current job
+and then stops. That is what makes it safe to pause a lane in order to rearrange
+what comes after it.
+
+A lane stops rather than stepping over a problem. If its next job is held, or
+its card is full of work the queue did not start, the whole lane waits and
+`blocked` in `nvidb queue lanes --json` says which it is. That is deliberate:
+the printed order is a promise about what runs next.
+
 ## Reporting progress from inside a job
 
 A job can publish a status line by writing `$NVIDB_STATUS_FILE`; only the last

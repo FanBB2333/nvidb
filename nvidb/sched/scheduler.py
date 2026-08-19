@@ -32,8 +32,11 @@ from .executor import JobExecutor, LaunchRejected, NodeProbe
 from .model import (
     GpuProcess,
     Job,
+    Lane,
     Node,
     format_mb,
+    make_lane_name,
+    parse_lane_name,
     parse_size_mb,
     utcnow,
 )
@@ -398,6 +401,8 @@ class Scheduler:
         tags: Optional[Sequence[str]] = None,
         max_retries: int = 0,
         notes: Optional[str] = None,
+        lane: Optional[str] = None,
+        at: Any = "tail",
     ) -> int:
         """Add a job to the queue and return its id."""
         if not command or not command.strip():
@@ -419,6 +424,18 @@ class Scheduler:
                     f"Node {resolved_node!r} is ignored; run "
                     f"`nvidb queue unignore {resolved_node}` before submitting to it"
                 )
+
+        lane_row = None
+        if lane:
+            lane_row = self.resolve_lane(lane)
+            if resolved_node and resolved_node != lane_row.node:
+                raise ValueError(
+                    f"Lane {lane_row.name!r} is on {lane_row.node!r}, but "
+                    f"--node asked for {resolved_node!r}"
+                )
+            # A lane already names its machine, so pinning follows from it and
+            # the placement code needs no special case.
+            resolved_node = lane_row.node
 
         depends_on = [int(x) for x in (depends_on or [])]
         depends_any = [int(x) for x in (depends_any or [])]
@@ -444,6 +461,10 @@ class Scheduler:
                 tags=list(tags or []),
                 max_retries=int(max_retries),
                 notes=notes,
+                lane=lane_row.name if lane_row else None,
+                lane_seq=(
+                    dbm.next_lane_seq(self.conn, lane_row.name) if lane_row else None
+                ),
             )
             dbm.add_event(
                 self.conn,
@@ -454,10 +475,302 @@ class Scheduler:
                     "gpus": int(gpus),
                     "vram_mb": vram_mb,
                     "node": resolved_node,
+                    "lane": lane_row.name if lane_row else None,
                     "submitter": submitter,
                 },
             )
+            # Submitted at the back, then moved: one path decides order, so a
+            # job placed by `--at head` sits exactly where a later `lane move`
+            # would put it.
+            if lane_row and str(at) not in ("tail", "", "None"):
+                self._reorder_lane(lane_row.name, job_id, to=at)
         return job_id
+
+    # --- lanes ------------------------------------------------------------
+
+    def resolve_lane(self, query: str) -> Lane:
+        """Find a lane by name or unambiguous abbreviation, or explain why not.
+
+        A lane that names a real GPU but has no row yet is created here, so
+        `--lane box406:1` works on a machine the queue has not probed since
+        the card was added.
+        """
+        name = dbm.resolve_lane_name(self.conn, query)
+        if name is not None:
+            lane = dbm.get_lane(self.conn, name)
+            if lane is not None:
+                return lane
+
+        try:
+            node_query, gpu_ids = parse_lane_name(query)
+        except ValueError as error:
+            known = ", ".join(lane.name for lane in dbm.get_lanes(self.conn))
+            raise ValueError(
+                f"{error} Known lanes: {known or '(none yet; run a tick first)'}"
+            ) from None
+
+        node_name = dbm.resolve_node_name(self.conn, node_query)
+        if node_name is None:
+            raise ValueError(f"Unknown node {node_query!r} in lane {query!r}")
+        name = make_lane_name(node_name, gpu_ids)
+        dbm.ensure_lane(self.conn, name, node=node_name, gpu_ids=gpu_ids)
+        lane = dbm.get_lane(self.conn, name)
+        if lane is None:  # pragma: no cover - the insert above just created it
+            raise ValueError(f"Could not create lane {name!r}")
+        return lane
+
+    def _reorder_lane(
+        self,
+        lane_name: str,
+        job_id: int,
+        *,
+        to: Any = None,
+        before: Optional[int] = None,
+        after: Optional[int] = None,
+    ) -> int:
+        """Move one pending job within its lane and return its new position.
+
+        Positions are 1-based and count only the pending jobs: a running job
+        cannot be reordered, so counting it would make `--to 1` mean different
+        things depending on whether the lane happened to be busy.
+        """
+        queue = [
+            job
+            for job in dbm.lane_jobs(self.conn, lane_name, states=["pending"])
+        ]
+        ids = [job.id for job in queue]
+        if job_id not in ids:
+            raise ValueError(
+                f"Job {job_id} is not queued in lane {lane_name!r} "
+                "(only pending jobs can be reordered)"
+            )
+        index = ids.index(job_id)
+
+        if before is not None or after is not None:
+            anchor = int(before if before is not None else after)
+            if anchor == job_id:
+                raise ValueError("A job cannot be moved relative to itself")
+            if anchor not in ids:
+                raise ValueError(
+                    f"Job {anchor} is not queued in lane {lane_name!r}"
+                )
+            ids.pop(index)
+            position = ids.index(anchor)
+            target = position if before is not None else position + 1
+        else:
+            text = str(to).lower()
+            if text == "head":
+                target = 0
+            elif text == "tail":
+                target = len(ids) - 1
+            else:
+                try:
+                    target = int(text) - 1
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid position {to!r}; use head, tail or a 1-based slot"
+                    ) from None
+                target = max(0, min(len(ids) - 1, target))
+            ids.pop(index)
+
+        ids.insert(target, job_id)
+        dbm.renumber_lane(self.conn, lane_name, ids)
+        return target + 1
+
+    def lane_move(
+        self,
+        job_id: int,
+        *,
+        to: Any = None,
+        before: Optional[int] = None,
+        after: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Move a queued job within its lane."""
+        given = [value for value in (to, before, after) if value is not None]
+        if len(given) != 1:
+            raise ValueError("Pass exactly one of --to, --before or --after")
+        with self._operation_lease("lane-move"):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None:
+                raise ValueError(f"Job {job_id} not found")
+            if not job.lane:
+                raise ValueError(
+                    f"Job {job_id} is not in a lane; assign it with "
+                    f"`nvidb queue lane assign {job_id} <lane>`"
+                )
+            if job.state != "pending":
+                raise ValueError(
+                    f"Job {job_id} is {job.state}; only queued jobs can be reordered"
+                )
+            position = self._reorder_lane(
+                job.lane, job_id, to=to, before=before, after=after
+            )
+            dbm.add_event(
+                self.conn,
+                "lane_reordered",
+                job_id=job_id,
+                message=f"{job.lane}: moved to slot {position}",
+            )
+            return {"lane": job.lane, "position": position}
+
+    def lane_swap(self, first_id: int, second_id: int) -> Dict[str, Any]:
+        """Exchange two queued jobs' places in their lane."""
+        with self._operation_lease("lane-swap"):
+            first = dbm.get_job(self.conn, first_id)
+            second = dbm.get_job(self.conn, second_id)
+            for job in (first, second):
+                if job is None:
+                    raise ValueError("Both jobs must exist")
+                if job.state != "pending":
+                    raise ValueError(
+                        f"Job {job.id} is {job.state}; only queued jobs can be swapped"
+                    )
+            if not first.lane or first.lane != second.lane:
+                raise ValueError("Both jobs must be queued in the same lane")
+
+            ids = [job.id for job in dbm.lane_jobs(self.conn, first.lane, states=["pending"])]
+            left, right = ids.index(first_id), ids.index(second_id)
+            ids[left], ids[right] = ids[right], ids[left]
+            dbm.renumber_lane(self.conn, first.lane, ids)
+            dbm.add_event(
+                self.conn,
+                "lane_reordered",
+                job_id=first_id,
+                message=f"{first.lane}: swapped with job {second_id}",
+            )
+            return {"lane": first.lane, "order": ids}
+
+    def lane_assign(
+        self, job_id: int, lane: Optional[str], *, at: Any = "tail"
+    ) -> Dict[str, Any]:
+        """Put a queued job into a lane, move it between lanes, or take it out.
+
+        Passing `lane=None` returns the job to the free pool, where the
+        scheduler places it by budget as it did before lanes existed.
+        """
+        with self._operation_lease("lane-assign"):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None:
+                raise ValueError(f"Job {job_id} not found")
+            if job.state != "pending":
+                raise ValueError(
+                    f"Job {job_id} is {job.state}; only queued jobs can be assigned"
+                )
+            previous = job.lane
+            if lane is None:
+                dbm.update_job(self.conn, job_id, lane=None, lane_seq=None)
+                dbm.add_event(
+                    self.conn,
+                    "lane_assigned",
+                    job_id=job_id,
+                    message=f"removed from lane {previous or '-'}",
+                )
+                return {"lane": None, "previous": previous}
+
+            target = self.resolve_lane(lane)
+            if job.gpus > len(target.gpu_ids) and job.gpus > 0:
+                raise ValueError(
+                    f"Job {job_id} needs {job.gpus} GPUs; lane {target.name!r} "
+                    f"has {len(target.gpu_ids)}"
+                )
+            dbm.update_job(
+                self.conn,
+                job_id,
+                lane=target.name,
+                lane_seq=dbm.next_lane_seq(self.conn, target.name),
+                node_constraint=target.node,
+            )
+            position = None
+            if str(at) not in ("tail", "", "None"):
+                position = self._reorder_lane(target.name, job_id, to=at)
+            dbm.add_event(
+                self.conn,
+                "lane_assigned",
+                job_id=job_id,
+                message=f"{previous or '-'} -> {target.name}",
+            )
+            return {"lane": target.name, "previous": previous, "position": position}
+
+    def set_lane_paused(self, lane: str, paused: bool) -> Lane:
+        """Stop or resume starting new jobs in a lane.
+
+        Pausing never touches what is already running: the lane finishes its
+        current job and then stops, which is what makes it safe to pause a
+        lane in order to rearrange what comes after.
+        """
+        target = self.resolve_lane(lane)
+        dbm.update_lane(self.conn, target.name, paused=paused)
+        dbm.add_event(
+            self.conn,
+            "lane_paused" if paused else "lane_resumed",
+            node=target.node,
+            message=target.name,
+        )
+        return dbm.get_lane(self.conn, target.name)
+
+    def set_lane_concurrency(self, lane: str, concurrency: int) -> Lane:
+        if int(concurrency) < 1:
+            raise ValueError("A lane must be allowed to run at least one job")
+        target = self.resolve_lane(lane)
+        dbm.update_lane(self.conn, target.name, concurrency=int(concurrency))
+        return dbm.get_lane(self.conn, target.name)
+
+    def lane_skip(self, lane: str) -> Dict[str, Any]:
+        """Send a lane's next job to the back, so the one behind it runs first.
+
+        The way past a head job that is waiting on something, without
+        cancelling it or rewriting the rest of the order by hand.
+        """
+        with self._operation_lease("lane-skip"):
+            target = self.resolve_lane(lane)
+            ids = [
+                job.id
+                for job in dbm.lane_jobs(self.conn, target.name, states=["pending"])
+            ]
+            if len(ids) < 2:
+                return {"lane": target.name, "skipped": None}
+            head = ids.pop(0)
+            ids.append(head)
+            dbm.renumber_lane(self.conn, target.name, ids)
+            dbm.add_event(
+                self.conn,
+                "lane_reordered",
+                job_id=head,
+                message=f"{target.name}: skipped to the back",
+            )
+            return {"lane": target.name, "skipped": head, "order": ids}
+
+    def lane_view(self, lane: Lane) -> Dict[str, Any]:
+        """One lane as reported to the UIs: its order and why it is or is not moving."""
+        jobs = dbm.lane_jobs(self.conn, lane.name)
+        running = [job for job in jobs if job.state == "running"]
+        queued = [job for job in jobs if job.state == "pending"]
+        node = dbm.get_node(self.conn, lane.node)
+
+        blocked = None
+        if lane.paused:
+            blocked = "paused"
+        elif node is None:
+            blocked = f"node {lane.node} is not configured"
+        elif node.ignored:
+            blocked = f"node {lane.node} is ignored"
+        elif not node.enabled:
+            blocked = f"node {lane.node} is drained"
+        elif node.state != "up":
+            blocked = f"node {lane.node} is {node.state}"
+        elif queued and queued[0].is_held:
+            blocked = f"job {queued[0].id} is held: {queued[0].held_reason}"
+
+        return {
+            **lane.to_dict(),
+            "node_state": node.state if node else "unknown",
+            "running": [job.to_dict() for job in running],
+            "queued": [job.to_dict() for job in queued],
+            "blocked": blocked,
+        }
+
+    def lanes(self, *, node: Optional[str] = None) -> List[Dict[str, Any]]:
+        return [self.lane_view(lane) for lane in dbm.get_lanes(self.conn, node)]
 
     # --- dependencies -----------------------------------------------------
 
@@ -668,7 +981,10 @@ class Scheduler:
         if not delta:
             return False
         with dbm.transaction(self.conn):
-            pending = dbm.pending_jobs(self.conn)
+            # Lane jobs are ordered by their lane, not by priority. Letting
+            # this rewrite their priorities would change nothing they obey
+            # while quietly reshuffling the free pool around them.
+            pending = [job for job in dbm.pending_jobs(self.conn) if not job.lane]
             ids = [job.id for job in pending]
             if job_id not in ids:
                 return False
@@ -867,6 +1183,7 @@ class Scheduler:
         still_running = dbm.live_jobs(self.conn, node.name)
         gpus = self._build_gpu_states(node, payload, probe, still_running)
         dbm.replace_node_gpus(self.conn, node.name, gpus)
+        self._ensure_lanes(node, gpus)
 
         error = None if payload.get("ok") else str(payload.get("error") or "")[:300]
         previous = dbm.set_node_state(
@@ -880,6 +1197,26 @@ class Scheduler:
                 message=f"{node.name} is online ({len(gpus)} GPU)",
             )
         return True
+
+    def _ensure_lanes(self, node: Node, gpus: List[dict]) -> None:
+        """Give every card this queue may schedule onto a lane of its own.
+
+        Created empty and unused: a lane only decides anything for jobs that
+        were submitted to it, so existing work is unaffected. Lanes are never
+        removed automatically, because a card that disappears for one probe
+        must not take a queue of pending jobs with it.
+        """
+        mask = self._gpu_allowlists.get(node.name)
+        for gpu in gpus:
+            index = int(gpu.get("index", 0))
+            if mask is not None and index not in mask:
+                continue
+            dbm.ensure_lane(
+                self.conn,
+                make_lane_name(node.name, [index]),
+                node=node.name,
+                gpu_ids=[index],
+            )
 
     def _mark_node_down(
         self, node: Node, error: str, summary: Optional[Dict[str, Any]] = None
@@ -1371,34 +1708,18 @@ class Scheduler:
                 for gpu in self._schedulable_gpus(node)
             ]
 
-        for job in pending:
-            self._renew_tick_lease()
-            impossible = self._impossible_reason(job, inventory, headroom)
-            if impossible:
-                dbm.update_job(
-                    self.conn,
-                    job.id,
-                    state="failed",
-                    finished_at=utcnow(),
-                    last_error=impossible,
-                )
-                dbm.add_event(
-                    self.conn, "job_failed", job_id=job.id, message=impossible
-                )
-                self._raise_alert(
-                    "job_unschedulable",
-                    f"{job.name or 'job'} will never run: {impossible}",
-                    job_id=job.id,
-                    summary=summary,
-                )
-                continue
+        # Lanes are an explicit order a person wrote down, so they are placed
+        # before the opportunistic pool competes for the same budget.
+        lane_pending = [job for job in pending if job.lane]
+        free_pending = [job for job in pending if not job.lane]
+        if lane_pending:
+            self._dispatch_lanes(
+                lane_pending, nodes, budgets, inventory, headroom, max_jobs, summary
+            )
 
-            ready, hold_reason = self._dependencies_ready(job)
-            if hold_reason:
-                self._hold(job, hold_reason, summary)
-                continue
-            self._unhold(job)
-            if not ready:
+        for job in free_pending:
+            self._renew_tick_lease()
+            if self._gate(job, inventory, headroom, summary) is not None:
                 continue
 
             excluded: Set[str] = set()
@@ -1450,34 +1771,211 @@ class Scheduler:
 
             if launched or not launch_errors:
                 continue
+            self._report_launch_failure(job, launch_errors, summary)
 
-            detail = "; ".join(
-                f"{node_name}: {error}" for node_name, error in launch_errors
-            )[:FAILURE_DETAIL_CHARS]
-            message = f"launch failed: {detail}"[:500]
-            # A persistent node fault should produce one warning, not one on
-            # every daemon pass.
-            if job.last_error == message:
+    def _gate(
+        self,
+        job: Job,
+        inventory: List[Node],
+        headroom: int,
+        summary: Dict[str, Any],
+    ) -> Optional[str]:
+        """Decide whether a pending job may be placed at all.
+
+        Returns None when it may, or why not: `impossible` (the job was just
+        failed, nothing could ever host it), `held` (a dependency ended badly)
+        or `waiting` (a dependency has not finished yet). Lanes and the free
+        pool share this so a job means the same thing in both.
+        """
+        impossible = self._impossible_reason(job, inventory, headroom)
+        if impossible:
+            dbm.update_job(
+                self.conn,
+                job.id,
+                state="failed",
+                finished_at=utcnow(),
+                last_error=impossible,
+            )
+            dbm.add_event(
+                self.conn, "job_failed", job_id=job.id, message=impossible
+            )
+            self._raise_alert(
+                "job_unschedulable",
+                f"{job.name or 'job'} will never run: {impossible}",
+                job_id=job.id,
+                summary=summary,
+            )
+            return "impossible"
+
+        ready, hold_reason = self._dependencies_ready(job)
+        if hold_reason:
+            self._hold(job, hold_reason, summary)
+            return "held"
+        self._unhold(job)
+        return None if ready else "waiting"
+
+    def _report_launch_failure(
+        self,
+        job: Job,
+        launch_errors: List[Tuple[str, str]],
+        summary: Dict[str, Any],
+    ) -> None:
+        detail = "; ".join(
+            f"{node_name}: {error}" for node_name, error in launch_errors
+        )[:FAILURE_DETAIL_CHARS]
+        message = f"launch failed: {detail}"[:500]
+        # A persistent node fault should produce one warning, not one on
+        # every daemon pass.
+        if job.last_error == message:
+            return
+        last_node = launch_errors[-1][0]
+        with dbm.transaction(self.conn):
+            dbm.update_job(self.conn, job.id, last_error=message)
+            dbm.add_event(
+                self.conn,
+                "job_failed",
+                job_id=job.id,
+                node=last_node,
+                message=message[:200],
+            )
+            self._raise_alert(
+                "launch_failed",
+                f"could not start {job.name or 'job'}",
+                severity="warning",
+                job_id=job.id,
+                node=last_node,
+                detail=detail,
+                summary=summary,
+            )
+
+    # --- lane dispatch ----------------------------------------------------
+
+    def _dispatch_lanes(
+        self,
+        lane_pending: List[Job],
+        nodes: List[Node],
+        budgets: Dict[str, List[GpuBudget]],
+        inventory: List[Node],
+        headroom: int,
+        max_jobs: int,
+        summary: Dict[str, Any],
+    ) -> None:
+        """Run each lane's queue strictly in order.
+
+        Head-of-line blocking is the feature, not a limitation: a lane exists
+        so that what runs next is knowable in advance, and quietly skipping
+        past a stuck job would make the printed order a lie.
+        """
+        queues: Dict[str, List[Job]] = {}
+        for job in lane_pending:
+            queues.setdefault(job.lane, []).append(job)
+
+        nodes_by_name = {node.name: node for node in nodes}
+        running: Dict[str, int] = {}
+        for job in dbm.live_jobs(self.conn):
+            if job.lane:
+                running[job.lane] = running.get(job.lane, 0) + 1
+
+        for lane_name in sorted(queues):
+            self._renew_tick_lease()
+            lane = self._lane_for(lane_name)
+            if lane is None or lane.paused:
                 continue
-            last_node = launch_errors[-1][0]
-            with dbm.transaction(self.conn):
-                dbm.update_job(self.conn, job.id, last_error=message)
-                dbm.add_event(
-                    self.conn,
-                    "job_failed",
-                    job_id=job.id,
-                    node=last_node,
-                    message=message[:200],
+            node = nodes_by_name.get(lane.node)
+            if node is None:
+                continue  # the node is down, drained or ignored; the lane waits
+
+            for job in sorted(queues[lane_name], key=_lane_order):
+                if running.get(lane_name, 0) >= max(1, lane.concurrency):
+                    break
+                blocked = self._gate(job, inventory, headroom, summary)
+                if blocked == "impossible":
+                    # It was just failed, so it has left the queue. Carrying on
+                    # is right: a job nothing can host must not wedge the lane.
+                    continue
+                if blocked:
+                    break
+                if not self._lane_has_room(lane, node, budgets, job, max_jobs):
+                    break
+
+                launched, errors = self._attempt_launch(
+                    job, node, lane.gpu_ids, summary
                 )
-                self._raise_alert(
-                    "launch_failed",
-                    f"could not start {job.name or 'job'}",
-                    severity="warning",
-                    job_id=job.id,
-                    node=last_node,
-                    detail=detail,
-                    summary=summary,
+                if not launched:
+                    if errors:
+                        self._report_launch_failure(job, errors, summary)
+                    break
+
+                running[lane_name] = running.get(lane_name, 0) + 1
+                for budget in budgets.get(node.name, []):
+                    if budget.index in lane.gpu_ids:
+                        budget.free_mb = max(0, budget.free_mb - job.vram_mb)
+                        budget.jobs += 1
+                summary["dispatched"].append(
+                    {
+                        "id": job.id,
+                        "node": node.name,
+                        "gpu_ids": list(lane.gpu_ids),
+                        "lane": lane_name,
+                    }
                 )
+
+    def _lane_for(self, lane_name: str) -> Optional[Lane]:
+        """The lane's row, recreated from its name if the row went missing.
+
+        Jobs outlive lane rows - a lane can be deleted while work is still
+        pinned to it - and stranding those jobs forever would be worse than
+        restoring the row the name already fully describes.
+        """
+        lane = dbm.get_lane(self.conn, lane_name)
+        if lane is not None:
+            return lane
+        try:
+            node_name, gpu_ids = parse_lane_name(lane_name)
+        except ValueError:
+            return None
+        dbm.ensure_lane(self.conn, lane_name, node=node_name, gpu_ids=gpu_ids)
+        return dbm.get_lane(self.conn, lane_name)
+
+    def _lane_has_room(
+        self,
+        lane: Lane,
+        node: Node,
+        budgets: Dict[str, List[GpuBudget]],
+        job: Job,
+        max_jobs: int,
+    ) -> bool:
+        """Whether the lane's own GPUs can take this job right now.
+
+        A lane owns its cards but does not own the machine: work nobody
+        submitted through the queue can fill them, and the lane then waits
+        rather than starting a job that would run into an out-of-memory error.
+        """
+        if job.gpus <= 0:
+            return True
+        by_index = {budget.index: budget for budget in budgets.get(node.name, [])}
+        for index in lane.gpu_ids:
+            budget = by_index.get(index)
+            if budget is None or not budget.fits(job.vram_mb, max_jobs):
+                return False
+        return True
+
+    def _attempt_launch(
+        self,
+        job: Job,
+        node: Node,
+        gpu_ids: Sequence[int],
+        summary: Dict[str, Any],
+    ) -> Tuple[bool, List[Tuple[str, str]]]:
+        """Start one job on one placement, reporting rather than raising."""
+        try:
+            self._launch(node, job, [int(index) for index in gpu_ids])
+        except (LaunchRejected, TransportError) as error:
+            summary["errors"].append({"job": job.id, "error": str(error)})
+            self._renew_tick_lease()
+            return False, [(node.name, str(error))]
+        self._renew_tick_lease()
+        return True, []
 
     def _impossible_reason(
         self, job: Job, inventory: List[Node], headroom_mb: int
@@ -1498,9 +1996,24 @@ class Scheduler:
         if not candidates:
             return None
 
-        gpu_inventory = [
-            (node, self._schedulable_gpus(node)) for node in candidates
-        ]
+        if job.lane:
+            # A lane job is pinned to named cards, so it is judged against
+            # those alone. Measuring it against the node's other GPUs would
+            # let a job that cannot fit its own lane wait there forever.
+            lane = dbm.get_lane(self.conn, job.lane)
+            if lane is None:
+                return None
+            gpu_inventory = [
+                (node, [gpu for gpu in node.gpus if gpu.index in set(lane.gpu_ids)])
+                for node in candidates
+                if node.name == lane.node
+            ]
+            if not gpu_inventory or not any(gpus for _node, gpus in gpu_inventory):
+                return None  # the lane's cards are not in view yet
+        else:
+            gpu_inventory = [
+                (node, self._schedulable_gpus(node)) for node in candidates
+            ]
         widest = max((len(gpus) for _node, gpus in gpu_inventory), default=0)
         if job.gpus > widest:
             where = job.node_constraint or "the largest known node"
@@ -1770,6 +2283,7 @@ class Scheduler:
             # they need saying separately or they read as ordinary queueing.
             "held": [job.to_dict() for job in dbm.held_jobs(self.conn)],
             "nodes": [self._node_view(node, headroom) for node in nodes],
+            "lanes": self.lanes(),
             "jobs": [job.to_dict() for job in jobs],
             "recent": [job.to_dict() for job in recent_terminal],
             "alerts": dbm.list_alerts(self.conn, open_only=True, limit=20),
@@ -1804,6 +2318,11 @@ class Scheduler:
             return ""
         backend = self.backend(node)
         return backend.executor.read_log(job.run_dir, stream=stream, lines=lines)
+
+
+def _lane_order(job: Job):
+    """A lane's running order. A job with no place yet goes to the back."""
+    return (job.lane_seq is None, job.lane_seq or 0, job.id)
 
 
 def _bytes_to_mb(value) -> int:

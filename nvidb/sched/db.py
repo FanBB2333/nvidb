@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .. import config
-from .model import TERMINAL_JOB_STATES, GpuState, Job, Node, utcnow
+from .model import TERMINAL_JOB_STATES, GpuState, Job, Lane, Node, utcnow
 
 SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 15000
@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at     TEXT,
     node            TEXT,
     gpu_ids         TEXT,
+    -- The serial queue this job belongs to, and its place in it.
+    lane            TEXT,
+    lane_seq        INTEGER,
     remote_pid      INTEGER,
     remote_pgid     INTEGER,
     run_dir         TEXT,
@@ -108,6 +111,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_node ON jobs(node);
+
+-- One serial queue, normally one GPU. A lane holds the answer to "what does
+-- this card run next", which priorities and dependency chains could only
+-- imply. Rows are created on demand and outlive the jobs that filled them.
+CREATE TABLE IF NOT EXISTS lanes (
+    name        TEXT PRIMARY KEY,
+    node        TEXT NOT NULL,
+    gpu_ids     TEXT NOT NULL DEFAULT '',
+    paused      INTEGER NOT NULL DEFAULT 0,
+    concurrency INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lanes_node ON lanes(node);
 
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -255,8 +273,18 @@ _ADDED_COLUMNS = {
         "progress_at": "TEXT",
         "depends_any": "TEXT",
         "held_reason": "TEXT",
+        "lane": "TEXT",
+        "lane_seq": "INTEGER",
     },
 }
+
+
+# Indexes over columns that were added after their table first shipped. These
+# cannot live in `_SCHEMA`: it runs before the columns are added, so on an
+# existing database the index would name a column that is not there yet.
+_ADDED_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_jobs_lane ON jobs(lane, lane_seq)",
+)
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -278,6 +306,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
                 # this write. Its work is ours; anything else is a real fault.
                 if "duplicate column" not in str(error).lower():
                     raise
+    for statement in _ADDED_INDEXES:
+        conn.execute(statement)
     with transaction(conn):
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -696,6 +726,144 @@ def resolve_node_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
     return None
 
 
+# --- lanes -----------------------------------------------------------------
+
+# The gap left between neighbouring jobs when a lane is renumbered. Wide enough
+# that a reorder is a handful of writes rather than a rewrite of the lane.
+LANE_STEP = 1000
+
+
+def ensure_lane(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    node: str,
+    gpu_ids: Sequence[int],
+) -> None:
+    """Register a lane if it is new, leaving an existing one's settings alone.
+
+    Called for every schedulable GPU on every refresh, so it must never
+    overwrite a lane a person has paused or reconfigured.
+    """
+    now = utcnow()
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO lanes(name, node, gpu_ids, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?) ON CONFLICT(name) DO NOTHING",
+            (name, node, ",".join(str(int(i)) for i in gpu_ids), now, now),
+        )
+
+
+def get_lane(conn: sqlite3.Connection, name: str) -> Optional[Lane]:
+    row = conn.execute("SELECT * FROM lanes WHERE name = ?", (name,)).fetchone()
+    return Lane.from_row(row) if row else None
+
+
+def get_lanes(conn: sqlite3.Connection, node: Optional[str] = None) -> List[Lane]:
+    if node:
+        rows = conn.execute(
+            "SELECT * FROM lanes WHERE node = ? ORDER BY name", (node,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM lanes ORDER BY name").fetchall()
+    return [Lane.from_row(row) for row in rows]
+
+
+def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:
+    if not fields:
+        return
+    if "gpu_ids" in fields and isinstance(fields["gpu_ids"], (list, tuple)):
+        fields["gpu_ids"] = ",".join(str(int(i)) for i in fields["gpu_ids"])
+    if "paused" in fields:
+        fields["paused"] = 1 if fields["paused"] else 0
+    fields["updated_at"] = utcnow()
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    with transaction(conn):
+        conn.execute(
+            f"UPDATE lanes SET {assignments} WHERE name = ?",
+            (*fields.values(), name),
+        )
+
+
+def delete_lane(conn: sqlite3.Connection, name: str) -> None:
+    with transaction(conn):
+        conn.execute("DELETE FROM lanes WHERE name = ?", (name,))
+
+
+def resolve_lane_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
+    """Match a lane by exact name, then case-insensitively, then by substring.
+
+    Lets a person say `lane 406` instead of `406-tailscale:0` when only one
+    lane could be meant.
+    """
+    if not query:
+        return None
+    names = [row["name"] for row in conn.execute("SELECT name FROM lanes ORDER BY name")]
+    if query in names:
+        return query
+    lowered = query.lower()
+    exact = [name for name in names if name.lower() == lowered]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [name for name in names if lowered in name.lower()]
+    if len(partial) == 1:
+        return partial[0]
+    return None
+
+
+def lane_jobs(
+    conn: sqlite3.Connection, lane: str, *, states: Optional[Iterable[str]] = None
+) -> List[Job]:
+    """A lane's jobs in the order it will run them.
+
+    `lane_seq` is the schedule, so it orders the result; the id only breaks
+    ties between rows that were never given distinct places.
+    """
+    states = list(states) if states else ["pending", "running"]
+    placeholders = ", ".join("?" for _ in states)
+    rows = conn.execute(
+        f"SELECT * FROM jobs WHERE lane = ? AND state IN ({placeholders}) "
+        "ORDER BY lane_seq IS NULL, lane_seq ASC, id ASC",
+        (lane, *states),
+    ).fetchall()
+    return [Job.from_row(row) for row in rows]
+
+
+def next_lane_seq(conn: sqlite3.Connection, lane: str) -> int:
+    """The place at the end of a lane, past everything already queued there.
+
+    Terminal jobs count: reusing a finished job's slot would silently put a new
+    submission ahead of work that is already waiting.
+    """
+    row = conn.execute(
+        "SELECT MAX(lane_seq) AS top FROM jobs WHERE lane = ?", (lane,)
+    ).fetchone()
+    top = row["top"] if row and row["top"] is not None else 0
+    return int(top) + LANE_STEP
+
+
+def renumber_lane(conn: sqlite3.Connection, lane: str, ordered_ids: Sequence[int]) -> None:
+    """Write an explicit order over a lane's pending jobs.
+
+    Rewriting all of them costs one small write each and removes every way the
+    numbering can run out of room, which matters more here than the writes: a
+    reorder that silently failed would be indistinguishable from one that
+    worked until the wrong job started.
+    """
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT MAX(lane_seq) AS top FROM jobs "
+            "WHERE lane = ? AND state = 'running'",
+            (lane,),
+        ).fetchone()
+        base = int(row["top"]) if row and row["top"] is not None else 0
+        for position, job_id in enumerate(ordered_ids, start=1):
+            conn.execute(
+                "UPDATE jobs SET lane_seq = ?, updated_at = ? WHERE id = ?",
+                (base + position * LANE_STEP, utcnow(), int(job_id)),
+            )
+
+
 # --- jobs ------------------------------------------------------------------
 
 def insert_job(conn: sqlite3.Connection, **fields) -> int:
@@ -719,6 +887,8 @@ def insert_job(conn: sqlite3.Connection, **fields) -> int:
         "updated_at": now,
         "max_retries": int(fields.get("max_retries") or 0),
         "notes": fields.get("notes") or None,
+        "lane": fields.get("lane") or None,
+        "lane_seq": fields.get("lane_seq"),
     }
     columns = ", ".join(payload)
     placeholders = ", ".join("?" for _ in payload)

@@ -12,7 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # --- Job lifecycle ---------------------------------------------------------
 # pending   waiting for a free GPU budget, an online node, or a dependency
@@ -219,6 +219,11 @@ class Job:
     finished_at: Optional[str] = None
     node: Optional[str] = None
     gpu_ids: List[int] = field(default_factory=list)
+    # The serial queue this job belongs to, and its place in it. A lane is one
+    # GPU (or one fixed group of GPUs) that runs its jobs strictly in order, so
+    # `lane_seq` *is* the schedule rather than a hint the scheduler may ignore.
+    lane: Optional[str] = None
+    lane_seq: Optional[int] = None
     remote_pid: Optional[int] = None
     remote_pgid: Optional[int] = None
     run_dir: Optional[str] = None
@@ -264,6 +269,8 @@ class Job:
             finished_at=data.get("finished_at"),
             node=data.get("node"),
             gpu_ids=_csv_ints(data.get("gpu_ids")),
+            lane=data.get("lane"),
+            lane_seq=data.get("lane_seq"),
             remote_pid=data.get("remote_pid"),
             remote_pgid=data.get("remote_pgid"),
             run_dir=data.get("run_dir"),
@@ -330,6 +337,8 @@ class Job:
             "elapsed_s": self.elapsed_seconds(),
             "node": self.node,
             "gpu_ids": self.gpu_ids,
+            "lane": self.lane,
+            "lane_seq": self.lane_seq,
             "remote_pid": self.remote_pid,
             "run_dir": self.run_dir,
             "exit_code": self.exit_code,
@@ -344,6 +353,86 @@ class Job:
             "progress_at": self.progress_at,
             "held_reason": self.held_reason,
             "held": self.is_held,
+        }
+
+
+def make_lane_name(node: str, gpu_ids: Sequence[int]) -> str:
+    """The stable name of a lane: `<node>:<gpu indices>`, e.g. `box406:0`."""
+    return f"{node}:{','.join(str(int(index)) for index in gpu_ids)}"
+
+
+def parse_lane_name(name: str) -> Tuple[str, List[int]]:
+    """Split a lane name back into its node and GPU indices.
+
+    Split from the right: a node with no nickname is named `user@host:port`,
+    so the first colon is part of the node rather than the separator.
+    """
+    text = str(name or "").strip()
+    node, separator, indices = text.rpartition(":")
+    if not separator:
+        raise ValueError(
+            f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. box406:0"
+        )
+    gpu_ids = []
+    for part in indices.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            gpu_ids.append(int(part))
+        except ValueError:
+            raise ValueError(
+                f"Invalid GPU index {part!r} in lane name {name!r}"
+            ) from None
+    if not node or not gpu_ids:
+        raise ValueError(
+            f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. box406:0"
+        )
+    return node, gpu_ids
+
+
+@dataclass
+class Lane:
+    """One serial queue: a GPU, or a fixed group of them, and its order.
+
+    A lane exists so that "what this card runs next, and next after that" is a
+    thing the queue stores and a person can edit, rather than something implied
+    by priorities and dependency chains and only knowable by simulating the
+    scheduler.
+    """
+
+    name: str
+    node: str
+    gpu_ids: List[int] = field(default_factory=list)
+    paused: bool = False
+    # How many of this lane's jobs may run at once. One is the point of a lane;
+    # raising it turns the lane back into a pool that happens to be ordered.
+    concurrency: int = 1
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row) -> "Lane":
+        data = dict(row)
+        return cls(
+            name=data["name"],
+            node=data["node"],
+            gpu_ids=_csv_ints(data.get("gpu_ids")),
+            paused=bool(data.get("paused", 0)),
+            concurrency=int(data.get("concurrency") or 1),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "node": self.node,
+            "gpu_ids": self.gpu_ids,
+            "paused": self.paused,
+            "concurrency": self.concurrency,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
 
 

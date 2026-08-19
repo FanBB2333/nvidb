@@ -372,7 +372,8 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
         f"  request     gpus={job.gpus} vram={format_mb(job.vram_mb)}"
         + (f" node={job.node_constraint}" if job.node_constraint else "")
         + (f" priority={job.priority}" if job.priority else ""),
-        f"  placement   node={job.node or '-'} gpu={','.join(str(i) for i in job.gpu_ids) or '-'} pid={job.remote_pid or '-'}",
+        f"  placement   node={job.node or '-'} gpu={','.join(str(i) for i in job.gpu_ids) or '-'} pid={job.remote_pid or '-'}"
+        + (f" lane={job.lane}" if job.lane else ""),
         f"  vram used   {format_mb(job.gpu_mem_mb) if job.gpu_mem_mb else '-'}",
         f"  timing      created={job.created_at or '-'} started={job.started_at or '-'} finished={job.finished_at or '-'}",
         f"  elapsed     {format_duration(data['elapsed_s']) if data['elapsed_s'] is not None else '-'}",
@@ -768,6 +769,219 @@ def cmd_nodes(args) -> int:
         scheduler.close()
 
 
+def _render_lanes(lanes: Sequence[Dict[str, Any]]) -> str:
+    """One row per lane: what it is running, what is next, and what stops it."""
+    if not lanes:
+        return "no lanes yet (run `nvidb queue tick` to discover the GPUs)"
+    rows = []
+    for lane in lanes:
+        running = lane["running"]
+        queued = lane["queued"]
+        state = "paused" if lane["paused"] else lane["node_state"]
+        head = queued[0] if queued else None
+        rows.append(
+            [
+                lane["name"],
+                state,
+                str(len(running)),
+                str(len(queued)),
+                _short(running[0]["name"] or str(running[0]["id"]), 22)
+                if running
+                else "-",
+                _short(f"{head['id']} {head['name'] or ''}", 22) if head else "-",
+                _short(lane["blocked"], 40) if lane["blocked"] else "-",
+            ]
+        )
+    return _table(
+        rows, ["LANE", "STATE", "RUN", "QUEUED", "NOW", "NEXT", "BLOCKED"], indent=""
+    )
+
+
+def _render_lane_detail(lane: Dict[str, Any]) -> str:
+    lines = [
+        f"LANE {lane['name']}  [{'paused' if lane['paused'] else lane['node_state']}]"
+        f"  node={lane['node']} gpu={','.join(str(i) for i in lane['gpu_ids'])}"
+        + (f" concurrency={lane['concurrency']}" if lane["concurrency"] != 1 else "")
+    ]
+    if lane["blocked"]:
+        lines.append(f"  blocked: {lane['blocked']}")
+    lines.append("")
+    if lane["running"]:
+        lines.append("RUNNING")
+        lines.append(_job_table(lane["running"]))
+        lines.append("")
+    # The queue is printed in the order it will run, numbered, because the
+    # number is what `lane move --to N` takes.
+    lines.append("QUEUED (in order)")
+    if not lane["queued"]:
+        lines.append("  (none)")
+    else:
+        rows = [
+            [
+                str(position),
+                str(job["id"]),
+                "held" if job.get("held") else "pending",
+                _short(job["name"] or "-", 24),
+                format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
+                _short(job.get("held_reason") or job["command"], 50),
+            ]
+            for position, job in enumerate(lane["queued"], start=1)
+        ]
+        lines.append(_table(rows, ["#", "ID", "STATE", "NAME", "VRAM", "WHAT"]))
+    return "\n".join(lines)
+
+
+def cmd_lanes(args) -> int:
+    scheduler = _open(args)
+    try:
+        _refresh(scheduler, args)
+        node = dbm.resolve_node_name(scheduler.conn, args.node) if args.node else None
+        lanes = scheduler.lanes(node=node)
+        if args.json:
+            _print_json({"lanes": lanes})
+        else:
+            print(_render_lanes(lanes))
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_show(args) -> int:
+    scheduler = _open(args)
+    try:
+        _refresh(scheduler, args)
+        try:
+            lane = scheduler.resolve_lane(args.lane)
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
+        view = scheduler.lane_view(lane)
+        if args.json:
+            _print_json(view)
+        else:
+            print(_render_lane_detail(view))
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_move(args) -> int:
+    scheduler = _open(args)
+    try:
+        try:
+            outcome = scheduler.lane_move(
+                args.id, to=args.to, before=args.before, after=args.after
+            )
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        if args.json:
+            _print_json({"ok": True, "id": args.id, **outcome})
+        else:
+            print(
+                f"job {args.id} is now #{outcome['position']} in {outcome['lane']}"
+            )
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_swap(args) -> int:
+    scheduler = _open(args)
+    try:
+        try:
+            outcome = scheduler.lane_swap(args.first, args.second)
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        if args.json:
+            _print_json({"ok": True, **outcome})
+        else:
+            print(f"swapped jobs {args.first} and {args.second} in {outcome['lane']}")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_assign(args) -> int:
+    scheduler = _open(args)
+    try:
+        try:
+            outcome = scheduler.lane_assign(
+                args.id, None if args.none else args.lane, at=args.at
+            )
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        summary = _maybe_tick(scheduler, args, force=True)
+        if args.json:
+            _print_json({"ok": True, "id": args.id, **outcome, "tick": summary})
+        elif outcome["lane"] is None:
+            print(f"job {args.id} left lane {outcome['previous'] or '-'}")
+        else:
+            where = f" at #{outcome['position']}" if outcome.get("position") else ""
+            print(f"job {args.id} queued in {outcome['lane']}{where}")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_pause(args) -> int:
+    scheduler = _open(args)
+    try:
+        paused = args.action == "pause"
+        try:
+            lane = scheduler.set_lane_paused(args.lane, paused)
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        summary = {} if paused else _maybe_tick(scheduler, args, force=True)
+        if args.json:
+            _print_json({"ok": True, "lane": lane.to_dict(), "tick": summary})
+        else:
+            print(
+                f"lane {lane.name} {'paused' if paused else 'resumed'}"
+                + (
+                    "; jobs already running are left alone"
+                    if paused
+                    else ""
+                )
+            )
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_skip(args) -> int:
+    scheduler = _open(args)
+    try:
+        try:
+            outcome = scheduler.lane_skip(args.lane)
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        summary = _maybe_tick(scheduler, args, force=True)
+        if args.json:
+            _print_json({"ok": True, **outcome, "tick": summary})
+        elif outcome["skipped"] is None:
+            print(f"lane {outcome['lane']} has nothing to skip past")
+        else:
+            print(f"job {outcome['skipped']} moved to the back of {outcome['lane']}")
+        return 0
+    finally:
+        scheduler.close()
+
+
+def cmd_lane_concurrency(args) -> int:
+    scheduler = _open(args)
+    try:
+        try:
+            lane = scheduler.set_lane_concurrency(args.lane, args.value)
+        except (ValueError, RuntimeError) as error:
+            return _error(str(error), as_json=args.json)
+        if args.json:
+            _print_json({"ok": True, "lane": lane.to_dict()})
+        else:
+            print(f"lane {lane.name} runs up to {lane.concurrency} job(s) at once")
+        return 0
+    finally:
+        scheduler.close()
+
+
 def cmd_node_set(args) -> int:
     scheduler = _open(args)
     try:
@@ -867,6 +1081,8 @@ def cmd_submit(args) -> int:
                 tags=args.tag or [],
                 max_retries=args.retries,
                 notes=args.note,
+                lane=args.lane,
+                at=args.at,
             )
         except ValueError as error:
             return _error(str(error), as_json=args.json)
@@ -880,9 +1096,16 @@ def cmd_submit(args) -> int:
         if args.json:
             _print_json({"ok": True, "job": job.to_dict(), "tick": summary})
         else:
-            print(f"submitted job {job_id} ({job.state})")
-            if job.node:
+            print(f"submitted job {job_id} ({job.display_state})")
+            if job.node and job.state == "running":
                 print(f"  running on {job.node} GPU {','.join(str(i) for i in job.gpu_ids) or '-'}")
+            elif job.lane:
+                queued = [
+                    item.id
+                    for item in dbm.lane_jobs(scheduler.conn, job.lane, states=["pending"])
+                ]
+                position = queued.index(job_id) + 1 if job_id in queued else len(queued)
+                print(f"  queued in lane {job.lane} at #{position} of {len(queued)}")
             elif job.state == "pending":
                 print("  waiting for capacity; it starts on the next tick that fits it")
         if args.wait:
@@ -1497,6 +1720,92 @@ def register_parsers(subparsers) -> None:
     _add_ignored_flag(nodes)
     nodes.set_defaults(func=cmd_nodes)
 
+    lanes = queue_sub.add_parser(
+        "lanes",
+        help="Show every GPU's serial queue: what it runs now and what is next",
+    )
+    _add_common(lanes)
+    _add_refresh_flags(lanes)
+    lanes.add_argument("--node", default=None, help="Only lanes on this node")
+    lanes.set_defaults(func=cmd_lanes)
+
+    lane = queue_sub.add_parser(
+        "lane",
+        help="Inspect and reorder one GPU's serial queue",
+        description=(
+            "A lane is one GPU and the order it runs its jobs in. With no "
+            "subcommand the lane's queue is printed in running order; the "
+            "subcommands edit that order."
+        ),
+    )
+    _add_common(lane)
+    _add_refresh_flags(lane)
+    lane.add_argument("lane", help="Lane name or an unambiguous part of one")
+    lane.set_defaults(func=cmd_lane_show)
+    lane_sub = lane.add_subparsers(dest="lane_command")
+
+    lane_move = lane_sub.add_parser(
+        "move",
+        help="Move a queued job within its lane",
+        description=(
+            "Positions are 1-based over the queued jobs, so `--to 1` means "
+            "next to run. A running job cannot be moved."
+        ),
+    )
+    _add_common(lane_move)
+    lane_move.add_argument("id", type=int)
+    lane_move.add_argument("--to", default=None, metavar="head|tail|N")
+    lane_move.add_argument("--before", type=int, default=None, metavar="ID")
+    lane_move.add_argument("--after", type=int, default=None, metavar="ID")
+    lane_move.set_defaults(func=cmd_lane_move)
+
+    lane_swap = lane_sub.add_parser("swap", help="Exchange two queued jobs' places")
+    _add_common(lane_swap)
+    lane_swap.add_argument("first", type=int)
+    lane_swap.add_argument("second", type=int)
+    lane_swap.set_defaults(func=cmd_lane_swap)
+
+    lane_assign = lane_sub.add_parser(
+        "assign", help="Put a queued job into this lane, or take it out"
+    )
+    _add_common(lane_assign)
+    lane_assign.add_argument("id", type=int)
+    lane_assign.add_argument("--at", default="tail", metavar="head|tail|N")
+    lane_assign.add_argument(
+        "--none",
+        action="store_true",
+        help="Remove the job from its lane and let the scheduler place it",
+    )
+    lane_assign.add_argument("--no-tick", action="store_true")
+    lane_assign.set_defaults(func=cmd_lane_assign)
+
+    lane_pause = lane_sub.add_parser(
+        "pause",
+        help="Stop starting new jobs here; what is running is left alone",
+    )
+    _add_common(lane_pause)
+    lane_pause.set_defaults(func=cmd_lane_pause, action="pause")
+
+    lane_resume = lane_sub.add_parser("resume", help="Start running this lane again")
+    _add_common(lane_resume)
+    lane_resume.add_argument("--no-tick", action="store_true")
+    lane_resume.set_defaults(func=cmd_lane_pause, action="resume")
+
+    lane_skip = lane_sub.add_parser(
+        "skip", help="Send the next job to the back of the lane"
+    )
+    _add_common(lane_skip)
+    lane_skip.add_argument("--no-tick", action="store_true")
+    lane_skip.set_defaults(func=cmd_lane_skip)
+
+    lane_concurrency = lane_sub.add_parser(
+        "concurrency",
+        help="How many of this lane's jobs may run at once (default 1)",
+    )
+    _add_common(lane_concurrency)
+    lane_concurrency.add_argument("value", type=int)
+    lane_concurrency.set_defaults(func=cmd_lane_concurrency)
+
     drain = queue_sub.add_parser("drain", help="Stop scheduling new jobs onto a node")
     _add_common(drain)
     drain.add_argument("name")
@@ -1548,6 +1857,18 @@ def register_parsers(subparsers) -> None:
     submit.add_argument("--vram", default=None, help="VRAM to reserve, e.g. 20G")
     submit.add_argument("--gpus", type=int, default=1, help="GPUs required (0 for CPU-only)")
     submit.add_argument("--node", default=None, help="Pin to one node (prefix match)")
+    submit.add_argument(
+        "--lane",
+        default=None,
+        metavar="NODE:GPU",
+        help="Queue on one GPU's serial lane, e.g. --lane box406:0",
+    )
+    submit.add_argument(
+        "--at",
+        default="tail",
+        metavar="head|tail|N",
+        help="Where in the lane to queue it (default: tail)",
+    )
     submit.add_argument("--workdir", default=None, help="Working directory on the node")
     submit.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     submit.add_argument("--priority", type=int, default=0, help="Higher runs first")
