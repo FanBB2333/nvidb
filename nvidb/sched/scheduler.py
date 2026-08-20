@@ -96,28 +96,21 @@ DEFAULT_SETTINGS = {
     "lane_idle_exit": 900,
 }
 
+_SETTING_CONVERTERS = {
+    key: int
+    for key, default in DEFAULT_SETTINGS.items()
+    if isinstance(default, int) and not isinstance(default, bool)
+}
+
 
 def load_settings(cfg: Optional[dict] = None) -> Dict[str, Any]:
     """Merge the `queue:` section of the queue's configuration over the defaults."""
     if cfg is None:
         cfg = nvidb_config.load_queue_config()
     raw = (cfg or {}).get("queue") or {}
-    settings = dict(DEFAULT_SETTINGS)
-    if isinstance(raw, dict):
-        for key, default in DEFAULT_SETTINGS.items():
-            if key not in raw:
-                continue
-            value = raw[key]
-            if isinstance(default, bool):
-                settings[key] = bool(value)
-            elif isinstance(default, int) and not isinstance(default, bool):
-                try:
-                    settings[key] = int(value)
-                except (TypeError, ValueError):
-                    pass
-            else:
-                settings[key] = value
-    return settings
+    return nvidb_config.merge_settings(
+        DEFAULT_SETTINGS, raw, converters=_SETTING_CONVERTERS
+    )
 
 
 def node_name_for_server(server: dict) -> str:

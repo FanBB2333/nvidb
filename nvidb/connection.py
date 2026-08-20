@@ -6364,7 +6364,7 @@ class NVClientPool:
                     f"[q] [g]{group_label} [u]{unsupported_label} [v]Nodes"
                 )
                 if compact_layout:
-                    controls = f"? · ⏎ proc · j/k GPU · d view · q quit"
+                    controls = "? · ⏎ proc · j/k GPU · d view · q quit"
             if len(controls) > terminal_width:
                 controls = controls[: max(0, terminal_width - 3)] + "..."
         else:

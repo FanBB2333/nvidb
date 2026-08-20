@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from ..tui_theme import display_width, fit_display, pad_display
 from . import backup as backup_mod
 from . import db as dbm
 from . import keeper as keeper_mod
@@ -30,11 +31,8 @@ from .model import (
     GpuProcess,
     Job,
     age_seconds,
-    display_width,
-    fit_display,
     format_duration,
     format_mb,
-    pad_display,
 )
 from .scheduler import Scheduler
 

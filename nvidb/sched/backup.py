@@ -35,24 +35,23 @@ def default_directory() -> Path:
 def load_settings(queue_settings: Optional[dict] = None) -> Dict[str, Any]:
     """Normalize ``queue.backup`` without making malformed values fatal."""
     raw = queue_settings.get("backup") if isinstance(queue_settings, dict) else None
-    settings = dict(DEFAULT_SETTINGS)
     if raw is False:
-        return settings
+        return dict(DEFAULT_SETTINGS)
     if raw is True:
+        settings = dict(DEFAULT_SETTINGS)
         settings["enabled"] = True
         return settings
     if not isinstance(raw, dict):
-        return settings
+        return dict(DEFAULT_SETTINGS)
 
-    settings["enabled"] = bool(raw.get("enabled", settings["enabled"]))
-    try:
-        settings["interval_hours"] = max(0.0, float(raw.get("interval_hours", 24)))
-    except (TypeError, ValueError):
-        pass
-    try:
-        settings["keep"] = max(0, int(raw.get("keep", 7)))
-    except (TypeError, ValueError):
-        pass
+    settings = nvidb_config.merge_settings(
+        DEFAULT_SETTINGS,
+        raw,
+        converters={
+            "interval_hours": lambda value: max(0.0, float(value)),
+            "keep": lambda value: max(0, int(value)),
+        },
+    )
     directory = raw.get("directory")
     if directory:
         path = Path(str(directory)).expanduser()

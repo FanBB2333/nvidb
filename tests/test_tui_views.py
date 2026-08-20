@@ -871,11 +871,12 @@ def test_detailed_focus_uses_quiet_highlight_and_solid_dashed_borders(
         pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
     )
     process_plain = _without_ansi(process_styled)
-    process_highlights = [
-        _without_ansi(line)
+    process_highlight_lines = [
+        line
         for line in process_styled.splitlines()
         if "\x1b[100m" in line
     ]
+    process_highlights = [_without_ansi(line) for line in process_highlight_lines]
 
     assert process_plain.startswith("Focus process")
     assert any(
@@ -889,8 +890,11 @@ def test_detailed_focus_uses_quiet_highlight_and_solid_dashed_borders(
     assert len(process_highlights) == 1
     assert "›    4242" in process_highlights[0]
     assert "› training-node GPU 0" not in process_plain
-    assert "\x1b[34m" not in process_styled
-    assert "\x1b[35m" not in process_styled
+    # Structural labels elsewhere in the frame may use accent colours; the
+    # selected process itself stays a quiet neutral highlight.
+    selected_process = "\n".join(process_highlight_lines)
+    assert "\x1b[34m" not in selected_process
+    assert "\x1b[35m" not in selected_process
 
 
 def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkeypatch):

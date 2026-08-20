@@ -32,7 +32,7 @@ BAR_EMPTY = "─"
 
 
 def display_width(text: Optional[str]) -> int:
-    """Terminal columns a string occupies, counting wide characters."""
+    """Return the terminal columns occupied by ``text``."""
     if not text:
         return 0
     width = 0
@@ -43,21 +43,37 @@ def display_width(text: Optional[str]) -> int:
     return width
 
 
-def fit(text: str, width: int) -> str:
-    """Truncate to terminal columns, marking the cut with an ellipsis."""
-    if width <= 0:
+def fit_display(text: Optional[str], limit: int, *, ellipsis: str = "…") -> str:
+    """Truncate text to a terminal-column limit, marking any loss."""
+    text = "" if text is None else str(text)
+    if limit <= 0:
         return ""
-    if display_width(text) <= width:
+    if display_width(text) <= limit:
         return text
+
+    budget = limit - display_width(ellipsis)
     kept = []
     used = 0
     for char in text:
-        char_width = display_width(char)
-        if used + char_width > width - 1:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        )
+        if used + char_width > budget:
             break
         kept.append(char)
         used += char_width
-    return "".join(kept) + "…"
+    return "".join(kept) + ellipsis
+
+
+def fit(text: Optional[str], width: int) -> str:
+    """Compatibility spelling for :func:`fit_display`."""
+    return fit_display(text, width)
+
+
+def pad_display(text: Optional[str], width: int) -> str:
+    """Left-align text to ``width`` terminal columns."""
+    text = "" if text is None else str(text)
+    return text + " " * max(0, width - display_width(text))
 
 
 def frame_top(width: int, *, title: str = "") -> str:

@@ -8,6 +8,7 @@ several short-lived clients take turns driving the same queue.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shlex
@@ -22,6 +23,15 @@ DEFAULT_JOB_ROOT = ".nvidb/jobs"
 
 # What a POSIX shell will accept on the left of `export NAME=value`.
 VALID_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _process_guard(pid_expr: str, script_expr: str) -> str:
+    """Return the shell predicate that proves a pid still owns ``run.sh``."""
+    return (
+        f'[ -n "{pid_expr}" ] && kill -0 "{pid_expr}" 2>/dev/null && '
+        f'ps -o command= -p "{pid_expr}" 2>/dev/null | '
+        f'grep -F -q -- "{script_expr}"'
+    )
 
 
 class LaunchRejected(TransportError):
@@ -141,6 +151,52 @@ def build_run_script(
     return "\n".join(lines) + "\n"
 
 
+def _build_launch_command(run_dir: str, script: str) -> str:
+    """Build the remote bootstrap that installs, starts, or adopts ``run.sh``."""
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    quoted_dir = shlex.quote(run_dir)
+    return "\n".join(
+        [
+            f"d={quoted_dir}",
+            'mkdir -p "$d" || exit 1',
+            # A retried transport command may find that its first attempt
+            # already started the job. Adopt only a live process that still
+            # owns this exact run.sh; a recycled pid must never qualify.
+            'nvidb_pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
+            f'if {_process_guard("$nvidb_pid", "$d/run.sh")}; then',
+            '  echo "NVIDB_ADOPTED=1"',
+            "else",
+            f"  printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || exit 1",
+            '  chmod +x "$d/run.sh"',
+            '  rm -f "$d/exit_code" "$d/pid" "$d/pgid" "$d/result.json"',
+            '  : > "$d/stdout.log"',
+            '  : > "$d/stderr.log"',
+            # setsid creates a private process group. macOS has no setsid, so
+            # nohup detaches there and the missing isolation is recorded; the
+            # caller will then avoid signalling the login shell's group.
+            '  if command -v setsid >/dev/null 2>&1; then',
+            '    echo 1 > "$d/session"',
+            '    ( setsid bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
+            " < /dev/null & )",
+            "  else",
+            '    echo 0 > "$d/session"',
+            '    ( nohup bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
+            " < /dev/null & )",
+            "  fi",
+            "  i=0",
+            '  while [ "$i" -lt 60 ]; do',
+            '    [ -s "$d/pid" ] && break',
+            "    sleep 0.05",
+            "    i=$((i+1))",
+            "  done",
+            "fi",
+            'echo "NVIDB_SETSID=$(cat "$d/session" 2>/dev/null | tr -d " \\n\\r")"',
+            'echo "NVIDB_PID=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")"',
+            'echo "NVIDB_PGID=$(cat "$d/pgid" 2>/dev/null | tr -d " \\n\\r")"',
+        ]
+    )
+
+
 class JobExecutor:
     """Drives job processes on one node through a `Transport`."""
 
@@ -206,58 +262,9 @@ class JobExecutor:
             gpu_ids=gpu_ids,
             node_name=node_name,
         )
-        import base64
-
-        encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-        quoted_dir = shlex.quote(run_dir)
-        bootstrap = "\n".join(
-            [
-                f"d={quoted_dir}",
-                'mkdir -p "$d" || exit 1',
-                # The transport retries a command whose channel died, which can
-                # happen after the remote shell already started the job. Adopt
-                # that process instead of starting a second copy: the pid must
-                # still be alive *and* still be running this job's run.sh, so a
-                # recycled pid cannot be mistaken for our own.
-                'nvidb_pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
-                'if [ -n "$nvidb_pid" ] && kill -0 "$nvidb_pid" 2>/dev/null && '
-                'ps -o command= -p "$nvidb_pid" 2>/dev/null | '
-                'grep -F -q -- "$d/run.sh"; then',
-                '  echo "NVIDB_ADOPTED=1"',
-                "else",
-                f"  printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || exit 1",
-                '  chmod +x "$d/run.sh"',
-                '  rm -f "$d/exit_code" "$d/pid" "$d/pgid" "$d/result.json"',
-                '  : > "$d/stdout.log"',
-                '  : > "$d/stderr.log"',
-                # setsid puts the job in its own session, so it survives the
-                # SSH channel closing and can later be signalled as a group.
-                # macOS has no setsid; nohup still detaches, but the job then
-                # shares a process group with the login shell and must never be
-                # signalled by group id. Which one ran is recorded on the node,
-                # so an adopting retry reports the same answer.
-                '  if command -v setsid >/dev/null 2>&1; then',
-                '    echo 1 > "$d/session"',
-                '    ( setsid bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
-                " < /dev/null & )",
-                "  else",
-                '    echo 0 > "$d/session"',
-                '    ( nohup bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
-                " < /dev/null & )",
-                "  fi",
-                "  i=0",
-                '  while [ "$i" -lt 60 ]; do',
-                '    [ -s "$d/pid" ] && break',
-                "    sleep 0.05",
-                "    i=$((i+1))",
-                "  done",
-                "fi",
-                'echo "NVIDB_SETSID=$(cat "$d/session" 2>/dev/null | tr -d " \\n\\r")"',
-                'echo "NVIDB_PID=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")"',
-                'echo "NVIDB_PGID=$(cat "$d/pgid" 2>/dev/null | tr -d " \\n\\r")"',
-            ]
+        result = self.transport.run(
+            _build_launch_command(run_dir, script), timeout=timeout
         )
-        result = self.transport.run(bootstrap, timeout=timeout)
         pid = _parse_marker_int(result.stdout, "NVIDB_PID=")
         pgid = _parse_marker_int(result.stdout, "NVIDB_PGID=")
         isolated = _parse_marker_int(result.stdout, "NVIDB_SETSID=") == 1
@@ -293,9 +300,7 @@ class JobExecutor:
             '  _ec=$(cat "$_d/exit_code" 2>/dev/null | tr -d "\\n\\r")',
             '  _st=$(cat "$_d/started" 2>/dev/null | tr -d " \\n\\r")',
             "  _alive=0",
-            '  if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && '
-            'ps -o command= -p "$_pid" 2>/dev/null | '
-            'grep -F -q -- "$_d/run.sh"; then _alive=1; fi',
+            f'  if {_process_guard("$_pid", "$_d/run.sh")}; then _alive=1; fi',
             '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive|$_st"',
             # The status line is free-form text, so it travels on its own line
             # where only the first two fields need splitting.
@@ -342,17 +347,13 @@ class JobExecutor:
             [
                 f"d={quoted_dir}",
                 f"pid={int(pid)}",
-                'if kill -0 "$pid" 2>/dev/null && '
-                'ps -o command= -p "$pid" 2>/dev/null | '
-                'grep -F -q -- "$d/run.sh"; then',
+                f'if {_process_guard("$pid", "$d/run.sh")}; then',
                 f"  {self._signal_command(pid=pid, pgid=pgid, signal='TERM')}",
                 # The wrapper only runs its EXIT trap once the work it is
                 # waiting on returns, so the escalation has to reach the same
                 # set of processes rather than just the wrapper again.
                 f"  ( sleep {int(grace)}; "
-                'if kill -0 "$pid" 2>/dev/null && '
-                'ps -o command= -p "$pid" 2>/dev/null | '
-                'grep -F -q -- "$d/run.sh"; then '
+                f'if {_process_guard("$pid", "$d/run.sh")}; then '
                 f"{self._signal_command(pid=pid, pgid=pgid, signal='KILL')}; fi ) "
                 ">/dev/null 2>&1 &",
                 '  echo "NVIDB_REAPED=1"',

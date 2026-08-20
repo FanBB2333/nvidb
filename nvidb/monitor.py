@@ -125,7 +125,7 @@ class GPUMonitor:
         if self._initialized:
             try:
                 pynvml.nvmlShutdown()
-            except:
+            except pynvml.NVMLError:
                 pass
             self._initialized = False
     
@@ -141,7 +141,7 @@ class GPUMonitor:
                 
                 try:
                     power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW to W
-                except:
+                except pynvml.NVMLError:
                     power = 0.0
                 
                 snapshot = GPUSnapshot(
@@ -275,19 +275,19 @@ def _print_stats(
     else:
         for idx, gpu_stat in sorted(stats.items()):
             print(f"  GPU {idx}: {gpu_stat.gpu_name}")
-            print(f"    Memory:")
+            print("    Memory:")
             print(f"      Peak:    {_format_bytes(gpu_stat.memory_peak)} / {_format_bytes(gpu_stat.memory_total)}")
             print(f"      Delta:   {_format_delta(gpu_stat.memory_delta)}")
             print(f"      Start:   {_format_bytes(gpu_stat.memory_start)}")
             print(f"      End:     {_format_bytes(gpu_stat.memory_end)}")
-            print(f"    Utilization:")
+            print("    Utilization:")
             print(f"      Avg:     {gpu_stat.avg_utilization:.1f}%")
             print(f"      Samples: {len(gpu_stat.utilization_samples)}")
-            print(f"    Temperature:")
+            print("    Temperature:")
             print(f"      Peak:    {gpu_stat.temperature_peak}C")
             print(f"      Avg:     {gpu_stat.avg_temperature:.1f}C")
             if gpu_stat.power_samples and any(p > 0 for p in gpu_stat.power_samples):
-                print(f"    Power:")
+                print("    Power:")
                 print(f"      Peak:    {gpu_stat.power_peak:.1f}W")
                 print(f"      Avg:     {gpu_stat.avg_power:.1f}W")
     

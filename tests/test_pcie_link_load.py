@@ -118,6 +118,8 @@ def test_an_idle_downshifted_link_falls_back_to_the_maximum_when_unreported():
 
 
 def test_a_saturated_direction_is_red_and_a_quiet_one_is_not(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("ANSI_COLORS_DISABLED", raising=False)
     monkeypatch.setenv("FORCE_COLOR", "1")
     pool = _pool()
     pool.unified_group_by_node = False
@@ -135,7 +137,7 @@ def test_a_saturated_direction_is_red_and_a_quiet_one_is_not(monkeypatch):
     )
     monkeypatch.setattr(
         "nvidb.connection.os.get_terminal_size",
-        lambda: __import__("os").terminal_size((200, 40)),
+        lambda *_args: __import__("os").terminal_size((200, 40)),
     )
 
     rendered = pool._format_fixed_width_table(

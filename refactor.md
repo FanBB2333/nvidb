@@ -1,9 +1,9 @@
 # nvidb refactor plan
 
-> ## 0. 执行进度（更新于 2026-08-17）
+> ## 0. 执行进度（更新于 2026-08-21）
 >
-> 工作树干净，所有已完成阶段均已提交，`pytest tests/` 全绿（455 passed，阶段 3 新增
-> 42 个 webdata 表征测试）。原始计划正文保留在下方，行号基于扫描时的树，后续阶段请按
+> `pytest tests/` 全绿（596 passed；阶段 3 新增的 42 个 webdata 表征测试仍在其中）。
+> 原始计划正文保留在下方，行号基于扫描时的树，后续阶段请按
 > 符号名定位。
 >
 > ### 已完成
@@ -15,13 +15,13 @@
 > | 阶段 1 | `a5dde1f` | 零风险删除：~730 行（run.py 调试入口/别名/init 双解析；connection.py 的 nvidbInit、pool 级 execute_command 系列、BaseClient 死方法、双 get_client、swap 死解析；utils.py 损坏查询助手；data_modules.py 的 GPUProcess/GPUInfo + 注释块【使 `import nvidb` 不再经死路径拉起 paramiko+pandas】；sched 的 TransportPool、write_file、purge_alerts、只写不读的 LaunchResult 字段、tick/_terminate/get_meta/purge_jobs/probe 死参数、未使用的 Queue/open_queue API；`build/`、`nvidb.egg-info/`、`nvidb/src/`、example_interactive.py、误导性 print；ruff F401/F841 清扫）。注意：`ServerListInfo.to_dict` 被测试使用，已保留 |
 > | 阶段 2 | `70e59b5` | 不可达兜底：connection.py 145 处 `getattr(self,…)` + 5 处 hasattr → 直接属性访问（唯一真懒加载 `_tui_diff_screen` 保留 getattr；测试 fixture 用 `__new__` 绕过 `__init__` 但已设齐属性，无需改）；connect() 重复 except 合并；`x[:11] if len(x)>11` 等 no-op 化简；键盘监听器崩溃改为记日志；dashboard.py import fallback 收敛；monitor.py `PYNVML_AVAILABLE` 删除；scheduler.py `(self.cfg or {})` → `self.cfg`；队列 TUI 配置同步失败改走 error 通道；metrics.py None 守卫删除；dcgm.py WatchFields/UpdateAllFields 共用 except 拆分 |
 > | 阶段 3 | `5113fd0` | 删除 web.py 的 Streamlit UI（~1,320 行），保留的 ~660 行数据层改名为 `nvidb/webdata.py`；`dashboard.py` 改从 `.webdata` 导入；折叠其中已证明不可达的 `try/except ImportError` 相对导入 fallback；删 `nvidb/.streamlit/config.toml`；修 `run.py` 两处 "Streamlit port" 帮助文案与 `README.md` 致谢措辞（Streamlit → Dash/Plotly）；为数据层新增 `tests/test_webdata.py`（42 例，覆盖此前零覆盖的解析/格式化/汇总函数）；手动验证 `nvidb web`（Dash 页面 HTTP 200）与 bare `nvidb --once`（真实连接远程节点）均可正常运行。**顺带修复阶段 1/2 引入的两个真实回归**：① `run.py` 顶部误删了 `from ..connection import NVClientPool`（当时以为只有死代码在用，实际上是裸 `nvidb` 默认动作在用，会导致主入口直接 `NameError` 崩溃）；② `monitor.py::_take_snapshot` 在阶段 1 删除局部 `snapshots` 字典构建时漏删了末尾 `return snapshots`，导致 `NameError`，会静默杀死 `@nvidb.monitor` 装饰器的后台采样线程。两者都不在 pytest 覆盖范围内（`nvidb/test/run.py` 的裸命令路径和 `monitor.py` 均无测试），是手动跑 CLI/装饰器验证时发现的 |
+> | 阶段 4（部分） | （本次） | `display_width` / `fit_display` / `pad_display` 收敛到 `tui_theme.py`，`sched/model.py` 仅保留兼容 re-export，队列 CLI/TUI 直接依赖共享实现并删除 `_fit` 别名；`executor.py` 抽出 launch bootstrap 构建器，四处 pid→`run.sh` 归属判断共用同一 shell guard；scheduler/notify/backup 的默认配置合并统一走 `config.merge_settings`；收窄 monitor/日志 CLI 中会吞掉 `KeyboardInterrupt` 的裸 `except`，并清完仓库现有 ruff 告警。|
 > | 阶段 5 | （本次） | 行为不变的性能项：DCGM 探测失败按客户端负缓存（无 DCGM 的主机不再每秒付一次远程 python 启动）；`cpu_cores` 每客户端缓存（nproc 只问一次）；lease 续约节流（同一 tick 内 16 个调用点合并为每 ttl/3 一次写，tick 入口记录基准时间戳）；`keeper.status()` 10s 缓存（TUI 每 3s 刷新不再每次拉起 1-2 个子进程，新增专门测试验证缓存行为，其余测试经 autouse fixture 置 TTL=0）；`sync_nodes_from_config` 配置签名守卫（CLI 每次调用跑两遍、每节点一次写事务 → 配置未变时零写）；队列 TUI `_request_log` 备忘录（渲染循环不再每帧空抢 worker 状态锁） |
 >
-> ### 下一步：阶段 4（§3.1/§3.3，未开始）
+> ### 下一步：阶段 4 余项（§3.1/§3.3）
 >
-> 共享助手收敛（truncate/display_width/阈值配色/设置合并；`tui_theme` 成为唯一家，
-> `sched/model.py` re-export 保测试；executor.py 的 kill-guard shell 模板四处复制 →
-> 一个模板生成器【正确性风险项，优先】）。
+> 继续收敛阈值配色和 CLI/TUI 的 GPU process 表征；这些输出路径较多，适合另起提交并
+> 逐个对照表征测试。
 >
 > ### 其余阶段（按 §9 顺序，未开始）
 >

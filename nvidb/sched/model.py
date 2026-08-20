@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from ..tui_theme import (
+    display_width as display_width,
+    fit_display as fit_display,
+    pad_display as pad_display,
+)
 
 # --- Job lifecycle ---------------------------------------------------------
 # pending   waiting for a free GPU budget, an online node, or a dependency
@@ -109,50 +114,6 @@ def format_mb(value: Optional[int]) -> str:
     if gib >= 100:
         return f"{gib:.0f}G"
     return f"{gib:.1f}G"
-
-
-def display_width(text: Optional[str]) -> int:
-    """Terminal columns a string occupies.
-
-    Job names and notes are routinely written in Chinese, where one character
-    takes two columns; counting characters instead would shear every table that
-    contains one.
-    """
-    if not text:
-        return 0
-    width = 0
-    for char in str(text):
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-    return width
-
-
-def fit_display(text: Optional[str], limit: int, *, ellipsis: str = "…") -> str:
-    """Truncate to at most `limit` terminal columns, marking any loss."""
-    text = "" if text is None else str(text)
-    if limit <= 0:
-        return ""
-    if display_width(text) <= limit:
-        return text
-    budget = limit - display_width(ellipsis)
-    out = []
-    used = 0
-    for char in text:
-        char_width = 0 if unicodedata.combining(char) else (
-            2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-        )
-        if used + char_width > budget:
-            break
-        out.append(char)
-        used += char_width
-    return "".join(out) + ellipsis
-
-
-def pad_display(text: Optional[str], width: int) -> str:
-    """Left-align to `width` terminal columns."""
-    text = "" if text is None else str(text)
-    return text + " " * max(0, width - display_width(text))
 
 
 def format_duration(seconds: Optional[float]) -> str:

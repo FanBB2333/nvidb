@@ -37,14 +37,11 @@ SEVERITY_ORDER = {"warning": 0, "error": 1}
 
 def load_notify_settings(queue_settings: Optional[dict] = None) -> Dict[str, Any]:
     raw = (queue_settings or {}).get("notify")
-    settings = dict(DEFAULT_NOTIFY_SETTINGS)
     if isinstance(raw, dict):
-        for key, default in DEFAULT_NOTIFY_SETTINGS.items():
-            if key not in raw:
-                continue
-            value = raw[key]
-            settings[key] = bool(value) if isinstance(default, bool) else value
-    elif raw is not None:
+        return nvidb_config.merge_settings(DEFAULT_NOTIFY_SETTINGS, raw)
+
+    settings = dict(DEFAULT_NOTIFY_SETTINGS)
+    if raw is not None:
         settings["enabled"] = bool(raw)
     return settings
 

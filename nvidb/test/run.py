@@ -421,24 +421,24 @@ def show_info(config_path=None):
         total_size = _get_directory_size(config.WORKING_DIR)
         print(f"   Disk Usage: {_format_size(total_size)}")
     else:
-        print(f"   Disk Usage: 0 bytes (directory not created)")
+        print("   Disk Usage: 0 bytes (directory not created)")
     print()
     
     # Config file info
     print(f"Config File: {config_path}")
     
     if not Path(config_path).exists():
-        print(f"   Status: Not found")
+        print("   Status: Not found")
     else:
-        print(f"   Status: Exists")
+        print("   Status: Exists")
     
     # Database file info
     db_path = config.get_db_path()
     print(f"\nDatabase File: {db_path}")
     if Path(db_path).exists():
-        print(f"   Status: Exists")
+        print("   Status: Exists")
     else:
-        print(f"   Status: Not created yet")
+        print("   Status: Not created yet")
     
     print("\n" + "-" * 50)
 
@@ -508,7 +508,7 @@ def interactive_clean(clean_all=False):
         print("         Clean All Data")
         print("=" * 50 + "\n")
         
-        print(f"This will delete the entire working directory:")
+        print("This will delete the entire working directory:")
         print(f"  {working_dir}")
         print("\nThis includes:")
         print(f"  - Configuration file: {config_path}")
@@ -579,7 +579,7 @@ def _clean_server(config_path):
         nickname = server.get('nickname') or server.get('description', f"{server.get('username', 'N/A')}@{host}:{port}")
         print(f"  [{idx + 1}] {nickname} ({host}:{port})")
     
-    print(f"  [0] Cancel")
+    print("  [0] Cancel")
     
     try:
         choice = input("\nEnter the number of the server to remove: ").strip()
@@ -603,7 +603,7 @@ def _clean_server(config_path):
             
             _write_config_yaml(config_path, cfg)
             
-            print(f"\nServer removed successfully.")
+            print("\nServer removed successfully.")
         else:
             print("\nOperation cancelled.")
             
@@ -656,7 +656,7 @@ def _clean_database(db_path):
     confirm = input("\nDelete this database? [y/N]: ").strip().lower()
     if confirm in ['y', 'yes']:
         db_path.unlink()
-        print(f"\nDatabase deleted successfully.")
+        print("\nDatabase deleted successfully.")
     else:
         print("\nOperation cancelled.")
 
@@ -712,14 +712,14 @@ def list_log_sessions(db_path=None):
             try:
                 start_dt = datetime.fromisoformat(start_time)
                 start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            except:
+            except (TypeError, ValueError):
                 start_str = start_time[:19] if start_time else "N/A"
             
             if end_time:
                 try:
                     end_dt = datetime.fromisoformat(end_time)
                     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-                except:
+                except (TypeError, ValueError):
                     end_str = end_time[:19] if end_time else "N/A"
             else:
                 end_str = "(running)"
@@ -786,7 +786,7 @@ def show_log_info(session_id=None, db_path=None):
                 end_dt = datetime.now()
             duration = end_dt - start_dt
             duration_str = str(duration).split('.')[0]  # Remove microseconds
-        except:
+        except (TypeError, ValueError):
             duration_str = "N/A"
         
         print("\n" + "-" * 60)
@@ -794,7 +794,7 @@ def show_log_info(session_id=None, db_path=None):
         print("-" * 60)
         
         # Session metadata
-        print(f"\nSession Info:")
+        print("\nSession Info:")
         print(f"  Start Time:     {start_time}")
         print(f"  End Time:       {end_time or '(still running)'}")
         print(f"  Duration:       {duration_str}")
@@ -853,7 +853,7 @@ def show_log_info(session_id=None, db_path=None):
                         # Track max memory
                         if key not in user_max_memory or mem_mb > user_max_memory[key]:
                             user_max_memory[key] = mem_mb
-                    except:
+                    except (AttributeError, TypeError, ValueError):
                         continue
         
         # Display top users by GPU time

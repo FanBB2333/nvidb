@@ -286,7 +286,7 @@ def test_reordering_needs_no_contact_with_the_node(scheduler, cluster):
 
 def test_move_before_and_after_place_relative_to_another_job(scheduler):
     scheduler.tick(force=True)
-    ids = _fill(scheduler, "big-node:0", 4)
+    _fill(scheduler, "big-node:0", 4)
     scheduler.tick(force=True)
     queued = _queue_ids(scheduler, "big-node:0")
 
@@ -299,7 +299,7 @@ def test_move_before_and_after_place_relative_to_another_job(scheduler):
 
 def test_move_to_a_numbered_slot_counts_only_queued_jobs(scheduler):
     scheduler.tick(force=True)
-    ids = _fill(scheduler, "big-node:0", 4)
+    _fill(scheduler, "big-node:0", 4)
     scheduler.tick(force=True)
     queued = _queue_ids(scheduler, "big-node:0")
 

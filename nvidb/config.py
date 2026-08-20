@@ -129,6 +129,26 @@ def load_queue_config(config_path=None) -> dict:
     return merged
 
 
+def merge_settings(defaults, raw, *, converters=None) -> dict:
+    """Overlay known settings on defaults, coercing only declared value types."""
+    settings = dict(defaults)
+    if not isinstance(raw, dict):
+        return settings
+
+    converters = converters or {}
+    for key, default in defaults.items():
+        if key not in raw:
+            continue
+        converter = converters.get(key)
+        if converter is None and isinstance(default, bool):
+            converter = bool
+        try:
+            settings[key] = converter(raw[key]) if converter else raw[key]
+        except (TypeError, ValueError):
+            continue
+    return settings
+
+
 def _dq(value) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 

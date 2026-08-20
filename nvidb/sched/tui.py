@@ -24,16 +24,19 @@ from ..mouse import (
     ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
     MouseSequenceParser,
 )
-from ..tui_theme import DiffScreen, smooth_bar
+from ..tui_theme import (
+    DiffScreen,
+    display_width,
+    fit_display,
+    pad_display,
+    smooth_bar,
+)
 from . import db as dbm
 from .model import (
     GpuProcess,
     age_seconds,
-    display_width,
-    fit_display,
     format_duration,
     format_mb,
-    pad_display,
 )
 from .scheduler import Scheduler
 
@@ -464,9 +467,6 @@ class QueueTUI:
         formatter = getattr(self.term, self._palette.get(style, style), None)
         return formatter(text) if callable(formatter) else text
 
-    def _fit(self, text: str, width: int) -> str:
-        return fit_display(text, width)
-
     @staticmethod
     def _wrap_plain(text: Any, width: int) -> List[str]:
         """Wrap plain text by terminal columns, including wide characters."""
@@ -777,7 +777,7 @@ class QueueTUI:
                 return [line]
             return [
                 self._node_header_line(head, tail, width, highlight=selected),
-                self._style(self._fit(f"    ! {node['last_error']}", width), "red"),
+                self._style(fit_display(f"    ! {node['last_error']}", width), "red"),
             ]
 
         if self.proc_view == "all":
@@ -1056,7 +1056,7 @@ class QueueTUI:
         if gpu.get("attribution") == "blind":
             lines = [
                 self._style(
-                    self._fit(
+                    fit_display(
                         f"        · ~{format_mb(gpu['external_mem_mb'])} of "
                         f"{format_mb(gpu['mem_used_mb'])} in use, this driver "
                         "reports no per-process memory",
@@ -1228,7 +1228,7 @@ class QueueTUI:
                 )
                 for name, size, _ in columns
             )
-            segments.append((self._fit(tail, command_width), tail_style))
+            segments.append((fit_display(tail, command_width), tail_style))
             lines.append(self._compose(segments, width, highlight=selected))
             self._job_line_targets[len(lines) - 1] = position
         if start + rows < len(self.jobs):
@@ -1295,7 +1295,7 @@ class QueueTUI:
             end = len(log_lines) - self.log_offset
             start = max(0, end - self._log_page_height)
             body = log_lines[start:end]
-            lines.extend("  " + self._fit(line, width - 2) for line in body)
+            lines.extend("  " + fit_display(line, width - 2) for line in body)
             return lines
 
         content: List[str] = []
@@ -1307,10 +1307,10 @@ class QueueTUI:
             f"pid {job['remote_pid'] or '-'}",
             f"submitter {job['submitter'] or '-'}",
         ]
-        content.append(self._fit("  " + "   ".join(pieces), width))
-        content.append(self._fit(f"  cmd  {' '.join(job['command'].split())}", width))
+        content.append(fit_display("  " + "   ".join(pieces), width))
+        content.append(fit_display(f"  cmd  {' '.join(job['command'].split())}", width))
         if job.get("workdir"):
-            content.append(self._fit(f"  cwd  {job['workdir']}", width))
+            content.append(fit_display(f"  cwd  {job['workdir']}", width))
         if job.get("progress"):
             content.extend(
                 self._field_lines(
@@ -1421,15 +1421,15 @@ class QueueTUI:
         lines = []
         self._footer_regions = []
         if error:
-            lines.append(self._style(self._fit(f" ! {error}", width), "red"))
+            lines.append(self._style(fit_display(f" ! {error}", width), "red"))
         elif notice:
             message, style = notice
-            lines.append(self._style(self._fit(f" {message}", width), style))
+            lines.append(self._style(fit_display(f" {message}", width), style))
         if self.pending_confirm:
             action, job_id, _ = self.pending_confirm
             lines.append(
                 self._style(
-                    self._fit(
+                    fit_display(
                         f" press {action[0]} again or click confirm to {action} job "
                         f"{job_id} (Esc cancels)",
                         width,
@@ -1586,7 +1586,7 @@ class QueueTUI:
         ]
         lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
         for key, description in rows:
-            lines.append(self._fit(f"  {key:<16}{description}", width))
+            lines.append(fit_display(f"  {key:<16}{description}", width))
         lines.append(self._style("  press ? or Esc to close", "bright_black"))
         return lines
 
