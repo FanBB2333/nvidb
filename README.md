@@ -319,8 +319,14 @@ memory and do not add remote requests. On terminals shorter than 36 lines, the
 history rows temporarily replace the selected process's command block so the
 action buttons remain visible; toggle History off to restore the command.
 
-Machines without NVIDIA GPUs (a macOS laptop, a CPU-only host) are not expanded
-by default in the per-node view and are collapsed into a single "hidden" line in
+The local machine is not one more node to manage: it reports through a
+one-line strip at the very top of the page (in both views) with the system
+description, CPU utilization, load average, and memory usage. It only keeps a
+node section of its own while it has NVIDIA GPUs to show, or when it is the
+only machine in the pool.
+
+Remote machines without NVIDIA GPUs (a CPU-only host) are not expanded by
+default in the per-node view and are collapsed into a single "hidden" line in
 the unified node status. Press `u` to show them.
 Layout toggles are written back to the `view` section of `~/.nvidb/config.yml`,
 so the next `nvidb` run starts with the same layout. Process filters, sorting,

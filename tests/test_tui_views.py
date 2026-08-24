@@ -925,18 +925,24 @@ def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkey
 def test_unsupported_nodes_are_hidden_until_toggled(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.pool.append(
+        SimpleNamespace(description="cpu-node", host="10.0.0.3", port=22)
+    )
     raw_stats = {
         0: (pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}),
         1: (
             pd.DataFrame([_gpu_row(0, "RTX 6000 Ada", "75 %", "24000/49140")]),
             {},
         ),
+        2: (pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}),
     }
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 30)))
 
     hidden = _without_ansi(
         "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
     )
+    # The GPU-less local machine lives in the top strip, not the node list,
+    # so only the remote CPU node counts as hidden here.
     assert "1 node without GPU support hidden ([u] to show)" in hidden
     assert "No GPU data available" not in hidden
 
@@ -945,8 +951,74 @@ def test_unsupported_nodes_are_hidden_until_toggled(monkeypatch):
     shown = _without_ansi(
         "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
     )
-    assert "Local" in shown
+    assert "cpu-node" in shown
     assert "No GPU data available" in shown
+    assert "Local" not in shown
+
+
+def test_local_machine_reports_through_the_top_strip(monkeypatch, capsys):
+    pool = _nodes_pool(
+        ["", _server_block(_pool(), 1)],
+        {
+            0: (
+                pd.DataFrame(),
+                {
+                    "system_stats": {
+                        "cpu_cores": 12,
+                        "cpu_percent": 34.0,
+                        "mem_used_gb": 37.2,
+                        "mem_total_gb": 64.0,
+                        "swap_used_gb": 0.0,
+                        "swap_total_gb": 0.0,
+                        "load_avg": (2.10, 2.45, 2.60),
+                    }
+                },
+            ),
+            1: (
+                pd.DataFrame([_gpu_row(0, "RTX 4090", "10 %", "1024/24576")]),
+                {},
+            ),
+        },
+    )
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 30)))
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    frame = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    # The strip opens the page with the local system's vitals...
+    assert frame[0].startswith("⌂ ")
+    assert "CPU 34%" in frame[0]
+    assert "Load 2.10 2.45 2.60" in frame[0]
+    assert "Mem 58%" in frame[0]
+    # ...and the GPU-less local machine is no longer one of the nodes:
+    # the single remote is server [1] and the only clickable row.
+    assert not any("Local Machine" in line for line in frame)
+    assert any("[1] ● training-node" in line for line in frame)
+    assert {index for kind, index in pool._click_targets.values() if kind == "server"} == {1}
+    assert any("Server 1" in line for line in frame)
+
+    # j/k moves the cursor across listed nodes only, never onto the strip.
+    assert pool.selected_server == 1
+    assert pool._handle_keypress("k") is False
+    assert pool.selected_server == 1
+
+
+def test_a_local_machine_with_gpus_keeps_its_node_section(monkeypatch, capsys):
+    pool = _nodes_pool(
+        [_server_block(_pool(), 1), _server_block(_pool(), 1)],
+        _raw_stats_for([1, 1]),
+    )
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 40)))
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    frame = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    assert frame[0].startswith("⌂ ")
+    assert any("[1] ● Local Machine" in line for line in frame)
+    assert any("[2] ● training-node" in line for line in frame)
+    assert {index for kind, index in pool._click_targets.values() if kind == "server"} == {0, 1}
 
 
 def test_default_expansion_skips_nodes_without_gpus():
@@ -1149,10 +1221,12 @@ def test_narrow_windows_never_wrap_a_server_row(monkeypatch, capsys):
     frame = pool._tui_diff_screen._previous
     plain = [_without_ansi(line) for line in frame]
     assert all(len(line) <= 58 for line in plain), max(map(len, plain))
-    # Compact chrome: short title and hint line instead of the wide ones.
-    assert plain[0].startswith("nvidb · 2 servers ·")
-    assert "v view" in plain[1] and "⏎ exp" in plain[1]
-    assert "[v] Unified view" not in plain[1]
+    # The local strip opens the page, then the compact chrome: short
+    # title and hint line instead of the wide ones.
+    assert plain[0].startswith("⌂ ")
+    assert plain[1].startswith("nvidb · 2 servers ·")
+    assert "v view" in plain[2] and "⏎ exp" in plain[2]
+    assert "[v] Unified view" not in plain[2]
     # The long description yields to the summary instead of wrapping.
     header = next(line for line in plain if "training-node" in line)
     assert header.count("training-node") == 1
@@ -1167,9 +1241,11 @@ def test_loading_is_said_once_per_server(monkeypatch, capsys):
     capsys.readouterr()
 
     frame = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
-    # Once per server, in the header summary - not again in a block below.
-    assert sum("Loading..." in line for line in frame) == len(pool.pool)
-    assert not any(line.strip() == "Loading..." for line in frame[3:])
+    # Once per listed server, in the header summary - not again in a block
+    # below. The GPU-less local machine is the top strip, not a server row.
+    assert sum("Loading..." in line for line in frame) == len(pool.pool) - 1
+    assert not any(line.strip() == "Loading..." for line in frame[4:])
+    assert not any("Local Machine" in line for line in frame)
 
 
 def _allowlist_frame(gpu_count):
@@ -2014,12 +2090,12 @@ def test_clicking_a_server_row_selects_then_expands_it(monkeypatch, capsys):
         for row, (kind, index) in pool._click_targets.items()
         if kind == "server"
     }
-    assert set(server_rows) == {0, 1}
+    # The GPU-less local machine is the top strip, not a clickable node row.
+    assert set(server_rows) == {1}
 
-    assert pool._handle_mouse_event(_click(server_rows[1] + 1)) is True
+    # The cursor already sits on the only listed node, so the first click
+    # expands it right away.
     assert pool.selected_server == 1
-    assert pool.expanded_servers == set()
-
     assert pool._handle_mouse_event(_click(server_rows[1] + 1)) is True
     assert pool.expanded_servers == {1}
 

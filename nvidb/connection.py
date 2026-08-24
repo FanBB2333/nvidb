@@ -1,6 +1,8 @@
 from typing import Optional
 from blessed import Terminal
+import functools
 import logging
+import platform
 import re
 import sys
 import os
@@ -147,6 +149,23 @@ def pause_connect_progress():
     """Wipe the startup meter so a prompt owns the line it was using."""
     if _active_connect_progress is not None:
         _active_connect_progress.clear()
+
+
+@functools.lru_cache(maxsize=1)
+def local_platform_summary() -> str:
+    """One-line description of the machine nvidb itself runs on."""
+    system = platform.system()
+    machine = platform.machine()
+    if system == "Darwin":
+        release = platform.mac_ver()[0]
+        label = f"macOS {release}".strip()
+    elif system == "Linux":
+        label = f"Linux {platform.release()}"
+    elif system == "Windows":
+        label = f"Windows {platform.release()}"
+    else:
+        label = system or "Unknown OS"
+    return " ".join(part for part in (label, machine) if part)
 
 
 def _prompt_secret(prompt):
@@ -1580,7 +1599,18 @@ class LocalClient(BaseClient):
 
     def query_nvml_snapshot(self) -> dict:
         return self._nvml_collector.collect()
-        
+
+    def get_system_stats(self) -> dict:
+        stats = super().get_system_stats()
+        # The load average feeds the local header strip only, so it is read
+        # straight from the OS here instead of adding one more command to
+        # the generic path every remote host pays for.
+        try:
+            stats["load_avg"] = os.getloadavg()
+        except (AttributeError, OSError):
+            pass
+        return stats
+
     def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
         """Local connection is always successful"""
         logging.info(msg=f"Connected to local machine as {self.username}")
@@ -1777,6 +1807,9 @@ class NVClientPool:
         self._last_fetch_duration = None
         self._last_fetch_error = None
         self._toggle_disabled_servers = set()
+        # Pool indices currently listed as nodes; the promoted local
+        # machine lives in the top strip instead (see _compute_node_indices).
+        self._node_listed_indices = list(range(len(self.pool)))
     
     def connect_all(self):
         """Open every client's session behind one self-rewriting line.
@@ -2184,6 +2217,183 @@ class NVClientPool:
             )
         return formatted_stats
 
+    def _local_client_index(self):
+        """Pool index of the local machine, or None when it is absent."""
+        for idx, client in enumerate(self.pool):
+            if getattr(client, "port", None) == "local" or isinstance(client, LocalClient):
+                return idx
+        return None
+
+    def _compute_node_indices(self, raw_stats_by_client):
+        """Pool indices listed as nodes in the TUI.
+
+        The local machine reports through the header strip at the top of
+        the page instead of the node list; it keeps a node section only
+        while it has GPU rows of its own (a CUDA workstation must not
+        lose its table) or when it is the only machine in the pool.
+        """
+        indices = list(range(len(self.pool)))
+        local_idx = self._local_client_index()
+        if local_idx is None or len(indices) <= 1:
+            return indices
+        raw = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        stats, _system_info = raw.get(local_idx, (pd.DataFrame(), {}))
+        if isinstance(stats, pd.DataFrame) and not stats.empty:
+            return indices
+        indices.remove(local_idx)
+        return indices
+
+    def _format_local_strip(self, terminal_width, raw_stats_by_client):
+        """The local machine's one-line strip at the very top of the page.
+
+        The machine nvidb runs on is not one more node to manage: by
+        default it only reports the ground the user stands on - what
+        system it is, CPU utilisation, load average, and memory - and
+        stays out of the node list unless it has GPUs of its own.
+        """
+        local_idx = self._local_client_index()
+        if local_idx is None:
+            return []
+        client = self.pool[local_idx]
+        username = str(getattr(client, "username", "") or "") or getpass.getuser()
+        hostname = platform.node().split(".")[0] or "localhost"
+        identity_plain = f"{username}@{hostname}"
+        os_plain = local_platform_summary()
+
+        sep_plain = " · "
+        sep = colored(sep_plain, "dark_grey")
+        head_plain = f"⌂ {identity_plain}{sep_plain}{os_plain}"
+        head = (
+            colored("⌂ ", "cyan", attrs=["bold"])
+            + colored(identity_plain, attrs=["bold"])
+            + sep
+            + colored(os_plain, "dark_grey")
+        )
+
+        raw = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        _stats, system_info = raw.get(local_idx, (pd.DataFrame(), {}))
+        sys_stats = (
+            system_info.get("system_stats") if isinstance(system_info, dict) else None
+        ) or {}
+        if not sys_stats:
+            tail_plain = "collecting system stats…"
+            plain = f"{head_plain}{sep_plain}{tail_plain}"
+            if len(plain) > terminal_width:
+                return [fit(plain, terminal_width)]
+            return [head + sep + colored(tail_plain, "dark_grey")]
+
+        cores = int(sys_stats.get("cpu_cores") or 0)
+        cpu_percent = int(round(float(sys_stats.get("cpu_percent") or 0.0)))
+        if cpu_percent >= 80:
+            cpu_color = "red"
+        elif cpu_percent >= 50:
+            cpu_color = "yellow"
+        else:
+            cpu_color = "green"
+
+        load_values = None
+        load_avg = sys_stats.get("load_avg")
+        if isinstance(load_avg, (list, tuple)) and len(load_avg) == 3:
+            try:
+                load_values = tuple(float(value) for value in load_avg)
+            except (TypeError, ValueError):
+                load_values = None
+        load_color = None
+        if load_values is not None and cores > 0:
+            load_ratio = load_values[0] / cores
+            if load_ratio >= 1.0:
+                load_color = "red"
+            elif load_ratio >= 0.7:
+                load_color = "yellow"
+            else:
+                load_color = "green"
+
+        mem_used = float(sys_stats.get("mem_used_gb") or 0.0)
+        mem_total = float(sys_stats.get("mem_total_gb") or 0.0)
+        mem_percent = (
+            int(round(mem_used / mem_total * 100)) if mem_total > 0 else None
+        )
+        if mem_percent is None:
+            mem_color = None
+        elif mem_percent >= 90:
+            mem_color = "red"
+        elif mem_percent >= 75:
+            mem_color = "yellow"
+        else:
+            mem_color = "green"
+
+        swap_used = float(sys_stats.get("swap_used_gb") or 0.0)
+        swap_total = float(sys_stats.get("swap_total_gb") or 0.0)
+
+        def _metric_parts(*, bars, cores_suffix, full_load, swap):
+            """(plain, styled) metric pieces for one strip variant."""
+            parts = []
+            cores_plain = f" ({cores}C)" if cores_suffix and cores > 0 else ""
+            bar_plain = " " + "─" * 6 if bars else ""
+            cpu_plain = f"CPU {cpu_percent}%{bar_plain}{cores_plain}"
+            cpu_styled = (
+                colored("CPU ", "dark_grey")
+                + colored(f"{cpu_percent}%", cpu_color)
+                + ((" " + self._mini_bar(cpu_percent, cpu_color)) if bars else "")
+                + cores_plain
+            )
+            parts.append((cpu_plain, cpu_styled))
+            if load_values is not None:
+                if full_load:
+                    load_plain_values = " ".join(
+                        f"{value:.2f}" for value in load_values
+                    )
+                else:
+                    load_plain_values = f"{load_values[0]:.2f}"
+                load_styled_values = (
+                    colored(load_plain_values, load_color)
+                    if load_color
+                    else load_plain_values
+                )
+                parts.append(
+                    (
+                        f"Load {load_plain_values}",
+                        colored("Load ", "dark_grey") + load_styled_values,
+                    )
+                )
+            if mem_percent is not None:
+                mem_detail = f" {mem_used:.1f}/{mem_total:.0f}G" if bars or full_load else ""
+                mem_plain = f"Mem {mem_percent}%{bar_plain}{mem_detail}"
+                mem_styled = (
+                    colored("Mem ", "dark_grey")
+                    + colored(f"{mem_percent}%", mem_color)
+                    + ((" " + self._mini_bar(mem_percent, mem_color)) if bars else "")
+                    + mem_detail
+                )
+                parts.append((mem_plain, mem_styled))
+            if swap and swap_total > 0 and swap_used >= 0.1:
+                swap_plain = f"Swap {swap_used:.1f}/{swap_total:.0f}G"
+                parts.append(
+                    (swap_plain, colored("Swap ", "dark_grey") + swap_plain[5:])
+                )
+            return parts
+
+        variants = (
+            _metric_parts(bars=True, cores_suffix=True, full_load=True, swap=True),
+            _metric_parts(bars=False, cores_suffix=True, full_load=True, swap=False),
+            _metric_parts(bars=False, cores_suffix=False, full_load=False, swap=False),
+        )
+        for variant_index, parts in enumerate(variants):
+            drop_os = variant_index == len(variants) - 1
+            plain_pieces = [head_plain if not drop_os else f"⌂ {identity_plain}"]
+            styled_pieces = [
+                head
+                if not drop_os
+                else colored("⌂ ", "cyan", attrs=["bold"])
+                + colored(identity_plain, attrs=["bold"])
+            ]
+            plain_pieces.extend(plain for plain, _styled in parts)
+            styled_pieces.extend(styled for _plain, styled in parts)
+            plain = sep_plain.join(plain_pieces)
+            if len(plain) <= terminal_width:
+                return [sep.join(styled_pieces)]
+        return [fit(plain, terminal_width)]
+
     def _client_table_identity(self, client_index):
         """Return compact node and hostname labels for the unified TUI table."""
         client = self.pool[client_index]
@@ -2567,6 +2777,8 @@ class NVClientPool:
             + (6 if show_trends else 0)
             # Room for the "filter is hiding GPUs" warning line.
             + (1 if self._get_unified_filter_mode() != "all" else 0)
+            # The local machine's strip at the top of the page.
+            + (1 if self._local_client_index() is not None else 0)
         )
         # Node bands take screen space too: two extra lines per block in the
         # detailed view (the block reuses one card border), one otherwise.
@@ -4634,7 +4846,9 @@ class NVClientPool:
         lines = []
         hidden_count = 0
         raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
-        for idx in range(len(self.pool)):
+        # The promoted local machine reports through the top strip, so it
+        # is neither listed nor counted among the hidden nodes here.
+        for idx in self._compute_node_indices(raw_stats_by_client):
             node, hostname = self._client_table_identity(idx)
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
             if isinstance(system_info, dict) and system_info.get("error"):
@@ -4971,6 +5185,7 @@ class NVClientPool:
             node_count = len(
                 source_table[["Node", "Hostname"]].drop_duplicates()
             )
+        node_total = len(self._compute_node_indices(raw_stats_by_client))
         detailed = self.unified_detailed
         try:
             terminal_size = os.get_terminal_size()
@@ -5060,13 +5275,13 @@ class NVClientPool:
             compact_page = page_status.removeprefix("Rows ")
             title_line = (
                 f"{focus_prefix} · D · G:{gpu_count_display} · "
-                f"N:{node_count}/{len(self.pool)}"
+                f"N:{node_count}/{node_total}"
                 + (f" · {compact_page}" if compact_page else "")
             )
         elif detailed and terminal_width < 100:
             title_line = (
                 f"{focus_prefix} · Detailed · GPUs {gpu_count_display} · "
-                f"Nodes {node_count}/{len(self.pool)}{page_suffix}"
+                f"Nodes {node_count}/{node_total}{page_suffix}"
             )
         else:
             title_with_focus = (
@@ -5076,7 +5291,7 @@ class NVClientPool:
             )
             title_line = (
                 f"{title_with_focus} · GPUs {gpu_count_display} · "
-                f"Nodes with GPU {node_count}/{len(self.pool)}{page_suffix}"
+                f"Nodes with GPU {node_count}/{node_total}{page_suffix}"
             )
         if len(title_line) > terminal_width:
             title_line = (
@@ -6246,6 +6461,11 @@ class NVClientPool:
 
         self._apply_default_expansion(raw_stats_by_client, last_update_time)
 
+        # The local machine reports through the top strip; the node list
+        # holds it only while it has GPU rows (or is the only machine).
+        node_indices = self._compute_node_indices(raw_stats_by_client)
+        self._node_listed_indices = node_indices
+
         # Disable expand/collapse for servers with auth errors (e.g., password incorrect)
         try:
             disabled = set()
@@ -6274,7 +6494,7 @@ class NVClientPool:
         warn_display = " · WARN: refresh failed" if last_fetch_error else ""
 
         output_lines = []
-        server_count = len(self.pool)
+        server_count = len(node_indices)
         server_label = "Server" if server_count == 1 else "Servers"
         try:
             terminal_size = os.get_terminal_size()
@@ -6303,6 +6523,11 @@ class NVClientPool:
             and terminal_height >= 14
             and not bool(self.tui_help_visible)
         )
+        # The local machine's own strip opens the page in both views. It
+        # sits above the per-node panel frame, so it is laid out for the
+        # full window width before the border margin is reserved.
+        strip_lines = self._format_local_strip(terminal_width, raw_stats_by_client)
+        output_lines.extend(strip_lines)
         if show_panel_border:
             terminal_width -= self._PANEL_BORDER_MARGIN
         if display_mode == self.DISPLAY_MODE_UNIFIED:
@@ -6510,13 +6735,20 @@ class NVClientPool:
         self._body_click_targets = {}
         self._body_click_regions = []
 
+        # The cursor may sit on the local machine from an earlier frame in
+        # which it was still listed; land it on a row that is on screen.
+        if node_indices and self.selected_server not in node_indices:
+            self.selected_server = node_indices[0]
+
         # Align the collapsed server list by padding headers to the same display width
-        index_width = len(str(len(self.pool)))
+        index_width = len(str(max(1, len(node_indices))))
         server_rows = []
         max_header_width = 0
 
         summary_rows = []
-        for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
+        for position, idx in enumerate(node_indices):
+            client = self.pool[idx]
+            stats_info = stats_list[idx] if idx < len(stats_list) else ""
             is_selected = idx == self.selected_server
             is_expanded = idx in self.expanded_servers
             toggle_disabled = idx in self._toggle_disabled_servers
@@ -6544,7 +6776,7 @@ class NVClientPool:
             selector = "❯" if is_selected else " "
             dot, _dot_color = self._server_health_dot(summary_data)
             header_plain = (
-                f"{selector} {expand_icon} [{idx + 1:{index_width}d}] "
+                f"{selector} {expand_icon} [{position + 1:{index_width}d}] "
                 f"{dot} {client.description}"
             )
 
@@ -6588,7 +6820,14 @@ class NVClientPool:
         )
 
         sections = []
-        for idx, is_selected, _is_expanded, _header_plain, summary_data, _stats_info in server_rows:
+        for position, (
+            idx,
+            is_selected,
+            _is_expanded,
+            _header_plain,
+            summary_data,
+            _stats_info,
+        ) in enumerate(server_rows):
             toggle_disabled = idx in self._toggle_disabled_servers
             # The icon reports what the user chose, nothing else: the
             # layout no longer collapses servers on its own.
@@ -6613,7 +6852,7 @@ class NVClientPool:
                 expand_icon, toggle_disabled
             )
             if compact_layout:
-                prefix = f"{selector} {expand_icon} {idx + 1} {dot} "
+                prefix = f"{selector} {expand_icon} {position + 1} {dot} "
                 description = fit(
                     self.pool[idx].description,
                     max(1, summary_room - len(prefix)),
@@ -6627,14 +6866,14 @@ class NVClientPool:
                         colored(expand_icon, icon_color) if icon_color else expand_icon
                     )
                     header_display = (
-                        f"{selector} {icon_display} {idx + 1} "
+                        f"{selector} {icon_display} {position + 1} "
                         f"{colored(dot, dot_color)} "
                         + colored(description, attrs=["bold"])
                     )
             else:
                 header_plain = (
                     f"{selector} {expand_icon} "
-                    f"[{idx + 1:{index_width}d}] {dot} {self.pool[idx].description}"
+                    f"[{position + 1:{index_width}d}] {dot} {self.pool[idx].description}"
                 )
                 pad = max_header_width - self.term.length(header_plain)
                 header_padded = header_plain + (" " * pad if pad > 0 else "")
@@ -6650,7 +6889,7 @@ class NVClientPool:
                     # rest (description + trailing pad) is bolded as one
                     # block so a mid-word cut never splits an ANSI code.
                     prefix_plain = (
-                        f"{selector} {expand_icon} [{idx + 1:{index_width}d}] {dot} "
+                        f"{selector} {expand_icon} [{position + 1:{index_width}d}] {dot} "
                     )
                     if len(header_padded) >= len(prefix_plain):
                         rest = header_padded[len(prefix_plain):]
@@ -6661,7 +6900,7 @@ class NVClientPool:
                         )
                         header_display = (
                             f"{selector} {icon_display} "
-                            f"[{idx + 1:{index_width}d}] "
+                            f"[{position + 1:{index_width}d}] "
                             f"{colored(dot, dot_color)} "
                             + colored(rest, attrs=["bold"])
                         )
@@ -6727,9 +6966,11 @@ class NVClientPool:
         for position in range(len(sections)):
             fit_section(position, region_height)
 
-        selected_pos = (
-            max(0, min(self.selected_server, len(sections) - 1)) if sections else 0
-        )
+        selected_pos = 0
+        for position, (idx, _lines) in enumerate(sections):
+            if idx == self.selected_server:
+                selected_pos = position
+                break
         view_start, view_end = self._nodes_viewport(
             [len(lines) for _idx, lines in sections],
             region_height,
@@ -6775,7 +7016,12 @@ class NVClientPool:
             )
 
         if show_panel_border:
-            output_lines = self._wrap_panel_border(output_lines, terminal_width)
+            # The frame wraps the node list only; the local strip stays
+            # above it as the first line of the page.
+            strip_count = len(strip_lines)
+            output_lines = output_lines[:strip_count] + self._wrap_panel_border(
+                output_lines[strip_count:], terminal_width
+            )
             self._click_targets = {
                 row + 1: target for row, target in self._click_targets.items()
             }
@@ -7408,6 +7654,30 @@ class NVClientPool:
         self._request_ui_refresh()
         return True
 
+    def _move_node_selection(self, delta):
+        """Move the nodes-view cursor across the listed nodes.
+
+        The promoted local machine is not in the list, so the cursor
+        steps over it instead of landing on a row that is not on screen.
+        """
+        indices = list(
+            getattr(self, "_node_listed_indices", None)
+            or range(len(self.pool))
+        )
+        if not indices:
+            return False
+        try:
+            position = indices.index(self.selected_server)
+        except ValueError:
+            position = 0
+            delta = 0
+        position = max(0, min(position + delta, len(indices) - 1))
+        if indices[position] == self.selected_server:
+            return False
+        self.selected_server = indices[position]
+        self._request_ui_refresh()
+        return True
+
     def _toggle_server_expansion(self, index):
         if index in self._toggle_disabled_servers:
             return False
@@ -7448,15 +7718,7 @@ class NVClientPool:
         if self.display_mode != self.DISPLAY_MODE_UNIFIED:
             if event.is_wheel_up or event.is_wheel_down:
                 delta = -1 if event.is_wheel_up else 1
-                selected = max(
-                    0,
-                    min(self.selected_server + delta, len(self.pool) - 1),
-                )
-                if selected == self.selected_server:
-                    return False
-                self.selected_server = selected
-                self._request_ui_refresh()
-                return True
+                return self._move_node_selection(delta)
             if not event.is_left_press:
                 return False
             if target is None or target[0] != "server":
@@ -7732,15 +7994,9 @@ class NVClientPool:
             return False
 
         if key_lower == "j" or key_name == "KEY_DOWN":
-            if self.selected_server < len(self.pool) - 1:
-                self.selected_server += 1
-                self._request_ui_refresh()
-                return True
+            return self._move_node_selection(1)
         elif key_lower == "k" or key_name == "KEY_UP":
-            if self.selected_server > 0:
-                self.selected_server -= 1
-                self._request_ui_refresh()
-                return True
+            return self._move_node_selection(-1)
         elif enter_pressed or key_text == " ":
             return self._toggle_server_expansion(self.selected_server)
         elif key_lower == "a":
@@ -7921,9 +8177,6 @@ class NVClientPool:
     def print_once(self):
         """Print GPU stats once and exit (no TUI loop)"""
         current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        server_count = len(self.pool)
-        server_label = "Server" if server_count == 1 else "Servers"
-        print(f"Time: {current_time} | {server_label}: {server_count}")
         try:
             terminal_width = os.get_terminal_size().columns
         except OSError:
@@ -7932,26 +8185,36 @@ class NVClientPool:
             separator_width = min(80, terminal_width)
         else:
             separator_width = max(20, terminal_width)
-        print("-" * separator_width)
-        
+
         # Get stats
         stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
+
+        node_indices = self._compute_node_indices(raw_stats_by_client)
+        self._node_listed_indices = node_indices
+        server_count = len(node_indices)
+        server_label = "Server" if server_count == 1 else "Servers"
+        for line in self._format_local_strip(terminal_width, raw_stats_by_client):
+            print(line)
+        print(f"Time: {current_time} | {server_label}: {server_count}")
+        print("-" * separator_width)
 
         meta = {}
         if isinstance(raw_stats_by_client, dict):
             meta = raw_stats_by_client.get("_nvidb", {}) or {}
         user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
         global_user_memory = meta.get("user_memory_global", {}) or {}
-        
-        for idx, (client, stats_info) in enumerate(zip(self.pool, stats_list)):
+
+        for position, idx in enumerate(node_indices):
+            client = self.pool[idx]
+            stats_info = stats_list[idx] if idx < len(stats_list) else ""
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-            
+
             # Build summary
             summary = self._get_server_summary(stats, system_info)
-            
+
             # Print header with summary
-            print(f"[{idx + 1}] {client.description}  {summary}")
-            
+            print(f"[{position + 1}] {client.description}  {summary}")
+
             # Print the full stats table
             print(stats_info)
             if isinstance(user_memory_by_client, dict):
