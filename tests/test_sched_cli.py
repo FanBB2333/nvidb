@@ -153,6 +153,63 @@ def test_submit_refuses_limits_that_would_silently_mean_nothing(parser, queue_db
         conn.close()
 
 
+def test_edit_changes_a_pending_jobs_vram_reservation(parser, queue_db, capsys):
+    _submit(
+        parser,
+        queue_db,
+        "--vram",
+        "40G",
+        "--note",
+        "preserve me",
+        "--",
+        "python",
+        "train.py",
+    )
+    capsys.readouterr()
+
+    assert _run(
+        parser,
+        ["job", "edit", "1", "--vram", "39.5G", "--no-tick", "--json"],
+        queue_db,
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["job"]["vram_mb"] == 40448
+    assert payload["job"]["notes"] == "preserve me"
+    assert payload["tick"] == {"skipped": "disabled"}
+
+    conn = dbm.open_db(queue_db)
+    try:
+        assert dbm.get_job(conn, 1).vram_mb == 40448
+        event = next(
+            item
+            for item in dbm.list_events(conn, job_id=1)
+            if item["kind"] == "job_vram"
+        )
+        assert event["data"] == {"before_mb": 40960, "after_mb": 40448}
+    finally:
+        conn.close()
+
+
+def test_edit_rejects_an_invalid_vram_without_changing_the_job(
+    parser, queue_db, capsys
+):
+    _submit(parser, queue_db, "--vram", "4G", "--", "true")
+    capsys.readouterr()
+
+    assert _run(
+        parser,
+        ["job", "edit", "1", "--vram", "many", "--no-tick", "--json"],
+        queue_db,
+    ) == 1
+    assert "Invalid size" in json.loads(capsys.readouterr().out)["error"]
+
+    conn = dbm.open_db(queue_db)
+    try:
+        assert dbm.get_job(conn, 1).vram_mb == 4096
+    finally:
+        conn.close()
+
+
 def test_ignore_hides_a_node_until_it_is_explicitly_requested(
     parser, queue_db, capsys
 ):

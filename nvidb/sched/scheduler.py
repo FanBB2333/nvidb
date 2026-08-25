@@ -840,6 +840,115 @@ class Scheduler:
                 dead.append(dep or Job(id=dep_id, name="", command="", state="missing"))
         return dead
 
+    def edit_job(
+        self,
+        job_id: int,
+        *,
+        vram: Any = None,
+        add: Optional[Sequence[int]] = None,
+        drop: Optional[Sequence[int]] = None,
+        add_any: Optional[Sequence[int]] = None,
+        drop_any: Optional[Sequence[int]] = None,
+    ) -> Job:
+        """Edit a queued job without losing its place or submission metadata.
+
+        The VRAM reservation may only change while the job is pending. The
+        scheduler lease keeps a concurrent tick from launching the job between
+        that state check and the update. Dependency edits retain their existing
+        behaviour: they may also reattach a held job to a replacement upstream.
+        """
+        vram_mb = parse_size_mb(vram) if vram is not None else None
+        with self._operation_lease("job-edit"):
+            with dbm.transaction(self.conn):
+                job = dbm.get_job(self.conn, job_id)
+                if job is None:
+                    raise ValueError(f"Job {job_id} not found")
+                if job.is_terminal:
+                    raise ValueError(
+                        f"Job {job_id} already finished as {job.state}; "
+                        "requeue it before editing its request"
+                    )
+                if vram_mb is not None and job.state != "pending":
+                    raise ValueError(
+                        f"Job {job_id} is {job.state}; only pending jobs can change "
+                        "their VRAM reservation"
+                    )
+
+                wanted = {
+                    "depends_on": (list(job.depends_on), add or [], drop or []),
+                    "depends_any": (
+                        list(job.depends_any),
+                        add_any or [],
+                        drop_any or [],
+                    ),
+                }
+                resolved: Dict[str, List[int]] = {}
+                for column, (current, additions, removals) in wanted.items():
+                    values = list(current)
+                    for dep in (int(x) for x in removals):
+                        while dep in values:
+                            values.remove(dep)
+                    for dep in (int(x) for x in additions):
+                        if dep == job_id:
+                            raise ValueError("A job cannot depend on itself")
+                        if dbm.get_job(self.conn, dep) is None:
+                            raise ValueError(f"Dependency job {dep} does not exist")
+                        if self._would_cycle(job_id, dep):
+                            raise ValueError(
+                                f"Job {dep} already waits on job {job_id}; "
+                                "that dependency would deadlock both"
+                            )
+                        if dep not in values:
+                            values.append(dep)
+                    resolved[column] = values
+
+                updates: Dict[str, Any] = {}
+                dependencies_changed = False
+                for column, values in resolved.items():
+                    if values != getattr(job, column):
+                        updates[column] = values
+                        dependencies_changed = True
+                vram_changed = vram_mb is not None and vram_mb != job.vram_mb
+                if vram_changed:
+                    updates["vram_mb"] = vram_mb
+                if not updates:
+                    return job
+
+                # Whatever the hold was about, the dependency answer changed.
+                # A reservation-only edit must not release a held job.
+                if dependencies_changed and job.held_reason:
+                    updates["held_reason"] = None
+                dbm.update_job(self.conn, job_id, **updates)
+                if dependencies_changed:
+                    dbm.add_event(
+                        self.conn,
+                        "job_dependencies",
+                        job_id=job_id,
+                        message=(
+                            "after="
+                            + (
+                                ",".join(str(i) for i in resolved["depends_on"])
+                                or "-"
+                            )
+                            + " after-any="
+                            + (
+                                ",".join(str(i) for i in resolved["depends_any"])
+                                or "-"
+                            )
+                        ),
+                    )
+                if vram_changed:
+                    dbm.add_event(
+                        self.conn,
+                        "job_vram",
+                        job_id=job_id,
+                        message=(
+                            f"vram {format_mb(job.vram_mb)} -> {format_mb(vram_mb)}"
+                        ),
+                        data={"before_mb": job.vram_mb, "after_mb": vram_mb},
+                    )
+                return dbm.get_job(self.conn, job_id)
+
     def edit_dependencies(
         self,
         job_id: int,
@@ -849,70 +958,14 @@ class Scheduler:
         add_any: Optional[Sequence[int]] = None,
         drop_any: Optional[Sequence[int]] = None,
     ) -> Job:
-        """Rewire what a job waits for, so a dead chain can be reattached.
-
-        Editing is what turns a held job back into a runnable one without
-        resubmitting it, which is the whole point of holding rather than
-        failing: the job, its notes and its queue position all survive.
-        """
-        with dbm.transaction(self.conn):
-            job = dbm.get_job(self.conn, job_id)
-            if job is None:
-                raise ValueError(f"Job {job_id} not found")
-            if job.is_terminal:
-                raise ValueError(
-                    f"Job {job_id} already finished as {job.state}; "
-                    "its dependencies no longer decide anything"
-                )
-
-            wanted = {
-                "depends_on": (list(job.depends_on), add or [], drop or []),
-                "depends_any": (list(job.depends_any), add_any or [], drop_any or []),
-            }
-            resolved: Dict[str, List[int]] = {}
-            for column, (current, additions, removals) in wanted.items():
-                values = list(current)
-                for dep in (int(x) for x in removals):
-                    while dep in values:
-                        values.remove(dep)
-                for dep in (int(x) for x in additions):
-                    if dep == job_id:
-                        raise ValueError("A job cannot depend on itself")
-                    if dbm.get_job(self.conn, dep) is None:
-                        raise ValueError(f"Dependency job {dep} does not exist")
-                    if self._would_cycle(job_id, dep):
-                        raise ValueError(
-                            f"Job {dep} already waits on job {job_id}; "
-                            "that dependency would deadlock both"
-                        )
-                    if dep not in values:
-                        values.append(dep)
-                resolved[column] = values
-
-            updates: Dict[str, Any] = {}
-            for column, values in resolved.items():
-                if values != getattr(job, column):
-                    updates[column] = values
-            if not updates:
-                return job
-
-            # Whatever the hold was about, the answer has changed. The next
-            # dispatch decides afresh instead of inheriting a stale reason.
-            if job.held_reason:
-                updates["held_reason"] = None
-            dbm.update_job(self.conn, job_id, **updates)
-            dbm.add_event(
-                self.conn,
-                "job_dependencies",
-                job_id=job_id,
-                message=(
-                    "after="
-                    + (",".join(str(i) for i in resolved["depends_on"]) or "-")
-                    + " after-any="
-                    + (",".join(str(i) for i in resolved["depends_any"]) or "-")
-                ),
-            )
-            return dbm.get_job(self.conn, job_id)
+        """Rewire what a job waits for, preserving the original API."""
+        return self.edit_job(
+            job_id,
+            add=add,
+            drop=drop,
+            add_any=add_any,
+            drop_any=drop_any,
+        )
 
     def _would_cycle(self, job_id: int, new_dependency: int) -> bool:
         """True when `new_dependency` already waits, directly or not, on `job_id`."""

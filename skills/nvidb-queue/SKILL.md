@@ -299,6 +299,7 @@ measured, so treat it as approximate.
 ```bash
 nvidb job cancel 12          # kill the remote process group
 nvidb job requeue 12         # run a finished job again
+nvidb job edit 12 --vram 19G # change a pending job's reservation in place
 nvidb job note 12 --append "loss plateaued at epoch 30"
 nvidb job priority 12 5      # dispatch earlier (bare number sets, +1/-2 adjust)
 nvidb job priority 12 --up 2 # move a pending job two slots earlier instead
@@ -310,6 +311,14 @@ nvidb queue unignore offline-node # restore it (`nodes --include-ignored` finds 
 Cancelling is destructive and discards work in progress. **Confirm with the user
 before cancelling a job you did not submit** — another session may be waiting on
 it.
+
+Use `job edit --vram` when a pending reservation was estimated incorrectly.
+It preserves the job's queue/lane position, note and submitter, and immediately
+runs a scheduler pass unless `--no-tick` is given. It refuses running jobs
+because their placement is already active. Lower a reservation only with
+evidence that the workload fits; the reservation is not an enforced memory
+limit, so underestimating it can oversubscribe a GPU and cause an out-of-memory
+failure.
 
 Draining and ignoring are different. A drained node is still probed so jobs
 already running there can finish. Ignore an unavailable node only when it has no

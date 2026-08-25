@@ -245,6 +245,28 @@ def test_a_lane_waits_when_foreign_work_fills_its_card(scheduler, cluster):
     assert dbm.get_job(scheduler.conn, job_id).state == "running"
 
 
+def test_a_vram_edit_replaces_the_spec_staged_with_a_lane_runner(
+    scheduler, cluster
+):
+    scheduler.tick(force=True)
+    cluster["small-node"].add_foreign_process(0, 22000)
+    job_id = scheduler.submit("waiting", lane="small-node:0", vram="4G")
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "pending"
+    assert job.run_dir  # the old 4G spec has already been staged remotely
+    runner = cluster.backends["small-node"].runner
+    assert runner.lanes["small-node:0"]["queued"][0]["vram_mb"] == 4096
+
+    scheduler.edit_job(job_id, vram="2G")
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.vram_mb == 2048
+    assert job.state == "running"
+
+
 def test_a_lane_on_an_unreachable_node_just_waits(scheduler, cluster):
     scheduler.tick(force=True)
     job_id = scheduler.submit("x", lane="small-node:0", vram="1G")

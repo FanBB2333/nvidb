@@ -475,6 +475,7 @@ nvidb job ls --active           # only pending and running
 nvidb job show 12 --logs 40     # detail plus the tail of stdout
 nvidb job logs 12 -f            # follow the output
 nvidb job wait 12 13            # block until both finish (0 ok, 1 failed, 2 timed out)
+nvidb job edit 12 --vram 39G    # change a pending job's reservation in place
 nvidb job cancel 12             # kill the remote process group
 nvidb job requeue 12            # run a finished job again
 nvidb job priority 12 5         # set the priority (bare number sets, +1/-2 adjust)
@@ -495,6 +496,11 @@ Useful `submit` options: `--priority N` (higher goes first), `--timeout SECONDS`
 (kill an overrunning job), `--retries N` (restart if the process vanishes),
 `--env KEY=VALUE`, `--tag`, `--note`, and `--wait` to block until the job
 finishes.
+
+`job edit --vram` changes the reservation of a `pending` job without replacing
+its record, so its lane/queue position, note and submitter are preserved. The
+command runs a scheduler pass afterward unless `--no-tick` is given. A running
+job's reservation cannot be changed because its placement is already active.
 
 Read commands refresh the queue themselves before printing, so `nvidb job show`
 never reports stale state. Pass `--no-tick` for a pure database read, or

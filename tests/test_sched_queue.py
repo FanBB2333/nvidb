@@ -851,6 +851,63 @@ def test_editing_dependencies_reattaches_a_held_job(scheduler, cluster):
     assert dbm.get_job(scheduler.conn, second).state == "running"
 
 
+def test_editing_vram_lets_a_pending_job_fit_without_resubmitting(
+    scheduler, cluster
+):
+    # 73,415 total - 32,455 external - 512 headroom = 40,448 MiB free:
+    # just below a 40 GiB reservation, but enough for 39 GiB.
+    cluster["big-node"].add_foreign_process(0, 32455)
+    scheduler.tick(force=True)
+    job_id = scheduler.submit(
+        "python train.py",
+        name="train",
+        vram="40G",
+        notes="keep this queue entry",
+        submitter="test-client",
+    )
+    scheduler.tick(force=True)
+    before = dbm.get_job(scheduler.conn, job_id)
+    assert before.state == "pending"
+
+    edited = scheduler.edit_job(job_id, vram="39G")
+    assert edited.vram_mb == 39936
+    assert edited.notes == "keep this queue entry"
+    assert edited.submitter == "test-client"
+    assert edited.created_at == before.created_at
+
+    events = dbm.list_events(scheduler.conn, job_id=job_id)
+    event = next(item for item in events if item["kind"] == "job_vram")
+    assert event["data"] == {"before_mb": 40960, "after_mb": 39936}
+
+    scheduler.tick(force=True)
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "running"
+    assert job.node == "big-node"
+
+
+def test_a_running_job_cannot_change_its_vram_reservation(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("train", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+
+    with pytest.raises(ValueError, match="only pending jobs"):
+        scheduler.edit_job(job_id, vram="2G")
+    assert dbm.get_job(scheduler.conn, job_id).vram_mb == 1024
+
+
+def test_a_vram_only_edit_does_not_release_a_held_job(scheduler, cluster):
+    scheduler.tick(force=True)
+    upstream = scheduler.submit("upstream", vram="1G", node="small-node")
+    held = scheduler.submit("held", vram="1G", depends_on=[upstream])
+    scheduler.tick(force=True)
+    scheduler.cancel(upstream)
+    scheduler.tick(force=True)
+    reason = dbm.get_job(scheduler.conn, held).held_reason
+
+    scheduler.edit_job(held, vram="2G")
+    assert dbm.get_job(scheduler.conn, held).held_reason == reason
+
+
 def test_a_dependency_edit_refuses_to_build_a_cycle(scheduler):
     first = scheduler.submit("a")
     second = scheduler.submit("b", depends_on=[first])

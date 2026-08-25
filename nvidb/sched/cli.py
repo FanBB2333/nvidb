@@ -1435,7 +1435,7 @@ def cmd_release(args) -> int:
 
 
 def cmd_edit(args) -> int:
-    """Rewire a job's dependencies without resubmitting it."""
+    """Change a queued job's reservation or dependencies in place."""
     scheduler = _open(args)
     try:
         changes = {
@@ -1444,15 +1444,15 @@ def cmd_edit(args) -> int:
             "add_any": _resolve_ids(scheduler, args.add_after_any or []),
             "drop_any": _resolve_ids(scheduler, args.drop_after_any or []),
         }
-        if not any(changes.values()):
+        if args.vram is None and not any(changes.values()):
             return _error(
-                "nothing to change (pass --add-after, --drop-after, "
+                "nothing to change (pass --vram, --add-after, --drop-after, "
                 "--add-after-any or --drop-after-any)",
                 as_json=args.json,
             )
         try:
-            job = scheduler.edit_dependencies(args.id, **changes)
-        except ValueError as error:
+            job = scheduler.edit_job(args.id, vram=args.vram, **changes)
+        except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
         summary = _maybe_tick(scheduler, args, force=True)
         job = dbm.get_job(scheduler.conn, args.id) or job
@@ -1461,7 +1461,10 @@ def cmd_edit(args) -> int:
         else:
             after = ",".join(str(i) for i in job.depends_on) or "-"
             after_any = ",".join(str(i) for i in job.depends_any) or "-"
-            print(f"job {job.id} ({job.display_state}): after={after} after-any={after_any}")
+            print(
+                f"job {job.id} ({job.display_state}): "
+                f"vram={format_mb(job.vram_mb)} after={after} after-any={after_any}"
+            )
             if job.held_reason:
                 print(f"  still held: {job.held_reason}")
         return 0
@@ -2077,14 +2080,15 @@ def register_parsers(subparsers) -> None:
 
     edit = job_sub.add_parser(
         "edit",
-        help="Change what a job waits for",
+        help="Change a queued job's request",
         description=(
-            "Repoint a queued job at different prerequisites, which is how a "
-            "held job is reattached to a re-run of the chain it was waiting on."
+            "Change a queued job's VRAM reservation or repoint it at different "
+            "prerequisites without losing its queue position or metadata."
         ),
     )
     _add_common(edit)
     edit.add_argument("id", type=int)
+    edit.add_argument("--vram", default=None, help="New VRAM reservation, e.g. 39G")
     edit.add_argument("--add-after", action="append", default=[], metavar="ID",
                       help="Also wait for this job to complete successfully")
     edit.add_argument("--drop-after", action="append", default=[], metavar="ID",
