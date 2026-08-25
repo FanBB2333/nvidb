@@ -200,7 +200,10 @@ def _mouse_at(output, text, *, button=0, occurrence=0):
 
 def test_the_screen_shows_nodes_capacity_and_jobs():
     output = _render(_tui())
+    assert "SERVERS (2)" in output
+    assert "▾ [1]" in output and "▾ [2]" in output
     assert "big-node" in output and "small-node" in output
+    assert output.index("big-node") < output.index("small-node")
     # The GPU model lives on the node header now, once per node.
     assert "1× RTX PRO 5000" in output
     # The grid cell shows used/total VRAM and the running job's id.
@@ -602,6 +605,95 @@ def test_clicking_any_line_in_a_node_card_selects_that_node():
     assert tui.handle_mouse(_mouse_at(output, "RTX 3090 Ti")) is True
     assert tui.focus == "nodes"
     assert tui.selected_node()["name"] == "small-node"
+    # A server scope shows only work that is actually running there; a pending
+    # job constrained to the server has not landed on it yet.
+    assert [job["id"] for job in tui.jobs] == [1]
+
+
+def test_server_and_gpu_clicks_drill_down_the_running_job_list():
+    snapshot = _snapshot(
+        jobs=[
+            _job(1, node="small-node", gpu_ids=[0], elapsed_s=400),
+            _job(2, node="small-node", gpu_ids=[1], elapsed_s=300),
+            _job(3, node="small-node", gpu_ids=[0, 1], elapsed_s=200),
+            _job(4, node="big-node", gpu_ids=[0], elapsed_s=500),
+            _job(
+                5,
+                state="pending",
+                node="small-node",
+                gpu_ids=[1],
+                started_at=None,
+                elapsed_s=None,
+            ),
+        ]
+    )
+    snapshot["nodes"][1]["gpus"] = [_gpu(0), _gpu(1)]
+    state = _state(snapshot)
+    tui = _tui()
+    output = _render(tui, state)
+
+    assert tui.handle_mouse(_mouse_at(output, "small-node")) is True
+    assert tui.job_scope_node == "small-node"
+    assert tui.job_scope_gpu is None
+    assert [job["id"] for job in tui.jobs] == [1, 2, 3]
+
+    output = _render(tui, state)
+    lines = output.splitlines()
+    gpu_row = next(
+        row
+        for row, line in enumerate(lines)
+        if "▾ [2]" in line and "G1 " in line
+    )
+    gpu_line = lines[gpu_row]
+    gpu_start = gpu_line.index("G1 ")
+    # Click the memory reading near the far end of the cell, not merely its
+    # label, to verify that the whole rendered GPU card is a hit target.
+    memory_column = gpu_line.index("0M/24.0G", gpu_start)
+    assert tui.handle_mouse(
+        MouseEvent(
+            button=0,
+            column=memory_column + 1,
+            row=gpu_row + 1,
+            pressed=True,
+        )
+    ) is True
+    assert tui.job_scope_node == "small-node"
+    assert tui.job_scope_gpu == 1
+    assert [job["id"] for job in tui.jobs] == [2, 3]
+
+    output = _render(tui, state)
+    assert "JOBS (2) · running on small-node/GPU1" in output
+    assert tui.handle_mouse(_mouse_at(output, "[all jobs]")) is True
+    assert tui.job_scope_node is None and tui.job_scope_gpu is None
+    assert [job["id"] for job in tui.jobs] == [4, 1, 2, 3, 5]
+
+
+def test_gpu_click_regions_follow_the_stacked_narrow_layout():
+    snapshot = _snapshot(
+        jobs=[_job(7, node="small-node", gpu_ids=[10], elapsed_s=60)]
+    )
+    small = snapshot["nodes"][1]
+    small["gpus"] = [_gpu(0), _gpu(1), _gpu(10)]
+    snapshot["nodes"] = [small]
+    tui = _tui(width=80)
+    output = _render(tui, _state(snapshot))
+    lines = output.splitlines()
+    gpu_row = next(
+        row for row, line in enumerate(lines) if line.startswith("    G10")
+    )
+    memory_column = lines[gpu_row].index("0M/24.0G")
+
+    assert tui.handle_mouse(
+        MouseEvent(
+            button=0,
+            column=memory_column + 1,
+            row=gpu_row + 1,
+            pressed=True,
+        )
+    ) is True
+    assert tui.job_scope_node == "small-node"
+    assert tui.job_scope_gpu == 10
+    assert [job["id"] for job in tui.jobs] == [7]
 
 
 def test_wheel_routes_to_the_pane_under_the_pointer():
@@ -612,7 +704,7 @@ def test_wheel_routes_to_the_pane_under_the_pointer():
     assert tui.focus == "jobs"
     assert tui.selected_job()["id"] == 2
 
-    assert tui.handle_mouse(_mouse_at(output, "NODES", button=65)) is True
+    assert tui.handle_mouse(_mouse_at(output, "SERVERS", button=65)) is True
     assert tui.focus == "nodes"
     assert tui.selected_node()["name"] == "small-node"
 
@@ -693,7 +785,7 @@ def test_help_and_quit_buttons_are_clickable():
     assert tui.handle_mouse(_mouse_at(output, "[? help]")) is True
     assert tui.show_help is True
     help_output = _render(tui)
-    assert tui.handle_mouse(_mouse_at(help_output, "Mouse click")) is True
+    assert tui.handle_mouse(_mouse_at(help_output, "Mouse server")) is True
     assert tui.show_help is False
 
     output = _render(tui)
@@ -779,18 +871,25 @@ def test_the_log_view_asks_the_worker_for_the_selected_job():
 
 # --- sorting, priority and reordering --------------------------------------
 
-def test_the_default_sort_is_dispatch_order():
+def test_the_default_sort_is_runtime_from_longest_to_shortest():
     tui = _tui()
     snapshot = _snapshot(
         jobs=[
-            _job(1, state="pending", name="low", priority=0),
-            _job(2, state="pending", name="high", priority=5),
-            _job(3, state="running", name="busy"),
+            _job(1, name="short", elapsed_s=15),
+            _job(2, name="long", elapsed_s=900),
+            _job(
+                3,
+                state="pending",
+                name="waiting",
+                started_at=None,
+                elapsed_s=None,
+            ),
+            _job(4, name="middle", elapsed_s=120),
         ]
     )
     _render(tui, _state(snapshot))
-    # Running first, then pending exactly as the scheduler would dispatch.
-    assert [job["id"] for job in tui.jobs] == [3, 2, 1]
+    assert tui.sort_key == "time" and tui.sort_reverse is False
+    assert [job["id"] for job in tui.jobs] == [2, 4, 1, 3]
 
 
 def test_the_job_table_shows_priority_and_compact_states():
@@ -806,9 +905,9 @@ def test_the_job_table_shows_priority_and_compact_states():
 def test_s_cycles_the_sort_and_S_flips_it():
     tui = _tui()
     _render(tui)
-    assert tui.sort_key == "queue" and tui.sort_reverse is False
+    assert tui.sort_key == "time" and tui.sort_reverse is False
     _press(tui, "s")
-    assert tui.sort_key == "id"
+    assert tui.sort_key == "queue"
     _press(tui, "S")
     assert tui.sort_reverse is True
     _render(tui)
@@ -830,12 +929,13 @@ def test_clicking_a_column_header_sorts_then_flips():
 def test_clicking_the_sort_label_cycles_the_sort():
     tui = _tui()
     output = _render(tui)
-    assert tui.handle_mouse(_mouse_at(output, "sort queue▼")) is True
-    assert tui.sort_key == "id"
+    assert tui.handle_mouse(_mouse_at(output, "sort time▼")) is True
+    assert tui.sort_key == "queue"
 
 
 def test_the_selection_follows_a_job_when_the_order_changes():
     tui = _tui()
+    tui.sort_key = "queue"
     snapshot = _snapshot(
         jobs=[
             _job(1, state="pending", name="a", priority=0),
@@ -893,6 +993,7 @@ def test_move_keys_reorder_only_pending_jobs():
 def test_moving_a_job_snaps_the_table_back_to_queue_order():
     tui = _tui()
     _render(tui)
+    _press(tui, "s")
     _press(tui, "s")  # sort by id instead
     _press(tui, "j")  # select the pending job
     _press(tui, "K")

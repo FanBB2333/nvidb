@@ -108,10 +108,21 @@ def display_state(job: Dict[str, Any]) -> str:
     return "held" if job.get("held") else job["state"]
 
 
-# "queue" is the order the scheduler will actually dispatch in - running
-# first, then pending by (priority DESC, id ASC) - which is what makes the
-# reorder keys make visual sense.
-SORT_KEYS = ("queue", "id", "state", "pri", "name", "node", "vram", "used", "time")
+# Runtime is the opening view: the TIME column reads naturally from the
+# longest-running job at the top to the shortest at the bottom.  Queue order
+# remains one keypress away and is restored automatically before a pending job
+# is moved, because that is the order in which K/J make sense.
+SORT_KEYS = (
+    "time",
+    "queue",
+    "id",
+    "state",
+    "pri",
+    "name",
+    "node",
+    "vram",
+    "used",
+)
 
 # (title, width, sort key or None when the column is not worth sorting by).
 JOB_COLUMNS = (
@@ -349,8 +360,14 @@ class QueueTUI:
         self.job_index = 0
         self.node_index = 0
         self.filter = "active"
-        self.sort_key = "queue"
+        self.sort_key = "time"
         self.sort_reverse = False
+        # A node/GPU click scopes the lower table to work that is running on
+        # that resource.  Keep this separate from node_index: the latter is a
+        # keyboard cursor and must not silently hide jobs just because focus
+        # moved into the server pane.
+        self.job_scope_node: Optional[str] = None
+        self.job_scope_gpu: Optional[int] = None
         # The cursor follows a job, not a row number: a refresh or a priority
         # change may reorder the table under the selection.
         self._selected_job_id: Optional[int] = None
@@ -377,6 +394,11 @@ class QueueTUI:
         self._header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
         self._alert_targets: Dict[int, Tuple[str, Any]] = {}
         self._node_line_targets: Dict[int, int] = {}
+        # (row offset within the server pane, start col, end col, target).
+        # Regions take precedence over the containing server card, allowing a
+        # click on a GPU cell to drill down one level further.
+        self._node_gpu_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
+        self._node_header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
         self._job_line_targets: Dict[int, int] = {}
         # (row offset within the job pane, start col, end col, target).
         self._job_header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
@@ -385,11 +407,22 @@ class QueueTUI:
     # --- data -------------------------------------------------------------
 
     def _visible_jobs(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if self.filter == "all":
-            jobs = list(snapshot["jobs"]) + list(snapshot["recent"])
+        pool = list(snapshot["jobs"]) + list(snapshot["recent"])
+        if self.job_scope_node is not None:
+            jobs = [
+                job
+                for job in pool
+                if job.get("state") == "running"
+                and job.get("node") == self.job_scope_node
+                and (
+                    self.job_scope_gpu is None
+                    or self.job_scope_gpu in (job.get("gpu_ids") or [])
+                )
+            ]
+        elif self.filter == "all":
+            jobs = pool
         else:
             wanted = FILTER_STATES[self.filter]
-            pool = list(snapshot["jobs"]) + list(snapshot["recent"])
             jobs = [job for job in pool if job["state"] in wanted]
         self._sort_jobs(jobs)
         return jobs
@@ -402,6 +435,13 @@ class QueueTUI:
             rank = {"running": 0, "pending": 1}.get(job["state"], 2)
             pri = -(job.get("priority") or 0) if job["state"] == "pending" else 0
             return (rank, pri, job["id"])
+
+        def time_key(job):
+            elapsed = job.get("elapsed_s")
+            # Jobs without a runtime (normally pending jobs) follow every
+            # measured job.  Durations then descend, matching the TIME column's
+            # opening arrow and keeping the longest-running work at the top.
+            return (elapsed is None, -(elapsed or 0.0), job["id"])
 
         key_funcs = {
             "queue": queue_key,
@@ -416,7 +456,7 @@ class QueueTUI:
             # Sizes and durations start biggest-first; S flips them.
             "vram": lambda job: (-(job.get("vram_mb") or 0), job["id"]),
             "used": lambda job: (-(job.get("gpu_mem_mb") or 0), job["id"]),
-            "time": lambda job: (-(job.get("elapsed_s") or 0.0), job["id"]),
+            "time": time_key,
         }
         jobs.sort(key=key_funcs.get(self.sort_key, queue_key))
         if self.sort_reverse:
@@ -426,6 +466,7 @@ class QueueTUI:
         """Put the cursor back on the job it was on before rows moved."""
         if not self.jobs:
             self.job_index = 0
+            self._selected_job_id = None
             return
         if self._selected_job_id is not None:
             for position, job in enumerate(self.jobs):
@@ -454,6 +495,70 @@ class QueueTUI:
             return None
         self.node_index = max(0, min(self.node_index, len(self.nodes) - 1))
         return self.nodes[self.node_index]
+
+    def _reanchor_node_scope(self) -> None:
+        """Keep a resource scope attached to its node across live refreshes."""
+        if not self.nodes:
+            self.node_index = 0
+            self.job_scope_node = None
+            self.job_scope_gpu = None
+            return
+        if self.job_scope_node is not None:
+            for position, node in enumerate(self.nodes):
+                if node.get("name") == self.job_scope_node:
+                    self.node_index = position
+                    gpu_ids = {
+                        gpu.get("index") for gpu in (node.get("gpus") or [])
+                    }
+                    if (
+                        self.job_scope_gpu is not None
+                        and self.job_scope_gpu not in gpu_ids
+                    ):
+                        self.job_scope_gpu = None
+                    return
+            self.job_scope_node = None
+            self.job_scope_gpu = None
+        self.node_index = max(0, min(self.node_index, len(self.nodes) - 1))
+
+    def _scope_label(self) -> Optional[str]:
+        if self.job_scope_node is None:
+            return None
+        if self.job_scope_gpu is None:
+            return self.job_scope_node
+        return f"{self.job_scope_node}/GPU{self.job_scope_gpu}"
+
+    def _reset_job_selection_for_view(self) -> None:
+        self.job_index = 0
+        self._selected_job_id = None
+        self.detail_page = 0
+        self.log_offset = 0
+        self.pending_confirm = None
+        if self._snapshot is not None:
+            self.jobs = self._visible_jobs(self._snapshot)
+            self._reanchor_selection()
+        if self.show_log:
+            job = self.selected_job()
+            self._request_log((job["id"], "stdout") if job is not None else None)
+
+    def _set_job_scope(self, node_name: str, gpu_index: Optional[int] = None) -> None:
+        node_name = str(node_name)
+        gpu_index = None if gpu_index is None else int(gpu_index)
+        if (
+            node_name == self.job_scope_node
+            and gpu_index == self.job_scope_gpu
+        ):
+            return
+        self.job_scope_node = node_name
+        self.job_scope_gpu = gpu_index
+        self._reset_job_selection_for_view()
+
+    def _clear_job_scope(self) -> bool:
+        if self.job_scope_node is None and self.job_scope_gpu is None:
+            return False
+        self.job_scope_node = None
+        self.job_scope_gpu = None
+        self._reset_job_selection_for_view()
+        return True
 
     # --- rendering --------------------------------------------------------
 
@@ -613,8 +718,10 @@ class QueueTUI:
             keeper_text = f"keeper {'up' if keeper.get('running') else 'DOWN'} · "
         # A coloured wordmark, tokscale-style, instead of a reverse-video block.
         title = " nvidb queue "
+        scope = self._scope_label()
+        job_view = f"running on {scope}" if scope else f"filter {self.filter}"
         meta = (
-            f"tick {tick_text} · {keeper_text}{mode} · {status} · filter {self.filter} "
+            f"tick {tick_text} · {keeper_text}{mode} · {status} · {job_view} "
             f"· procs {self.proc_view} "
         )
         gap = max(1, width - len(title) - len(meta))
@@ -691,17 +798,59 @@ class QueueTUI:
 
     def _node_lines(self, width: int) -> List[str]:
         self._node_line_targets = {}
-        lines = [self._style("─ NODES " + "─" * max(0, width - 8), "bright_black")]
+        self._node_gpu_regions = []
+        self._node_header_regions = []
+        title = f"─ SERVERS ({len(self.nodes)}) "
+        scope = self._scope_label()
+        if scope:
+            scope_text = f"running on {scope} "
+            clear_text = "[all jobs]"
+            clear_start = display_width(title) + display_width(scope_text)
+            self._node_header_regions.append(
+                (
+                    0,
+                    clear_start,
+                    clear_start + display_width(clear_text) - 1,
+                    ("scope_all", None),
+                )
+            )
+            heading = title + scope_text + clear_text + " "
+        else:
+            heading = title
+        lines = [
+            self._compose(
+                [
+                    (heading, "cyan" if scope else "bright_black"),
+                    ("─" * max(0, width - display_width(heading)), "bright_black"),
+                ],
+                width,
+            )
+        ]
+        index_width = len(str(max(1, len(self.nodes))))
         for position, node in enumerate(self.nodes):
             if position:
                 # Node rows are single lines now, so a thin rule is what keeps
                 # neighbouring nodes from reading as one list.
                 lines.append(self._style("┄" * width, "bright_black"))
             node_start = len(lines)
-            selected = self.focus == "nodes" and position == self.node_index
-            lines.extend(self._node_block(node, width, selected))
+            selected = node.get("name") == self.job_scope_node or (
+                self.job_scope_node is None
+                and self.focus == "nodes"
+                and position == self.node_index
+            )
+            block = self._node_block(
+                node,
+                width,
+                selected,
+                position=position,
+                index_width=index_width,
+            )
+            lines.extend(block)
             for line_index in range(node_start, len(lines)):
                 self._node_line_targets[line_index] = position
+            self._node_gpu_regions.extend(
+                self._gpu_click_regions(node, block, node_start, position, width)
+            )
         return lines
 
     @staticmethod
@@ -734,7 +883,15 @@ class QueueTUI:
             [*head, (" " * gap, None), *tail], width, highlight=highlight
         )
 
-    def _node_block(self, node: Dict[str, Any], width: int, selected: bool) -> List[str]:
+    def _node_block(
+        self,
+        node: Dict[str, Any],
+        width: int,
+        selected: bool,
+        *,
+        position: int = 0,
+        index_width: int = 1,
+    ) -> List[str]:
         state = node["state"]
         # An up node is the normal case and stays quiet; only trouble
         # (down, drain) earns colour.
@@ -757,8 +914,10 @@ class QueueTUI:
             else ""
         )
         marker = "❯" if selected else " "
+        expand_icon = "▾" if node.get("gpus") else "▸"
         head = [
             (f"{marker} ", "cyan"),
+            (f"{expand_icon} [{position + 1:{index_width}d}] ", "bright_black"),
             (f"{dot} ", dot_style),
             (node["name"], "bold"),
             (model_text, "bright_black"),
@@ -784,14 +943,32 @@ class QueueTUI:
             # The full drill-down: one line per GPU, one per process.
             block = [self._node_header_line(head, tail, width, highlight=selected)]
             for gpu in node["gpus"]:
-                block.append(self._compose(self._gpu_segments(gpu, width), width))
+                block.append(
+                    self._compose(
+                        self._gpu_segments(
+                            gpu,
+                            width,
+                            selected=(
+                                node.get("name") == self.job_scope_node
+                                and gpu.get("index") == self.job_scope_gpu
+                            ),
+                        ),
+                        width,
+                    )
+                )
                 block.extend(self._gpu_process_lines(gpu, width))
             return block
 
         running = self._running_job_ids_by_gpu(node)
         cells = [
             self._gpu_cell_segments(
-                gpu, running.get(gpu["index"], []), fixed_width=False
+                gpu,
+                running.get(gpu["index"], []),
+                fixed_width=False,
+                selected=(
+                    node.get("name") == self.job_scope_node
+                    and gpu.get("index") == self.job_scope_gpu
+                ),
             )
             for gpu in node.get("gpus") or []
         ]
@@ -821,6 +998,69 @@ class QueueTUI:
             block.append(self._compose([("    ", None), *ext], width))
         return block
 
+    def _gpu_click_regions(
+        self,
+        node: Dict[str, Any],
+        block: List[str],
+        row_offset: int,
+        node_position: int,
+        width: int,
+    ) -> List[Tuple[int, int, int, Tuple[str, Any]]]:
+        """Locate each rendered GPU cell in terminal display coordinates.
+
+        A node may fit inline, fall back to a fixed grid, or use the full
+        per-process row.  Deriving hit boxes from the finished lines keeps the
+        mouse map aligned with all three layouts, including wide node names.
+        """
+        regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
+        running = self._running_job_ids_by_gpu(node)
+        for gpu in node.get("gpus") or []:
+            gpu_index = int(gpu["index"])
+            label = f"GPU{gpu_index}" if self.proc_view == "all" else f"G{gpu_index}"
+            for relative_row, line in enumerate(block):
+                plain = self.term.strip_seqs(line)
+                if self.proc_view == "all":
+                    prefix = f"    {label} "
+                    character_start = 4 if plain.startswith(prefix) else -1
+                else:
+                    character_start = plain.find(label)
+                    while character_start >= 0:
+                        after = character_start + len(label)
+                        index_width = max(3, len(label))
+                        bar_start = character_start + index_width
+                        if (
+                            (after >= len(plain) or not plain[after].isdigit())
+                            and bar_start < len(plain)
+                            and plain[bar_start] in "━─"
+                        ):
+                            break
+                        character_start = plain.find(label, after)
+                if character_start < 0:
+                    continue
+                start = display_width(plain[:character_start])
+                if self.proc_view == "all":
+                    cell_width = max(1, display_width(plain) - start)
+                else:
+                    cell_width = self._segments_width(
+                        self._gpu_cell_segments(
+                            gpu,
+                            running.get(gpu_index, []),
+                            fixed_width=relative_row != 0,
+                            selected=False,
+                        )
+                    )
+                end = min(width - 1, start + max(1, cell_width) - 1)
+                regions.append(
+                    (
+                        row_offset + relative_row,
+                        start,
+                        end,
+                        ("gpu", (node_position, gpu_index)),
+                    )
+                )
+                break
+        return regions
+
     # Plain columns one grid cell occupies: "G0 " + 10-column bar + " " +
     # 6-column used + "/" + 6-column total + " " + 5-column job ids.
     _GPU_CELL_WIDTH = 3 + 10 + 1 + 6 + 1 + 6 + 1 + 5
@@ -843,6 +1083,7 @@ class QueueTUI:
         running_ids: List[int],
         *,
         fixed_width: bool = True,
+        selected: bool = False,
     ) -> List[Tuple[str, Optional[str]]]:
         """One GPU as a grid cell: index, bar, used/total, jobs.
 
@@ -874,7 +1115,7 @@ class QueueTUI:
                 ids_text = f"#{running_ids[0]}+{len(running_ids) - 1}"
         index_label = f"G{gpu['index']}"
         segments: List[Tuple[str, Optional[str]]] = [
-            (f"{index_label:<3}", "bright_black"),
+            (f"{index_label:<3}", "cyan" if selected else "bright_black"),
         ]
         segments.extend(
             smooth_bar(
@@ -920,7 +1161,14 @@ class QueueTUI:
                 if offset:
                     segments.append((" " * self._GPU_CELL_GAP, None))
                 segments.extend(
-                    self._gpu_cell_segments(gpu, running.get(gpu["index"], []))
+                    self._gpu_cell_segments(
+                        gpu,
+                        running.get(gpu["index"], []),
+                        selected=(
+                            node.get("name") == self.job_scope_node
+                            and gpu.get("index") == self.job_scope_gpu
+                        ),
+                    )
                 )
             lines.append(self._compose(segments, width))
         return lines
@@ -965,7 +1213,7 @@ class QueueTUI:
         return segments
 
     def _gpu_segments(
-        self, gpu: Dict[str, Any], width: int
+        self, gpu: Dict[str, Any], width: int, *, selected: bool = False
     ) -> List[Tuple[str, Optional[str]]]:
         """One GPU as a btop-style line: temp, util, and a memory bar whose
         segments say *whose* memory it is - foreign processes (yellow), this
@@ -1003,7 +1251,7 @@ class QueueTUI:
         )
         name_width = 20 if width >= 100 else 14
         segments: List[Tuple[str, Optional[str]]] = [
-            (f"    GPU{gpu['index']} ", "bright_black"),
+            (f"    GPU{gpu['index']} ", "cyan" if selected else "bright_black"),
             (pad_display(fit_display(gpu["name"] or "-", name_width), name_width + 1), None),
             (temp_text + " ", temp_style),
             (util_text + " ", util_style),
@@ -1129,7 +1377,9 @@ class QueueTUI:
         self._job_line_targets = {}
         self._job_header_regions = []
         order = "▲" if self.sort_reverse else "▼"
-        title = f"─ JOBS ({len(self.jobs)}) ── "
+        scope = self._scope_label()
+        scope_text = f" · running on {scope}" if scope else ""
+        title = f"─ JOBS ({len(self.jobs)}){scope_text} ── "
         sort_label = f"sort {self.sort_key}{order}"
         self._job_header_regions.append(
             (
@@ -1178,7 +1428,12 @@ class QueueTUI:
         lines.append(self._compose(header_segments, width))
 
         if not self.jobs:
-            lines.append(self._style("  (no jobs match this filter)", "bright_black"))
+            empty = (
+                f"  (no running jobs on {scope})"
+                if scope
+                else "  (no jobs match this filter)"
+            )
+            lines.append(self._style(empty, "bright_black"))
             return lines
 
         # Reserve a row for the hidden-count indicator when the table cannot
@@ -1497,6 +1752,8 @@ class QueueTUI:
                     "green" if not node["enabled"] else "yellow",
                 )
             )
+        if self.job_scope_node is not None:
+            controls.append(("x all jobs", "scope_all", None, "cyan"))
 
         controls.extend(
             [
@@ -1563,7 +1820,7 @@ class QueueTUI:
             ("j / k / ↑ / ↓", "Move the selection in the focused pane"),
             ("PgUp / PgDn", "Move a page at a time"),
             ("Tab", "Switch focus between the node and job panes"),
-            ("Enter", "Show or hide the selected job's detail pane"),
+            ("Enter", "Scope to a server, or show/hide job detail"),
             ("[ / ]", "Page through wrapped detail or log text"),
             ("L", "Toggle the log tail for the selected job"),
             ("c", "Cancel the selected job (press twice)"),
@@ -1574,14 +1831,20 @@ class QueueTUI:
             ("t", "Force a scheduler tick now"),
             ("a", "Toggle automatic ticking"),
             ("f", "Cycle the job filter"),
+            ("x / Esc", "Clear a server or GPU job scope"),
             ("p", "GPU detail: compact / full per-process view / bars only"),
-        ("T", "Switch colour theme (classic / muted)"),
+            ("T", "Switch colour theme (classic / muted)"),
             ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
-            ("Mouse click", "Select rows, activate [buttons], sort by a column header"),
+            ("Mouse server", "Show only jobs running on that server"),
+            ("Mouse GPU", "Show only jobs running on that GPU"),
+            ("Mouse job", "Select a job; click it again to toggle detail"),
             ("Mouse wheel", "Move in nodes/jobs; page detail or log text"),
             ("GPU bar", "amber: others' memory · teal: queue reservations · dim: free"),
-        ("GPU cell", "used/total VRAM · #id: running jobs · ~: split inferred (blind)"),
+            (
+                "GPU cell",
+                "used/total VRAM · #id: running jobs · ~: split inferred (blind)",
+            ),
             ("q", "Quit"),
         ]
         lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
@@ -1608,6 +1871,7 @@ class QueueTUI:
             return [f"  {message}"]
 
         self.nodes = snapshot["nodes"]
+        self._reanchor_node_scope()
         self.jobs = self._visible_jobs(snapshot)
         self._reanchor_selection()
         self._sync_detail_selection()
@@ -1664,6 +1928,26 @@ class QueueTUI:
                         self._row_targets[node_start + relative_row] = (
                             "node",
                             position,
+                        )
+                for relative_row, start, end, target in self._node_gpu_regions:
+                    if relative_row < len(node_lines) and start < width:
+                        self._click_regions.append(
+                            (
+                                node_start + relative_row,
+                                start,
+                                min(end, width - 1),
+                                target,
+                            )
+                        )
+                for relative_row, start, end, target in self._node_header_regions:
+                    if relative_row < len(node_lines) and start < width:
+                        self._click_regions.append(
+                            (
+                                node_start + relative_row,
+                                start,
+                                min(end, width - 1),
+                                target,
+                            )
                         )
             footer = self._footer_lines(state, width)
             body_height = usable - len(footer)
@@ -1766,7 +2050,20 @@ class QueueTUI:
     def _move(self, delta: int) -> None:
         if self.focus == "nodes":
             if self.nodes:
-                self.node_index = max(0, min(self.node_index + delta, len(self.nodes) - 1))
+                previous = self.node_index
+                self.node_index = max(
+                    0,
+                    min(self.node_index + delta, len(self.nodes) - 1),
+                )
+                # Once a resource scope is active, keyboard/wheel navigation
+                # carries it to the newly selected server.  Before that, the
+                # node cursor remains harmless until Enter or a click applies
+                # a scope.
+                if (
+                    self.node_index != previous
+                    and self.job_scope_node is not None
+                ):
+                    self._set_job_scope(self.nodes[self.node_index]["name"])
         elif self.jobs:
             previous = self.job_index
             self._set_job_index(self.job_index + delta)
@@ -1844,6 +2141,20 @@ class QueueTUI:
             return
         self.focus = "nodes"
         self.node_index = position
+        self._set_job_scope(self.nodes[position]["name"])
+
+    def _select_gpu(self, position: int, gpu_index: int) -> None:
+        if not (0 <= position < len(self.nodes)):
+            return
+        node = self.nodes[position]
+        if not any(
+            int(gpu.get("index")) == int(gpu_index)
+            for gpu in (node.get("gpus") or [])
+        ):
+            return
+        self.focus = "nodes"
+        self.node_index = position
+        self._set_job_scope(node["name"], int(gpu_index))
 
     def _select_job_id(self, job_id: int, *, show_log: bool = False) -> bool:
         snapshot = self._snapshot or {}
@@ -1851,6 +2162,8 @@ class QueueTUI:
         if not any(job.get("id") == job_id for job in pool):
             self.worker.set_notice(f"job {job_id} is no longer in the snapshot", "yellow")
             return False
+        self.job_scope_node = None
+        self.job_scope_gpu = None
         self.filter = "all"
         self.jobs = self._visible_jobs(snapshot)
         for position, job in enumerate(self.jobs):
@@ -1902,6 +2215,8 @@ class QueueTUI:
         elif action == "log":
             self._toggle_log()
         elif action == "filter":
+            self.job_scope_node = None
+            self.job_scope_gpu = None
             if value in FILTERS:
                 self.filter = value
             else:
@@ -1998,6 +2313,8 @@ class QueueTUI:
             self._select_job_id(int(value), show_log=True)
         elif action == "node_name" and value is not None:
             self._select_node_name(str(value))
+        elif action == "scope_all":
+            self._clear_job_scope()
         elif action == "pane" and value in ("jobs", "nodes"):
             self.focus = value
         return True
@@ -2024,7 +2341,7 @@ class QueueTUI:
         if event.is_wheel_up or event.is_wheel_down:
             delta = -1 if event.is_wheel_up else 1
             kind, value = target if target is not None else (None, None)
-            if kind == "node" or (kind == "pane" and value == "nodes"):
+            if kind in ("node", "gpu") or (kind == "pane" and value == "nodes"):
                 self.focus = "nodes"
                 self._move(delta)
             elif kind in ("job", "sort") or (kind == "pane" and value == "jobs"):
@@ -2043,6 +2360,10 @@ class QueueTUI:
         if kind == "node":
             self._select_node_position(int(value))
             return True
+        if kind == "gpu":
+            position, gpu_index = value
+            self._select_gpu(int(position), int(gpu_index))
+            return True
         return self._activate(kind, value)
 
     def handle_key(self, key) -> bool:
@@ -2056,6 +2377,8 @@ class QueueTUI:
             return True
 
         if name == "KEY_ESCAPE":
+            if self._clear_job_scope():
+                return True
             self.pending_confirm = None
             return True
         if text == "q":
@@ -2079,7 +2402,10 @@ class QueueTUI:
         elif name == "KEY_TAB":
             self._activate("switch_pane")
         elif name in ("KEY_ENTER", "KEY_RETURN") or text in ("\n", "\r"):
-            self._activate("detail")
+            if self.focus == "nodes":
+                self._select_node_position(self.node_index)
+            else:
+                self._activate("detail")
         elif text == "[" and self.show_detail:
             self._scroll_detail(-1, page=True)
         elif text == "]" and self.show_detail:
@@ -2119,6 +2445,8 @@ class QueueTUI:
             self._activate("node_toggle")
         elif text == "A":
             self._activate("ack")
+        elif text == "x":
+            self._activate("scope_all")
         return True
 
     # --- main loop --------------------------------------------------------

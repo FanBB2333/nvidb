@@ -644,16 +644,19 @@ ln -s "$PWD/skills/nvidb-queue" ~/.codex/skills/nvidb-queue
 nvidb queue                 # or: nvidb queue tui
 ```
 
-The screen stacks node capacity, the job table, and a detail or log pane for the
-selected job. All SSH work happens on a worker thread, so an unreachable node
-slows the numbers down but never freezes the interface.
+The screen stacks server capacity, the job table, and a detail or log pane for
+the selected job. The server pane follows the active configuration order (the
+same list as the monitor TUI unless `queue.yml` deliberately overrides
+`servers`); database rows for removed servers do not linger in the normal view.
+All SSH work happens on a worker thread, so an unreachable node slows the
+numbers down but never freezes the interface.
 
 | Key                | Action                                        |
 | ------------------ | --------------------------------------------- |
 | `j` / `k` / arrows | Move the selection in the focused pane        |
 | `PgUp` / `PgDn`    | Move a page at a time                         |
 | `Tab`              | Switch focus between the node and job panes   |
-| `Enter`            | Show or hide the selected job's detail pane   |
+| `Enter`            | Scope to a server, or show/hide job detail    |
 | `[` / `]`          | Page through wrapped detail or log text       |
 | `L`                | Toggle a live tail of the selected job's log  |
 | `c`                | Cancel the selected job (press twice)         |
@@ -664,28 +667,32 @@ slows the numbers down but never freezes the interface.
 | `t`                | Force a scheduler tick now                    |
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
+| `x` / `Esc`        | Clear the current server/GPU scope            |
 | `p`                | GPU processes: unmanaged only / all / none    |
 | `d`                | Drain or resume the selected node             |
 | `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
-| Mouse click        | Select rows, activate actions, sort by column |
+| Mouse click        | Scope server/GPU jobs, select, sort or act    |
 | Mouse wheel        | Move selections or page detail/log text       |
 
-The job table opens in *queue* order — running jobs first, then pending jobs
-exactly as the scheduler would dispatch them — so `K`/`J` visibly reorder the
-line a job is waiting in. Reordering rewrites the priorities of the pending
-jobs the moved one passes; the `PRI` column always shows the real values.
-Clicking a column header sorts by that column (a second click flips it), and
-each GPU line draws one memory bar whose segments distinguish foreign memory
-(amber) from this queue's reservations (teal) and free space (dim). Colours
-are deliberately muted: healthy values render grey or plain, and saturation
-is reserved for states that need attention.
+The job table opens in *runtime* order, longest-running first; jobs without a
+runtime follow the measured jobs. Queue order remains available through `s`,
+and using `K`/`J` automatically restores it before moving a pending job.
+Reordering rewrites the priorities of the pending jobs the moved one passes;
+the `PRI` column always shows the real values. Clicking a column header sorts
+by that column (a second click flips it), and each GPU line draws one memory
+bar whose segments distinguish foreign memory (amber) from this queue's
+reservations (teal) and free space (dim). Colours are deliberately muted:
+healthy values render grey or plain, and saturation is reserved for states
+that need attention.
 
-Mouse reporting is enabled by default. Click anywhere in a node card to select
-that node, or click a job row to select it; clicking the selected job again
-shows or hides its detail pane. The wheel acts on the pane under the pointer.
-Status counts select their matching job filter, and clicking a job alert opens
+Mouse reporting is enabled by default. Clicking a server limits the lower table
+to jobs running on that server; clicking any GPU cell drills down to jobs whose
+allocation includes that card. `[all jobs]`, `x`, or `Esc` returns to the global
+job view. Click a job row to select it; clicking the selected job again shows or
+hides its detail pane. The wheel acts on the pane under the pointer. Status
+counts select their matching global job filter, and clicking a job alert opens
 that job's log. The bottom action bar exposes the actions that apply to the
 current selection, including the second confirmation required for cancellation.
 Most terminals reserve normal text selection for `Shift`-drag or `Option`-drag

@@ -2856,6 +2856,17 @@ class Scheduler:
         """A single JSON-friendly view of the whole queue, for other tools."""
         headroom = int(self.settings["headroom_mb"])
         nodes = dbm.get_nodes(self.conn, include_ignored=include_ignored)
+        if not include_ignored:
+            # The database deliberately retains removed nodes while their
+            # detached jobs or deferred cleanup are still being observed.  It
+            # is history and lifecycle state, not part of the current server
+            # list: ordinary queue views should match the active configured
+            # list instead of showing stale rows forever.  When queue.yml does
+            # not override servers, this is the monitor TUI's list exactly.
+            # Administrative callers can still request the complete inventory.
+            nodes = [
+                node for node in nodes if node.name in self._configured_nodes
+            ]
         jobs = dbm.list_jobs(self.conn, states=["pending", "running"])
         recent = dbm.list_jobs(self.conn, limit=20, newest_first=True)
         recent_terminal = [job for job in recent if job.is_terminal][:10]

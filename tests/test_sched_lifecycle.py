@@ -130,6 +130,20 @@ def test_a_removed_config_node_only_finishes_existing_work(scheduler, cluster):
 
     with pytest.raises(ValueError, match="no longer configured"):
         scheduler.submit("new-pinned", vram="1G", node="small-node")
+    # The removed node remains in SQLite while its detached job is observed,
+    # but ordinary snapshots mirror the current configured server list just as
+    # the monitor TUI does.
+    assert [node["name"] for node in scheduler.snapshot()["nodes"]] == [
+        "big-node"
+    ]
+    assert any(
+        job["id"] == running_id and job["node"] == "small-node"
+        for job in scheduler.snapshot()["jobs"]
+    )
+    assert "small-node" in {
+        node["name"]
+        for node in scheduler.snapshot(include_ignored=True)["nodes"]
+    }
     new_id = scheduler.submit("new-unpinned", vram="1G")
     scheduler.tick(force=True)
     assert dbm.get_job(scheduler.conn, new_id).node == "big-node"
