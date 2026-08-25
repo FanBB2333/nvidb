@@ -1,7 +1,7 @@
 """Interactive terminal UI for the nvidb job queue.
 
-The screen is three stacked panes - node capacity, the job table, and a detail
-or log view for the selected job - drawn with `blessed`.
+The screen is three stacked panes - task flow or node capacity, the job table,
+and a detail or log view for the selected job - drawn with `blessed`.
 
 All database and SSH work happens on one worker thread that owns the scheduler;
 the render thread only reads an immutable snapshot and posts actions onto a
@@ -45,6 +45,9 @@ FILTERS = ("active", "all", "running", "pending", "finished")
 # a card being full; all: those plus this queue's own jobs; off: neither.
 PROC_VIEWS = ("summary", "all", "off")
 PROC_SUMMARY_LIMIT = 2
+# The flow view answers "what is every card doing, and what runs next?".  The
+# existing server view remains available for capacity/process inspection.
+RESOURCE_VIEWS = ("flow", "servers")
 FILTER_STATES = {
     "active": ("pending", "running"),
     "running": ("running",),
@@ -368,6 +371,7 @@ class QueueTUI:
         # moved into the server pane.
         self.job_scope_node: Optional[str] = None
         self.job_scope_gpu: Optional[int] = None
+        self.resource_view = "flow"
         # The cursor follows a job, not a row number: a refresh or a priority
         # change may reorder the table under the selection.
         self._selected_job_id: Optional[int] = None
@@ -722,7 +726,7 @@ class QueueTUI:
         job_view = f"running on {scope}" if scope else f"filter {self.filter}"
         meta = (
             f"tick {tick_text} · {keeper_text}{mode} · {status} · {job_view} "
-            f"· procs {self.proc_view} "
+            f"· view {self.resource_view} "
         )
         gap = max(1, width - len(title) - len(meta))
         return [
@@ -795,6 +799,420 @@ class QueueTUI:
         if any(gpu.get("free_mb", 0) >= 1024 for gpu in gpus):
             return ("●", "green")
         return ("●", "yellow")
+
+    @staticmethod
+    def _flow_segment_width(segments) -> int:
+        return sum(display_width(segment[0]) for segment in segments)
+
+    def _flow_line(self, segments, width: int, row: int) -> str:
+        """Render styled flow segments and retain hit boxes for job tokens."""
+        rendered = []
+        column = 0
+        for text, style, target in segments:
+            if column >= width:
+                break
+            shown = fit_display(str(text), width - column)
+            shown_width = display_width(shown)
+            if shown_width and target is not None:
+                self._node_gpu_regions.append(
+                    (row, column, column + shown_width - 1, target)
+                )
+            rendered.append(self._style(shown, style))
+            column += shown_width
+        return "".join(rendered)
+
+    @staticmethod
+    def _flow_job_map(snapshot: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+        """All jobs reachable from a snapshot, including lane-only entries."""
+        jobs: Dict[int, Dict[str, Any]] = {}
+        for job in list(snapshot.get("jobs") or []) + list(snapshot.get("recent") or []):
+            if job.get("id") is not None:
+                jobs[int(job["id"])] = job
+        for lane in snapshot.get("lanes") or []:
+            for job in list(lane.get("running") or []) + list(lane.get("queued") or []):
+                if job.get("id") is not None:
+                    jobs[int(job["id"])] = job
+        return jobs
+
+    @staticmethod
+    def _flow_priority(job: Dict[str, Any]) -> str:
+        priority = int(job.get("priority") or 0)
+        return f"P{priority:+d}" if priority else "P0"
+
+    def _flow_job_token(
+        self,
+        job: Dict[str, Any],
+        *,
+        position: Optional[int] = None,
+        name_width: int = 12,
+    ) -> str:
+        name = fit_display(job.get("name") or "-", name_width)
+        prefix = f"{position}:" if position is not None else ""
+        markers = []
+        if job.get("held") or job.get("held_reason"):
+            markers.append("HOLD")
+        dependencies = list(job.get("depends_on") or [])
+        any_dependencies = list(job.get("depends_any") or [])
+        if dependencies:
+            markers.append(f"←✓#{dependencies[0]}")
+            if len(dependencies) > 1:
+                markers[-1] += f"+{len(dependencies) - 1}"
+        if any_dependencies:
+            markers.append(f"←◇#{any_dependencies[0]}")
+            if len(any_dependencies) > 1:
+                markers[-1] += f"+{len(any_dependencies) - 1}"
+        marker_text = f" {' '.join(markers)}" if markers else ""
+        node = ""
+        if job.get("lane") is None and job.get("node_constraint"):
+            node = f" @{fit_display(job['node_constraint'], 8)}"
+        return (
+            f"[{prefix}#{job['id']} {self._flow_priority(job)} "
+            f"{name}{node}{marker_text}]"
+        )
+
+    def _flow_running_token(self, jobs: List[Dict[str, Any]], width: int) -> str:
+        if not jobs:
+            return "[ IDLE ]"
+        job = jobs[0]
+        more = f" +{len(jobs) - 1}" if len(jobs) > 1 else ""
+        if width < 70:
+            return (
+                f"[ RUN #{job['id']} "
+                f"{fit_display(job.get('name') or '-', 6)}{more} ]"
+            )
+        runtime = (
+            format_duration(job.get("elapsed_s"))
+            if job.get("elapsed_s") is not None
+            else "-"
+        )
+        name_width = 12 if width >= 120 else 8
+        return (
+            f"[ RUN #{job['id']} {fit_display(job.get('name') or '-', name_width)} "
+            f"{runtime}{more} ]"
+        )
+
+    @staticmethod
+    def _unique_flow_jobs(jobs) -> List[Dict[str, Any]]:
+        seen = set()
+        unique = []
+        for job in jobs:
+            job_id = job.get("id")
+            if job_id in seen:
+                continue
+            seen.add(job_id)
+            unique.append(job)
+        return unique
+
+    def _append_flow_queue_tokens(
+        self,
+        segments,
+        queued: List[Dict[str, Any]],
+        width: int,
+    ) -> None:
+        """Append as many ordered queue tokens as fit, then an overflow count."""
+        if not queued:
+            return
+        name_width = 12 if width >= 130 else 8
+        shown = 0
+        for position, job in enumerate(queued, start=1):
+            token = self._flow_job_token(
+                job,
+                position=position,
+                name_width=name_width,
+            )
+            addition = [
+                (" ──▶ ", "bright_black", None),
+                (
+                    token,
+                    "magenta"
+                    if job.get("held") or job.get("held_reason")
+                    else "yellow",
+                    ("flow_job", int(job["id"])),
+                ),
+            ]
+            remaining_after = len(queued) - position
+            reserve = display_width(f"  +{remaining_after}") if remaining_after else 0
+            if self._flow_segment_width(segments + addition) + reserve > width:
+                break
+            segments.extend(addition)
+            shown += 1
+        hidden = len(queued) - shown
+        if hidden:
+            segments.append((f"  +{hidden}", "bright_black", None))
+
+    def _flow_dependency_lines(
+        self,
+        jobs: Dict[int, Dict[str, Any]],
+        width: int,
+        start_row: int,
+    ) -> List[str]:
+        edges = []
+        for job in sorted(jobs.values(), key=lambda item: int(item.get("id") or 0)):
+            if job.get("state") not in ("pending", "running"):
+                continue
+            for dependency in job.get("depends_on") or []:
+                edges.append((int(dependency), int(job["id"]), "✓"))
+            for dependency in job.get("depends_any") or []:
+                edges.append((int(dependency), int(job["id"]), "◇"))
+        if not edges:
+            return []
+
+        lines: List[str] = []
+        edge_index = 0
+        while edge_index < len(edges) and len(lines) < 2:
+            segments = [
+                (
+                    "  DEPS " if not lines else "       ",
+                    "magenta" if not lines else "bright_black",
+                    None,
+                )
+            ]
+            while edge_index < len(edges):
+                dependency, dependent, kind = edges[edge_index]
+                upstream = jobs.get(dependency) or {}
+                state = upstream.get("state")
+                style = (
+                    "green"
+                    if state == "completed"
+                    else "red"
+                    if state in ("failed", "cancelled", "timeout", "lost")
+                    else "cyan"
+                    if state == "running"
+                    else "yellow"
+                    if state == "pending"
+                    else "bright_black"
+                )
+                separator = " · " if len(segments) > 1 else ""
+                edge = f"#{dependency} ─{kind}▶ #{dependent}"
+                addition = [
+                    (separator, "bright_black", None),
+                    (edge, style, ("flow_job", dependent)),
+                ]
+                remaining = len(edges) - edge_index - 1
+                reserve = display_width(f"  +{remaining}") if remaining else 0
+                if self._flow_segment_width(segments + addition) + reserve > width:
+                    break
+                segments.extend(addition)
+                edge_index += 1
+            if len(segments) == 1:
+                break
+            lines.append(self._flow_line(segments, width, start_row + len(lines)))
+        hidden = len(edges) - edge_index
+        if hidden and lines:
+            suffix = f"  +{hidden}"
+            if display_width(self.term.strip_seqs(lines[-1])) + display_width(suffix) <= width:
+                lines[-1] += self._style(suffix, "bright_black")
+        return lines
+
+    def _flow_lines(self, width: int) -> List[str]:
+        """Visual task pools: node → GPU → running job → ordered lane queue."""
+        self._node_line_targets = {}
+        self._node_gpu_regions = []
+        self._node_header_regions = []
+        snapshot = self._snapshot or {}
+        active = list(snapshot.get("jobs") or [])
+        job_map = self._flow_job_map(snapshot)
+        lanes = list(snapshot.get("lanes") or [])
+        gpu_count = sum(len(node.get("gpus") or []) for node in self.nodes)
+        running_count = len({job["id"] for job in active if job.get("state") == "running"})
+        pending_count = len({job["id"] for job in active if job.get("state") == "pending"})
+
+        title = (
+            f"─ TASK FLOW · {len(self.nodes)}N {gpu_count}G · "
+            f"R{running_count} Q{pending_count} "
+        )
+        scope = self._scope_label()
+        if scope:
+            scope_text = f"· running on {scope} "
+            clear_text = "[all jobs]"
+            clear_start = display_width(title) + display_width(scope_text)
+            self._node_header_regions.append(
+                (
+                    0,
+                    clear_start,
+                    clear_start + display_width(clear_text) - 1,
+                    ("scope_all", None),
+                )
+            )
+            title += scope_text + clear_text + " "
+        else:
+            title += "· ✓=success ◇=any-result "
+        lines = [
+            self._compose(
+                [
+                    (title, "cyan" if scope else "bright_black"),
+                    ("─" * max(0, width - display_width(title)), "bright_black"),
+                ],
+                width,
+            )
+        ]
+
+        lanes_by_gpu: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for lane in lanes:
+            for gpu_index in lane.get("gpu_ids") or []:
+                lanes_by_gpu.setdefault((str(lane.get("node")), int(gpu_index)), lane)
+        running_by_gpu: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+        for job in active:
+            if job.get("state") != "running" or not job.get("node"):
+                continue
+            for gpu_index in job.get("gpu_ids") or []:
+                running_by_gpu.setdefault(
+                    (str(job["node"]), int(gpu_index)), []
+                ).append(job)
+
+        index_width = len(str(max(1, len(self.nodes))))
+        for position, node in enumerate(self.nodes):
+            node_name = str(node.get("name"))
+            node_lanes = [lane for lane in lanes if lane.get("node") == node_name]
+            node_queued = {
+                job["id"]
+                for lane in node_lanes
+                for job in (lane.get("queued") or [])
+            }
+            node_running = {
+                job["id"]
+                for job in active
+                if job.get("state") == "running" and job.get("node") == node_name
+            }
+            selected = node_name == self.job_scope_node or (
+                self.job_scope_node is None
+                and self.focus == "nodes"
+                and position == self.node_index
+            )
+            marker = "❯" if selected else " "
+            dot, dot_style = self._node_health_dot(node)
+            state = "drain" if not node.get("enabled") else node.get("state") or "unknown"
+            header = [
+                (f"{marker} ▾ [{position + 1:{index_width}d}] ", "cyan" if selected else "bright_black", None),
+                (f"{dot} ", dot_style, None),
+                (node_name, "bold", None),
+                (
+                    f"  {len(node.get('gpus') or [])} GPU · R{len(node_running)} · Q{len(node_queued)}",
+                    "bright_black",
+                    None,
+                ),
+                (f"  {state}", "red" if state == "down" else "yellow" if state == "drain" else "bright_black", None),
+            ]
+            if state == "down" and node.get("last_error"):
+                header.append(
+                    (
+                        f" · ! {fit_display(node['last_error'], 28)}",
+                        "red",
+                        None,
+                    )
+                )
+            header_row = len(lines)
+            lines.append(self._flow_line(header, width, header_row))
+            self._node_line_targets[header_row] = position
+
+            for gpu in node.get("gpus") or []:
+                gpu_index = int(gpu.get("index") or 0)
+                lane = lanes_by_gpu.get((node_name, gpu_index))
+                lane_running = list((lane or {}).get("running") or [])
+                observed_running = running_by_gpu.get((node_name, gpu_index), [])
+                running = self._unique_flow_jobs(lane_running + observed_running)
+                queued = list((lane or {}).get("queued") or [])
+                util = gpu.get("util_percent")
+                util_text = f"{int(util):>3}%" if util is not None else "  -%"
+                if width < 70:
+                    gpu_status = (
+                        f"{util_text} {format_mb(gpu.get('free_mb') or 0):>6}  "
+                    )
+                    flow_arrow = " → "
+                else:
+                    gpu_status = (
+                        f"{util_text} · "
+                        f"{format_mb(gpu.get('free_mb') or 0):>6} free  "
+                    )
+                    flow_arrow = " ──▶ "
+                gpu_selected = (
+                    node_name == self.job_scope_node
+                    and gpu_index == self.job_scope_gpu
+                )
+                segments = [
+                    (f"    G{gpu_index:<2} ", "cyan" if gpu_selected else "bright_black", None),
+                    (
+                        gpu_status,
+                        "bright_black",
+                        None,
+                    ),
+                    (
+                        self._flow_running_token(running, width),
+                        "green" if running else "bright_black",
+                        ("flow_job", int(running[0]["id"])) if running else None,
+                    ),
+                    (flow_arrow, "bright_black", None),
+                    (
+                        f"{{ lane Q{len(queued)} }}",
+                        "yellow" if queued else "bright_black",
+                        None,
+                    ),
+                ]
+                self._append_flow_queue_tokens(segments, queued, width)
+                if lane:
+                    blocked = lane.get("blocked")
+                    lane_state = (
+                        "PAUSED"
+                        if lane.get("paused")
+                        else fit_display(blocked, 22)
+                        if blocked
+                        else ""
+                    )
+                    if lane_state:
+                        segments.append((f"  ! {lane_state}", "magenta", None))
+                gpu_row = len(lines)
+                lines.append(self._flow_line(segments, width, gpu_row))
+                # Job tokens were registered first and therefore win over this
+                # whole-row GPU target when their regions overlap.
+                self._node_gpu_regions.append(
+                    (gpu_row, 0, width - 1, ("gpu", (position, gpu_index)))
+                )
+                self._node_line_targets[gpu_row] = position
+
+        shared = sorted(
+            [
+                job
+                for job in active
+                if job.get("state") == "pending"
+                and not job.get("lane")
+                and int(job.get("gpus") or 0) > 0
+            ],
+            key=lambda job: (-(int(job.get("priority") or 0)), int(job["id"])),
+        )
+        if shared:
+            segments = [
+                ("  ANY GPU  ", "cyan", None),
+                ("──▶ ", "bright_black", None),
+                (f"{{ Q{len(shared)} · priority }}", "yellow", None),
+            ]
+            self._append_flow_queue_tokens(segments, shared, width)
+            lines.append(self._flow_line(segments, width, len(lines)))
+
+        cpu = [
+            job
+            for job in active
+            if int(job.get("gpus") or 0) <= 0
+            and job.get("state") in ("pending", "running")
+        ]
+        if cpu:
+            cpu_running = [job for job in cpu if job.get("state") == "running"]
+            cpu_queued = sorted(
+                [job for job in cpu if job.get("state") == "pending"],
+                key=lambda job: (-(int(job.get("priority") or 0)), int(job["id"])),
+            )
+            segments = [
+                ("  CPU      ", "cyan", None),
+                (self._flow_running_token(cpu_running, width), "green" if cpu_running else "bright_black", ("flow_job", int(cpu_running[0]["id"])) if cpu_running else None),
+                (" ──▶ ", "bright_black", None),
+                (f"{{ Q{len(cpu_queued)} }}", "yellow" if cpu_queued else "bright_black", None),
+            ]
+            self._append_flow_queue_tokens(segments, cpu_queued, width)
+            lines.append(self._flow_line(segments, width, len(lines)))
+
+        lines.extend(self._flow_dependency_lines(job_map, width, len(lines)))
+        if not self.nodes and not shared and not cpu:
+            lines.append(self._style("  (no active resources or jobs)", "bright_black"))
+        return lines
 
     def _node_lines(self, width: int) -> List[str]:
         self._node_line_targets = {}
@@ -1783,6 +2201,12 @@ class QueueTUI:
                     "bright_black",
                 ),
                 (
+                    f"v view:{self.resource_view}",
+                    "resource_view",
+                    None,
+                    "cyan" if self.resource_view == "flow" else "bright_black",
+                ),
+                (
                     f"p procs:{self.proc_view}",
                     "procs",
                     None,
@@ -1832,13 +2256,16 @@ class QueueTUI:
             ("a", "Toggle automatic ticking"),
             ("f", "Cycle the job filter"),
             ("x / Esc", "Clear a server or GPU job scope"),
-            ("p", "GPU detail: compact / full per-process view / bars only"),
+            ("v", "Switch task flow / server capacity view"),
+            ("Flow arrows", "✓ requires success · ◇ accepts any result"),
+            ("p", "Open capacity view; cycle GPU process detail"),
             ("T", "Switch colour theme (classic / muted)"),
             ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
             ("Mouse server", "Show only jobs running on that server"),
             ("Mouse GPU", "Show only jobs running on that GPU"),
-            ("Mouse job", "Select a job; click it again to toggle detail"),
+            ("Mouse task", "Open a flow task; click it again to toggle detail"),
+            ("Mouse job", "Select a table job; click it again to toggle detail"),
             ("Mouse wheel", "Move in nodes/jobs; page detail or log text"),
             ("GPU bar", "amber: others' memory · teal: queue reservations · dim: free"),
             (
@@ -1904,18 +2331,31 @@ class QueueTUI:
                 for row in range(help_start, help_end + 1):
                     self._row_targets[row] = ("close_help", None)
         else:
-            # The job table is what this screen is for, so the node pane is
-            # capped: a third of the height for the compact grid, half when
-            # the user asked for the full per-process drill-down.
-            node_lines = self._node_lines(width)
-            node_budget = max(
-                6, usable // 2 if self.proc_view == "all" else usable // 3
+            # Flow is the primary overview and gets half the screen.  The
+            # capacity cards remain compact unless full process detail is on.
+            node_lines = (
+                self._flow_lines(width)
+                if self.resource_view == "flow"
+                else self._node_lines(width)
             )
+            node_budget = max(
+                8 if self.resource_view == "flow" else 6,
+                usable // 2
+                if self.resource_view == "flow" or self.proc_view == "all"
+                else usable // 3,
+            )
+            node_target_rows = len(node_lines)
             if len(node_lines) > node_budget:
                 hidden = len(node_lines) - node_budget + 1
+                node_target_rows = node_budget - 1
                 node_lines = node_lines[: node_budget - 1]
+                overflow = (
+                    f"    … {hidden} more flow line(s); enlarge the terminal"
+                    if self.resource_view == "flow"
+                    else f"    … {hidden} more line(s), press p"
+                )
                 node_lines.append(
-                    self._style(f"    … {hidden} more line(s), press p", "bright_black")
+                    self._style(overflow, "bright_black")
                 )
             node_start = len(lines)
             lines.extend(node_lines)
@@ -1924,13 +2364,13 @@ class QueueTUI:
                 for row in range(node_start, node_end + 1):
                     self._row_targets[row] = ("pane", "nodes")
                 for relative_row, position in self._node_line_targets.items():
-                    if relative_row < len(node_lines):
+                    if relative_row < node_target_rows:
                         self._row_targets[node_start + relative_row] = (
                             "node",
                             position,
                         )
                 for relative_row, start, end, target in self._node_gpu_regions:
-                    if relative_row < len(node_lines) and start < width:
+                    if relative_row < node_target_rows and start < width:
                         self._click_regions.append(
                             (
                                 node_start + relative_row,
@@ -1940,7 +2380,7 @@ class QueueTUI:
                             )
                         )
                 for relative_row, start, end, target in self._node_header_regions:
-                    if relative_row < len(node_lines) and start < width:
+                    if relative_row < node_target_rows and start < width:
                         self._click_regions.append(
                             (
                                 node_start + relative_row,
@@ -2275,6 +2715,15 @@ class QueueTUI:
             self.proc_view = PROC_VIEWS[
                 (PROC_VIEWS.index(self.proc_view) + 1) % len(PROC_VIEWS)
             ]
+            # Process rows belong to the capacity view.  Switching here makes
+            # `p` useful from the default flow view instead of changing hidden
+            # state with no visible result.
+            self.resource_view = "servers"
+        elif action == "resource_view":
+            self.resource_view = RESOURCE_VIEWS[
+                (RESOURCE_VIEWS.index(self.resource_view) + 1)
+                % len(RESOURCE_VIEWS)
+            ]
         elif action == "theme":
             self.theme = THEME_ORDER[
                 (THEME_ORDER.index(self.theme) + 1) % len(THEME_ORDER)
@@ -2313,6 +2762,18 @@ class QueueTUI:
             self._select_job_id(int(value), show_log=True)
         elif action == "node_name" and value is not None:
             self._select_node_name(str(value))
+        elif action == "flow_job" and value is not None:
+            job_id = int(value)
+            current = self.selected_job()
+            if (
+                self.focus == "jobs"
+                and current is not None
+                and int(current["id"]) == job_id
+            ):
+                self._toggle_detail()
+            else:
+                self._select_job_id(job_id)
+                self.show_detail = True
         elif action == "scope_all":
             self._clear_job_scope()
         elif action == "pane" and value in ("jobs", "nodes"):
@@ -2341,7 +2802,9 @@ class QueueTUI:
         if event.is_wheel_up or event.is_wheel_down:
             delta = -1 if event.is_wheel_up else 1
             kind, value = target if target is not None else (None, None)
-            if kind in ("node", "gpu") or (kind == "pane" and value == "nodes"):
+            if kind in ("node", "gpu", "flow_job") or (
+                kind == "pane" and value == "nodes"
+            ):
                 self.focus = "nodes"
                 self._move(delta)
             elif kind in ("job", "sort") or (kind == "pane" and value == "jobs"):
@@ -2364,6 +2827,8 @@ class QueueTUI:
             position, gpu_index = value
             self._select_gpu(int(position), int(gpu_index))
             return True
+        if kind == "flow_job":
+            return self._activate("flow_job", value)
         return self._activate(kind, value)
 
     def handle_key(self, key) -> bool:
@@ -2431,6 +2896,8 @@ class QueueTUI:
             self._activate("move", 1)
         elif text == "p":
             self._activate("procs")
+        elif text == "v":
+            self._activate("resource_view")
         elif text == "T":
             self._activate("theme")
         elif text == "t":

@@ -85,6 +85,7 @@ def _job(job_id, state="running", name="train", node="small-node", **overrides):
         "vram_mb": 20480,
         "node_constraint": None,
         "depends_on": [],
+        "depends_any": [],
         "max_runtime_s": None,
         "submitter": "client-a",
         "tags": [],
@@ -94,6 +95,8 @@ def _job(job_id, state="running", name="train", node="small-node", **overrides):
         "elapsed_s": 125.0,
         "node": node,
         "gpu_ids": [0],
+        "lane": None,
+        "lane_seq": None,
         "remote_pid": 4321,
         "run_dir": "/home/u/.nvidb/jobs/1",
         "exit_code": None,
@@ -106,12 +109,14 @@ def _job(job_id, state="running", name="train", node="small-node", **overrides):
         "notes": None,
         "progress": None,
         "progress_at": None,
+        "held_reason": None,
+        "held": False,
     }
     job.update(overrides)
     return job
 
 
-def _snapshot(jobs=None, recent=None, nodes=None, counts=_MISSING):
+def _snapshot(jobs=None, recent=None, nodes=None, lanes=None, counts=_MISSING):
     return {
         "generated_at": "2026-07-27T10:02:00+00:00",
         "db_path": "/tmp/queue.db",
@@ -151,7 +156,132 @@ def _snapshot(jobs=None, recent=None, nodes=None, counts=_MISSING):
         ],
         "jobs": jobs if jobs is not None else [_job(1), _job(2, state="pending", name="eval")],
         "recent": recent or [],
+        "lanes": lanes or [],
     }
+
+
+def _lane(
+    node,
+    gpu_ids,
+    *,
+    running=None,
+    queued=None,
+    paused=False,
+    blocked=None,
+    runner_up=True,
+):
+    suffix = ",".join(str(index) for index in gpu_ids)
+    return {
+        "name": f"{node}:{suffix}",
+        "node": node,
+        "gpu_ids": list(gpu_ids),
+        "paused": paused,
+        "concurrency": 1,
+        "runner": True,
+        "runner_up": runner_up,
+        "runner_state": {},
+        "runner_seen_at": None,
+        "node_state": "up",
+        "running": list(running or []),
+        "queued": list(queued or []),
+        "blocked": blocked,
+    }
+
+
+def _flow_snapshot():
+    running = _job(
+        10,
+        name="train",
+        node="small-node",
+        gpu_ids=[0],
+        lane="small-node:0",
+        lane_seq=1,
+        elapsed_s=3600,
+    )
+    evaluate = _job(
+        11,
+        state="pending",
+        name="evaluate",
+        node=None,
+        gpu_ids=[],
+        lane="small-node:0",
+        lane_seq=2,
+        priority=5,
+        depends_on=[10],
+        started_at=None,
+        elapsed_s=None,
+    )
+    report = _job(
+        12,
+        state="pending",
+        name="report",
+        node=None,
+        gpu_ids=[],
+        lane="small-node:0",
+        lane_seq=3,
+        depends_any=[11],
+        started_at=None,
+        elapsed_s=None,
+    )
+    held = _job(
+        13,
+        state="pending",
+        name="archive",
+        node=None,
+        gpu_ids=[],
+        lane="small-node:0",
+        lane_seq=4,
+        priority=-1,
+        depends_on=[12],
+        held=True,
+        held_reason="job 12 failed",
+        started_at=None,
+        elapsed_s=None,
+    )
+    second_gpu = _job(
+        14,
+        state="pending",
+        name="sweep-b",
+        node=None,
+        gpu_ids=[],
+        lane="small-node:1",
+        lane_seq=1,
+        priority=2,
+        started_at=None,
+        elapsed_s=None,
+    )
+    shared = _job(
+        20,
+        state="pending",
+        name="urgent-free",
+        node=None,
+        gpu_ids=[],
+        priority=8,
+        started_at=None,
+        elapsed_s=None,
+    )
+    snapshot = _snapshot(
+        jobs=[running, evaluate, report, held, second_gpu, shared],
+        lanes=[
+            _lane(
+                "small-node",
+                [0],
+                running=[running],
+                queued=[evaluate, report, held],
+                blocked="job 13 is held: job 12 failed",
+            ),
+            _lane(
+                "small-node",
+                [1],
+                queued=[second_gpu],
+                paused=True,
+                blocked="paused",
+            ),
+        ],
+        counts={"running": 1, "pending": 5},
+    )
+    snapshot["nodes"][1]["gpus"] = [_gpu(0), _gpu(1)]
+    return snapshot
 
 
 def _state(snapshot=_MISSING, **overrides):
@@ -168,9 +298,12 @@ def _state(snapshot=_MISSING, **overrides):
     return state
 
 
-def _tui(width=150):
+def _tui(width=150, *, resource_view=None):
     os.environ["COLUMNS"] = str(width)
-    return QueueTUI()
+    tui = QueueTUI()
+    if resource_view is not None:
+        tui.resource_view = resource_view
+    return tui
 
 
 def _render(tui, state=None):
@@ -198,8 +331,109 @@ def _mouse_at(output, text, *, button=0, occurrence=0):
 
 # --- rendering -------------------------------------------------------------
 
+def test_task_flow_is_the_default_and_shows_each_gpu_lane():
+    snapshot = _flow_snapshot()
+    tui = _tui()
+    output = _render(tui, _state(snapshot))
+    lines = output.splitlines()
+
+    assert tui.resource_view == "flow"
+    assert "TASK FLOW · 2N 3G · R1 Q5" in output
+    gpu0 = next(line for line in lines if line.startswith("    G0 ") and "RUN #10" in line)
+    assert "[ RUN #10 train 01:00:00 ]" in gpu0
+    assert "{ lane Q3 }" in gpu0
+    assert "[1:#11 P+5 evaluate ←✓#10]" in gpu0
+    assert "[2:#12 P0 report ←◇#11]" in gpu0
+    assert "+1" in gpu0
+
+    gpu1 = next(line for line in lines if line.startswith("    G1 "))
+    assert "[ IDLE ]" in gpu1
+    assert "{ lane Q1 }" in gpu1
+    assert "[1:#14 P+2 sweep-b]" in gpu1
+    assert "! PAUSED" in gpu1
+
+
+def test_task_flow_keeps_unassigned_jobs_in_the_shared_priority_pool():
+    output = _render(_tui(), _state(_flow_snapshot()))
+    lines = output.splitlines()
+    shared = next(line for line in lines if line.startswith("  ANY GPU"))
+
+    assert "{ Q1 · priority }" in shared
+    assert "[1:#20 P+8 urgent-free]" in shared
+    assert all("#20" not in line for line in lines if line.startswith("    G"))
+
+
+def test_task_flow_draws_success_and_any_result_dependencies():
+    output = _render(_tui(), _state(_flow_snapshot()))
+    dependency = next(line for line in output.splitlines() if "DEPS" in line)
+
+    assert "#10 ─✓▶ #11" in dependency
+    assert "#11 ─◇▶ #12" in dependency
+    assert "#12 ─✓▶ #13" in dependency
+
+
+def test_task_flow_job_tokens_open_the_corresponding_job_detail():
+    snapshot = _flow_snapshot()
+    state = _state(snapshot)
+    tui = _tui()
+    output = _render(tui, state)
+    click = _mouse_at(output, "[1:#14 P+2 sweep-b]")
+
+    assert tui.handle_mouse(click) is True
+    assert tui.focus == "jobs"
+    assert tui.selected_job()["id"] == 14
+    assert "JOB 14 DETAIL" in _render(tui, state)
+
+    # Repeating the click follows job-row behaviour and collapses its detail.
+    assert tui.handle_mouse(click) is True
+    assert tui.show_detail is False
+
+
+def test_clicking_a_flow_gpu_scopes_the_job_list_to_that_card():
+    snapshot = _flow_snapshot()
+    state = _state(snapshot)
+    tui = _tui()
+    output = _render(tui, state)
+
+    assert tui.handle_mouse(_mouse_at(output, "{ lane Q3 }")) is True
+    assert tui.job_scope_node == "small-node"
+    assert tui.job_scope_gpu == 0
+    assert [job["id"] for job in tui.jobs] == [10]
+    assert "JOBS (1) · running on small-node/GPU0" in _render(tui, state)
+
+
+def test_v_switches_between_task_flow_and_server_capacity_views():
+    tui = _tui()
+    state = _state(_flow_snapshot())
+    assert "TASK FLOW" in _render(tui, state)
+
+    _press(tui, "v")
+    assert tui.resource_view == "servers"
+    assert "SERVERS (2)" in _render(tui, state)
+
+    output = _render(tui, state)
+    assert tui.handle_mouse(_mouse_at(output, "[v view:servers]")) is True
+    assert tui.resource_view == "flow"
+    assert "TASK FLOW" in _render(tui, state)
+
+
+def test_task_flow_remains_readable_on_a_narrow_terminal():
+    from nvidb.sched.model import display_width
+
+    tui = _tui(width=60)
+    output = _render(tui, _state(_flow_snapshot()))
+
+    assert "TASK FLOW" in output
+    assert "✓=success ◇=any-result" in output
+    assert "{ lane Q3 }" in output
+    assert "{ lane Q1 }" in output
+    assert "+" in output  # queue/dependency overflow is counted, not wrapped
+    for line in output.splitlines():
+        assert display_width(line) <= 60, line
+
+
 def test_the_screen_shows_nodes_capacity_and_jobs():
-    output = _render(_tui())
+    output = _render(_tui(resource_view="servers"))
     assert "SERVERS (2)" in output
     assert "▾ [1]" in output and "▾ [2]" in output
     assert "big-node" in output and "small-node" in output
@@ -219,7 +453,7 @@ def test_gpus_share_lines_instead_of_taking_one_each():
     snapshot["nodes"][0]["gpus"] = [
         _gpu(index, name="RTX PRO 5000", total=73415) for index in range(4)
     ]
-    tui = _tui(width=150)
+    tui = _tui(width=150, resource_view="servers")
     output = _plain(tui.render(_state(snapshot)))
     gpu_rows = [line for line in output.splitlines() if "G0 " in line or "G3 " in line]
     # Four GPUs at 150 columns fit on a single grid line.
@@ -243,7 +477,7 @@ def test_external_processes_collapse_to_one_summary_line():
             ],
         )
     ]
-    output = _plain(_tui().render(_state(snapshot)))
+    output = _plain(_tui(resource_view="servers").render(_state(snapshot)))
     ext_lines = [line for line in output.splitlines() if line.lstrip().startswith("ext ")]
     assert len(ext_lines) == 1
     # Biggest foreign process first, overflow counted instead of listed.
@@ -254,7 +488,7 @@ def test_external_processes_collapse_to_one_summary_line():
 def test_a_node_compresses_to_a_single_line_when_the_width_allows():
     """Name, model, GPU occupancy, hostname and state all share one line, so
     a fullscreen terminal is not mostly blank to the right of each node."""
-    output = _render(_tui())
+    output = _render(_tui(resource_view="servers"))
     line = next(line for line in output.splitlines() if "big-node" in line)
     assert "1× RTX PRO 5000" in line
     assert "G0 " in line and "67.4G/71.7G" in line
@@ -262,7 +496,7 @@ def test_a_node_compresses_to_a_single_line_when_the_width_allows():
 
 
 def test_a_thin_rule_separates_node_rows():
-    output = _render(_tui())
+    output = _render(_tui(resource_view="servers"))
     lines = output.splitlines()
     first = next(i for i, line in enumerate(lines) if "big-node" in line)
     second = next(i for i, line in enumerate(lines) if "small-node" in line)
@@ -282,7 +516,7 @@ def test_the_external_summary_joins_the_node_line_when_it_fits():
             processes=[_proc(100, 40000, "python train.py", "alice")],
         )
     ]
-    output = _plain(_tui().render(_state(snapshot)))
+    output = _plain(_tui(resource_view="servers").render(_state(snapshot)))
     line = next(line for line in output.splitlines() if "big-node" in line)
     assert "ext " in line and "alice" in line
     # Everything moved inline, so no stacked ext line remains.
@@ -296,7 +530,7 @@ def test_a_narrow_screen_stacks_the_node_back_into_a_grid():
     snapshot["nodes"][0]["gpus"] = [
         _gpu(index, name="RTX PRO 5000", total=73415) for index in range(3)
     ]
-    tui = _tui(width=100)
+    tui = _tui(width=100, resource_view="servers")
     output = _plain(tui.render(_state(snapshot)))
     lines = output.splitlines()
     header = next(line for line in lines if "big-node" in line)
@@ -321,7 +555,7 @@ def test_procs_all_still_lists_every_process_line():
             ],
         )
     ]
-    tui = _tui()
+    tui = _tui(resource_view="servers")
     tui.proc_view = "all"
     output = _plain(tui.render(_state(snapshot)))
     assert "alice" in output and "bob" in output
@@ -329,7 +563,7 @@ def test_procs_all_still_lists_every_process_line():
 
 
 def test_capacity_reflects_foreign_usage():
-    output = _render(_tui())
+    output = _render(_tui(resource_view="servers"))
     # The 69000MB of foreign memory shows up as the card's used total.
     assert "67.4G/71.7G" in output
 
@@ -338,7 +572,7 @@ def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
     snapshot = _snapshot()
     snapshot["nodes"][1]["gpus"] = [_gpu(used=8000, external=0, reserved=8192,
                                          attribution="blind", jobs=1)]
-    output = _render(_tui(), _state(snapshot))
+    output = _render(_tui(resource_view="servers"), _state(snapshot))
     # A `~` before the used amount marks the split as inferred.
     assert "~7.8G/24.0G" in output
 
@@ -599,7 +833,7 @@ def test_clicking_job_rows_selects_then_toggles_the_current_detail():
 
 
 def test_clicking_any_line_in_a_node_card_selects_that_node():
-    tui = _tui()
+    tui = _tui(resource_view="servers")
     output = _render(tui)
 
     assert tui.handle_mouse(_mouse_at(output, "RTX 3090 Ti")) is True
@@ -629,7 +863,7 @@ def test_server_and_gpu_clicks_drill_down_the_running_job_list():
     )
     snapshot["nodes"][1]["gpus"] = [_gpu(0), _gpu(1)]
     state = _state(snapshot)
-    tui = _tui()
+    tui = _tui(resource_view="servers")
     output = _render(tui, state)
 
     assert tui.handle_mouse(_mouse_at(output, "small-node")) is True
@@ -675,7 +909,7 @@ def test_gpu_click_regions_follow_the_stacked_narrow_layout():
     small = snapshot["nodes"][1]
     small["gpus"] = [_gpu(0), _gpu(1), _gpu(10)]
     snapshot["nodes"] = [small]
-    tui = _tui(width=80)
+    tui = _tui(width=80, resource_view="servers")
     output = _render(tui, _state(snapshot))
     lines = output.splitlines()
     gpu_row = next(
@@ -704,7 +938,7 @@ def test_wheel_routes_to_the_pane_under_the_pointer():
     assert tui.focus == "jobs"
     assert tui.selected_job()["id"] == 2
 
-    assert tui.handle_mouse(_mouse_at(output, "SERVERS", button=65)) is True
+    assert tui.handle_mouse(_mouse_at(output, "TASK FLOW", button=65)) is True
     assert tui.focus == "nodes"
     assert tui.selected_node()["name"] == "small-node"
 

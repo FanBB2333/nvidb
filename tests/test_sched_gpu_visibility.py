@@ -429,6 +429,7 @@ def _render(tui, state):
 
 
 def test_the_tui_lists_unmanaged_processes_by_default(tui):
+    tui.resource_view = "servers"
     state = _tui_state(
         [_proc(11, 6000, "ollama", "root"), _proc(12, 4000, "python train.py", job_id=3, job_name="train")]
     )
@@ -449,6 +450,7 @@ def test_pressing_p_cycles_to_every_process_then_to_none(tui):
 
     tui.handle_key(_Key("p"))
     assert tui.proc_view == "all"
+    assert tui.resource_view == "servers"
     output = _render(tui, state)
     assert "ollama" in output and "job 3 train" in output
 
@@ -465,6 +467,7 @@ def test_the_tui_says_when_a_cards_split_is_inferred(tui):
     # The compact cell marks the used amount as approximate; the full
     # explanation lives one press of p away, so a permanently blind card
     # does not cost a line forever.
+    tui.resource_view = "servers"
     output = _render(tui, _tui_state([], attribution="blind", external=8000))
     assert "~9.8G/24.0G" in output
 
@@ -479,6 +482,7 @@ def test_the_tui_names_the_job_behind_blind_memory(tui):
         attribution="blind",
         external=8000,
     )
+    tui.resource_view = "servers"
     tui.proc_view = "all"
     output = _render(tui, state)
     assert "job 32 sweep" in output
@@ -486,6 +490,7 @@ def test_the_tui_names_the_job_behind_blind_memory(tui):
 
 def test_a_long_process_list_cannot_push_the_jobs_off_the_screen(tui):
     processes = [_proc(100 + i, 500 - i, f"proc{i}") for i in range(30)]
+    tui.resource_view = "servers"
     tui.proc_view = "all"
     state = _tui_state(processes)
     output = _render(tui, state)

@@ -644,12 +644,30 @@ ln -s "$PWD/skills/nvidb-queue" ~/.codex/skills/nvidb-queue
 nvidb queue                 # or: nvidb queue tui
 ```
 
-The screen stacks server capacity, the job table, and a detail or log pane for
-the selected job. The server pane follows the active configuration order (the
-same list as the monitor TUI unless `queue.yml` deliberately overrides
-`servers`); database rows for removed servers do not linger in the normal view.
-All SSH work happens on a worker thread, so an unreachable node slows the
-numbers down but never freezes the interface.
+The screen opens with a task-flow pane above the job table and detail or log
+pane. It follows the active server configuration order (the same list as the
+monitor TUI unless `queue.yml` deliberately overrides `servers`); database rows
+for removed servers do not linger in the normal view. Every GPU gets a row that
+reads from left to right: live utilisation and free VRAM, the running job, the
+number of jobs in that card's lane, and as many ordered job cards as fit:
+
+```text
+G0  30% · 23.5G free  [ RUN #10 train 01:00:00 ] ──▶ { lane Q3 } ──▶ [1:#11 P+5 eval ←✓#10] ──▶ [2:#12 P0 report ←◇#11]  +1
+ANY GPU ──▶ { Q2 · priority } ──▶ [1:#20 P+8 urgent]
+DEPS #10 ─✓▶ #11 · #11 ─◇▶ #12
+```
+
+`lane Q3` is the queue attached to that exact card; the numbered positions are
+its real execution order. `P+5` is the job priority (it controls dispatch in the
+shared `ANY GPU` pool and is informational once a job has a fixed lane).
+`✓` dependencies require successful completion, while `◇` dependencies accept
+any terminal result. Held jobs and paused or blocked lanes are called out on
+their GPU row. Pending GPU jobs without a lane are deliberately kept in the
+`ANY GPU` pool because the scheduler has not assigned them to a card yet.
+
+Press `v` or click the view control to switch to the server-capacity pane with
+memory bars and process details. All SSH work happens on a worker thread, so an
+unreachable node slows the numbers down but never freezes the interface.
 
 | Key                | Action                                        |
 | ------------------ | --------------------------------------------- |
@@ -668,7 +686,8 @@ numbers down but never freezes the interface.
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
 | `x` / `Esc`        | Clear the current server/GPU scope            |
-| `p`                | GPU processes: unmanaged only / all / none    |
+| `v`                | Switch task flow / server capacity view       |
+| `p`                | Open capacity view; cycle GPU process detail  |
 | `d`                | Drain or resume the selected node             |
 | `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
@@ -681,23 +700,25 @@ runtime follow the measured jobs. Queue order remains available through `s`,
 and using `K`/`J` automatically restores it before moving a pending job.
 Reordering rewrites the priorities of the pending jobs the moved one passes;
 the `PRI` column always shows the real values. Clicking a column header sorts
-by that column (a second click flips it), and each GPU line draws one memory
-bar whose segments distinguish foreign memory (amber) from this queue's
-reservations (teal) and free space (dim). Colours are deliberately muted:
-healthy values render grey or plain, and saturation is reserved for states
-that need attention.
+by that column (a second click flips it). In the server-capacity view, each GPU
+line draws one memory bar whose segments distinguish foreign memory (amber)
+from this queue's reservations (teal) and free space (dim). Colours are
+deliberately muted: healthy values render grey or plain, and saturation is
+reserved for states that need attention.
 
 Mouse reporting is enabled by default. Clicking a server limits the lower table
 to jobs running on that server; clicking any GPU cell drills down to jobs whose
-allocation includes that card. `[all jobs]`, `x`, or `Esc` returns to the global
-job view. Click a job row to select it; clicking the selected job again shows or
-hides its detail pane. The wheel acts on the pane under the pointer. Status
-counts select their matching global job filter, and clicking a job alert opens
-that job's log. The bottom action bar exposes the actions that apply to the
-current selection, including the second confirmation required for cancellation.
-Most terminals reserve normal text selection for `Shift`-drag or `Option`-drag
-while mouse reporting is active. Set `mouse: false` under `view` in
-`~/.nvidb/config.yml` to disable it in both nvidb TUIs.
+allocation includes that card. Clicking a running or queued task card in the
+flow opens that job directly; clicking it again hides its detail. `[all jobs]`,
+`x`, or `Esc` returns to the global job view. Click a job-table row to select it;
+clicking the selected row again shows or hides its detail pane. The wheel acts
+on the pane under the pointer. Status counts select their matching global job
+filter, and clicking a job alert opens that job's log. The bottom action bar
+exposes the actions that apply to the current selection, including the second
+confirmation required for cancellation. Most terminals reserve normal text
+selection for `Shift`-drag or `Option`-drag while mouse reporting is active. Set
+`mouse: false` under `view` in `~/.nvidb/config.yml` to disable it in both nvidb
+TUIs.
 
 ### 3.8 What runs on the nodes
 
