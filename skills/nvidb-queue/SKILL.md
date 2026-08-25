@@ -18,6 +18,9 @@ SQLite file (`~/.nvidb/queue.db`), which is the point: several agent sessions
 coordinate through that file alone, without talking to each other and without
 any of them needing to stay alive.
 
+`nvidb q` is a short alias for `nvidb queue`; both forms expose the same command
+tree. The examples below use the full spelling for clarity.
+
 That file may be on another machine. When `~/.nvidb/queue.yml` has a `remote:`
 section, every command below is forwarded to the queue host and behaves
 identically — same output, same exit codes — so nothing here changes. It does

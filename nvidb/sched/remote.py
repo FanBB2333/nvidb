@@ -143,6 +143,11 @@ def build_command(
     """The shell command to run on the queue host for this invocation."""
     head, tail = split_command(argv)
     head = _strip_local_flags(head)
+    # The short alias is a client-side convenience. Forward the canonical
+    # spelling so queue hosts running an older nvidb still understand it, and
+    # so keeper lifecycle detection below has one command form to recognise.
+    if head and head[0] == "q":
+        head[0] = "queue"
     if script_text is not None:
         head = _point_script_at_temp_file(head)
 

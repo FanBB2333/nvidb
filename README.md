@@ -390,6 +390,9 @@ After function execution, it outputs:
 `config.yml`. Jobs are submitted from any machine that can SSH to the nodes, wait
 until a GPU has room for them, run detached on the node, and report back.
 
+`nvidb q` is a short alias for `nvidb queue`; every queue subcommand accepts
+either spelling.
+
 The queue's only shared state is one SQLite file (`~/.nvidb/queue.db`). Several
 independent clients — several Claude Code sessions, a script, an open TUI —
 coordinate purely by reading and writing that file, so none of them has to stay

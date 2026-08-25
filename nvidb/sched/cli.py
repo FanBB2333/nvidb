@@ -1683,7 +1683,9 @@ def _add_ignored_flag(parser: argparse.ArgumentParser) -> None:
 def register_parsers(subparsers) -> None:
     """Attach the `queue` and `job` command trees to the main nvidb parser."""
     queue = subparsers.add_parser(
-        "queue", help="Cluster job queue: status, TUI, scheduler tick"
+        "queue",
+        aliases=["q"],
+        help="Cluster job queue: status, TUI, scheduler tick",
     )
     _add_common(queue)
     queue.add_argument(

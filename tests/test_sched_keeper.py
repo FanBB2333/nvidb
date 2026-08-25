@@ -511,6 +511,22 @@ def test_the_keeper_is_ensured_in_the_same_round_trip(target):
     )
 
 
+def test_the_q_alias_is_forwarded_with_the_canonical_spelling(target):
+    command = remote_mod.build_command(target, ["q", "status"])
+    assert command.splitlines()[-1] == (
+        "NVIDB_QUEUE_NO_REMOTE=1 /home/alice/.local/bin/nvidb queue status"
+    )
+
+
+def test_q_keeper_commands_do_not_auto_start_the_keeper(target):
+    command = remote_mod.build_command(target, ["q", "keeper", "status"])
+    assert "nvidb_keeper=" not in command
+    assert command == (
+        "NVIDB_QUEUE_NO_REMOTE=1 /home/alice/.local/bin/nvidb "
+        "queue keeper status"
+    )
+
+
 def test_keeper_lifecycle_commands_do_not_auto_start_it(target):
     command = remote_mod.build_command(target, ["queue", "keeper", "status"])
     assert "nvidb_keeper=" not in command

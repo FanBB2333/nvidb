@@ -77,6 +77,14 @@ def test_the_queue_commands_are_all_recognised(parser):
         assert callable(args.func)
 
 
+def test_q_is_a_full_alias_for_the_queue_command_tree(parser):
+    for suffix in ([], ["status"], ["tick"], ["lane", "box:0"]):
+        canonical = parser.parse_args(["queue", *suffix])
+        alias = parser.parse_args(["q", *suffix])
+        assert alias.queue_cli is True
+        assert alias.func is canonical.func
+
+
 def test_paramiko_internal_errors_are_quiet_in_machine_readable_commands():
     loggers = [
         logging.getLogger(name)
