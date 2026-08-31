@@ -1,1 +1,1 @@
-python -m nvidb.test.run
+python -m pytest "$@"
