@@ -298,8 +298,10 @@ def _state(snapshot=_MISSING, **overrides):
     return state
 
 
-def _tui(width=150, *, resource_view=None):
+def _tui(width=150, height=None, *, resource_view=None):
     os.environ["COLUMNS"] = str(width)
+    if height is not None:
+        os.environ["LINES"] = str(height)
     tui = QueueTUI()
     if resource_view is not None:
         tui.resource_view = resource_view
@@ -430,6 +432,56 @@ def test_task_flow_remains_readable_on_a_narrow_terminal():
     assert "+" in output  # queue/dependency overflow is counted, not wrapped
     for line in output.splitlines():
         assert display_width(line) <= 60, line
+
+
+@pytest.mark.parametrize("width,height", [(40, 15), (60, 20), (80, 24)])
+def test_frame_respects_the_physical_terminal_size(width, height):
+    from nvidb.sched.model import display_width
+
+    output = _render(_tui(width=width, height=height))
+    lines = output.splitlines()
+
+    assert len(lines) <= height - 1
+    assert all(display_width(line) <= width for line in lines)
+
+
+def test_compact_layout_keeps_jobs_visible_and_limits_the_footer():
+    tui = _tui(width=60, height=20)
+    state = _state()
+    output = _render(tui, state)
+
+    assert "JOBS (2)" in output
+    assert "train" in output
+    assert len(tui._footer_lines(state, 60, max_rows=2)) <= 2
+
+
+def test_resource_viewport_follows_the_selected_node():
+    nodes = []
+    for index in range(10):
+        nodes.append(
+            {
+                "name": f"node-{index}",
+                "hostname": f"10.0.0.{index}",
+                "port": 22,
+                "username": "u",
+                "state": "up",
+                "enabled": True,
+                "last_seen": "2026-07-27T10:01:58+00:00",
+                "last_error": None,
+                "gpu_count": 1,
+                "probed_at": None,
+                "gpus": [_gpu()],
+            }
+        )
+    snapshot = _snapshot(nodes=nodes)
+    tui = _tui(width=60, height=20, resource_view="servers")
+    tui.focus = "nodes"
+    tui.node_index = len(nodes) - 1
+
+    output = _render(tui, _state(snapshot))
+
+    assert "node-9" in output
+    assert "above" in output
 
 
 def test_the_screen_shows_nodes_capacity_and_jobs():
@@ -579,7 +631,9 @@ def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
 
 def test_progress_replaces_the_command_in_the_job_row():
     snapshot = _snapshot(jobs=[_job(1, progress="epoch 3/10 loss 0.42")])
-    output = _render(_tui(), _state(snapshot))
+    tui = _tui()
+    tui.show_detail = True
+    output = _render(tui, _state(snapshot))
     assert "PROGRESS / COMMAND" in output
     assert "▸ epoch 3/10 loss 0.42" in output
     # The command is still reachable in the detail pane.
@@ -596,7 +650,9 @@ def test_the_detail_pane_shows_both_the_note_and_the_live_status():
     snapshot = _snapshot(
         jobs=[_job(1, progress="epoch 3/10", notes="baseline A, lr=1e-4")]
     )
-    output = _render(_tui(), _state(snapshot))
+    tui = _tui()
+    tui.show_detail = True
+    output = _render(tui, _state(snapshot))
     assert "note baseline A, lr=1e-4" in output
     assert "live " in output
 
@@ -613,6 +669,7 @@ def test_a_long_note_wraps_instead_of_being_truncated():
     )
     snapshot = _snapshot(jobs=[_job(1, notes=note)], nodes=[])
     tui = _tui(width=60)
+    tui.show_detail = True
 
     output = _render(tui, _state(snapshot))
 
@@ -632,6 +689,7 @@ def test_a_very_long_note_can_be_paged_to_its_end():
     snapshot = _snapshot(jobs=[_job(1, notes=note)], nodes=[])
     state = _state(snapshot)
     tui = _tui(width=70)
+    tui.show_detail = True
 
     first_page = _render(tui, state)
 
@@ -732,22 +790,22 @@ def test_enter_has_visible_expand_and_collapse_states():
     state = _state(snapshot)
     tui = _tui()
 
-    expanded = _render(tui, state)
-    assert "▼ JOB 1 DETAIL" in expanded
-    assert "Enter hide detail" in expanded
-    assert "note visible detail" in expanded
-
-    _press(tui, "", name="KEY_ENTER")
     collapsed = _render(tui, state)
     assert "▶ JOB 1 DETAIL HIDDEN" in collapsed
     assert "Enter show detail" in collapsed
     assert "note visible detail" not in collapsed
 
+    _press(tui, "", name="KEY_ENTER")
+    expanded = _render(tui, state)
+    assert "▼ JOB 1 DETAIL" in expanded
+    assert "Enter hide detail" in expanded
+    assert "note visible detail" in expanded
+
     # Some terminal definitions report Return separately from KEY_ENTER.
     _press(tui, "", name="KEY_RETURN")
-    reopened = _render(tui, state)
-    assert "▼ JOB 1 DETAIL" in reopened
-    assert "note visible detail" in reopened
+    hidden_again = _render(tui, state)
+    assert "▶ JOB 1 DETAIL HIDDEN" in hidden_again
+    assert "note visible detail" not in hidden_again
 
 
 def test_the_filter_cycles_through_the_useful_views():
@@ -816,20 +874,38 @@ def test_help_opens_and_closes_without_quitting():
     assert tui.show_help is False
 
 
+def test_help_is_contextual_and_fits_the_terminal():
+    tui = _tui(width=60, height=20)
+    _render(tui)
+
+    _press(tui, "?")
+    job_help = _render(tui)
+    assert "Cancel the selected job" in job_help
+    assert "Drain or resume" not in job_help
+    assert len(job_help.splitlines()) <= 19
+
+    _press(tui, "?")
+    _press(tui, "", name="KEY_TAB")
+    _press(tui, "?")
+    node_help = _render(tui)
+    assert "Drain or resume" in node_help
+    assert "Cancel the selected job" not in node_help
+
+
 # --- mouse interaction -----------------------------------------------------
 
 def test_clicking_job_rows_selects_then_toggles_the_current_detail():
     tui = _tui()
     output = _render(tui)
 
-    click = _mouse_at(output, "eval")
+    click = _mouse_at(output, "eval", occurrence=1)
     assert tui.handle_mouse(click) is True
     assert tui.focus == "jobs"
     assert tui.selected_job()["id"] == 2
 
-    assert tui.show_detail is True
-    assert tui.handle_mouse(click) is True
     assert tui.show_detail is False
+    assert tui.handle_mouse(click) is True
+    assert tui.show_detail is True
 
 
 def test_clicking_any_line_in_a_node_card_selects_that_node():
@@ -949,6 +1025,7 @@ def test_wheel_pages_wrapped_detail_and_scrolls_back_through_logs():
     snapshot = _snapshot(jobs=[_job(1, notes=note)], nodes=[])
     state = _state(snapshot)
     tui = _tui(width=80)
+    tui.show_detail = True
     output = _render(tui, state)
 
     assert tui.detail_pages > 1
@@ -1019,7 +1096,7 @@ def test_help_and_quit_buttons_are_clickable():
     assert tui.handle_mouse(_mouse_at(output, "[? help]")) is True
     assert tui.show_help is True
     help_output = _render(tui)
-    assert tui.handle_mouse(_mouse_at(help_output, "Mouse server")) is True
+    assert tui.handle_mouse(_mouse_at(help_output, "Mouse job")) is True
     assert tui.show_help is False
 
     output = _render(tui)
@@ -1088,6 +1165,20 @@ def test_d_drains_the_selected_node_and_resumes_a_drained_one():
     _render(tui, _state(snapshot))
     _press(tui, "d")
     assert tui.worker.actions.get_nowait() == ("resume", "big-node")
+
+
+def test_node_actions_only_apply_while_the_node_pane_has_focus():
+    tui = _tui()
+    output = _render(tui)
+
+    assert "drain:big-node" not in output
+    _press(tui, "d")
+    assert tui.worker.actions.empty()
+
+    _press(tui, "", name="KEY_TAB")
+    assert "drain:big-node" in _render(tui)
+    _press(tui, "d")
+    assert tui.worker.actions.get_nowait() == ("drain", "big-node")
 
 
 def test_the_log_view_asks_the_worker_for_the_selected_job():
@@ -1252,11 +1343,11 @@ def test_the_row_marker_tracks_the_detail_state():
     row = next(
         line for line in output.splitlines() if "train" in line and "python" in line
     )
-    assert row.startswith("▼")
+    assert row.startswith("▶")
 
     _press(tui, "", name="KEY_ENTER")
     output = _render(tui)
     row = next(
         line for line in output.splitlines() if "train" in line and "python" in line
     )
-    assert row.startswith("▶")
+    assert row.startswith("▼")

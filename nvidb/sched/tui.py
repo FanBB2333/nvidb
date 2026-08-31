@@ -14,6 +14,7 @@ import queue as queue_module
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from blessed import Terminal
@@ -72,6 +73,29 @@ THEMES = {
     },
 }
 THEME_ORDER = tuple(THEMES)
+
+
+@dataclass(frozen=True)
+class LayoutProfile:
+    """Space policy for a terminal size.
+
+    The renderer still owns the exact row counts.  A profile only states how
+    much of the body the resource overview may claim, which keeps the job
+    table and its controls usable as the terminal shrinks.
+    """
+
+    name: str
+    resource_fraction: float
+    resource_limit: int
+    footer_rows: int = 2
+
+    @classmethod
+    def for_terminal(cls, width: int, height: int) -> "LayoutProfile":
+        if width < 72 or height < 24:
+            return cls("compact", 0.30, 10)
+        if width < 120 or height < 32:
+            return cls("standard", 0.34, 14)
+        return cls("wide", 0.50, height)
 
 # The selection band: a grey clearly lighter than a dark terminal background,
 # so the cursor is findable at a glance yet still reads as a tint, not a bar.
@@ -376,7 +400,10 @@ class QueueTUI:
         # change may reorder the table under the selection.
         self._selected_job_id: Optional[int] = None
         self.proc_view = "summary"
-        self.show_detail = True
+        # Start with the table as the primary view.  Detail is one Enter away
+        # and no longer consumes most of a short terminal before it is asked
+        # for.
+        self.show_detail = False
         self.show_log = False
         self.show_help = False
         self.detail_page = 0
@@ -2047,7 +2074,7 @@ class QueueTUI:
                     (job_start + row_offset, start, min(end, width - 1), target)
                 )
 
-    def _control_lines(self, controls, width: int):
+    def _control_lines(self, controls, width: int, *, max_lines: Optional[int] = None):
         """Render a wrapping action bar and retain each button's hit box."""
         lines: List[str] = []
         regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
@@ -2069,6 +2096,8 @@ class QueueTUI:
             separator = " · " if segments else " "
             if segments and column + display_width(separator) + token_width > width:
                 finish_line()
+                if max_lines is not None and len(lines) >= max_lines:
+                    break
                 separator = " "
             start = column + display_width(separator)
             available = max(1, width - start)
@@ -2085,51 +2114,51 @@ class QueueTUI:
                     )
                 )
             column = start + shown_width
-        finish_line()
+        if max_lines is None or len(lines) < max_lines:
+            finish_line()
         return lines, regions
 
-    def _footer_lines(self, state: Dict[str, Any], width: int) -> List[str]:
-        notice = state.get("notice")
-        error = state.get("error")
-        lines = []
+    def _footer_lines(
+        self,
+        state: Dict[str, Any],
+        width: int,
+        *,
+        max_rows: int = 2,
+    ) -> List[str]:
+        """Render only actions that apply to the focused pane.
+
+        The bar is capped so controls cannot push the selected data off a
+        short screen.  Less common actions remain documented in ``?`` help.
+        """
+        lines: List[str] = []
         self._footer_regions = []
-        if error:
-            lines.append(self._style(fit_display(f" ! {error}", width), "red"))
-        elif notice:
-            message, style = notice
-            lines.append(self._style(fit_display(f" {message}", width), style))
         if self.pending_confirm:
             action, job_id, _ = self.pending_confirm
-            lines.append(
-                self._style(
-                    fit_display(
-                        f" press {action[0]} again or click confirm to {action} job "
-                        f"{job_id} (Esc cancels)",
-                        width,
-                    ),
-                    "yellow",
-                )
+            message = (
+                f" press {action[0]} again or click confirm to {action} job "
+                f"{job_id} (Esc cancels)"
             )
+            lines.append(self._style(fit_display(message, width), "yellow"))
+        elif state.get("error"):
+            lines.append(
+                self._style(fit_display(f" ! {state['error']}", width), "red")
+            )
+        elif state.get("notice"):
+            message, style = state["notice"]
+            lines.append(self._style(fit_display(f" {message}", width), style))
 
-        controls = []
+        context_controls = []
+        extra_controls = []
         job = self.selected_job()
         node = self.selected_node()
-        if job is not None:
-            controls.extend(
-                [
-                    (
-                        f"Enter {'hide' if self.show_detail else 'show'} detail",
-                        "detail",
-                        None,
-                        "cyan" if self.show_detail else "bright_black",
-                    ),
-                    (
-                        f"L log:{'on' if self.show_log else 'off'}",
-                        "log",
-                        None,
-                        "cyan" if self.show_log else "bright_black",
-                    ),
-                ]
+        if self.focus == "jobs" and job is not None:
+            context_controls.append(
+                (
+                    f"Enter {'hide' if self.show_detail else 'show'} detail",
+                    "detail",
+                    None,
+                    "cyan" if self.show_detail else "bright_black",
+                )
             )
             if job["state"] in ("pending", "running"):
                 confirming = bool(
@@ -2137,7 +2166,7 @@ class QueueTUI:
                     and self.pending_confirm[0] == "cancel"
                     and self.pending_confirm[1] == job["id"]
                 )
-                controls.append(
+                context_controls.append(
                     (
                         "c confirm cancel" if confirming else "c cancel",
                         "cancel",
@@ -2145,24 +2174,33 @@ class QueueTUI:
                         "red" if confirming else "yellow",
                     )
                 )
-                controls.extend(
+                extra_controls.extend(
                     [
                         (f"+ pri:{job.get('priority') or 0}", "priority", 1, "cyan"),
                         ("-", "priority", -1, "cyan"),
                     ]
                 )
                 if job["state"] == "pending":
-                    controls.extend(
+                    extra_controls.extend(
                         [
                             ("K ▲queue", "move", -1, "cyan"),
                             ("J ▼", "move", 1, "cyan"),
                         ]
                     )
             elif job["state"] in ("completed", "failed", "cancelled", "timeout", "lost"):
-                controls.append(("r requeue", "requeue", None, "yellow"))
-        if node is not None:
+                context_controls.append(("r requeue", "requeue", None, "yellow"))
+            extra_controls.insert(
+                0,
+                (
+                    f"L log:{'on' if self.show_log else 'off'}",
+                    "log",
+                    None,
+                    "cyan" if self.show_log else "bright_black",
+                )
+            )
+        if self.focus == "nodes" and node is not None:
             node_name = fit_display(node["name"], 12)
-            controls.append(
+            context_controls.append(
                 (
                     f"d {'resume' if not node['enabled'] else 'drain'}:{node_name}",
                     "node_toggle",
@@ -2171,67 +2209,61 @@ class QueueTUI:
                 )
             )
         if self.job_scope_node is not None:
-            controls.append(("x all jobs", "scope_all", None, "cyan"))
+            context_controls.append(("x all jobs", "scope_all", None, "cyan"))
 
-        controls.extend(
-            [
-                (
-                    f"Tab {'nodes' if self.focus == 'jobs' else 'jobs'}",
-                    "switch_pane",
-                    None,
-                    "cyan",
-                ),
-                ("t tick", "tick", None, "bright_black"),
-                (
-                    f"a auto:{'on' if state['auto_tick'] else 'off'}",
-                    "auto",
-                    not state["auto_tick"],
-                    "cyan" if state["auto_tick"] else "yellow",
-                ),
-                (
-                    f"f filter:{self.filter}",
-                    "filter",
-                    None,
-                    "bright_black",
-                ),
-                (
-                    f"s sort:{self.sort_key}{'▲' if self.sort_reverse else '▼'}",
-                    "sort",
-                    None,
-                    "bright_black",
-                ),
-                (
-                    f"v view:{self.resource_view}",
-                    "resource_view",
-                    None,
-                    "cyan" if self.resource_view == "flow" else "bright_black",
-                ),
-                (
-                    f"p procs:{self.proc_view}",
-                    "procs",
-                    None,
-                    "bright_black",
-                ),
-                (
-                    f"T theme:{self.theme}",
-                    "theme",
-                    None,
-                    "bright_black",
-                ),
-            ]
-        )
+        navigation_controls = [
+            (
+                f"Tab {'nodes' if self.focus == 'jobs' else 'jobs'}",
+                "switch_pane",
+                None,
+                "cyan",
+            ),
+            ("? help", "help", None, "bright_black"),
+            ("q quit", "quit", None, "bright_black"),
+        ]
+        secondary_controls = [
+            (f"f filter:{self.filter}", "filter", None, "bright_black"),
+            (
+                f"s sort:{self.sort_key}{'▲' if self.sort_reverse else '▼'}",
+                "sort",
+                None,
+                "bright_black",
+            ),
+            (
+                f"v view:{self.resource_view}",
+                "resource_view",
+                None,
+                "cyan" if self.resource_view == "flow" else "bright_black",
+            ),
+            (f"p procs:{self.proc_view}", "procs", None, "bright_black"),
+            ("t tick", "tick", None, "bright_black"),
+            (
+                f"a auto:{'on' if state['auto_tick'] else 'off'}",
+                "auto",
+                not state["auto_tick"],
+                "cyan" if state["auto_tick"] else "yellow",
+            ),
+            (f"T theme:{self.theme}", "theme", None, "bright_black"),
+        ]
         alerts = (state.get("snapshot") or {}).get("alerts") or []
         if alerts:
-            controls.append((f"A ack:{len(alerts)}", "ack", None, "red"))
-        controls.extend(
-            [
-                ("? help", "help", None, "bright_black"),
-                ("q quit", "quit", None, "bright_black"),
-            ]
-        )
+            secondary_controls.append((f"A ack:{len(alerts)}", "ack", None, "red"))
 
+        remaining_rows = max(0, max_rows - len(lines))
+        if not remaining_rows:
+            return lines[:max_rows]
+        controls = [
+            *context_controls,
+            *navigation_controls,
+            *extra_controls,
+            *secondary_controls,
+        ]
         control_offset = len(lines)
-        control_lines, control_regions = self._control_lines(controls, width)
+        control_lines, control_regions = self._control_lines(
+            controls,
+            width,
+            max_lines=remaining_rows,
+        )
         lines.extend(control_lines)
         self._footer_regions = [
             (line + control_offset, start, end, target)
@@ -2239,46 +2271,150 @@ class QueueTUI:
         ]
         return lines
 
-    def _help_lines(self, width: int) -> List[str]:
-        rows = [
-            ("j / k / ↑ / ↓", "Move the selection in the focused pane"),
-            ("PgUp / PgDn", "Move a page at a time"),
+    def _help_lines(self, width: int, height: Optional[int] = None) -> List[str]:
+        common_rows = [
             ("Tab", "Switch focus between the node and job panes"),
-            ("Enter", "Scope to a server, or show/hide job detail"),
-            ("[ / ]", "Page through wrapped detail or log text"),
-            ("L", "Toggle the log tail for the selected job"),
-            ("c", "Cancel the selected job (press twice)"),
-            ("r", "Re-queue the selected finished job"),
-            ("+ / -", "Raise or lower the selected job's priority"),
-            ("K / J", "Move a pending job up / down the dispatch order"),
-            ("s / S", "Cycle the sort column / flip its direction"),
+            ("x / Esc", "Clear a server or GPU job scope"),
             ("t", "Force a scheduler tick now"),
             ("a", "Toggle automatic ticking"),
-            ("f", "Cycle the job filter"),
-            ("x / Esc", "Clear a server or GPU job scope"),
-            ("v", "Switch task flow / server capacity view"),
-            ("Flow arrows", "✓ requires success · ◇ accepts any result"),
-            ("p", "Open capacity view; cycle GPU process detail"),
             ("T", "Switch colour theme (classic / muted)"),
-            ("d", "Drain or resume the selected node"),
             ("A", "Acknowledge every open alert"),
-            ("Mouse server", "Show only jobs running on that server"),
-            ("Mouse GPU", "Show only jobs running on that GPU"),
-            ("Mouse task", "Open a flow task; click it again to toggle detail"),
-            ("Mouse job", "Select a table job; click it again to toggle detail"),
-            ("Mouse wheel", "Move in nodes/jobs; page detail or log text"),
-            ("GPU bar", "amber: others' memory · teal: queue reservations · dim: free"),
-            (
-                "GPU cell",
-                "used/total VRAM · #id: running jobs · ~: split inferred (blind)",
-            ),
-            ("q", "Quit"),
+            ("? / Esc", "Close this help"),
+            ("q", "Quit (or close this help)"),
         ]
-        lines = [self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")]
-        for key, description in rows:
-            lines.append(fit_display(f"  {key:<16}{description}", width))
-        lines.append(self._style("  press ? or Esc to close", "bright_black"))
-        return lines
+        if self.focus == "jobs":
+            rows = [
+                ("j / k / ↑ / ↓", "Move the selected job"),
+                ("PgUp / PgDn", "Move a page at a time"),
+                ("g / G", "Select the first / last job"),
+                ("Enter", "Show or hide job detail"),
+                ("[ / ]", "Page through wrapped detail or log text"),
+                ("L", "Toggle the selected job's log tail"),
+                ("c", "Cancel the selected job (press twice)"),
+                ("r", "Re-queue the selected finished job"),
+                ("+ / -", "Raise or lower the selected job's priority"),
+                ("K / J", "Move a pending job in dispatch order"),
+                ("s / S", "Cycle the sort column / flip direction"),
+                ("f", "Cycle the job filter"),
+                ("Mouse job", "Select a job; click it again for detail"),
+            ]
+        else:
+            rows = [
+                ("j / k / ↑ / ↓", "Move the selected node"),
+                ("PgUp / PgDn", "Move a page at a time"),
+                ("g / G", "Select the first / last node"),
+                ("Enter", "Show jobs running on the selected node"),
+                ("d", "Drain or resume the selected node"),
+                ("v", "Switch task flow / server capacity view"),
+                ("p", "Open capacity view; cycle process detail"),
+                ("Mouse server", "Show jobs running on that server"),
+                ("Mouse GPU", "Show jobs running on that GPU"),
+                ("GPU bar", "amber: others · teal: queue · dim: free"),
+            ]
+        rows.extend(common_rows)
+
+        title = self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")
+        body = [fit_display(f"  {key:<16}{description}", width) for key, description in rows]
+        close = self._style("  press ? or Esc to close", "bright_black")
+        if height is not None and len(body) + 2 > height:
+            visible = max(0, height - 3)
+            hidden = len(body) - visible
+            body = body[:visible]
+            body.append(
+                self._style(
+                    fit_display(f"  … {hidden} more command(s)", width),
+                    "bright_black",
+                )
+            )
+        return [title, *body, close]
+
+    def _resource_viewport(
+        self,
+        lines: List[str],
+        budget: int,
+        width: int,
+    ) -> List[str]:
+        """Crop a resource pane around its selected node and remap hit boxes."""
+        budget = max(0, budget)
+        if len(lines) <= budget:
+            return lines
+        if budget == 0:
+            self._node_line_targets = {}
+            self._node_gpu_regions = []
+            self._node_header_regions = []
+            return []
+        if budget == 1:
+            self._node_line_targets = {}
+            self._node_gpu_regions = []
+            self._node_header_regions = [
+                region for region in self._node_header_regions if region[0] == 0
+            ]
+            return lines[:1]
+
+        content_size = len(lines) - 1
+        slots = budget - 1
+        selected_rows = [
+            row
+            for row, position in self._node_line_targets.items()
+            if position == self.node_index and row > 0
+        ]
+        anchor = (min(selected_rows) - 1) if selected_rows else 0
+
+        data_rows = slots
+        start = 0
+        show_above = False
+        show_below = False
+        for _ in range(3):
+            start = max(0, min(anchor - data_rows // 2, content_size - data_rows))
+            show_above = start > 0
+            show_below = start + data_rows < content_size
+            next_data_rows = max(1, slots - int(show_above) - int(show_below))
+            if next_data_rows == data_rows:
+                break
+            data_rows = next_data_rows
+        start = max(0, min(anchor - data_rows // 2, content_size - data_rows))
+        show_above = start > 0
+        show_below = start + data_rows < content_size
+        end = min(content_size, start + data_rows)
+
+        visible: List[str] = [lines[0]]
+        row_map = {0: 0}
+        if show_above:
+            visible.append(
+                self._style(
+                    fit_display(f"  ↑ {start} line(s) above · j/k to move", width),
+                    "bright_black",
+                )
+            )
+        for content_index in range(start, end):
+            old_row = content_index + 1
+            row_map[old_row] = len(visible)
+            visible.append(lines[old_row])
+        if show_below:
+            hidden = content_size - end
+            visible.append(
+                self._style(
+                    fit_display(f"  ↓ {hidden} line(s) below · j/k to move", width),
+                    "bright_black",
+                )
+            )
+
+        self._node_line_targets = {
+            row_map[row]: position
+            for row, position in self._node_line_targets.items()
+            if row in row_map
+        }
+        self._node_gpu_regions = [
+            (row_map[row], start_col, end_col, target)
+            for row, start_col, end_col, target in self._node_gpu_regions
+            if row in row_map
+        ]
+        self._node_header_regions = [
+            (row_map[row], start_col, end_col, target)
+            for row, start_col, end_col, target in self._node_header_regions
+            if row in row_map
+        ]
+        return visible
 
     def render(self, state: Dict[str, Any]) -> str:
         """The whole frame as one string; tests read this, the loop paints
@@ -2286,8 +2422,9 @@ class QueueTUI:
         return "\n".join(self._frame_lines(state))
 
     def _frame_lines(self, state: Dict[str, Any]) -> List[str]:
-        width = max(60, self.term.width or 100)
-        height = max(20, self.term.height or 30)
+        width = max(1, self.term.width or 100)
+        height = max(2, self.term.height or 30)
+        layout = LayoutProfile.for_terminal(width, height)
         self._click_regions = []
         self._row_targets = {}
         self._alert_targets = {}
@@ -2295,7 +2432,7 @@ class QueueTUI:
         self._snapshot = snapshot
         if snapshot is None:
             message = state.get("error") or "connecting to nodes…"
-            return [f"  {message}"]
+            return [fit_display(f"  {message}", width)]
 
         self.nodes = snapshot["nodes"]
         self._reanchor_node_scope()
@@ -2323,7 +2460,7 @@ class QueueTUI:
 
         if self.show_help:
             help_start = len(lines)
-            help_lines = self._help_lines(width)
+            help_lines = self._help_lines(width, max(1, usable - help_start))
             lines.extend(help_lines)
             lines = lines[:usable]
             if help_start < len(lines):
@@ -2331,32 +2468,34 @@ class QueueTUI:
                 for row in range(help_start, help_end + 1):
                     self._row_targets[row] = ("close_help", None)
         else:
-            # Flow is the primary overview and gets half the screen.  The
-            # capacity cards remain compact unless full process detail is on.
+            footer = self._footer_lines(
+                state,
+                width,
+                max_rows=layout.footer_rows,
+            )
+            body_height = max(0, usable - len(footer))
+            pane_rows = max(0, body_height - len(lines))
+
             node_lines = (
                 self._flow_lines(width)
                 if self.resource_view == "flow"
                 else self._node_lines(width)
             )
-            node_budget = max(
-                8 if self.resource_view == "flow" else 6,
-                usable // 2
-                if self.resource_view == "flow" or self.proc_view == "all"
-                else usable // 3,
+            # A useful job table needs a title, a header, and at least one row;
+            # its collapsed detail summary takes one more.  Opening detail in
+            # compact mode temporarily gives those rows back to the job pane.
+            job_reserve = 4 if self.jobs else 3
+            if self.show_detail and self.jobs:
+                job_reserve = 6
+            resource_room = max(0, pane_rows - job_reserve)
+            desired_resource_rows = min(
+                layout.resource_limit,
+                max(2, int(pane_rows * layout.resource_fraction)),
             )
-            node_target_rows = len(node_lines)
-            if len(node_lines) > node_budget:
-                hidden = len(node_lines) - node_budget + 1
-                node_target_rows = node_budget - 1
-                node_lines = node_lines[: node_budget - 1]
-                overflow = (
-                    f"    … {hidden} more flow line(s); enlarge the terminal"
-                    if self.resource_view == "flow"
-                    else f"    … {hidden} more line(s), press p"
-                )
-                node_lines.append(
-                    self._style(overflow, "bright_black")
-                )
+            if layout.name == "compact" and self.show_detail:
+                desired_resource_rows = 0
+            node_budget = min(resource_room, desired_resource_rows)
+            node_lines = self._resource_viewport(node_lines, node_budget, width)
             node_start = len(lines)
             lines.extend(node_lines)
             if node_lines:
@@ -2364,13 +2503,13 @@ class QueueTUI:
                 for row in range(node_start, node_end + 1):
                     self._row_targets[row] = ("pane", "nodes")
                 for relative_row, position in self._node_line_targets.items():
-                    if relative_row < node_target_rows:
+                    if relative_row < len(node_lines):
                         self._row_targets[node_start + relative_row] = (
                             "node",
                             position,
                         )
                 for relative_row, start, end, target in self._node_gpu_regions:
-                    if relative_row < node_target_rows and start < width:
+                    if relative_row < len(node_lines) and start < width:
                         self._click_regions.append(
                             (
                                 node_start + relative_row,
@@ -2380,7 +2519,7 @@ class QueueTUI:
                             )
                         )
                 for relative_row, start, end, target in self._node_header_regions:
-                    if relative_row < node_target_rows and start < width:
+                    if relative_row < len(node_lines) and start < width:
                         self._click_regions.append(
                             (
                                 node_start + relative_row,
@@ -2389,8 +2528,6 @@ class QueueTUI:
                                 target,
                             )
                         )
-            footer = self._footer_lines(state, width)
-            body_height = usable - len(footer)
             available = max(0, body_height - len(lines))
             if self.show_detail and self.jobs:
                 minimum_detail = min(8, max(3, available - 4))
@@ -2644,6 +2781,11 @@ class QueueTUI:
         """Run one named UI action. False means the caller should quit."""
         if action == "quit":
             return False
+        if action in {"detail", "log", "cancel", "requeue", "priority", "move"}:
+            if self.focus != "jobs":
+                return True
+        if action == "node_toggle" and self.focus != "nodes":
+            return True
         if action == "help":
             self.show_help = True
         elif action == "close_help":
@@ -2829,6 +2971,8 @@ class QueueTUI:
             return True
         if kind == "flow_job":
             return self._activate("flow_job", value)
+        if kind in {"detail", "log", "cancel", "requeue", "priority", "move"}:
+            self.focus = "jobs"
         return self._activate(kind, value)
 
     def handle_key(self, key) -> bool:
@@ -2859,11 +3003,13 @@ class QueueTUI:
         elif name in ("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP"):
             self._move(-10)
         elif text == "g":
-            self._set_job_index(0)
-            self.detail_page = 0
+            self._move(-max(len(self.nodes), len(self.jobs)))
+            if self.focus == "jobs":
+                self.detail_page = 0
         elif text == "G":
-            self._set_job_index(len(self.jobs) - 1)
-            self.detail_page = 0
+            self._move(max(len(self.nodes), len(self.jobs)))
+            if self.focus == "jobs":
+                self.detail_page = 0
         elif name == "KEY_TAB":
             self._activate("switch_pane")
         elif name in ("KEY_ENTER", "KEY_RETURN") or text in ("\n", "\r"):
