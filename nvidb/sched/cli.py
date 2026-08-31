@@ -12,6 +12,7 @@ import getpass
 import json
 import os
 import shlex
+import shutil
 import socket
 import sqlite3
 import sys
@@ -67,7 +68,14 @@ def _error(message: str, *, as_json: bool = False) -> int:
     return 1
 
 
-def _table(rows: List[Sequence[str]], headers: Sequence[str], indent: str = "  ") -> str:
+def _table(
+    rows: List[Sequence[str]],
+    headers: Sequence[str],
+    indent: str = "  ",
+    *,
+    drop_columns: Sequence[str] = (),
+    minimum_cell_padding: int = 0,
+) -> str:
     """Render a fixed-width table; column widths follow the widest cell.
 
     Widths are measured in terminal columns rather than characters, so a
@@ -75,18 +83,64 @@ def _table(rows: List[Sequence[str]], headers: Sequence[str], indent: str = "  "
     """
     if not rows:
         return f"{indent}(none)"
-    columns = len(headers)
-    widths = [display_width(header) for header in headers]
-    for row in rows:
-        for index in range(columns):
-            widths[index] = max(widths[index], display_width(row[index]))
+    terminal_width = max(20, shutil.get_terminal_size(fallback=(120, 24)).columns)
+    selected = list(range(len(headers)))
+
+    def available_width() -> int:
+        separators = 2 * max(0, len(selected) - 1)
+        return max(1, terminal_width - display_width(indent) - separators)
+
+    def header_width() -> int:
+        return sum(
+            display_width(headers[index]) + minimum_cell_padding
+            for index in selected
+        )
+
+    for header in drop_columns:
+        if header_width() <= available_width():
+            break
+        try:
+            selected.remove(headers.index(header))
+        except ValueError:
+            continue
+
+    widths = []
+    minimums = []
+    for index in selected:
+        width = max(
+            [display_width(headers[index])]
+            + [display_width(str(row[index])) for row in rows]
+        )
+        widths.append(width)
+        minimums.append(min(width, max(1, display_width(headers[index]))))
+
+    excess = max(0, sum(widths) - available_width())
+    while excess:
+        candidates = [
+            index
+            for index, width in enumerate(widths)
+            if width > minimums[index]
+        ]
+        if not candidates:
+            candidates = [index for index, width in enumerate(widths) if width > 1]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda index: widths[index] - minimums[index])
+        widths[widest] -= 1
+        excess -= 1
+
+    def format_row(values: Sequence[str]) -> str:
+        cells = [
+            pad_display(fit_display(str(values[index]), width), width)
+            for index, width in zip(selected, widths)
+        ]
+        return indent + "  ".join(cells).rstrip()
+
     lines = [
-        indent + "  ".join(pad_display(headers[i], widths[i]) for i in range(columns)).rstrip()
+        format_row(headers)
     ]
     for row in rows:
-        lines.append(
-            indent + "  ".join(pad_display(row[i], widths[i]) for i in range(columns)).rstrip()
-        )
+        lines.append(format_row(row))
     return "\n".join(lines)
 
 
@@ -307,7 +361,13 @@ def _job_table(jobs: Sequence[Dict[str, Any]], indent: str = "  ") -> str:
     optional = {"held_reason": "HELD BY", "progress": "PROGRESS", "notes": "NOTE"}
     extra = [key for key in optional if any(job.get(key) for job in jobs)]
     headers = JOB_HEADERS + [optional[key] for key in extra]
-    return _table([_job_row(job, extra=extra) for job in jobs], headers, indent=indent)
+    return _table(
+        [_job_row(job, extra=extra) for job in jobs],
+        headers,
+        indent=indent,
+        drop_columns=("USED", "RC", "NODE", "GPU", "VRAM", "PROGRESS", "NOTE"),
+        minimum_cell_padding=2,
+    )
 
 
 def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:

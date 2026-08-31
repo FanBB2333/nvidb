@@ -14,6 +14,7 @@ import pytest
 from nvidb.sched import cli as sched_cli
 from nvidb.sched import db as dbm
 from nvidb.sched.scheduler import TICK_LOCK, Scheduler
+from nvidb.tui_theme import display_width
 
 
 @pytest.fixture
@@ -465,6 +466,40 @@ def test_the_job_table_only_shows_columns_that_carry_data(parser, queue_db, caps
     assert _run(parser, ["job", "ls"], queue_db) == 0
     output = capsys.readouterr().out
     assert "PROGRESS" in output and "epoch 3/10" in output
+
+
+def test_the_job_table_adapts_to_a_narrow_terminal(
+    parser,
+    queue_db,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        sched_cli.shutil,
+        "get_terminal_size",
+        lambda fallback: os.terminal_size((40, 24)),
+    )
+    _submit(
+        parser,
+        queue_db,
+        "--name",
+        "中文训练任务",
+        "--",
+        "python",
+        "train.py",
+        "--epochs",
+        "100",
+    )
+    capsys.readouterr()
+
+    assert _run(parser, ["job", "ls"], queue_db) == 0
+    output = capsys.readouterr().out
+    header = output.splitlines()[0]
+
+    assert all(display_width(line) <= 40 for line in output.splitlines())
+    assert "ID" in header and "STATE" in header and "COMMAND" in header
+    assert "USED" not in header and "NODE" not in header
+    assert "中" in output and "python" in output
 
 
 def test_events_replay_from_a_given_id(parser, queue_db, capsys):
