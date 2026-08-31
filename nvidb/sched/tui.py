@@ -97,6 +97,271 @@ class LayoutProfile:
             return cls("standard", 0.34, 14)
         return cls("wide", 0.50, height)
 
+
+@dataclass(frozen=True)
+class Command:
+    """One keyboard command shared by dispatch, help, and the action bar."""
+
+    name: str
+    action: str
+    text_keys: Tuple[str, ...] = ()
+    key_names: Tuple[str, ...] = ()
+    contexts: Tuple[str, ...] = ("jobs", "nodes")
+    value: Any = None
+    help_key: Optional[str] = None
+    description: Optional[str] = None
+    footer_order: Optional[int] = None
+
+    def matches(self, text: str, key_name: str, context: str) -> bool:
+        return (
+            context in self.contexts
+            and (text in self.text_keys or key_name in self.key_names)
+        )
+
+
+COMMANDS = (
+    Command(
+        "cursor_down",
+        "move_cursor",
+        ("j",),
+        ("KEY_DOWN",),
+        value=1,
+        help_key="j / k / ↑ / ↓",
+        description="Move the selection in the focused pane",
+    ),
+    Command("cursor_up", "move_cursor", ("k",), ("KEY_UP",), value=-1),
+    Command(
+        "page_down",
+        "move_cursor",
+        key_names=("KEY_PGDOWN", "KEY_NPAGE", "KEY_PAGEDOWN"),
+        value=10,
+        help_key="PgUp / PgDn",
+        description="Move a page at a time",
+    ),
+    Command(
+        "page_up",
+        "move_cursor",
+        key_names=("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP"),
+        value=-10,
+    ),
+    Command(
+        "first",
+        "move_edge",
+        ("g",),
+        value=-1,
+        help_key="g / G",
+        description="Select the first / last item",
+    ),
+    Command("last", "move_edge", ("G",), value=1),
+    Command(
+        "switch_pane",
+        "switch_pane",
+        key_names=("KEY_TAB",),
+        help_key="Tab",
+        description="Switch focus between nodes and jobs",
+        footer_order=20,
+    ),
+    Command(
+        "job_detail",
+        "detail",
+        ("\n", "\r"),
+        ("KEY_ENTER", "KEY_RETURN"),
+        ("jobs",),
+        help_key="Enter",
+        description="Show or hide job detail",
+        footer_order=10,
+    ),
+    Command(
+        "node_scope",
+        "scope_node",
+        ("\n", "\r"),
+        ("KEY_ENTER", "KEY_RETURN"),
+        ("nodes",),
+        help_key="Enter",
+        description="Show jobs running on the selected node",
+    ),
+    Command(
+        "detail_previous",
+        "scroll_detail",
+        ("[",),
+        contexts=("jobs",),
+        value=-1,
+        help_key="[ / ]",
+        description="Page through detail or log text",
+    ),
+    Command(
+        "detail_next",
+        "scroll_detail",
+        ("]",),
+        contexts=("jobs",),
+        value=1,
+    ),
+    Command(
+        "log",
+        "log",
+        ("L",),
+        contexts=("jobs",),
+        help_key="L",
+        description="Toggle the selected job's log tail",
+        footer_order=30,
+    ),
+    Command(
+        "cancel",
+        "cancel",
+        ("c",),
+        contexts=("jobs",),
+        help_key="c",
+        description="Cancel the selected job (press twice)",
+        footer_order=11,
+    ),
+    Command(
+        "requeue",
+        "requeue",
+        ("r",),
+        contexts=("jobs",),
+        help_key="r",
+        description="Re-queue the selected finished job",
+        footer_order=11,
+    ),
+    Command(
+        "priority_up",
+        "priority",
+        ("+", "="),
+        contexts=("jobs",),
+        value=1,
+        help_key="+ / -",
+        description="Raise or lower the selected job's priority",
+        footer_order=31,
+    ),
+    Command(
+        "priority_down",
+        "priority",
+        ("-",),
+        contexts=("jobs",),
+        value=-1,
+        footer_order=32,
+    ),
+    Command(
+        "queue_up",
+        "move",
+        text_keys=("K",),
+        key_names=("KEY_SR",),
+        contexts=("jobs",),
+        value=-1,
+        help_key="K / J",
+        description="Move a pending job in dispatch order",
+        footer_order=33,
+    ),
+    Command(
+        "queue_down",
+        "move",
+        text_keys=("J",),
+        key_names=("KEY_SF",),
+        contexts=("jobs",),
+        value=1,
+        footer_order=34,
+    ),
+    Command(
+        "filter",
+        "filter",
+        ("f",),
+        help_key="f",
+        description="Cycle the job filter",
+        footer_order=40,
+    ),
+    Command(
+        "sort",
+        "sort",
+        ("s",),
+        help_key="s / S",
+        description="Cycle the sort column / flip direction",
+        footer_order=41,
+    ),
+    Command("sort_reverse", "reverse_sort", ("S",)),
+    Command(
+        "resource_view",
+        "resource_view",
+        ("v",),
+        help_key="v",
+        description="Switch task flow / server capacity view",
+        footer_order=42,
+    ),
+    Command(
+        "process_view",
+        "procs",
+        ("p",),
+        help_key="p",
+        description="Open capacity view; cycle process detail",
+        footer_order=43,
+    ),
+    Command(
+        "tick",
+        "tick",
+        ("t",),
+        help_key="t",
+        description="Force a scheduler tick now",
+        footer_order=44,
+    ),
+    Command(
+        "auto_tick",
+        "auto",
+        ("a",),
+        help_key="a",
+        description="Toggle automatic ticking",
+        footer_order=45,
+    ),
+    Command(
+        "theme",
+        "theme",
+        ("T",),
+        help_key="T",
+        description="Switch colour theme (classic / muted)",
+        footer_order=46,
+    ),
+    Command(
+        "node_toggle",
+        "node_toggle",
+        ("d",),
+        contexts=("nodes",),
+        help_key="d",
+        description="Drain or resume the selected node",
+        footer_order=11,
+    ),
+    Command(
+        "scope_all",
+        "scope_all",
+        ("x",),
+        help_key="x / Esc",
+        description="Clear a server or GPU job scope",
+        footer_order=12,
+    ),
+    Command("escape", "escape", key_names=("KEY_ESCAPE",)),
+    Command(
+        "acknowledge",
+        "ack",
+        ("A",),
+        help_key="A",
+        description="Acknowledge every open alert",
+        footer_order=47,
+    ),
+    Command(
+        "help",
+        "help",
+        ("?",),
+        help_key="?",
+        description="Show this context-sensitive help",
+        footer_order=21,
+    ),
+    Command(
+        "quit",
+        "quit",
+        ("q",),
+        help_key="q",
+        description="Quit",
+        footer_order=22,
+    ),
+)
+
 # The selection band: a grey clearly lighter than a dark terminal background,
 # so the cursor is findable at a glance yet still reads as a tint, not a bar.
 SELECTION_BG = "gray27"
@@ -2074,7 +2339,13 @@ class QueueTUI:
                     (job_start + row_offset, start, min(end, width - 1), target)
                 )
 
-    def _control_lines(self, controls, width: int, *, max_lines: Optional[int] = None):
+    def _control_lines(
+        self,
+        controls,
+        width: int,
+        *,
+        max_lines: Optional[int] = None,
+    ):
         """Render a wrapping action bar and retain each button's hit box."""
         lines: List[str] = []
         regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
@@ -2118,6 +2389,99 @@ class QueueTUI:
             finish_line()
         return lines, regions
 
+    def _footer_control(self, command: Command, state: Dict[str, Any]):
+        """Return the current label and target for one registered command."""
+        if command.footer_order is None or self.focus not in command.contexts:
+            return None
+        job = self.selected_job()
+        node = self.selected_node()
+        name = command.name
+        label = None
+        style = "bright_black"
+        value = command.value
+
+        if name == "job_detail" and job is not None:
+            label = f"Enter {'hide' if self.show_detail else 'show'} detail"
+            style = "cyan" if self.show_detail else "bright_black"
+        elif name == "cancel" and job is not None and job["state"] in (
+            "pending",
+            "running",
+        ):
+            confirming = bool(
+                self.pending_confirm
+                and self.pending_confirm[0] == "cancel"
+                and self.pending_confirm[1] == job["id"]
+            )
+            label = "c confirm cancel" if confirming else "c cancel"
+            style = "red" if confirming else "yellow"
+        elif name == "requeue" and job is not None and job["state"] in (
+            "completed",
+            "failed",
+            "cancelled",
+            "timeout",
+            "lost",
+        ):
+            label, style = "r requeue", "yellow"
+        elif name == "log" and job is not None:
+            label = f"L log:{'on' if self.show_log else 'off'}"
+            style = "cyan" if self.show_log else "bright_black"
+        elif name == "priority_up" and job is not None and job["state"] in (
+            "pending",
+            "running",
+        ):
+            label, style = f"+ pri:{job.get('priority') or 0}", "cyan"
+        elif name == "priority_down" and job is not None and job["state"] in (
+            "pending",
+            "running",
+        ):
+            label, style = "-", "cyan"
+        elif name in ("queue_up", "queue_down") and job is not None and job[
+            "state"
+        ] == "pending":
+            label, style = (
+                ("K ▲queue", "cyan") if value < 0 else ("J ▼", "cyan")
+            )
+        elif name == "node_toggle" and node is not None:
+            node_name = fit_display(node["name"], 12)
+            label = f"d {'resume' if not node['enabled'] else 'drain'}:{node_name}"
+            style = "green" if not node["enabled"] else "yellow"
+        elif name == "scope_all" and self.job_scope_node is not None:
+            label, style = "x all jobs", "cyan"
+        elif name == "switch_pane":
+            label, style = (
+                f"Tab {'nodes' if self.focus == 'jobs' else 'jobs'}",
+                "cyan",
+            )
+        elif name == "help":
+            label = "? help"
+        elif name == "quit":
+            label = "q quit"
+        elif name == "filter":
+            label = f"f filter:{self.filter}"
+        elif name == "sort":
+            label = f"s sort:{self.sort_key}{'▲' if self.sort_reverse else '▼'}"
+        elif name == "resource_view":
+            label = f"v view:{self.resource_view}"
+            style = "cyan" if self.resource_view == "flow" else "bright_black"
+        elif name == "process_view":
+            label = f"p procs:{self.proc_view}"
+        elif name == "tick":
+            label = "t tick"
+        elif name == "auto_tick":
+            label = f"a auto:{'on' if state['auto_tick'] else 'off'}"
+            value = not state["auto_tick"]
+            style = "cyan" if state["auto_tick"] else "yellow"
+        elif name == "theme":
+            label = f"T theme:{self.theme}"
+        elif name == "acknowledge":
+            alerts = (state.get("snapshot") or {}).get("alerts") or []
+            if alerts:
+                label, style = f"A ack:{len(alerts)}", "red"
+
+        if label is None:
+            return None
+        return (label, command.action, value, style)
+
     def _footer_lines(
         self,
         state: Dict[str, Any],
@@ -2147,116 +2511,16 @@ class QueueTUI:
             message, style = state["notice"]
             lines.append(self._style(fit_display(f" {message}", width), style))
 
-        context_controls = []
-        extra_controls = []
-        job = self.selected_job()
-        node = self.selected_node()
-        if self.focus == "jobs" and job is not None:
-            context_controls.append(
-                (
-                    f"Enter {'hide' if self.show_detail else 'show'} detail",
-                    "detail",
-                    None,
-                    "cyan" if self.show_detail else "bright_black",
-                )
-            )
-            if job["state"] in ("pending", "running"):
-                confirming = bool(
-                    self.pending_confirm
-                    and self.pending_confirm[0] == "cancel"
-                    and self.pending_confirm[1] == job["id"]
-                )
-                context_controls.append(
-                    (
-                        "c confirm cancel" if confirming else "c cancel",
-                        "cancel",
-                        None,
-                        "red" if confirming else "yellow",
-                    )
-                )
-                extra_controls.extend(
-                    [
-                        (f"+ pri:{job.get('priority') or 0}", "priority", 1, "cyan"),
-                        ("-", "priority", -1, "cyan"),
-                    ]
-                )
-                if job["state"] == "pending":
-                    extra_controls.extend(
-                        [
-                            ("K ▲queue", "move", -1, "cyan"),
-                            ("J ▼", "move", 1, "cyan"),
-                        ]
-                    )
-            elif job["state"] in ("completed", "failed", "cancelled", "timeout", "lost"):
-                context_controls.append(("r requeue", "requeue", None, "yellow"))
-            extra_controls.insert(
-                0,
-                (
-                    f"L log:{'on' if self.show_log else 'off'}",
-                    "log",
-                    None,
-                    "cyan" if self.show_log else "bright_black",
-                )
-            )
-        if self.focus == "nodes" and node is not None:
-            node_name = fit_display(node["name"], 12)
-            context_controls.append(
-                (
-                    f"d {'resume' if not node['enabled'] else 'drain'}:{node_name}",
-                    "node_toggle",
-                    None,
-                    "green" if not node["enabled"] else "yellow",
-                )
-            )
-        if self.job_scope_node is not None:
-            context_controls.append(("x all jobs", "scope_all", None, "cyan"))
-
-        navigation_controls = [
-            (
-                f"Tab {'nodes' if self.focus == 'jobs' else 'jobs'}",
-                "switch_pane",
-                None,
-                "cyan",
-            ),
-            ("? help", "help", None, "bright_black"),
-            ("q quit", "quit", None, "bright_black"),
-        ]
-        secondary_controls = [
-            (f"f filter:{self.filter}", "filter", None, "bright_black"),
-            (
-                f"s sort:{self.sort_key}{'▲' if self.sort_reverse else '▼'}",
-                "sort",
-                None,
-                "bright_black",
-            ),
-            (
-                f"v view:{self.resource_view}",
-                "resource_view",
-                None,
-                "cyan" if self.resource_view == "flow" else "bright_black",
-            ),
-            (f"p procs:{self.proc_view}", "procs", None, "bright_black"),
-            ("t tick", "tick", None, "bright_black"),
-            (
-                f"a auto:{'on' if state['auto_tick'] else 'off'}",
-                "auto",
-                not state["auto_tick"],
-                "cyan" if state["auto_tick"] else "yellow",
-            ),
-            (f"T theme:{self.theme}", "theme", None, "bright_black"),
-        ]
-        alerts = (state.get("snapshot") or {}).get("alerts") or []
-        if alerts:
-            secondary_controls.append((f"A ack:{len(alerts)}", "ack", None, "red"))
-
         remaining_rows = max(0, max_rows - len(lines))
         if not remaining_rows:
             return lines[:max_rows]
         controls = [
-            *context_controls,
-            *navigation_controls,
-            *extra_controls,
-            *secondary_controls,
+            control
+            for command in sorted(
+                COMMANDS,
+                key=lambda item: item.footer_order or 10_000,
+            )
+            if (control := self._footer_control(command, state)) is not None
         ]
         control_offset = len(lines)
         control_lines, control_regions = self._control_lines(
@@ -2272,46 +2536,23 @@ class QueueTUI:
         return lines
 
     def _help_lines(self, width: int, height: Optional[int] = None) -> List[str]:
-        common_rows = [
-            ("Tab", "Switch focus between the node and job panes"),
-            ("x / Esc", "Clear a server or GPU job scope"),
-            ("t", "Force a scheduler tick now"),
-            ("a", "Toggle automatic ticking"),
-            ("T", "Switch colour theme (classic / muted)"),
-            ("A", "Acknowledge every open alert"),
-            ("? / Esc", "Close this help"),
-            ("q", "Quit (or close this help)"),
+        rows = [
+            (command.help_key, command.description)
+            for command in COMMANDS
+            if self.focus in command.contexts
+            and command.help_key is not None
+            and command.description is not None
         ]
         if self.focus == "jobs":
-            rows = [
-                ("j / k / ↑ / ↓", "Move the selected job"),
-                ("PgUp / PgDn", "Move a page at a time"),
-                ("g / G", "Select the first / last job"),
-                ("Enter", "Show or hide job detail"),
-                ("[ / ]", "Page through wrapped detail or log text"),
-                ("L", "Toggle the selected job's log tail"),
-                ("c", "Cancel the selected job (press twice)"),
-                ("r", "Re-queue the selected finished job"),
-                ("+ / -", "Raise or lower the selected job's priority"),
-                ("K / J", "Move a pending job in dispatch order"),
-                ("s / S", "Cycle the sort column / flip direction"),
-                ("f", "Cycle the job filter"),
-                ("Mouse job", "Select a job; click it again for detail"),
-            ]
+            rows.append(("Mouse job", "Select a job; click it again for detail"))
         else:
-            rows = [
-                ("j / k / ↑ / ↓", "Move the selected node"),
-                ("PgUp / PgDn", "Move a page at a time"),
-                ("g / G", "Select the first / last node"),
-                ("Enter", "Show jobs running on the selected node"),
-                ("d", "Drain or resume the selected node"),
-                ("v", "Switch task flow / server capacity view"),
-                ("p", "Open capacity view; cycle process detail"),
-                ("Mouse server", "Show jobs running on that server"),
-                ("Mouse GPU", "Show jobs running on that GPU"),
-                ("GPU bar", "amber: others · teal: queue · dim: free"),
-            ]
-        rows.extend(common_rows)
+            rows.extend(
+                [
+                    ("Mouse server", "Show jobs running on that server"),
+                    ("Mouse GPU", "Show jobs running on that GPU"),
+                    ("GPU bar", "amber: others · teal: queue · dim: free"),
+                ]
+            )
 
         title = self._style("─ HELP " + "─" * max(0, width - 7), "bright_black")
         body = [fit_display(f"  {key:<16}{description}", width) for key, description in rows]
@@ -2975,8 +3216,37 @@ class QueueTUI:
             self.focus = "jobs"
         return self._activate(kind, value)
 
+    def _dispatch_command(self, command: Command) -> bool:
+        if command.action == "move_cursor":
+            self._move(int(command.value))
+            return True
+        if command.action == "move_edge":
+            distance = max(len(self.nodes), len(self.jobs))
+            self._move(distance if command.value > 0 else -distance)
+            if self.focus == "jobs":
+                self.detail_page = 0
+            return True
+        if command.action == "scope_node":
+            self._select_node_position(self.node_index)
+            return True
+        if command.action == "scroll_detail":
+            if self.show_detail:
+                self._scroll_detail(int(command.value), page=True)
+            return True
+        if command.action == "reverse_sort":
+            self.sort_reverse = not self.sort_reverse
+            if self._snapshot is not None:
+                self.jobs = self._visible_jobs(self._snapshot)
+                self._reanchor_selection()
+            return True
+        if command.action == "escape":
+            if not self._clear_job_scope():
+                self.pending_confirm = None
+            return True
+        return self._activate(command.action, command.value)
+
     def handle_key(self, key) -> bool:
-        """Return False to quit."""
+        """Dispatch one key through the command registry."""
         name = key.name or ""
         text = str(key)
 
@@ -2985,82 +3255,15 @@ class QueueTUI:
                 self.show_help = False
             return True
 
-        if name == "KEY_ESCAPE":
-            if self._clear_job_scope():
-                return True
-            self.pending_confirm = None
-            return True
-        if text == "q":
-            return self._activate("quit")
-        if text == "?":
-            return self._activate("help")
-        if text in ("j",) or name == "KEY_DOWN":
-            self._move(1)
-        elif text in ("k",) or name == "KEY_UP":
-            self._move(-1)
-        elif name in ("KEY_PGDOWN", "KEY_NPAGE", "KEY_PAGEDOWN"):
-            self._move(10)
-        elif name in ("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP"):
-            self._move(-10)
-        elif text == "g":
-            self._move(-max(len(self.nodes), len(self.jobs)))
-            if self.focus == "jobs":
-                self.detail_page = 0
-        elif text == "G":
-            self._move(max(len(self.nodes), len(self.jobs)))
-            if self.focus == "jobs":
-                self.detail_page = 0
-        elif name == "KEY_TAB":
-            self._activate("switch_pane")
-        elif name in ("KEY_ENTER", "KEY_RETURN") or text in ("\n", "\r"):
-            if self.focus == "nodes":
-                self._select_node_position(self.node_index)
-            else:
-                self._activate("detail")
-        elif text == "[" and self.show_detail:
-            self._scroll_detail(-1, page=True)
-        elif text == "]" and self.show_detail:
-            self._scroll_detail(1, page=True)
-        elif text == "L":
-            self._activate("log")
-        elif text == "f":
-            self._activate("filter")
-        elif text == "s":
-            self._activate("sort")
-        elif text == "S":
-            self.sort_reverse = not self.sort_reverse
-            if self._snapshot is not None:
-                self.jobs = self._visible_jobs(self._snapshot)
-                self._reanchor_selection()
-        elif text in ("+", "="):
-            self._activate("priority", 1)
-        elif text == "-":
-            self._activate("priority", -1)
-        elif text == "K" or name == "KEY_SR":
-            self._activate("move", -1)
-        elif text == "J" or name == "KEY_SF":
-            self._activate("move", 1)
-        elif text == "p":
-            self._activate("procs")
-        elif text == "v":
-            self._activate("resource_view")
-        elif text == "T":
-            self._activate("theme")
-        elif text == "t":
-            self._activate("tick")
-        elif text == "a":
-            self._activate("auto")
-        elif text == "c":
-            self._activate("cancel")
-        elif text == "r":
-            self._activate("requeue")
-        elif text == "d":
-            self._activate("node_toggle")
-        elif text == "A":
-            self._activate("ack")
-        elif text == "x":
-            self._activate("scope_all")
-        return True
+        command = next(
+            (
+                candidate
+                for candidate in COMMANDS
+                if candidate.matches(text, name, self.focus)
+            ),
+            None,
+        )
+        return self._dispatch_command(command) if command is not None else True
 
     # --- main loop --------------------------------------------------------
 

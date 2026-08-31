@@ -10,7 +10,7 @@ import pytest
 from blessed.keyboard import Keystroke
 
 from nvidb.mouse import MouseEvent
-from nvidb.sched.tui import QueueTUI, _Worker
+from nvidb.sched.tui import COMMANDS, QueueTUI, _Worker
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 _MISSING = object()
@@ -862,6 +862,40 @@ def test_q_quits_and_other_keys_do_not():
     _render(tui)
     assert _press(tui, "j") is True
     assert _press(tui, "q") is False
+
+
+def test_command_registry_has_unique_bindings_in_each_context():
+    seen = set()
+    for command in COMMANDS:
+        if command.help_key is not None:
+            assert command.description
+        for context in command.contexts:
+            for kind, keys in (("text", command.text_keys), ("name", command.key_names)):
+                for key in keys:
+                    binding = (context, kind, key)
+                    assert binding not in seen
+                    seen.add(binding)
+
+
+def test_g_and_G_follow_the_focused_pane():
+    snapshot = _snapshot(
+        nodes=[
+            {
+                **_snapshot()["nodes"][0],
+                "name": f"node-{index}",
+                "hostname": f"10.0.0.{index}",
+            }
+            for index in range(5)
+        ]
+    )
+    tui = _tui()
+    _render(tui, _state(snapshot))
+    _press(tui, "", name="KEY_TAB")
+
+    _press(tui, "G")
+    assert tui.selected_node()["name"] == "node-4"
+    _press(tui, "g")
+    assert tui.selected_node()["name"] == "node-0"
 
 
 def test_help_opens_and_closes_without_quitting():
