@@ -2606,9 +2606,14 @@ class QueueTUI:
             visible.append(lines[old_row])
         if show_below:
             hidden = content_size - end
+            hint = (
+                "press p to collapse"
+                if self.resource_view == "servers" and self.proc_view == "all"
+                else "j/k to move"
+            )
             visible.append(
                 self._style(
-                    fit_display(f"  ↓ {hidden} line(s) below · j/k to move", width),
+                    fit_display(f"  ↓ {hidden} more line(s), {hint}", width),
                     "bright_black",
                 )
             )
