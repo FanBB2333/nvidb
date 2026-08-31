@@ -29,6 +29,7 @@ view:
   trends: false          # GPU + selected-process history     ([t])
   group_by_node: true    # node bands in the unified view      ([g])
   hide_unsupported: true # skip nodes without NVIDIA GPUs       ([u])
+  theme: classic         # classic | muted                      ([T])
   # Click monitor/queue rows or actions; the wheel scrolls the pane under it.
   # Set to false to keep the terminal's own mouse selection (with reporting on,
   # most terminals need Shift to drag-select).
@@ -89,7 +90,7 @@ servers:
     # Optional: restrict the queue to these GPU indices on this node. Other
     # cards stay visible in monitoring but never receive queue jobs; jobs
     # already running on an excluded card are left to finish.
-    # gpus: [0, 1]
+    # gpu_ids: [0, 1]
 
   # Example server with password authentication
   - hostname: "192.168.1.100"

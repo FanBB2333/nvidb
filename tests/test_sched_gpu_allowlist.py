@@ -1,8 +1,10 @@
 """A server entry's `gpu_ids:` key picks which of its cards nvidb uses."""
 import os
 import sys
+from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -25,6 +27,21 @@ SETTINGS = {
     "placement": "spread",
     "include_local": False,
 }
+
+REPOSITORY_ROOT = Path(__file__).parents[1]
+
+
+def test_example_configs_use_the_supported_gpu_allowlist_key():
+    main_text = (REPOSITORY_ROOT / "config.example.yml").read_text()
+    main_config = yaml.safe_load(main_text)
+    queue_config = yaml.safe_load(
+        (REPOSITORY_ROOT / "queue.example.yml").read_text()
+    )
+
+    assert "# gpu_ids: [0, 1]" in main_text
+    assert main_config["view"]["theme"] == "classic"
+    assert queue_config["servers"][0]["gpu_ids"] == [0, 1]
+    assert "gpus" not in queue_config["servers"][0]
 
 
 def _shared_cluster():
