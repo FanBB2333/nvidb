@@ -1016,5 +1016,5 @@ def main():
             pool.print_refresh()
 
 if __name__ == "__main__":
-    # python -m nvidb.test.run
+    # Kept for compatibility; the public module is `python -m nvidb`.
     main()

@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "A package that provides an aggregated view of the NVIDIA GPU information on several hosts."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [{ name = "L1ght" }]
 keywords = ["nvidia", "gpu", "monitoring", "ssh", "remote"]
 classifiers = [
@@ -18,11 +18,11 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Hardware",
     "Topic :: System :: Monitoring",
 ]
@@ -43,7 +43,7 @@ Homepage = "https://github.com/FanBB2333/nvidb"
 Repository = "https://github.com/FanBB2333/nvidb"
 
 [project.scripts]
-nvidb = "nvidb.test.run:main"
+nvidb = "nvidb.cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "nvidb.config.VERSION" }

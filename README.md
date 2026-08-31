@@ -832,8 +832,8 @@ database is atomically published without replacing an existing path.
 ## 4. System Requirements
 
 - NVIDIA driver with NVML (`libnvidia-ml.so.1`)
-- Python 3.8+
-- Python 3.8+ and SSH access on remote servers
+- Python 3.9+
+- Python 3.9+ and SSH access on remote servers
 - Local OpenSSH client when `proxyjump` is configured
 - `nvidia-smi` is optional and used only as an NVML failure fallback
 
