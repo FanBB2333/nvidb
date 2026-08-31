@@ -10,7 +10,6 @@ import subprocess
 import getpass
 import json
 import socket
-import textwrap
 import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
@@ -21,7 +20,7 @@ import paramiko
 from paramiko import AuthenticationException
 from paramiko.ssh_exception import NoValidConnectionsError, PasswordRequiredException
 import pandas as pd
-from termcolor import colored
+from termcolor import colored as _term_colored
 from . import config as nvidb_config
 from .data_modules import ServerInfo, ServerListInfo
 from .dcgm import make_dcgm_snapshot_command
@@ -42,10 +41,13 @@ from .tui_theme import (
     DiffScreen,
     display_width,
     fit,
+    fit_display,
     frame_bottom,
     frame_separator,
     frame_top,
     meter,
+    pad_display,
+    wrap_display,
 )
 from .utils import (
     units_from_str,
@@ -58,6 +60,25 @@ from .utils import (
     parse_link_number,
     pcie_link_capacity_kib_per_second,
 )
+
+
+MONITOR_THEMES = {
+    "classic": {},
+    # Keep warnings intact while making routine accents less saturated.
+    "muted": {"cyan": "blue", "green": "cyan", "magenta": "blue"},
+}
+_monitor_theme = "classic"
+
+
+def _set_monitor_theme(theme):
+    global _monitor_theme
+    _monitor_theme = theme if theme in MONITOR_THEMES else "classic"
+
+
+def colored(text, color=None, on_color=None, attrs=None):
+    """Apply the active monitor palette through termcolor."""
+    mapped = MONITOR_THEMES[_monitor_theme].get(color, color)
+    return _term_colored(text, mapped, on_color, attrs)
 
 
 def _as_gpu_index(value):
@@ -1765,6 +1786,8 @@ class NVClientPool:
         self.unified_group_by_node = settings["group_by_node"]
         self.hide_unsupported = settings["hide_unsupported"]
         self.mouse_enabled = settings["mouse"]
+        self.theme = settings["theme"]
+        _set_monitor_theme(self.theme)
         # Detailed unified mode has two selectable panes.  The GPU cards stay
         # on screen while the lower pane shows and controls their processes.
         self.unified_active_pane = "gpu"
@@ -2278,7 +2301,7 @@ class NVClientPool:
         if not sys_stats:
             tail_plain = "collecting system stats…"
             plain = f"{head_plain}{sep_plain}{tail_plain}"
-            if len(plain) > terminal_width:
+            if display_width(plain) > terminal_width:
                 return [fit(plain, terminal_width)]
             return [head + sep + colored(tail_plain, "dark_grey")]
 
@@ -2390,7 +2413,7 @@ class NVClientPool:
             plain_pieces.extend(plain for plain, _styled in parts)
             styled_pieces.extend(styled for _plain, styled in parts)
             plain = sep_plain.join(plain_pieces)
-            if len(plain) <= terminal_width:
+            if display_width(plain) <= terminal_width:
                 return [sep.join(styled_pieces)]
         return [fit(plain, terminal_width)]
 
@@ -3029,7 +3052,7 @@ class NVClientPool:
             else f"History  {len(history)}/60 samples"
         )
         if not history and not gpu_history:
-            plain = f"{title} | waiting for samples"[:width]
+            plain = fit(f"{title} | waiting for samples", width)
             return [(plain, colored(plain, "cyan"))]
 
         rows = [(title, colored(title, "cyan", attrs=["bold"]))]
@@ -3057,7 +3080,7 @@ class NVClientPool:
                 f"now {formatter(current)}  avg {formatter(average)}  "
                 f"max {formatter(peak)}"
             )
-            spark_width = max(6, width - 8 - len(suffix) - 1)
+            spark_width = max(6, width - 8 - display_width(suffix) - 1)
             spark = self._sparkline(
                 values,
                 minimum=minimum,
@@ -3065,8 +3088,8 @@ class NVClientPool:
                 width=spark_width,
             )
             plain = f"{label:<7}{spark} {suffix}"
-            if len(plain) > width:
-                plain = plain[: max(0, width - 2)] + ".."
+            if display_width(plain) > width:
+                plain = fit_display(plain, width, ellipsis="..")
                 return plain, colored(plain, color)
             styled = (
                 colored(f"{label:<7}", color, attrs=["bold"])
@@ -3206,11 +3229,11 @@ class NVClientPool:
 
         def trim(text, limit):
             text = str(text)
-            if len(text) <= limit:
+            if display_width(text) <= limit:
                 return text
             if limit <= 2:
-                return text[:limit]
-            return text[: limit - 2] + ".."
+                return fit_display(text, limit, ellipsis="")
+            return fit_display(text, limit, ellipsis="..")
 
         def panel_rule(label, *, bottom=False):
             left, right = ("╰", "╯") if bottom else ("├", "┤")
@@ -3228,7 +3251,7 @@ class NVClientPool:
             plain = (
                 left
                 + label
-                + border_horizontal * max(0, width - 2 - len(label))
+                + border_horizontal * max(0, width - 2 - display_width(label))
                 + right
             )
             return colored(plain, "dark_grey")
@@ -3238,7 +3261,7 @@ class NVClientPool:
             plain = trim(original_plain, inner_width)
             if styled is None or plain != original_plain:
                 styled = plain
-            padding = " " * max(0, inner_width - len(plain))
+            padding = " " * max(0, inner_width - display_width(plain))
             return (
                 colored(f"{border_vertical} ", "dark_grey")
                 + (styled if styled is not None else plain)
@@ -3249,23 +3272,24 @@ class NVClientPool:
         def pack_fields(label, fields):
             """Pack colored detail fields onto as many panel rows as needed."""
             prefix = f"{label:<9}"
-            continuation = " " * len(prefix)
+            continuation = " " * display_width(prefix)
             packed = []
             current = []
-            current_length = len(prefix)
+            current_length = display_width(prefix)
             for text, color in fields:
                 separator_length = 3 if current else 0
                 if (
                     current
-                    and current_length + separator_length + len(text) > inner_width
+                    and current_length + separator_length + display_width(text)
+                    > inner_width
                 ):
                     packed.append((prefix, current))
                     prefix = continuation
                     current = []
-                    current_length = len(prefix)
+                    current_length = display_width(prefix)
                     separator_length = 0
                 current.append((text, color))
-                current_length += separator_length + len(text)
+                current_length += separator_length + display_width(text)
             packed.append((prefix, current))
 
             rows = []
@@ -3571,8 +3595,8 @@ class NVClientPool:
         def padded_cell(value, column):
             value = trim(value, column["width"])
             if column["align"] == "right":
-                return value.rjust(column["width"])
-            return value.ljust(column["width"])
+                return " " * max(0, column["width"] - display_width(value)) + value
+            return pad_display(value, column["width"])
 
         def process_cells(process, index):
             vram_mib = self._extract_metric_number(process.get("used_memory"))
@@ -3931,13 +3955,8 @@ class NVClientPool:
             process.get("command") or process.get("process_name") or "N/A"
         ).strip()
         command_prefix = "Command  "
-        command_width = max(1, inner_width - len(command_prefix))
-        all_command_parts = textwrap.wrap(
-            command,
-            width=command_width,
-            break_long_words=True,
-            break_on_hyphens=False,
-        ) or ["N/A"]
+        command_width = max(1, inner_width - display_width(command_prefix))
+        all_command_parts = wrap_display(command, command_width) or ["N/A"]
         history_rows = (
             self._format_unified_process_history(
                 selected_row,
@@ -4011,7 +4030,7 @@ class NVClientPool:
                 prefix = (
                     command_prefix
                     if command_index == 0
-                    else " " * len(command_prefix)
+                    else " " * display_width(command_prefix)
                 )
                 plain = prefix + command_part
                 styled = (
@@ -4185,14 +4204,19 @@ class NVClientPool:
         action_line_index = len(lines)
         search_from = 0
         for text, _color, target in action_segments:
-            start_column = action_plain.find(text, search_from)
-            search_from = start_column + len(text)
+            character_start = action_plain.find(text, search_from)
+            search_from = character_start + len(text)
+            start_column = display_width(action_plain[:character_start])
             if target and start_column < inner_width:
                 action_regions.append(
                     (
                         action_line_index,
                         2 + start_column,
-                        2 + min(inner_width, start_column + len(text)) - 1,
+                        2 + min(
+                            inner_width,
+                            start_column + display_width(text),
+                        )
+                        - 1,
                         target,
                     )
                 )
@@ -4393,7 +4417,10 @@ class NVClientPool:
             suffix = f"now {current:.0f}{unit} avg {average:.0f}{unit}"
             spark_width = max(
                 8,
-                terminal_width - len(label) - len(suffix) - 4,
+                terminal_width
+                - display_width(label)
+                - display_width(suffix)
+                - 4,
             )
             spark = self._sparkline(
                 values,
@@ -4402,8 +4429,8 @@ class NVClientPool:
                 width=spark_width,
             )
             line = f"{label:<5} {spark} {suffix}"
-            if len(line) > terminal_width:
-                return colored(line[:terminal_width], color)
+            if display_width(line) > terminal_width:
+                return colored(fit(line, terminal_width), color)
             return (
                 colored(f"{label:<5}", color, attrs=["bold"])
                 + " "
@@ -4413,7 +4440,7 @@ class NVClientPool:
 
         return "\n".join(
             [
-                colored(title[:terminal_width], "cyan", attrs=["bold"]),
+                colored(fit(title, terminal_width), "cyan", attrs=["bold"]),
                 metric_line("Util", "utilization", 0, 100, "%", "green"),
                 metric_line("VRAM", "memory", 0, 100, "%", "yellow"),
                 metric_line("Temp", "temperature", 20, 100, "C", "red"),
@@ -4467,11 +4494,11 @@ class NVClientPool:
             text = str(text)
             if width <= 0:
                 return ""
-            if len(text) <= width:
+            if display_width(text) <= width:
                 return text
             if width <= 2:
-                return text[:width]
-            return text[: width - 2] + ".."
+                return fit_display(text, width, ellipsis="")
+            return fit_display(text, width, ellipsis="..")
 
         def utilization_status(value):
             percent = self._extract_metric_number(value)
@@ -4557,8 +4584,11 @@ class NVClientPool:
                 if not active:
                     return 0
                 return (
-                    sum(min(len(field["text"]), field["minimum"]) for field in active)
-                    + len(separator) * (len(active) - 1)
+                    sum(
+                        min(display_width(field["text"]), field["minimum"])
+                        for field in active
+                    )
+                    + display_width(separator) * (len(active) - 1)
                 )
 
             for key in drop_order:
@@ -4569,10 +4599,10 @@ class NVClientPool:
             if not active:
                 return " " * content_width
 
-            widths = [len(field["text"]) for field in active]
+            widths = [display_width(field["text"]) for field in active]
             excess = (
                 sum(widths)
-                + len(separator) * (len(active) - 1)
+                + display_width(separator) * (len(active) - 1)
                 - content_width
             )
             for key in shrink_order:
@@ -4581,7 +4611,7 @@ class NVClientPool:
                 for index, field in enumerate(active):
                     if field["key"] != key:
                         continue
-                    minimum = min(len(field["text"]), field["minimum"])
+                    minimum = min(display_width(field["text"]), field["minimum"])
                     reducible = max(0, widths[index] - minimum)
                     reduction = min(excess, reducible)
                     widths[index] -= reduction
@@ -4602,8 +4632,8 @@ class NVClientPool:
                 for field, width in zip(active, widths)
             ]
             plain_length = (
-                sum(len(part) for part in plain_parts)
-                + len(separator) * (len(plain_parts) - 1)
+                sum(display_width(part) for part in plain_parts)
+                + display_width(separator) * (len(plain_parts) - 1)
             )
             padding = " " * max(0, content_width - plain_length)
             plain_line = separator.join(plain_parts) + padding
@@ -5051,6 +5081,7 @@ class NVClientPool:
                 ("key", "a / c", "Expand all / collapse all"),
                 ("section", "VIEWS", ""),
                 ("key", "v", "Open the unified GPU view"),
+                ("key", "C", "Switch the colour theme"),
                 ("key", "?", "Close this help"),
                 ("key", "q", "Close help; q again quits"),
             ]
@@ -5096,6 +5127,7 @@ class NVClientPool:
                 ("section", "DETAILS AND ACTIONS", ""),
                 ("key", "[ / ]", "Page through the full command"),
                 ("key", "t", "Toggle GPU and process history"),
+                ("key", "C", "Switch the colour theme"),
                 ("key", "i / T / K", "Arm INT / TERM / KILL"),
                 ("key", "? / q", "Close this help"),
             ]
@@ -5115,17 +5147,18 @@ class NVClientPool:
                 ("key", "g", "Toggle per-node grouping"),
                 ("key", "u", "Show or hide unsupported nodes"),
                 ("key", "t", "Toggle GPU history"),
+                ("key", "C", "Switch the colour theme"),
                 ("key", "v", "Return to the per-node view"),
                 ("key", "? / q", "Close this help"),
             ]
 
         def trim(text, limit):
             text = str(text)
-            if len(text) <= limit:
+            if display_width(text) <= limit:
                 return text
             if limit <= 1:
-                return text[:limit]
-            return text[: limit - 1] + "…"
+                return fit_display(text, limit, ellipsis="")
+            return fit(text, limit)
 
         title = trim(
             f"─ Help · {context} · ?/Esc/q close ",
@@ -5134,7 +5167,10 @@ class NVClientPool:
         lines = [
             colored("╭", "dark_grey")
             + colored(title, "cyan", attrs=["bold"])
-            + colored("─" * max(0, width - 2 - len(title)) + "╮", "dark_grey")
+            + colored(
+                "─" * max(0, width - 2 - display_width(title)) + "╮",
+                "dark_grey",
+            )
         ]
 
         max_entries = max(1, height - 2)
@@ -5148,14 +5184,14 @@ class NVClientPool:
         for kind, key, description in entries:
             if kind == "section":
                 plain = trim(f"── {key} ", inner_width)
-                plain += "─" * max(0, inner_width - len(plain))
+                plain += "─" * max(0, inner_width - display_width(plain))
                 styled = colored(plain, "dark_grey")
             else:
-                key_text = trim(key, key_width).ljust(key_width)
-                description_text = trim(
-                    description,
+                key_text = pad_display(trim(key, key_width), key_width)
+                description_text = pad_display(
+                    trim(description, description_width),
                     description_width,
-                ).ljust(description_width)
+                )
                 plain = f"{key_text} {description_text}"
                 styled = colored(
                     key_text,
@@ -5293,12 +5329,8 @@ class NVClientPool:
                 f"{title_with_focus} · GPUs {gpu_count_display} · "
                 f"Nodes with GPU {node_count}/{node_total}{page_suffix}"
             )
-        if len(title_line) > terminal_width:
-            title_line = (
-                title_line[: max(0, terminal_width - 2)] + ".."
-                if terminal_width >= 2
-                else title_line[:terminal_width]
-            )
+        if display_width(title_line) > terminal_width:
+            title_line = fit_display(title_line, terminal_width, ellipsis="..")
         if detailed and title_line.startswith(focus_prefix):
             title_line = (
                 colored(focus_prefix, "cyan", attrs=["bold"])
@@ -5486,14 +5518,20 @@ class NVClientPool:
             title = "Authentication failed"
         else:
             title = "Error"
-        line1 = f" {title} ".center(width, " ")
-        line2 = f" {message} ".center(width, " ")
-        line3 = " ".center(width, " ")
+        def centered(text):
+            text = fit(f" {text} ", width)
+            remaining = max(0, width - display_width(text))
+            left = remaining // 2
+            return " " * left + text + " " * (remaining - left)
+
+        line1 = centered(title)
+        line2 = centered(message)
+        line3 = " " * width
         return "\n".join(
             [
-                colored(line1[:width], "white", "on_red", attrs=["bold"]),
-                colored(line2[:width], "white", "on_red", attrs=["bold"]),
-                colored(line3[:width], "white", "on_red", attrs=["bold"]),
+                colored(line1, "white", "on_red", attrs=["bold"]),
+                colored(line2, "white", "on_red", attrs=["bold"]),
+                colored(line3, "white", "on_red", attrs=["bold"]),
             ]
         )
     
@@ -5510,24 +5548,32 @@ class NVClientPool:
         detail = str(detail)
         separator = " · "
 
-        if len(label) >= width:
-            label = label[: width - 2] + ".." if width > 2 else label[:width]
+        if display_width(label) >= width:
+            label = fit_display(label, width, ellipsis=".." if width > 2 else "")
             separator = ""
             detail = ""
-        elif len(label) + len(separator) + len(detail) > width:
-            room = width - len(label) - len(separator)
+        elif (
+            display_width(label) + display_width(separator) + display_width(detail)
+            > width
+        ):
+            room = width - display_width(label) - display_width(separator)
             if room <= 3:
                 separator = ""
                 detail = ""
             else:
-                detail = detail[: room - 2] + ".."
+                detail = fit_display(detail, room, ellipsis="..")
 
         pieces = [colored(label, "cyan", attrs=["bold"])]
         if separator:
             pieces.append(colored(separator, attrs=["dark"]))
         if detail:
             pieces.append(detail)
-        tail = width - len(label) - len(separator) - len(detail)
+        tail = (
+            width
+            - display_width(label)
+            - display_width(separator)
+            - display_width(detail)
+        )
         if tail == 1:
             pieces.append(" ")
         elif tail > 1:
@@ -5665,7 +5711,7 @@ class NVClientPool:
         for col in all_columns:
             min_width = min_widths.get(col, 12)
             label = column_labels.get(col, col)
-            min_widths_for_cols[col] = max(min_width, len(str(label)))
+            min_widths_for_cols[col] = max(min_width, display_width(str(label)))
 
         def min_table_width(cols) -> int:
             if not cols:
@@ -5692,9 +5738,9 @@ class NVClientPool:
         # Compute content width for each column
         content_widths = {}
         for col in selected_columns:
-            max_len = len(str(col))
+            max_len = display_width(str(col))
             for value in df_display[col]:
-                value_len = len(str(value))
+                value_len = display_width(str(value))
                 if value_len > max_len:
                     max_len = value_len
             content_widths[col] = max_len
@@ -5791,13 +5837,31 @@ class NVClientPool:
             if text is None:
                 text = ""
             text = str(text)
-            if len(text) <= width:
+            if display_width(text) <= width:
                 return text
             if width <= 2:
-                return text[:width]
+                return fit_display(text, width, ellipsis="")
             if tail_preserve:
-                return ".." + text[-(width - 2):]
-            return text[:width - 2] + ".."
+                budget = width - 2
+                kept = []
+                used = 0
+                for char in reversed(text):
+                    char_width = display_width(char)
+                    if used + char_width > budget:
+                        break
+                    kept.append(char)
+                    used += char_width
+                return ".." + "".join(reversed(kept))
+            return fit_display(text, width, ellipsis="..")
+
+        def align_text(text: str, width: int, alignment: str = "center") -> str:
+            remaining = max(0, width - display_width(text))
+            if alignment == "left":
+                return text + " " * remaining
+            if alignment == "right":
+                return " " * remaining + text
+            left = remaining // 2
+            return " " * left + text + " " * (remaining - left)
 
         def parse_percent(value: str) -> Optional[float]:
             if value is None:
@@ -5865,7 +5929,7 @@ class NVClientPool:
             text = truncate_text(text, width)
 
             chars = [" "] * width
-            start = max(0, (width - len(text)) // 2)
+            start = max(0, (width - display_width(text)) // 2)
             for i, ch in enumerate(text):
                 pos = start + i
                 if 0 <= pos < width:
@@ -5910,7 +5974,7 @@ class NVClientPool:
         for col in selected_columns:
             width = column_widths.get(col, 12)
             col_name = truncate_text(str(column_labels.get(col, col)), width)
-            cell = f"{col_name:^{width}}"
+            cell = align_text(col_name, width)
             header_parts.append(cell)
             header_styled_parts.append(colored(cell, "cyan", attrs=["bold"]))
         header_plain = " │ ".join(header_parts)
@@ -5924,7 +5988,7 @@ class NVClientPool:
         separator = colored("─┼─", "dark_grey").join(separator_parts)
 
         # Format data rows
-        inner_width = len(header_plain)
+        inner_width = display_width(header_plain)
         data_lines = []
         row_lines = {}
         for row_index, (_, row) in enumerate(df_display.iterrows()):
@@ -5945,11 +6009,11 @@ class NVClientPool:
                 )
 
                 if col in left_align_columns:
-                    row_parts.append(f"{value:<{width}}")
+                    row_parts.append(align_text(value, width, "left"))
                     continue
 
                 if col == "GPU":
-                    cell = f"{value:^{width}}"
+                    cell = align_text(value, width)
                     if row_util_color:
                         cell = colored(cell, row_util_color, attrs=["bold"])
                     row_parts.append(cell)
@@ -5987,7 +6051,7 @@ class NVClientPool:
 
                 if col == "temp":
                     degrees = parse_percent(raw_value)
-                    cell = f"{value:^{width}}"
+                    cell = align_text(value, width)
                     if degrees is not None:
                         if degrees >= 80:
                             cell = colored(cell, "red", attrs=["bold"])
@@ -6006,7 +6070,7 @@ class NVClientPool:
                     continue
 
                 # Center-align all other columns
-                row_parts.append(f"{value:^{width}}")
+                row_parts.append(align_text(value, width))
 
             data_lines.append(cell_separator.join(row_parts))
 
@@ -6399,6 +6463,7 @@ class NVClientPool:
     
     def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
+        _set_monitor_theme(getattr(self, "theme", "classic"))
         # Fetch new data or use cache
         if use_cache:
             with self._cache_lock:
@@ -6567,7 +6632,7 @@ class NVClientPool:
                     self.unified_process_filter or ""
                 )
                 find_label = (
-                    f"Find:{process_filter[:12]}"
+                    f"Find:{fit(process_filter, 12)}"
                     if process_filter
                     else "Find"
                 )
@@ -6575,7 +6640,7 @@ class NVClientPool:
                     f"[?]Help [/]{find_label} "
                     f"[o]{process_sort_label}{process_sort_arrow} "
                     f"[+/-]Rows [←]GPU [j/k]Select [i/T/K]Signal "
-                    f"[t]History [p]{process_action} [q]"
+                    f"[t]History [p]{process_action} [C]{self.theme} [q]"
                 )
                 if compact_layout:
                     controls = (
@@ -6586,17 +6651,17 @@ class NVClientPool:
                 controls = (
                     f"[?]Help [Enter/→]Proc [j/k]GPU [p]{process_action} "
                     f"[d]{detail_action} [s]{sort_label} [f]{filter_label} "
-                    f"[q] [g]{group_label} [u]{unsupported_label} [v]Nodes"
+                    f"[C]{self.theme} [q] [g]{group_label} "
+                    f"[u]{unsupported_label} [v]Nodes"
                 )
                 if compact_layout:
                     controls = "? · ⏎ proc · j/k GPU · d view · q quit"
-            if len(controls) > terminal_width:
-                controls = controls[: max(0, terminal_width - 3)] + "..."
+            controls = fit(controls, terminal_width)
         else:
             view_label = "Per-node"
             controls = (
                 "[?] Help  [v] Unified view  [j/k] Select  "
-                "[Enter] Toggle  [a/c] Expand/Collapse  [q] Quit"
+                f"[Enter] Toggle  [a/c] Expand/Collapse  [C] {self.theme}  [q] Quit"
             )
             if compact_layout:
                 controls = "? help · v view · j/k sel · ⏎ exp · q quit"
@@ -6609,7 +6674,7 @@ class NVClientPool:
             )
             title_line = (
                 fit(plain_title, terminal_width)
-                if len(plain_title) > terminal_width
+                if display_width(plain_title) > terminal_width
                 else colored("nvidb", "green", attrs=["bold"])
                 + colored(" · ", "dark_grey")
                 + colored(f"{server_count}", "magenta")
@@ -6626,7 +6691,7 @@ class NVClientPool:
             )
             title_line = (
                 fit(plain_title, terminal_width)
-                if len(plain_title) > terminal_width
+                if display_width(plain_title) > terminal_width
                 else colored("Time ", "dark_grey") + colored(current_time, "cyan")
                 + title_sep
                 + colored("Updated ", "dark_grey")
@@ -6700,8 +6765,7 @@ class NVClientPool:
             user_totals = self._format_user_memory_totals(global_user_memory, max_users=12)
             plain_line = f"Users (all nodes): {user_totals}"
             if self.term.length(plain_line) > terminal_width:
-                plain_line = plain_line[: max(0, terminal_width - 3)] + "..."
-                output_lines.append(plain_line)
+                output_lines.append(fit(plain_line, terminal_width))
             else:
                 global_line = (
                     colored("Users (all nodes):", "magenta", attrs=["bold"])
@@ -6780,7 +6844,7 @@ class NVClientPool:
                 f"{dot} {client.description}"
             )
 
-            header_width = self.term.length(header_plain)
+            header_width = display_width(header_plain)
             max_header_width = max(max_header_width, header_width)
 
             summary_rows.append(summary_data)
@@ -6844,7 +6908,11 @@ class NVClientPool:
             # A server header is exactly one terminal line. The description
             # gives ground to the summary when both cannot fit, so the
             # terminal never soft-wraps the row and shears the click map.
-            summary_room = terminal_width - 2 - len(self._ANSI_ESCAPE_RE.sub("", summary))
+            summary_room = (
+                terminal_width
+                - 2
+                - display_width(self._ANSI_ESCAPE_RE.sub("", summary))
+            )
             # Colour is skipped on the selected row: it is already picked
             # out with reverse video, and termcolor's per-segment reset
             # codes would cut that reverse video short partway through.
@@ -6855,7 +6923,7 @@ class NVClientPool:
                 prefix = f"{selector} {expand_icon} {position + 1} {dot} "
                 description = fit(
                     self.pool[idx].description,
-                    max(1, summary_room - len(prefix)),
+                    max(1, summary_room - display_width(prefix)),
                 )
                 if is_selected:
                     header_display = (
@@ -6875,9 +6943,9 @@ class NVClientPool:
                     f"{selector} {expand_icon} "
                     f"[{position + 1:{index_width}d}] {dot} {self.pool[idx].description}"
                 )
-                pad = max_header_width - self.term.length(header_plain)
+                pad = max_header_width - display_width(header_plain)
                 header_padded = header_plain + (" " * pad if pad > 0 else "")
-                header_padded = header_padded[: max(1, summary_room)]
+                header_padded = fit(header_padded, max(1, summary_room))
                 if is_selected:
                     header_display = (
                         self.term.reverse + header_padded + self.term.normal
@@ -6907,7 +6975,7 @@ class NVClientPool:
                     else:
                         header_display = header_padded
             row = f"{header_display}  {summary}"
-            if len(self._ANSI_ESCAPE_RE.sub("", row)) > terminal_width:
+            if display_width(self._ANSI_ESCAPE_RE.sub("", row)) > terminal_width:
                 # A pathologically long error message is the one input that
                 # can still overflow; dropping its colour beats wrapping.
                 row = fit(self._ANSI_ESCAPE_RE.sub("", row), terminal_width)
@@ -7094,6 +7162,7 @@ class NVClientPool:
             "group_by_node": bool(self.unified_group_by_node),
             "hide_unsupported": bool(self.hide_unsupported),
             "mouse": bool(self.mouse_enabled),
+            "theme": getattr(self, "theme", "classic"),
         }
 
     def _persist_view_settings(self):
@@ -7101,8 +7170,8 @@ class NVClientPool:
         if not self._persist_view_enabled:
             return
         try:
-            # Merge over what is stored: settings this TUI does not manage
-            # (the queue TUI's theme choice) must survive the write.
+            # Merge over what is stored so future view settings this version
+            # does not know about survive the write.
             settings = nvidb_config.load_view_settings()
             settings.update(self._current_view_settings())
             nvidb_config.save_view_settings(settings)
@@ -7112,6 +7181,12 @@ class NVClientPool:
     def _apply_view_change(self):
         self._request_ui_refresh()
         self._persist_view_settings()
+
+    def _toggle_theme(self):
+        self.theme = "muted" if getattr(self, "theme", "classic") == "classic" else "classic"
+        _set_monitor_theme(self.theme)
+        self._apply_view_change()
+        return True
 
     def _toggle_display_mode(self):
         current_mode = self.display_mode
@@ -7852,6 +7927,9 @@ class NVClientPool:
 
         if key_text == "?":
             return self._toggle_tui_help()
+
+        if key_text == "C":
+            return self._toggle_theme()
 
         if key_lower == "q":
             self.quit_flag.set()

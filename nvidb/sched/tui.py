@@ -31,6 +31,7 @@ from ..tui_theme import (
     fit_display,
     pad_display,
     smooth_bar,
+    wrap_display,
 )
 from . import db as dbm
 from .model import (
@@ -870,35 +871,7 @@ class QueueTUI:
 
     @staticmethod
     def _wrap_plain(text: Any, width: int) -> List[str]:
-        """Wrap plain text by terminal columns, including wide characters."""
-        width = max(1, int(width))
-        wrapped: List[str] = []
-        logical_lines = str(text).splitlines() or [""]
-        for logical_line in logical_lines:
-            remaining = " ".join(logical_line.split())
-            if not remaining:
-                wrapped.append("")
-                continue
-            while display_width(remaining) > width:
-                used = 0
-                split_at = 0
-                for index, char in enumerate(remaining):
-                    char_width = display_width(char)
-                    if used + char_width > width:
-                        break
-                    used += char_width
-                    split_at = index + 1
-                if split_at == 0:
-                    split_at = 1
-                candidate = remaining[:split_at]
-                word_break = candidate.rfind(" ")
-                if word_break > 0:
-                    candidate = candidate[:word_break]
-                    split_at = word_break + 1
-                wrapped.append(candidate.rstrip())
-                remaining = remaining[split_at:].lstrip()
-            wrapped.append(remaining)
-        return wrapped
+        return wrap_display(text, width)
 
     def _field_lines(
         self,

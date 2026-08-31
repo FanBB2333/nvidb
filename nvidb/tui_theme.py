@@ -76,6 +76,37 @@ def pad_display(text: Optional[str], width: int) -> str:
     return text + " " * max(0, width - display_width(text))
 
 
+def wrap_display(text: Optional[str], width: int) -> List[str]:
+    """Wrap plain text without splitting a terminal column in half."""
+    width = max(1, int(width))
+    wrapped: List[str] = []
+    for logical_line in str(text or "").splitlines() or [""]:
+        remaining = " ".join(logical_line.split())
+        if not remaining:
+            wrapped.append("")
+            continue
+        while display_width(remaining) > width:
+            used = 0
+            split_at = 0
+            for index, char in enumerate(remaining):
+                char_width = display_width(char)
+                if used + char_width > width:
+                    break
+                used += char_width
+                split_at = index + 1
+            if split_at == 0:
+                split_at = 1
+            candidate = remaining[:split_at]
+            word_break = candidate.rfind(" ")
+            if word_break > 0:
+                candidate = candidate[:word_break]
+                split_at = word_break + 1
+            wrapped.append(candidate.rstrip())
+            remaining = remaining[split_at:].lstrip()
+        wrapped.append(remaining)
+    return wrapped
+
+
 def frame_top(width: int, *, title: str = "") -> str:
     """`╭─ title ─────╮`, the top edge of a rounded panel."""
     inner = max(0, width - 2)

@@ -11,6 +11,7 @@ from blessed import Terminal
 
 from nvidb.connection import NVClientPool
 from nvidb.mouse import MouseEvent
+from nvidb.tui_theme import display_width
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
@@ -63,6 +64,7 @@ def _pool():
     pool.unified_group_by_node = True
     pool.hide_unsupported = True
     pool.mouse_enabled = True
+    pool.theme = "classic"
     pool.unified_active_pane = "gpu"
     pool.unified_process_panel_hidden = False
     pool.unified_selected_process = 0
@@ -922,6 +924,20 @@ def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkey
     assert all(len(line) == 140 for line in plain.splitlines())
 
 
+def test_detailed_cards_align_wide_node_and_model_names(monkeypatch):
+    pool = _pool()
+    pool.unified_detailed = True
+    table = pd.DataFrame([_gpu_row(0, "计算卡一号", "35 %", "12000/49140")])
+    table["Node"] = "训练节点甲"
+    table["Hostname"] = "gpu-北京"
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((60, 30)))
+
+    rendered = _without_ansi(pool._format_unified_detailed_table(table))
+
+    assert "训练节点" in rendered
+    assert all(display_width(line) == 60 for line in rendered.splitlines())
+
+
 def test_unsupported_nodes_are_hidden_until_toggled(monkeypatch):
     pool = _pool()
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
@@ -1019,6 +1035,21 @@ def test_a_local_machine_with_gpus_keeps_its_node_section(monkeypatch, capsys):
     assert any("[1] ● Local Machine" in line for line in frame)
     assert any("[2] ● training-node" in line for line in frame)
     assert {index for kind, index in pool._click_targets.values() if kind == "server"} == {0, 1}
+
+
+def test_local_strip_counts_wide_characters_as_terminal_columns(monkeypatch):
+    pool = _pool()
+    monkeypatch.setattr("nvidb.connection.getpass.getuser", lambda: "研究员")
+    monkeypatch.setattr("nvidb.connection.platform.node", lambda: "本地工作站")
+    monkeypatch.setattr(
+        "nvidb.connection.local_platform_summary",
+        lambda: "Linux 中文系统",
+    )
+
+    line = _without_ansi(pool._format_local_strip(30, {})[0])
+
+    assert display_width(line) <= 30
+    assert "研究员" in line
 
 
 def test_default_expansion_skips_nodes_without_gpus():
@@ -1640,7 +1671,7 @@ def test_detailed_process_layout_stays_inside_terminal_bounds(monkeypatch):
             else 4
         )
 
-        assert all(len(line) <= width for line in lines)
+        assert all(display_width(line) <= width for line in lines)
         assert len(lines) <= height - frame_reserve
         signal_targets = {
             target
@@ -1666,6 +1697,27 @@ def test_detailed_process_layout_stays_inside_terminal_bounds(monkeypatch):
                 ("command_scroll", -1),
                 ("command_scroll", 1),
             }
+
+
+def test_process_layout_wraps_wide_text_without_crossing_the_border(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    pool.unified_active_pane = "process"
+    raw_stats = _focus_raw_stats(
+        "python 训练.py --模型 千问 --说明 " + "中文参数" * 18
+    )
+    process = raw_stats["_nvidb"]["process_details_by_client"][1]["0"][0]
+    process["username"] = "研究员"
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((60, 30)))
+
+    rendered = _without_ansi(
+        "\n".join(pool._render_unified_gpu_lines(raw_stats, 1))
+    )
+
+    assert "训练.py" in rendered
+    assert "研究员" in rendered
+    assert all(display_width(line) <= 60 for line in rendered.splitlines())
 
 
 def test_process_filter_is_live_and_keeps_shortcuts_out_of_the_query(
@@ -2201,10 +2253,16 @@ def test_view_changes_are_persisted_to_config(monkeypatch):
         "group_by_node": False,
         "hide_unsupported": True,
         "mouse": True,
-        # Carried over from the stored settings: this TUI does not manage
-        # the theme but must not clobber the queue TUI's choice.
         "theme": "classic",
     }
+    saved.clear()
+    assert pool._handle_keypress("C") is True
+    assert pool.theme == "muted"
+    assert saved[-1]["theme"] == "muted"
+    # Restore the module-level palette so later direct formatter tests start
+    # from the default theme.
+    assert pool._handle_keypress("C") is True
+    assert pool.theme == "classic"
     pool._unified_gpu_count = 4
     saved.clear()
     assert pool._handle_keypress("p") is True
