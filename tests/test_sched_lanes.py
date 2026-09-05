@@ -64,6 +64,26 @@ def _fill(scheduler, lane, count, **kwargs):
     ]
 
 
+def test_tui_moves_lane_jobs_in_actual_order_without_changing_priorities(scheduler):
+    from nvidb.sched.tui import _Worker
+
+    scheduler.tick(force=True)
+    ids = _fill(scheduler, "small-node:0", 3)
+    scheduler.set_priority(ids[2], 99)
+    free = scheduler.submit("free", vram="1G", priority=7)
+    worker = _Worker()
+    worker._scheduler = scheduler
+    worker._run_action(("move", ids[1], -1))
+    assert _queue_ids(scheduler, "small-node:0") == [ids[1], ids[0], ids[2]]
+    assert "slot 1" in worker.read_state()["notice"][0]
+    worker._run_action(("move", ids[1], -1))
+    assert "end of lane" in worker.read_state()["notice"][0]
+    worker._run_action(("move", ids[1], 1))
+    assert _queue_ids(scheduler, "small-node:0") == ids
+    assert [dbm.get_job(scheduler.conn, jid).priority for jid in ids] == [0, 0, 99]
+    assert dbm.get_job(scheduler.conn, free).priority == 7
+
+
 # --- naming ----------------------------------------------------------------
 
 def test_a_lane_name_round_trips():

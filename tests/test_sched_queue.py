@@ -1184,6 +1184,18 @@ def test_rate_limiting_keeps_chatty_clients_off_the_nodes(scheduler):
 
 # --- the machine-readable view ---------------------------------------------
 
+def test_snapshot_keeps_old_dependency_states_without_expanding_recent(scheduler):
+    upstream = scheduler.submit("old-upstream", vram="1G")
+    dbm.update_job(scheduler.conn, upstream, state="completed")
+    for index in range(25):
+        jid = scheduler.submit(f"newer-{index}", vram="1G")
+        dbm.update_job(scheduler.conn, jid, state="completed")
+    scheduler.submit("dependent", vram="1G", depends_on=[upstream])
+    snapshot = scheduler.snapshot()
+    assert upstream not in [job["id"] for job in snapshot["recent"]]
+    assert snapshot["dependencies"] == [{"id": upstream, "name": "", "state": "completed"}]
+
+
 def test_snapshot_carries_everything_a_client_needs(scheduler, cluster):
     cluster["big-node"].add_foreign_process(0, 69000)
     scheduler.tick(force=True)

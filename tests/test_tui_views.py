@@ -267,7 +267,12 @@ def test_unified_view_reports_nodes_without_gpu_rows():
     rendered = "\n".join(pool._render_unified_gpu_lines(raw_stats, last_update_time=1))
 
     assert "Nodes with GPU 1/2" in rendered
-    assert "! training-node (100.64.0.42): Connection timed out" in rendered
+    assert "1 node error(s)" in rendered
+    assert "training-node (100.64.0.42)" in rendered
+    pool.unified_filter_mode = "errors"
+    assert "! training-node (100.64.0.42): Connection timed out" in "\n".join(
+        pool._render_unified_gpu_lines(raw_stats, last_update_time=1)
+    )
 
 
 def test_unified_capacity_summary_and_sort_modes(monkeypatch):
@@ -394,6 +399,44 @@ def test_unified_filter_modes_and_error_view():
             errors_only=True,
         )
     )
+
+
+def test_offline_alert_stays_visible_above_a_long_process_panel(monkeypatch):
+    raw = _focus_raw_stats("python train.py " + "--checkpoint /long/path " * 30)
+    pool = _nodes_pool([""] * 5, raw)
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_detailed = True
+    for index in range(2, 5):
+        pool.pool.append(SimpleNamespace(
+            description=f"offline-{index}", host=f"10.0.0.{index}", port=22,
+        ))
+        raw[index] = (pd.DataFrame(), {"error": "SSH timeout"})
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((80, 24)))
+    captured = []
+    monkeypatch.setattr(pool, "_write_tui_lines", lambda lines: captured.extend(lines))
+    pool.print_stats(use_cache=True)
+    visible = _without_ansi("\n".join(captured)).splitlines()[:23]
+    assert any("3 node error(s)" in line and "SSH timeout" in line for line in visible)
+    row = next(row for row, _, _, target in pool._click_regions if target[0] == "error_filter")
+    pool._handle_mouse_event(_click(row + 1))
+    assert pool.unified_filter_mode == "errors"
+    error_page = _without_ansi("\n".join(pool._render_unified_gpu_lines(raw, 1)))
+    assert all(f"offline-{index}" in error_page for index in range(2, 5))
+
+
+def test_error_page_scrolls_to_every_offline_node(monkeypatch):
+    pool = _pool()
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.unified_filter_mode = "errors"
+    pool.pool = [SimpleNamespace(description=f"offline-{i}", host=f"10.0.0.{i}", port=22) for i in range(30)]
+    raw = {i: (pd.DataFrame(), {"error": "SSH timeout"}) for i in range(30)}
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((80, 24)))
+    first = "\n".join(pool._render_unified_gpu_lines(raw, 1, height_budget=19))
+    assert "offline-29" not in first
+    pool._move_unified_selection(29)
+    last = "\n".join(pool._render_unified_gpu_lines(raw, 1, height_budget=19))
+    assert "offline-29" in last
+    assert len(last.splitlines()) <= 19
 
 
 def test_unified_detailed_view_paginates_and_scrolls(monkeypatch):

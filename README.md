@@ -264,6 +264,9 @@ means at least 50% GPU utilization. Error-only mode hides GPU rows and lists
 nodes whose latest refresh failed. Because the filter is restored from the
 config on the next run, a warning line above the table spells out how many GPUs
 it is hiding.
+Node failures also appear in a fixed top-of-body alert, ahead of GPU and
+process details. Click that alert to open the error-only list; `j`/`k`,
+PgUp/PgDn, and the wheel can reach every failed node on a short terminal.
 Detailed mode places the selected GPU's process pane directly below the cards;
 there is no separate drill-down screen. `Enter`, `Space`, `→`, or `l` shows the
 pane when necessary and moves focus into its task list. Repeating one of these
@@ -665,16 +668,24 @@ any terminal result. Held jobs and paused or blocked lanes are called out on
 their GPU row. Pending GPU jobs without a lane are deliberately kept in the
 `ANY GPU` pool because the scheduler has not assigned them to a card yet.
 
+The GPU activity badge distinguishes queue-managed `RUN`, `EXTERNAL` work,
+unattributed `BUSY` activity, confirmed `IDLE`, and `UNKNOWN` readings (including
+unreachable nodes). Clicking `lane QN`, the shared pool, or a `+N` overflow count
+opens the complete pending list for that pool. Job detail includes the lane
+position and each dependency's state, even when the upstream job is older than
+the recent-job list. Commands and working directories wrap across detail pages.
+
 Press `v` or click the view control to switch to the server-capacity pane with
 memory bars and process details. All SSH work happens on a worker thread, so an
 unreachable node slows the numbers down but never freezes the interface.
 
 | Key                | Action                                        |
 | ------------------ | --------------------------------------------- |
-| `j` / `k` / arrows | Move the selection in the focused pane        |
-| `PgUp` / `PgDn`    | Move a page at a time                         |
+| `j` / `k` / ↑ / ↓ | Move the node or job selection                |
+| `←` / `→`         | Select a GPU on the focused node              |
+| `PgUp` / `PgDn`    | Scroll resource rows, or page job selection   |
 | `Tab`              | Switch focus between the node and job panes   |
-| `Enter`            | Scope to a server, or show/hide job detail    |
+| `Enter`            | Scope to selected node/GPU, or toggle detail  |
 | `[` / `]`          | Page through wrapped detail or log text       |
 | `L`                | Toggle a live tail of the selected job's log  |
 | `c`                | Cancel the selected job (press twice)         |
@@ -685,7 +696,7 @@ unreachable node slows the numbers down but never freezes the interface.
 | `t`                | Force a scheduler tick now                    |
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
-| `x` / `Esc`        | Clear the current server/GPU scope            |
+| `x` / `Esc`        | Clear the current server/GPU/task-pool scope  |
 | `v`                | Switch task flow / server capacity view       |
 | `p`                | Open capacity view; cycle GPU process detail  |
 | `d`                | Drain or resume the selected node             |
@@ -693,13 +704,15 @@ unreachable node slows the numbers down but never freezes the interface.
 | `?`                | Help                                          |
 | `q`                | Quit                                          |
 | Mouse click        | Scope server/GPU jobs, select, sort or act    |
-| Mouse wheel        | Move selections or page detail/log text       |
+| Mouse wheel        | Scroll resources/help, jobs, or detail/log    |
 
 The job table opens in *runtime* order, longest-running first; jobs without a
 runtime follow the measured jobs. Queue order remains available through `s`,
 and using `K`/`J` automatically restores it before moving a pending job.
-Reordering rewrites the priorities of the pending jobs the moved one passes;
-the `PRI` column always shows the real values. Clicking a column header sorts
+For lane jobs, queue sorting follows lane position and `K`/`J` moves the job
+within its lane without changing priorities. Lanes are grouped independently;
+there is no single dispatch order across GPUs. Free-pool reordering adjusts
+priorities, and the `PRI` column always shows the real values. Clicking a column header sorts
 by that column (a second click flips it). In the server-capacity view, each GPU
 line draws one memory bar whose segments distinguish foreign memory (amber)
 from this queue's reservations (teal) and free space (dim). Colours are
@@ -719,6 +732,11 @@ confirmation required for cancellation. Most terminals reserve normal text
 selection for `Shift`-drag or `Option`-drag while mouse reporting is active. Set
 `mouse: false` under `view` in `~/.nvidb/config.yml` to disable it in both nvidb
 TUIs.
+
+The resource pane scrolls independently, so GPU rows and the shared/dependency
+pools remain reachable even when a single node is taller than the pane. In
+help, use `j`/`k`, PgUp/PgDn, or the wheel to read every command; `g`/`G` jumps
+to the first/last help page.
 
 ### 3.8 What runs on the nodes
 

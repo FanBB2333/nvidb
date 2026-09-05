@@ -281,6 +281,7 @@ def _flow_snapshot():
         counts={"running": 1, "pending": 5},
     )
     snapshot["nodes"][1]["gpus"] = [_gpu(0), _gpu(1)]
+    snapshot["nodes"][1]["gpus"][1]["util_percent"] = 0
     return snapshot
 
 
@@ -365,6 +366,75 @@ def test_task_flow_keeps_unassigned_jobs_in_the_shared_priority_pool():
     assert all("#20" not in line for line in lines if line.startswith("    G"))
 
 
+@pytest.mark.parametrize("gpu_state,node_state,expected", [
+    ({"external_mem_mb": 24000, "external_procs": 1, "util_percent": 99}, "up", "EXTERNAL"),
+    ({"util_percent": 75}, "up", "BUSY"),
+    ({"util_percent": 0}, "up", "IDLE"),
+    ({"util_percent": None}, "up", "UNKNOWN"),
+    ({"util_percent": 0}, "down", "UNKNOWN"),
+])
+def test_flow_activity_distinguishes_external_idle_and_unknown(gpu_state, node_state, expected):
+    snapshot = _snapshot(jobs=[], nodes=[_snapshot()["nodes"][1]])
+    node = snapshot["nodes"][0]
+    node["state"] = node_state
+    node["gpus"][0].update(gpu_state)
+    output = _render(_tui(), _state(snapshot))
+    assert f"[ {expected} ]" in output
+
+
+@pytest.mark.parametrize("target", ["{ lane Q3 }", "+3"])
+def test_task_pool_and_overflow_open_complete_lane_queue(target):
+    snapshot = _flow_snapshot()
+    tui = _tui(width=100, height=42)
+    state = _state(snapshot)
+    output = _render(tui, state)
+    tui.handle_mouse(_mouse_at(output, target))
+    assert [job["id"] for job in tui.jobs] == [11, 12, 13]
+    assert "queued in lane small-node:0" in _render(tui, state)
+    _press(tui, "x")
+    assert tui.job_scope_pool is None
+    assert len(tui.jobs) == 6
+
+
+def test_shared_pool_excludes_running_and_cpu_jobs_and_can_open_job_detail():
+    snapshot = _flow_snapshot()
+    snapshot["jobs"].extend([
+        _job(21, state="pending", gpus=0), _job(22, state="running", lane=None),
+    ])
+    tui = _tui()
+    state = _state(snapshot)
+    output = _render(tui, state)
+    tui.handle_mouse(_mouse_at(output, "{ Q1 · priority }"))
+    assert [job["id"] for job in tui.jobs] == [20]
+    _press(tui, "", name="KEY_ENTER")
+    assert "JOB 20 DETAIL" in _render(tui, state)
+    _press(tui, "f")
+    assert tui.job_scope_pool is None
+
+
+def test_job_details_page_through_full_commands_and_dependency_states():
+    snapshot = _flow_snapshot()
+    job = snapshot["jobs"][1]
+    job["command"] = "python train.py " + "--checkpoint /models/team/checkpoint " * 12 + "--LAST-ARG"
+    job["workdir"] = "/workspace/" + "nested/" * 20 + "END-PATH"
+    job["depends_any"] = [999]
+    snapshot["dependencies"] = [{"id": 999, "name": "old", "state": "failed"}]
+    tui = _tui(width=60, height=20)
+    state = _state(snapshot)
+    _render(tui, state)
+    tui._select_job_id(11)
+    tui.show_detail = True
+    pages = [_render(tui, state)]
+    for _ in range(tui.detail_pages - 1):
+        _press(tui, "]")
+        pages.append(_render(tui, state))
+    output = "\n".join(pages)
+    assert "--LAST-ARG" in output and "END-PATH" in output
+    assert "queued position 1/3" in output
+    assert "#10 · running · requires success" in output
+    assert "#999 · failed · requires any terminal result" in output
+
+
 def test_task_flow_draws_success_and_any_result_dependencies():
     output = _render(_tui(), _state(_flow_snapshot()))
     dependency = next(line for line in output.splitlines() if "DEPS" in line)
@@ -397,7 +467,7 @@ def test_clicking_a_flow_gpu_scopes_the_job_list_to_that_card():
     tui = _tui()
     output = _render(tui, state)
 
-    assert tui.handle_mouse(_mouse_at(output, "{ lane Q3 }")) is True
+    assert tui.handle_mouse(_mouse_at(output, "G0 ", occurrence=1)) is True
     assert tui.job_scope_node == "small-node"
     assert tui.job_scope_gpu == 0
     assert [job["id"] for job in tui.jobs] == [10]
@@ -482,6 +552,47 @@ def test_resource_viewport_follows_the_selected_node():
 
     assert "node-9" in output
     assert "above" in output
+
+
+def test_all_gpu_rows_and_shared_pool_are_reachable_on_one_large_node():
+    snapshot = _flow_snapshot()
+    node = snapshot["nodes"][1]
+    node["gpus"] = [_gpu(index) for index in range(8)]
+    snapshot["nodes"] = [node]
+    tui = _tui(width=100, height=30)
+    tui.focus = "nodes"
+    state = _state(snapshot)
+    output = _render(tui, state)
+    assert "G7 " not in output
+    _press(tui, "", name="KEY_PGDOWN")
+    output = _render(tui, state)
+    assert "G7 " in output
+    assert "ANY GPU" in output
+    assert "DEPS" in output
+    tui.handle_mouse(_mouse_at(output, "G7 "))
+    assert tui.job_scope_gpu == 7
+    _press(tui, "", name="KEY_LEFT")
+    output = _render(tui, state)
+    assert "❯ G6 " in output
+    _press(tui, "", name="KEY_ENTER")
+    assert tui.job_scope_gpu == 6
+
+
+def test_keyboard_gpu_cursor_reaches_the_last_card_and_survives_removal():
+    snapshot = _snapshot(nodes=[_snapshot()["nodes"][1]])
+    snapshot["nodes"][0]["gpus"] = [_gpu(index) for index in (0, 2, 7)]
+    tui = _tui(width=80, height=24)
+    tui.focus = "nodes"
+    _render(tui, _state(snapshot))
+    for _ in range(3):
+        _press(tui, "", name="KEY_RIGHT")
+    assert "❯ G7 " in _render(tui, _state(snapshot))
+    _press(tui, "", name="KEY_ENTER")
+    assert tui.job_scope_gpu == 7
+    snapshot["nodes"][0]["gpus"] = [_gpu(0)]
+    _render(tui, _state(snapshot))
+    assert tui._cursor_gpu is None
+    assert tui.job_scope_gpu is None
 
 
 def test_the_screen_shows_nodes_capacity_and_jobs():
@@ -926,6 +1037,26 @@ def test_help_is_contextual_and_fits_the_terminal():
     assert "Cancel the selected job" not in node_help
 
 
+def test_help_scrolls_with_keyboard_and_wheel_without_running_commands():
+    tui = _tui(width=80, height=24)
+    state = _state()
+    _render(tui, state)
+    _press(tui, "?")
+    first = _render(tui, state)
+    _press(tui, "", name="KEY_PGDOWN")
+    last = _render(tui, state)
+    assert first != last and "Mouse job" in last
+    assert len(last.splitlines()) <= 23
+    _press(tui, "c")
+    assert tui.pending_confirm is None
+    tui.handle_mouse(_mouse_at(last, "HELP", button=64))
+    assert tui.help_offset < tui._help_max_offset
+    _press(tui, "g")
+    assert _render(tui, state) == first
+    _press(tui, "", name="KEY_ESCAPE")
+    assert not tui.show_help
+
+
 # --- mouse interaction -----------------------------------------------------
 
 def test_clicking_job_rows_selects_then_toggles_the_current_detail():
@@ -1050,7 +1181,8 @@ def test_wheel_routes_to_the_pane_under_the_pointer():
 
     assert tui.handle_mouse(_mouse_at(output, "TASK FLOW", button=65)) is True
     assert tui.focus == "nodes"
-    assert tui.selected_node()["name"] == "small-node"
+    assert tui.selected_node()["name"] == "big-node"
+    assert tui._resource_scroll is not None
 
 
 def test_wheel_pages_wrapped_detail_and_scrolls_back_through_logs():
@@ -1229,6 +1361,17 @@ def test_the_log_view_asks_the_worker_for_the_selected_job():
 
 
 # --- sorting, priority and reordering --------------------------------------
+
+def test_queue_sort_preserves_lane_positions_even_when_priorities_differ():
+    snapshot = _flow_snapshot()
+    snapshot["jobs"][3]["priority"] = 99
+    tui = _tui()
+    tui.sort_key = "queue"
+    _render(tui, _state(snapshot))
+    assert [job["id"] for job in tui.jobs if job.get("lane") == "small-node:0"
+            and job["state"] == "pending"] == [11, 12, 13]
+    assert tui.jobs[1]["id"] == 20  # the free pool still uses priority
+
 
 def test_the_default_sort_is_runtime_from_longest_to_shortest():
     tui = _tui()

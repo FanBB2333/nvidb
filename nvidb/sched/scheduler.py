@@ -635,11 +635,12 @@ class Scheduler:
         to: Any = None,
         before: Optional[int] = None,
         after: Optional[int] = None,
+        delta: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Move a queued job within its lane."""
-        given = [value for value in (to, before, after) if value is not None]
+        given = [value for value in (to, before, after, delta) if value is not None]
         if len(given) != 1:
-            raise ValueError("Pass exactly one of --to, --before or --after")
+            raise ValueError("Pass exactly one of --to, --before, --after or delta")
         with self._operation_lease("lane-move"):
             job = dbm.get_job(self.conn, job_id)
             if job is None:
@@ -653,6 +654,13 @@ class Scheduler:
                 raise ValueError(
                     f"Job {job_id} is {job.state}; only queued jobs can be reordered"
                 )
+            if delta is not None:
+                ids = [item.id for item in dbm.lane_jobs(self.conn, job.lane, states=["pending"])]
+                current = ids.index(job_id)
+                target = max(0, min(current + int(delta), len(ids) - 1))
+                if target == current:
+                    return {"lane": job.lane, "position": current + 1, "moved": False}
+                to = target + 1
             position = self._reorder_lane(
                 job.lane, job_id, to=to, before=before, after=after
             )
@@ -662,7 +670,10 @@ class Scheduler:
                 job_id=job_id,
                 message=f"{job.lane}: moved to slot {position}",
             )
-            return {"lane": job.lane, "position": position}
+            result = {"lane": job.lane, "position": position}
+            if delta is not None:
+                result["moved"] = True
+            return result
 
     def lane_swap(self, first_id: int, second_id: int) -> Dict[str, Any]:
         """Exchange two queued jobs' places in their lane."""
@@ -2870,6 +2881,17 @@ class Scheduler:
         jobs = dbm.list_jobs(self.conn, states=["pending", "running"])
         recent = dbm.list_jobs(self.conn, limit=20, newest_first=True)
         recent_terminal = [job for job in recent if job.is_terminal][:10]
+        # The recent list is bounded, but an active job can depend on a much
+        # older result. Include just enough metadata to explain every edge.
+        known_ids = {job.id for job in jobs + recent_terminal}
+        dependency_ids = sorted({dep for job in jobs for dep in job.depends_on + job.depends_any} - known_ids)
+        dependencies = []
+        for start in range(0, len(dependency_ids), 500):
+            batch = dependency_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            dependencies.extend(dict(row) for row in self.conn.execute(
+                f"SELECT id, name, state FROM jobs WHERE id IN ({placeholders})", batch,
+            ))
         holder = dbm.lock_holder(self.conn, TICK_LOCK)
         return {
             "generated_at": utcnow(),
@@ -2895,6 +2917,7 @@ class Scheduler:
             "lanes": self.lanes(),
             "jobs": [job.to_dict() for job in jobs],
             "recent": [job.to_dict() for job in recent_terminal],
+            "dependencies": dependencies,
             "alerts": dbm.list_alerts(self.conn, open_only=True, limit=20),
             "open_alerts": dbm.open_alert_count(self.conn),
             # Processes still to be killed on nodes that were unreachable when

@@ -5207,7 +5207,9 @@ class NVClientPool:
         lines.append(colored("╰" + "─" * (width - 2) + "╯", "dark_grey"))
         return lines
 
-    def _render_unified_gpu_lines(self, raw_stats_by_client, last_update_time):
+    def _render_unified_gpu_lines(
+        self, raw_stats_by_client, last_update_time, *, height_budget=None
+    ):
         """Render the unified TUI body from cached per-node GPU data."""
         self._body_click_targets = {}
         self._body_click_regions = []
@@ -5231,6 +5233,39 @@ class NVClientPool:
             terminal_width = 80
             terminal_height = 24
         filter_mode = self._get_unified_filter_mode()
+        errors = self._get_unified_node_status_lines(
+            raw_stats_by_client, last_update_time, errors_only=True,
+        )
+        if filter_mode == "errors":
+            # Errors have their own scrollable page; a long process panel
+            # must never hide the machines that stopped responding.
+            budget = max(3, height_budget if height_budget is not None else terminal_height - 4)
+            page_size = max(1, budget - 2)
+            selected = max(0, min(self.unified_selected_gpu, len(errors) - 1))
+            start = selected // page_size * page_size
+            self.unified_active_pane = "gpu"
+            self.unified_selected_gpu = selected
+            self.unified_selected_gpu_key = None
+            self._unified_gpu_count = len(errors)
+            self._unified_page_size = page_size
+            self._unified_page_start = start
+            self._body_click_targets = {
+                row + 2: ("error", start + row)
+                for row in range(len(errors[start:start + page_size]))
+            }
+            title = (
+                f"Node errors {len(errors)} · GPUs 0/{len(source_table)} · "
+                f"Rows {start + 1 if errors else 0}-{min(start + page_size, len(errors))}"
+                f"/{len(errors)} · j/k / PgUp/PgDn"
+            )
+            return [
+                fit_display(title, terminal_width),
+                "Error filter: GPU rows hidden",
+                *[
+                    colored(fit_display(self._ANSI_ESCAPE_RE.sub('', line), terminal_width), "red")
+                    for line in (errors[start:start + page_size] or ["No node errors"])
+                ],
+            ]
         show_process_panel = self._process_panel_visible()
         compact_history = (
             show_process_panel
@@ -5337,6 +5372,17 @@ class NVClientPool:
                 + title_line[len(focus_prefix):]
             )
         lines = [title_line]
+        if errors:
+            # Keep the count and navigation hint ahead of the truncated text.
+            banner = fit_display(
+                f"! {len(errors)} node error(s) [click: errors] · "
+                + self._ANSI_ESCAPE_RE.sub("", errors[0]).lstrip("! "),
+                terminal_width,
+            )
+            lines.insert(0, colored(banner, "red", attrs=["bold"]))
+            self._body_click_regions.append(
+                (0, 0, terminal_width - 1, ("error_filter", None))
+            )
         if not compact_history:
             lines.append(self._format_unified_capacity_summary(source_table))
         # The filter is restored from config.yml, so say it out loud whenever it
@@ -5386,8 +5432,7 @@ class NVClientPool:
             )
             process_height_budget = max(
                 8,
-                terminal_height
-                - frame_reserve
+                (height_budget if height_budget is not None else terminal_height - frame_reserve)
                 - process_offset
                 - future_trend_lines,
             )
@@ -5451,8 +5496,8 @@ class NVClientPool:
             # node hidden" reminder that is already reflected in the title.
             errors_only=(filter_mode == "errors" or detailed),
         )
-        if filter_mode == "errors" and not status_lines:
-            status_lines = ["No node errors"]
+        # Real errors are always visible in the top banner and its error page.
+        status_lines = [line for line in status_lines if line not in errors]
         if status_lines:
             lines.append("Node status:")
             lines.extend(status_lines)
@@ -6778,6 +6823,7 @@ class NVClientPool:
             body = self._render_unified_gpu_lines(
                 raw_stats_by_client,
                 last_update_time,
+                height_budget=max(0, terminal_height - 1 - body_offset),
             )
             output_lines.extend(body)
             # Translate the body-relative hit boxes into absolute screen rows.
@@ -7806,10 +7852,19 @@ class NVClientPool:
             self._request_ui_refresh()
             return True
 
+        if event.is_left_press and target and target[0] == "error_filter":
+            self.unified_filter_mode = "errors"
+            self.unified_selected_gpu = 0
+            self.unified_selected_gpu_key = None
+            self.unified_active_pane = "gpu"
+            self._pending_process_signal = None
+            self._request_ui_refresh()
+            return True
+
         if event.is_wheel_up or event.is_wheel_down:
             delta = -1 if event.is_wheel_up else 1
             kind = target[0] if target else None
-            if kind == "gpu":
+            if kind in {"gpu", "error"}:
                 self.unified_active_pane = "gpu"
                 return self._move_unified_selection(delta)
             if kind in {"command", "command_scroll"}:
@@ -8055,13 +8110,13 @@ class NVClientPool:
                 if process_pane:
                     return self._move_unified_process_selection(-1)
                 return self._move_unified_selection(-1)
-            if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN"}:
+            if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN", "KEY_PGDOWN"}:
                 if process_pane:
                     return self._move_unified_process_selection(5)
                 return self._move_unified_selection(
                     max(1, int(self._unified_page_size or 1))
                 )
-            if key_name in {"KEY_PPAGE", "KEY_PAGEUP"}:
+            if key_name in {"KEY_PPAGE", "KEY_PAGEUP", "KEY_PGUP"}:
                 if process_pane:
                     return self._move_unified_process_selection(-5)
                 return self._move_unified_selection(
