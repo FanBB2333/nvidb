@@ -10,6 +10,7 @@ import pandas as pd
 from blessed import Terminal
 
 from nvidb.connection import NVClientPool
+from nvidb import config
 from nvidb.mouse import MouseEvent
 from nvidb.tui_theme import display_width
 
@@ -1298,7 +1299,8 @@ def test_narrow_windows_never_wrap_a_server_row(monkeypatch, capsys):
     # The local strip opens the page, then the compact chrome: short
     # title and hint line instead of the wide ones.
     assert plain[0].startswith("⌂ ")
-    assert plain[1].startswith("nvidb · 2 servers ·")
+    assert plain[1].startswith("Updated ")
+    assert plain[1].endswith(" · 2 servers")
     assert "v view" in plain[2] and "⏎ exp" in plain[2]
     assert "[v] Unified view" not in plain[2]
     # The long description yields to the summary instead of wrapping.
@@ -1307,8 +1309,65 @@ def test_narrow_windows_never_wrap_a_server_row(monkeypatch, capsys):
     assert "…" in header
 
 
-def test_loading_is_said_once_per_server(monkeypatch, capsys):
+@pytest.mark.parametrize("width", [36, 80, 120])
+@pytest.mark.parametrize("mode", ["nodes", "unified"])
+def test_version_is_right_aligned_on_the_top_strip(monkeypatch, capsys, width, mode):
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((width, 30)))
+    monkeypatch.setattr(config, "VERSION", "2.3.4")
+    pool = _nodes_pool(None, {}, updated=None)
+    pool.display_mode = mode
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+    frame = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    assert frame[0].endswith("v2.3.4")
+    assert display_width(frame[0]) == width
+    assert sum("v2.3.4" in line for line in frame) == 1
+
+
+def test_version_header_handles_long_titles_and_tiny_terminals():
+    for width in (4, 12, 24, 80):
+        line = NVClientPool._with_version_header("节点状态 " * 20, width)
+        assert display_width(line) <= width
+        if width >= len(config.VERSION) + 1:
+            assert _without_ansi(line).endswith(f"v{config.VERSION}")
+
+
+@pytest.mark.parametrize("width", [36, 80, 120])
+@pytest.mark.parametrize("loading", [False, True])
+def test_colour_terminal_keeps_version_at_the_actual_right_edge(monkeypatch, capsys, width, loading):
+    from nvidb import connection
+    from termcolor import colored as term_colored
+
+    monkeypatch.setattr(connection, "_term_colored", lambda *args, **kwargs: term_colored(*args, **kwargs, force_color=True))
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((width, 30)))
+    raw = {} if loading else {
+        0: (pd.DataFrame(), {"system_stats": {"cpu_cores": 8, "cpu_percent": 10, "load_avg": [1.0, 1.0, 1.0]}}),
+    }
+    pool = _nodes_pool(None, raw, updated=None if loading else 1)
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+    header = pool._tui_diff_screen._previous[0]
+    assert "\x1b[" in header
+    plain = pool._ANSI_ESCAPE_RE.sub("", header)
+    assert display_width(plain) == width
+    assert plain.endswith(f"v{config.VERSION}")
+    if width == 120 and not loading:
+        assert "Load 1.00 1.00 1.00" in plain
+
+
+def test_version_header_measures_ansi_styles_as_zero_width():
+    styled = "\x1b[1mLocal Machine\x1b[0m\x1b(B · \x1b[32mLoad 1.00\x1b[0m"
+    header = NVClientPool._with_version_header(styled, 80)
+    plain = NVClientPool._ANSI_ESCAPE_RE.sub("", header)
+    assert styled in header  # Keep the colours when visible text fits.
+    assert "Load 1.00" in plain
+    assert display_width(plain) == 80
+    assert plain.endswith(f"v{config.VERSION}")
+
+
+def test_loading_is_said_once_per_server_in_debug_mode(monkeypatch, capsys):
     pool = _nodes_pool(None, _raw_stats_for([0, 0]), updated=None)
+    pool.debug = True
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((120, 30)))
 
     pool.print_stats(use_cache=True)

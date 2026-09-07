@@ -241,6 +241,26 @@ def test_scheduler_copies_proxyjump_from_server_config():
     scheduler.close()
 
 
+def test_live_monitor_jump_helper_cannot_prompt_over_the_tui(monkeypatch):
+    _FakeSSHClient.instances = []
+    _FakeSSHClient.connect_error = None
+    monkeypatch.setattr("nvidb.connection.paramiko.SSHClient", _FakeSSHClient)
+    seen = []
+
+    def open_proxy(*args, **kwargs):
+        seen.append(kwargs["batch_mode"])
+        return _FakeProxy()
+
+    monkeypatch.setattr("nvidb.connection.open_proxyjump_socket", open_proxy)
+    client = RemoteClient(ServerInfo(host="10.0.0.42", port=22, username="alice", auth="key", proxyjump="login"))
+    client.secret_prompt = lambda text: "ui-managed secret"
+    try:
+        assert client.connect(allow_prompt=True, announce=False)
+        assert seen == [True]
+    finally:
+        client._close_proxy()
+
+
 def test_server_config_round_trips_proxyjump():
     servers = ServerListInfo()
     servers.add_server(

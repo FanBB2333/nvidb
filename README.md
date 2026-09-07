@@ -189,6 +189,36 @@ nvidb clean all          # Delete all data (requires double confirmation)
 
 ### 2.6 Interactive TUI Navigation
 
+The monitor opens before connecting to remote nodes. Each node connects and
+refreshes independently, so an unreachable or slow SSH server does not delay
+healthy nodes. GPU rows appear first; CPU/memory and process details follow.
+The live monitor does not query DCGM or show its advanced tables by default.
+Use `nvidb --dcgm` (or `nvidb --remote --dcgm`) to explicitly enable DCGM
+profiling; its metrics load after the base GPU rows. `--debug` does not enable
+DCGM, and `d` only changes the GPU row layout.
+
+By default, refresh progress is represented only by the
+top **Updated** timestamp; per-node telemetry, loading/collecting phases, sample
+ages and timing banners are hidden to keep the layout stable. Real connection
+and collection errors remain visible.
+
+Use `nvidb --debug` (or `nvidb --remote --debug`) to show collection phases,
+stale-sample banners and per-node SSH/GPU/details timings (`v` switches to
+per-node panels). Debug display is off on every normal invocation and is not
+saved in the view settings. The `d` key still switches unified GPU row detail;
+it does not toggle debugging.
+
+The normal refresh interval is one second after each node finishes its own
+sample; failed connections use increasing retry delays, including the first
+failure. Password/passphrase prompts are still supported and temporarily pause
+screen updates while other nodes continue collecting. `q` exits without waiting
+for pending SSH calls (use Ctrl+C to exit a credential prompt).
+ProxyJump helpers run in batch mode in the live monitor; jump hosts must already
+have non-interactive authentication configured (for example, an unlocked key in
+`ssh-agent`). Destination password/passphrase prompts remain available.
+
+`--once`, logging and web consumers retain their complete-snapshot behavior.
+
 When viewing GPU stats, use these keyboard shortcuts:
 
 | Key               | Action                        |

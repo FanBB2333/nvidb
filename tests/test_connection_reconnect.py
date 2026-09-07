@@ -248,6 +248,22 @@ def test_a_reconnect_never_blocks_the_ui_thread_forever(client):
     assert connect_kwargs["auth_timeout"] == RemoteClient.CONNECT_TIMEOUT_SECONDS
 
 
+def test_initial_failure_does_not_retry_again_during_first_sample(monkeypatch):
+    _FakeSSHClient.reset()
+    _FakeSSHClient.network_up = False
+    monkeypatch.setattr("nvidb.connection.paramiko.SSHClient", _FakeSSHClient)
+    remote = RemoteClient(ServerInfo(host="10.0.0.42", port=22, username="alice", auth="key"))
+    assert remote.connect(allow_prompt=False, announce=False) is False
+    assert _FakeSSHClient.connect_attempts == 1
+    stats, info = remote.get_full_gpu_info()
+    assert stats.empty and info["error_type"] == "connect"
+    assert _FakeSSHClient.connect_attempts == 1
+    _FakeSSHClient.network_up = True
+    remote._reconnect_after = 0
+    assert remote.ensure_connected() is True
+    assert _FakeSSHClient.connect_attempts == 2
+
+
 def test_a_dropped_node_keeps_its_error_line_in_the_unified_view():
     """The status line must not read like a node that simply has no GPU."""
     from test_tui_views import _pool, _without_ansi

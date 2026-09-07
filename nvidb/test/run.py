@@ -909,6 +909,8 @@ def main():
     parser.add_argument('--remote', action='store_true', help='Use remote servers')
     parser.add_argument('--no-remote', action='store_true', help='Ignore `basic.remote` in config and use local machine only')
     parser.add_argument('--once', action='store_true', help='Print GPU stats once and exit (no TUI loop)')
+    parser.add_argument('--debug', action='store_true', help='Show monitor collection phases, sample ages and timings in the TUI')
+    parser.add_argument('--dcgm', action='store_true', help='Enable optional DCGM profiling collection and panels in the TUI')
     parser.add_argument(
         '--compact',
         action='store_true',
@@ -1009,6 +1011,9 @@ def main():
             server_list,
             compact=compact,
             view_settings=config.load_view_settings(cfg=cfg),
+            defer_connect=not args.once,
+            debug=args.debug,
+            dcgm=args.dcgm,
         )
         if args.once:
             pool.print_once()

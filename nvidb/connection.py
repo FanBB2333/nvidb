@@ -14,6 +14,7 @@ import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from collections import deque
+from queue import Empty, Queue
 import threading
 
 import paramiko
@@ -337,7 +338,7 @@ class BaseClient(ABC):
                 return details
         return {}
 
-    def get_full_gpu_info(self):
+    def get_full_gpu_info(self, *, include_advanced=True):
         """Get GPU information (base + optional advanced profiling).
 
         - Base table: NVML, with `nvidia-smi -q -x` used only when NVML is unavailable.
@@ -611,6 +612,15 @@ class BaseClient(ABC):
                     "error": self.last_connect_error or "Not connected",
                     "error_type": self.last_error_type or "error",
                 }
+            return stats, system_info
+
+        if not include_advanced:
+            return stats, system_info
+        return self._add_advanced_gpu_info(stats, system_info)
+
+    def _add_advanced_gpu_info(self, stats, system_info):
+        """Enrich a base snapshot after its GPU rows can already be displayed."""
+        if stats.empty:
             return stats, system_info
 
         def fmt_percent(value) -> str:
@@ -910,12 +920,14 @@ class BaseClient(ABC):
 
         return result
 
-    def get_process_summary(self, gpu_stats=None, detailed: bool = False):
+    def get_process_summary(self, gpu_stats=None, detailed: bool = False, *, resolve_users=True):
         """Get detailed GPU processes information with user summary.
 
         With `detailed`, one extra batched `ps` call per host enriches every GPU
         process with htop-style fields (CPU/MEM share, RSS, elapsed time, state,
         thread count) and the full command line.
+        With `resolve_users=False`, only the supplied GPU snapshot is used;
+        PIDs remain visible before any additional SSH round trips complete.
         """
         def safe_get_text(element, path, default="N/A"):
             """Safely get text from XML element, return default if not found"""
@@ -1021,13 +1033,13 @@ class BaseClient(ABC):
                         }
                     )
 
-            pid_details = self.get_pid_process_info(all_pids) if detailed else {}
+            pid_details = self.get_pid_process_info(all_pids) if detailed and resolve_users else {}
             missing_user_pids = [
                 pid_str
                 for pid_str in pids
                 if not (pid_details.get(pid_str) or {}).get("username")
             ]
-            pid_to_user = self.get_pid_user_map(missing_user_pids)
+            pid_to_user = self.get_pid_user_map(missing_user_pids) if resolve_users else {}
 
             all_processes = []
             user_memory_summary = {}
@@ -1121,6 +1133,7 @@ class RemoteClient(BaseClient):
         self._nvml_agent_stdout = None
         self._nvml_agent_stderr = None
         self._nvml_agent_channel = None
+        self.secret_prompt = _prompt_secret
 
     def _make_ssh_client(self):
         client = paramiko.SSHClient()
@@ -1154,6 +1167,9 @@ class RemoteClient(BaseClient):
         kwargs.setdefault("banner_timeout", self.CONNECT_TIMEOUT_SECONDS)
         kwargs.setdefault("auth_timeout", self.CONNECT_TIMEOUT_SECONDS)
 
+        # A native ssh jump helper cannot use our UI-owned secret prompt.
+        # Never let it read /dev/tty concurrently with the live monitor.
+        batch_mode = batch_mode or self.secret_prompt is not _prompt_secret
         proxy = None
         try:
             proxy = open_proxyjump_socket(
@@ -1318,7 +1334,7 @@ class RemoteClient(BaseClient):
 
     def _start_nvml_agent_locked(self):
         stdin, stdout, stderr = self.client.exec_command(
-            command=make_nvml_agent_command()
+            command=make_nvml_agent_command(), timeout=10.0,
         )
         channel = stdout.channel
         channel.settimeout(10.0)
@@ -1405,11 +1421,11 @@ class RemoteClient(BaseClient):
                     return False
                 else:
                     remaining = max_attempts - attempt
-                    if attempt > 0:
+                    if attempt > 0 and self.secret_prompt is _prompt_secret:
                         logging.warning(msg=f"Authentication failed. {remaining} attempt(s) remaining.")
                         pause_connect_progress()
                         print(f"  ⚠ Authentication failed. {remaining} attempt(s) remaining.")
-                    password = _prompt_secret(f"Enter password for {self.username}@{self.host}:{self.port} -> ")
+                    password = self.secret_prompt(f"Enter password for {self.username}@{self.host}:{self.port} (attempt {attempt + 1}/{max_attempts}) -> ")
 
                 self._connect_client(
                     batch_mode=not allow_prompt,
@@ -1443,6 +1459,19 @@ class RemoteClient(BaseClient):
         return False
 
     def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
+        with self._connect_lock:
+            connected = self._connect_once(allow_prompt=allow_prompt, announce=announce)
+            if connected:
+                self._reconnect_attempts = 0
+                self._reconnect_after = 0.0
+            elif self._reconnect_attempts == 0:
+                # Initial failure must also enter backoff: the first sample
+                # must not repeat the handshake that just timed out.
+                self._reconnect_attempts = 1
+                self._reconnect_after = time.monotonic() + self.RECONNECT_BACKOFF_SECONDS[0]
+            return connected
+
+    def _connect_once(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
         """Open the SSH session.
 
         `allow_prompt` and `announce` are cleared by the background reconnect,
@@ -1488,7 +1517,7 @@ class RemoteClient(BaseClient):
                             error_type="auth",
                         )
                         return False
-                    passphrase = _prompt_secret(f"Enter passphrase for key {identityfile} -> ")
+                    passphrase = self.secret_prompt(f"Enter passphrase for key {identityfile} -> ")
                     self._connect_client(
                         batch_mode=batch_mode,
                         hostname=self.host,
@@ -1539,7 +1568,7 @@ class RemoteClient(BaseClient):
                             error_type="auth",
                         )
                         return False
-                    passphrase = _prompt_secret(f"Enter passphrase for key {identityfile} -> ")
+                    passphrase = self.secret_prompt(f"Enter passphrase for key {identityfile} -> ")
                     self._connect_client(
                         batch_mode=batch_mode,
                         hostname=self.host,
@@ -1644,7 +1673,7 @@ class LocalClient(BaseClient):
         """Execute local command"""
         try:
             # Use shell=True to support pipes and complex commands
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False, timeout=10.0)
             if result.returncode != 0:
                 # Only log at debug level for expected failures on systems without NVIDIA GPUs
                 logging.debug(msg=f"Command '{command}' execution failed with return code {result.returncode}")
@@ -1741,11 +1770,16 @@ class NVClientPool:
         *,
         compact: bool = False,
         view_settings=None,
+        defer_connect: bool = False,
+        debug: bool = False,
+        dcgm: bool = False,
     ):
         """Build the client pool.
 
         `view_settings` restores the layout persisted in config.yml; passing it
         also enables writing later view changes back to that file.
+        `defer_connect` lets the interactive monitor paint its first frame
+        before the per-node workers open their SSH sessions.
         """
         self.pool = [LocalClient()]
         if server_list is not None:
@@ -1754,9 +1788,15 @@ class NVClientPool:
         # later, so at info level this only put a bare log line on screen
         # ahead of it.
         logging.debug(msg=f"Initialized pool with {len(self.pool)} clients.")
-        self.connect_all()
+        if not defer_connect:
+            self.connect_all()
         self.term = Terminal()
         self.compact = bool(compact)
+        # Diagnostic chrome is opt-in per invocation, never a persisted view.
+        self.debug = bool(debug)
+        # Interactive profiling is explicit; --debug controls diagnostics only.
+        # Synchronous logger/web/--once snapshots keep their existing policy.
+        self.dcgm = bool(dcgm)
         self.quit_flag = threading.Event()  # Exit flag for inter-thread communication
         # Collapsible display state - every server starts expanded so the
         # dashboard opens showing the whole cluster; the stacked tables
@@ -1833,6 +1873,9 @@ class NVClientPool:
         # Pool indices currently listed as nodes; the promoted local
         # machine lives in the top strip instead (see _compute_node_indices).
         self._node_listed_indices = list(range(len(self.pool)))
+        self._node_samples = {}
+        self._node_workers = []
+        self._secret_requests = Queue()
     
     def connect_all(self):
         """Open every client's session behind one self-rewriting line.
@@ -1978,173 +2021,171 @@ class NVClientPool:
                 system_info["attached_gpus"] = str(len(stats))
         return stats, system_info
 
-    def get_client_gpus_info(self, return_raw: bool = False):
-        # Set pandas display options for terminal output
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)  # Auto-fill terminal width
-        pd.set_option('display.colheader_justify', 'center')  # Center column headers
-        
-        stats_str = []
-        raw_stats_by_client = {}
-        user_memory_by_client = {}
-        global_user_memory = {}
-        process_details_by_client = {}
-        # The htop-style process panel needs one extra `ps` call per host, so it
-        # is only collected while that panel is on screen.
-        want_process_details = self._process_panel_visible()
-        for idx, client in enumerate(self.pool):
-            stats, system_info = client.get_full_gpu_info()
-            stats, system_info = self._apply_gpu_allowlist(client, stats, system_info)
+    def _collect_client_gpu_info(
+        self, client, *, want_process_details=False, snapshot=None, enrich=True,
+    ):
+        """Collect and normalize one node without touching shared UI state."""
+        stats, system_info = snapshot if snapshot is not None else client.get_full_gpu_info()
+        stats, system_info = stats.copy(), dict(system_info)
+        stats, system_info = self._apply_gpu_allowlist(client, stats, system_info)
 
-            # Fetch system stats (CPU, memory, swap) and merge into system_info
-            if not (isinstance(system_info, dict) and system_info.get("error")):
-                try:
-                    sys_stats = client.get_system_stats()
-                    system_info["system_stats"] = sys_stats
-                except Exception as e:
-                    logging.warning(f"Failed to get system stats for {client.description}: {e}")
-
-            user_summary_for_client = {}
-            
-            # Skip processing if stats is empty
-            if stats.empty:
-                raw_stats_by_client[idx] = (stats, system_info)
-                stats_str.append((stats, system_info))
-                user_memory_by_client[idx] = {}
-                process_details_by_client[idx] = {}
-                continue
-            
-            # Optimize rx/tx display - split into two columns
-            rx_list = []
-            tx_list = []
-            for _, row in stats.iterrows():
-                rx_val, rx_unit = extract_value_and_unit(row['rx_util'])
-                tx_val, tx_unit = extract_value_and_unit(row['tx_util'])
-
-                rx_formatted = format_bandwidth(rx_val, rx_unit)
-                tx_formatted = format_bandwidth(tx_val, tx_unit)
-
-                # Ensure formatted strings don't exceed column width limit
-                rx_list.append(rx_formatted[:11])
-                tx_list.append(tx_formatted[:11])
-
-            stats['rx'] = rx_list
-            stats['tx'] = tx_list
-            self._add_pcie_link_columns(stats)
-            stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
-            stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
-
-            # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)
-            process_list = []
+        # Fetch system stats (CPU, memory, swap) and merge into system_info
+        if enrich and not system_info.get("error"):
             try:
-                all_processes, user_summary_for_client = client.get_process_summary(
-                    stats,
-                    detailed=want_process_details,
+                sys_stats = client.get_system_stats()
+                system_info["system_stats"] = sys_stats
+            except Exception as e:
+                logging.warning(f"Failed to get system stats for {client.description}: {e}")
+
+        user_summary_for_client = {}
+
+        # Empty/error samples still retain their node identity.
+        if stats.empty:
+            return stats, system_info, {}, {}
+
+        # Optimize rx/tx display - split into two columns
+        rx_list = []
+        tx_list = []
+        for _, row in stats.iterrows():
+            rx_val, rx_unit = extract_value_and_unit(row['rx_util'])
+            tx_val, tx_unit = extract_value_and_unit(row['tx_util'])
+
+            rx_formatted = format_bandwidth(rx_val, rx_unit)
+            tx_formatted = format_bandwidth(tx_val, tx_unit)
+
+            # Ensure formatted strings don't exceed column width limit
+            rx_list.append(rx_formatted[:11])
+            tx_list.append(tx_formatted[:11])
+
+        stats['rx'] = rx_list
+        stats['tx'] = tx_list
+        self._add_pcie_link_columns(stats)
+        stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
+        stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
+
+        # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)
+        process_list = []
+        per_gpu_process_details = {}
+        try:
+            all_processes, user_summary_for_client = client.get_process_summary(
+                stats,
+                detailed=want_process_details,
+            ) if enrich else client.get_process_summary(stats, resolve_users=False)
+
+            per_gpu_user_summary = {}
+            per_gpu_process_details = {}
+            for proc in all_processes:
+                gpu_idx = proc.get("gpu_index")
+                gpu_key = str(gpu_idx)
+                username = proc.get("username")
+                used_memory = proc.get("used_memory", "0 MiB")
+                per_gpu_process_details.setdefault(gpu_key, []).append(
+                    {
+                        "pid": proc.get("pid", "N/A"),
+                        "username": username or "N/A",
+                        "used_memory": used_memory,
+                        "type": proc.get("type", "N/A"),
+                        "process_name": proc.get("process_name", "N/A"),
+                        "command": proc.get("command") or proc.get("process_name", "N/A"),
+                        "cpu_percent": proc.get("cpu_percent"),
+                        "mem_percent": proc.get("mem_percent"),
+                        "rss_kb": proc.get("rss_kb"),
+                        "elapsed": proc.get("elapsed"),
+                        "state": proc.get("state"),
+                        "threads": proc.get("threads"),
+                    }
                 )
 
-                per_gpu_user_summary = {}
-                per_gpu_process_details = {}
-                for proc in all_processes:
-                    gpu_idx = proc.get("gpu_index")
-                    gpu_key = str(gpu_idx)
-                    username = proc.get("username")
-                    used_memory = proc.get("used_memory", "0 MiB")
-                    per_gpu_process_details.setdefault(gpu_key, []).append(
-                        {
-                            "pid": proc.get("pid", "N/A"),
-                            "username": username or "N/A",
-                            "used_memory": used_memory,
-                            "type": proc.get("type", "N/A"),
-                            "process_name": proc.get("process_name", "N/A"),
-                            "command": proc.get("command") or proc.get("process_name", "N/A"),
-                            "cpu_percent": proc.get("cpu_percent"),
-                            "mem_percent": proc.get("mem_percent"),
-                            "rss_kb": proc.get("rss_kb"),
-                            "elapsed": proc.get("elapsed"),
-                            "state": proc.get("state"),
-                            "threads": proc.get("threads"),
-                        }
-                    )
-
-                    if not username or username == "N/A":
-                        continue
-                    try:
-                        memory_value = int(str(used_memory).replace("MiB", "").strip())
-                    except Exception:
-                        memory_value = 0
-                    if memory_value <= 0:
-                        continue
-
-                    gpu_summary = per_gpu_user_summary.setdefault(gpu_idx, {})
-                    gpu_summary[username] = gpu_summary.get(username, 0) + memory_value
-
-                for gpu_idx, _row in stats.iterrows():
-                    user_summary = per_gpu_user_summary.get(gpu_idx, {})
-                    if user_summary:
-                        process_list.append(client.format_user_memory_compact(user_summary))
-                    else:
-                        process_list.append("-")
-                process_details_by_client[idx] = per_gpu_process_details
-            except Exception as e:
-                logging.warning(f"Failed to get process info: {e}")
-                process_list = ["-" for _ in range(len(stats))]
-                user_summary_for_client = {}
-                process_details_by_client[idx] = {}
-            
-            stats['processes'] = process_list
-
-            # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> util, gpu_index -> GPU
-            stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem_util', 'gpu_util': 'util', 'gpu_index': 'GPU'})
-            
-            # replace the NVIDIA/GeForce with "" in name column
-            stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
-            
-            # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
-            # but keep the new processes column
-            columns_to_drop = [
-                'product_architecture', 'rx_util', 'tx_util', 'power_state',
-                'power_draw', 'current_power_limit', 'used', 'total', 'free',
-                'pcie_link_gen_current', 'pcie_link_width_current',
-                'pcie_link_gen_max', 'pcie_link_width_max',
-            ]
-            # Only drop columns that exist in the DataFrame
-            columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
-            stats = stats.drop(columns=columns_to_drop)
-            
-            # Reorder columns: move mem_util before memory[used/total] and processes at the end
-            if 'processes' in stats.columns:
-                # Define desired column order
-                desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'link', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
-                # Only keep columns that exist in stats
-                ordered_columns = [col for col in desired_order if col in stats.columns]
-                # Add any remaining columns that weren't in desired_order
-                remaining_columns = [col for col in stats.columns if col not in ordered_columns]
-                stats = stats[ordered_columns + remaining_columns]
-
-            stats_str.append((stats, system_info))
-
-            # Cache processed table (not raw XML) and per-user memory stats for this client
-            raw_stats_by_client[idx] = (stats.copy() if not stats.empty else stats, system_info)
-            user_memory_by_client[idx] = dict(user_summary_for_client or {})
-            for username, total_mib in (user_summary_for_client or {}).items():
+                if not username or username == "N/A":
+                    continue
                 try:
-                    total_mib_int = int(total_mib)
+                    memory_value = int(str(used_memory).replace("MiB", "").strip())
                 except Exception:
+                    memory_value = 0
+                if memory_value <= 0:
                     continue
-                if total_mib_int <= 0:
-                    continue
-                global_user_memory[username] = global_user_memory.get(username, 0) + total_mib_int
 
-        raw_stats_by_client["_nvidb"] = {
-            "user_memory_by_client": user_memory_by_client,
-            "user_memory_global": global_user_memory,
-            "process_details_by_client": process_details_by_client,
+                gpu_summary = per_gpu_user_summary.setdefault(gpu_idx, {})
+                gpu_summary[username] = gpu_summary.get(username, 0) + memory_value
+
+            for gpu_idx, _row in stats.iterrows():
+                user_summary = per_gpu_user_summary.get(gpu_idx, {})
+                if user_summary:
+                    process_list.append(client.format_user_memory_compact(user_summary))
+                else:
+                    process_list.append("-")
+        except Exception as e:
+            logging.warning(f"Failed to get process info: {e}")
+            process_list = ["-" for _ in range(len(stats))]
+            user_summary_for_client = {}
+            per_gpu_process_details = {}
+
+        stats['processes'] = process_list
+
+        # rename columns: product_name -> name, gpu_temp -> temp, fan_speed -> fan, memory_util -> mem_util, gpu_util -> util, gpu_index -> GPU
+        stats = stats.rename(columns={'product_name': 'name', 'gpu_temp': 'temp', 'fan_speed': 'fan', 'memory_util': 'mem_util', 'gpu_util': 'util', 'gpu_index': 'GPU'})
+
+        # replace the NVIDIA/GeForce with "" in name column
+        stats['name'] = stats['name'].str.replace('NVIDIA', '').str.replace('GeForce', '').str.strip()
+
+        # remove rows: product_architecture, rx_util, tx_util, power_state, power_draw, current_power_limit, used, total, free
+        # but keep the new processes column
+        columns_to_drop = [
+            'product_architecture', 'rx_util', 'tx_util', 'power_state',
+            'power_draw', 'current_power_limit', 'used', 'total', 'free',
+            'pcie_link_gen_current', 'pcie_link_width_current',
+            'pcie_link_gen_max', 'pcie_link_width_max',
+        ]
+        # Only drop columns that exist in the DataFrame
+        columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
+        stats = stats.drop(columns=columns_to_drop)
+
+        # Reorder columns: move mem_util before memory[used/total] and processes at the end
+        if 'processes' in stats.columns:
+            # Define desired column order
+            desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'link', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
+            # Only keep columns that exist in stats
+            ordered_columns = [col for col in desired_order if col in stats.columns]
+            # Add any remaining columns that weren't in desired_order
+            remaining_columns = [col for col in stats.columns if col not in ordered_columns]
+            stats = stats[ordered_columns + remaining_columns]
+
+
+        return stats, system_info, dict(user_summary_for_client or {}), per_gpu_process_details
+
+    @staticmethod
+    def _sample_metadata(samples):
+        users = {idx: sample[2] for idx, sample in samples.items()}
+        processes = {idx: sample[3] for idx, sample in samples.items()}
+        totals = {}
+        for summary in users.values():
+            for username, mib in summary.items():
+                try:
+                    mib = int(mib)
+                except (TypeError, ValueError):
+                    continue
+                if mib > 0:
+                    totals[username] = totals.get(username, 0) + mib
+        return {
+            "user_memory_by_client": users,
+            "user_memory_global": totals,
+            "process_details_by_client": processes,
         }
-        # reformat the str into a single string with fixed width formatting
-        formatted_stats = self._format_client_blocks(stats_str)
-        if return_raw:
-            return formatted_stats, raw_stats_by_client
-        return formatted_stats
+
+    def get_client_gpus_info(self, return_raw: bool = False):
+        # Synchronous consumers (--once, logger, web) keep a complete snapshot.
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.colheader_justify', 'center')
+        want_details = self._process_panel_visible()
+        samples = {
+            idx: self._collect_client_gpu_info(client, want_process_details=want_details)
+            for idx, client in enumerate(self.pool)
+        }
+        raw = {idx: (sample[0], sample[1]) for idx, sample in samples.items()}
+        raw["_nvidb"] = self._sample_metadata(samples)
+        formatted = self._format_client_blocks([raw[idx] for idx in range(len(self.pool))])
+        return (formatted, raw) if return_raw else formatted
 
     def _format_client_blocks(self, stats_str):
         """Render each client's (stats, system_info) pair into its TUI block.
@@ -2163,7 +2204,19 @@ class NVClientPool:
         self._blocks_formatted_width = _fetch_width
         panel_margin = 0 if _fetch_width < 72 else self._PANEL_BORDER_MARGIN
         formatted_stats = []
-        for client, (stats, system_info) in zip(self.pool, stats_str):
+        cache = getattr(self, "_formatted_node_blocks", {})
+        self._formatted_node_blocks = cache
+        render_key = (_fetch_width, _monitor_theme, bool(getattr(self, "compact", False)))
+        for idx, (client, (stats, system_info)) in enumerate(zip(self.pool, stats_str)):
+            monitor_text = self._node_monitor_text(system_info) if system_info.get("_monitor") else ""
+            monitor_line = "\n" + monitor_text if monitor_text else ""
+            cached = cache.get(idx)
+            if cached and cached[0] is stats and cached[1] is system_info and cached[2] == render_key:
+                formatted_stats.append(cached[3] + monitor_line)
+                continue
+            if system_info.get("loading"):
+                formatted_stats.append("")
+                continue
             # Create formatted table display (or error panel)
             if isinstance(system_info, dict) and system_info.get("error"):
                 error_panel = self._format_error_panel(
@@ -2171,7 +2224,7 @@ class NVClientPool:
                     error_type=system_info.get("error_type"),
                     outer_margin=panel_margin,
                 )
-                formatted_stats.append(error_panel)
+                formatted_stats.append(error_panel + monitor_line)
                 continue
 
             formatted_table = self._format_fixed_width_table(
@@ -2235,10 +2288,46 @@ class NVClientPool:
                 except Exception:
                     advanced_block = ""
 
-            formatted_stats.append(
-                f"{system_info_header}{formatted_table}{advanced_block}"
-            )
+            block = f"{system_info_header}{formatted_table}{advanced_block}"
+            cache[idx] = (stats, system_info, render_key, block)
+            formatted_stats.append(block + monitor_line)
         return formatted_stats
+
+    @staticmethod
+    def _with_version_header(line, width):
+        """Reserve the right edge for the same version reported by --version."""
+        version = f"v{nvidb_config.VERSION}"
+        remaining = width - display_width(version) - 1
+        if remaining <= 0:
+            return fit_display(version, max(0, width))
+        # The shared fit/pad helpers accept plain text, not ANSI styling.
+        # Counting escape bytes here clips visible metrics (e.g. "Load") and
+        # leaves the version well short of the real right edge in a colour TTY.
+        plain = NVClientPool._ANSI_ESCAPE_RE.sub("", str(line))
+        left = str(line) if display_width(plain) <= remaining else fit_display(plain, remaining)
+        visible_width = display_width(NVClientPool._ANSI_ESCAPE_RE.sub("", left))
+        return left + " " * (remaining - visible_width + 1) + colored(version, "dark_grey")
+
+    def _node_monitor_text(self, system_info):
+        if not getattr(self, "debug", False):
+            return ""
+        monitor = system_info.get("_monitor", {})
+        if not monitor:
+            return "Loading..."
+        phase = monitor.get("phase", "connecting")
+        labels = {"connecting": "Connecting SSH", "collecting": "Collecting GPU", "details": "Loading details"}
+        if phase in labels:
+            elapsed = max(0, time.time() - monitor.get("started", time.time()))
+            text = f"{labels[phase]} ({elapsed:.0f}s)"
+        else:
+            text = "Telemetry"
+        if monitor.get("updated"):
+            age = max(0, time.time() - monitor["updated"])
+            text += f" · updated {age:.0f}s ago"
+        timings = monitor.get("timings", {})
+        if timings:
+            text += " · " + " / ".join(f"{key.upper()} {value:.1f}s" for key, value in timings.items())
+        return text
 
     def _local_client_index(self):
         """Pool index of the local machine, or None when it is absent."""
@@ -2299,6 +2388,8 @@ class NVClientPool:
             system_info.get("system_stats") if isinstance(system_info, dict) else None
         ) or {}
         if not sys_stats:
+            if not getattr(self, "debug", False):
+                return [head if display_width(head_plain) <= terminal_width else fit_display(head_plain, terminal_width)]
             tail_plain = "collecting system stats…"
             plain = f"{head_plain}{sep_plain}{tail_plain}"
             if display_width(plain) > terminal_width:
@@ -4869,9 +4960,6 @@ class NVClientPool:
         errors_only=False,
     ):
         """Describe nodes that cannot contribute rows to the unified table."""
-        if last_update_time is None:
-            return []
-
         hide_unsupported = bool(self.hide_unsupported)
         lines = []
         hidden_count = 0
@@ -4886,6 +4974,9 @@ class NVClientPool:
                 # A node that dropped off must not read like a node that simply
                 # has no NVIDIA GPU, so it keeps the red marker of a real error.
                 lines.append(colored(f"! {node} ({hostname}): {message}", "red"))
+            elif idx not in raw_stats_by_client or system_info.get("loading"):
+                if not errors_only and getattr(self, "debug", False):
+                    lines.append(f"- {node} ({hostname}): {self._node_monitor_text(system_info)}")
             elif (
                 not errors_only
                 and (not isinstance(stats, pd.DataFrame) or stats.empty)
@@ -4913,7 +5004,11 @@ class NVClientPool:
         """
         if last_update_time is None or self._default_expansion_applied:
             return
-        self._default_expansion_applied = True
+        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        self._default_expansion_applied = all(
+            idx in raw_stats_by_client and not raw_stats_by_client[idx][1].get("loading")
+            for idx in range(len(self.pool))
+        )
         if self._expansion_touched:
             return
         if not bool(self.hide_unsupported):
@@ -4923,7 +5018,7 @@ class NVClientPool:
         expanded = set()
         for idx in range(len(self.pool)):
             stats, _system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-            if isinstance(stats, pd.DataFrame) and not stats.empty:
+            if (isinstance(stats, pd.DataFrame) and not stats.empty) or idx not in raw_stats_by_client or _system_info.get("loading"):
                 expanded.add(idx)
         self.expanded_servers = expanded
 
@@ -5213,8 +5308,8 @@ class NVClientPool:
         """Render the unified TUI body from cached per-node GPU data."""
         self._body_click_targets = {}
         self._body_click_regions = []
-        if last_update_time is None:
-            return ["Unified GPU table", "Loading GPU data..."]
+        if last_update_time is None and not raw_stats_by_client:
+            return ["Unified GPU table"] + (["Loading GPU data..."] if getattr(self, "debug", False) else [])
 
         source_table = self._build_unified_gpu_table(raw_stats_by_client)
         if source_table.empty:
@@ -6340,7 +6435,7 @@ class NVClientPool:
                 else None
             )
             if status == "loading":
-                return colored("loading…", "dark_grey")
+                return colored(summary_data.get("message", "loading…"), "dark_grey")
             if status == "error":
                 message = " ".join(str(summary_data.get("message", "Error")).split())
                 return colored(f"err: {message or 'error'}", "red")
@@ -6359,7 +6454,7 @@ class NVClientPool:
         if not summary_data:
             return colored("No GPU data available", "dark_grey")
         if isinstance(summary_data, dict) and summary_data.get("status") == "loading":
-            return colored("Loading...", "dark_grey")
+            return colored(summary_data.get("message", "Loading..."), "dark_grey")
         if isinstance(summary_data, dict) and summary_data.get("status") == "error":
             message = summary_data.get("message", "Error")
             error_type = summary_data.get("error_type")
@@ -6558,11 +6653,11 @@ class NVClientPool:
                 current_width = os.get_terminal_size().columns
             except OSError:
                 current_width = 80
-            if getattr(self, "_blocks_formatted_width", None) != current_width:
+            if getattr(self, "_node_workers", None) or getattr(self, "_blocks_formatted_width", None) != current_width:
                 try:
                     stats_list = self._format_client_blocks(
                         [
-                            raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
+                            raw_stats_by_client.get(idx, (pd.DataFrame(), {"loading": True}))
                             for idx in range(len(self.pool))
                         ]
                     )
@@ -6599,7 +6694,8 @@ class NVClientPool:
         if last_update_time:
             update_display = time.strftime("%H:%M:%S", time.localtime(last_update_time))
         fetch_display = ""
-        if isinstance(last_fetch_duration, (int, float)):
+        debug = bool(getattr(self, "debug", False))
+        if debug and isinstance(last_fetch_duration, (int, float)):
             fetch_display = f" ({last_fetch_duration:.1f}s)"
         warn_display = " · WARN: refresh failed" if last_fetch_error else ""
 
@@ -6636,7 +6732,10 @@ class NVClientPool:
         # The local machine's own strip opens the page in both views. It
         # sits above the per-node panel frame, so it is laid out for the
         # full window width before the border margin is reserved.
-        strip_lines = self._format_local_strip(terminal_width, raw_stats_by_client)
+        version_space = display_width(f"v{nvidb_config.VERSION}") + 1
+        strip_lines = self._format_local_strip(max(1, terminal_width - version_space), raw_stats_by_client)
+        if strip_lines:
+            strip_lines[0] = self._with_version_header(strip_lines[0], terminal_width)
         output_lines.extend(strip_lines)
         if show_panel_border:
             terminal_width -= self._PANEL_BORDER_MARGIN
@@ -6714,31 +6813,29 @@ class NVClientPool:
             controls = "[? / Esc / q] Close help"
         if compact_layout:
             plain_title = (
-                f"nvidb · {server_count} {server_label.lower()} · {current_time}"
+                f"Updated {update_display} · {server_count} {server_label.lower()}"
                 + (" · refresh failed" if last_fetch_error else "")
             )
             title_line = (
                 fit(plain_title, terminal_width)
                 if display_width(plain_title) > terminal_width
-                else colored("nvidb", "green", attrs=["bold"])
+                else colored("Updated ", "dark_grey") + colored(update_display, "cyan")
                 + colored(" · ", "dark_grey")
                 + colored(f"{server_count}", "magenta")
                 + f" {server_label.lower()}"
-                + colored(" · ", "dark_grey")
-                + colored(current_time, "cyan")
                 + (colored(" · refresh failed", "red") if last_fetch_error else "")
             )
         else:
             title_sep = colored(" · ", "dark_grey")
             plain_title = (
-                f"Time {current_time} · Updated {update_display}{fetch_display} · "
+                (f"Time {current_time} · " if debug else "")
+                + f"Updated {update_display}{fetch_display} · "
                 f"{server_label} {server_count} · View {view_label}{warn_display}"
             )
             title_line = (
                 fit(plain_title, terminal_width)
                 if display_width(plain_title) > terminal_width
-                else colored("Time ", "dark_grey") + colored(current_time, "cyan")
-                + title_sep
+                else (colored("Time ", "dark_grey") + colored(current_time, "cyan") + title_sep if debug else "")
                 + colored("Updated ", "dark_grey")
                 + colored(f"{update_display}{fetch_display}", "cyan")
                 + title_sep
@@ -6748,7 +6845,7 @@ class NVClientPool:
                 + colored("View ", "dark_grey") + colored(view_label, "green")
                 + (colored(warn_display, "red") if warn_display else "")
             )
-        output_lines.append(title_line)
+        output_lines.append(title_line if strip_lines else self._with_version_header(title_line, terminal_width))
 
         def _colorize_controls(text):
             """Highlight [key] shortcut patterns in cyan bold."""
@@ -6762,6 +6859,22 @@ class NVClientPool:
             return "".join(result)
 
         output_lines.append(_colorize_controls(fit(controls, terminal_width)))
+
+        pending_nodes = []
+        slow_nodes = []
+        for idx in node_indices:
+            _stats, info = raw_stats_by_client.get(idx, (None, {"loading": True}))
+            monitor = info.get("_monitor", {})
+            if info.get("loading"):
+                pending_nodes.append(self._client_table_identity(idx)[0])
+            elif monitor.get("updated") and not info.get("error") and time.time() - monitor["updated"] > 5:
+                slow_nodes.append(self._client_table_identity(idx)[0])
+        if debug and (pending_nodes or slow_nodes):
+            notices = []
+            for label, nodes in (("Loading", pending_nodes), ("Stale >5s", slow_nodes)):
+                if nodes:
+                    notices.append(f"{label} {len(nodes)}: {', '.join(nodes[:3])}" + (" …" if len(nodes) > 3 else ""))
+            output_lines.append(colored(fit_display(" · ".join(notices), terminal_width), "yellow"))
 
         # The rule under the chrome is decoration; a very short window
         # spends the row on data instead.
@@ -6873,8 +6986,8 @@ class NVClientPool:
                     "message": system_info.get("error", "Error"),
                     "error_type": system_info.get("error_type"),
                 }
-            elif last_update_time is None and stats.empty:
-                summary_data = {"status": "loading"}
+            elif idx not in raw_stats_by_client or system_info.get("loading") or (last_update_time is None and stats.empty):
+                summary_data = {"status": "loading", "message": self._node_monitor_text(system_info)}
             else:
                 summary_data = self._get_server_summary_data(stats, system_info) or {"status": "empty"}
 
@@ -7747,6 +7860,25 @@ class NVClientPool:
             f"status=$?; printf '\\n{marker}%s\\n' \"$status\""
         )
         self._pending_process_signal = None
+        if getattr(self, "_node_workers", None):
+            worker = getattr(self, "_signal_worker", None)
+            if worker is not None and worker.is_alive():
+                self._set_process_action_notice("A signal request is still in progress", "yellow")
+            else:
+                self._set_process_action_notice(f"Sending SIG{signal_name} to PID {pid}…", "yellow")
+                self._signal_worker = threading.Thread(
+                    target=self._execute_confirmed_signal,
+                    args=(client, command, marker, pending), daemon=True,
+                )
+                self._signal_worker.start()
+            self._request_ui_refresh()
+            return True
+        return self._execute_confirmed_signal(client, command, marker, pending)
+
+    def _execute_confirmed_signal(self, client, command, marker, pending):
+        """Run an already-confirmed action without blocking the UI input loop."""
+        signal_name = pending["signal"]
+        pid = pending["pid"]
         try:
             output = client.execute_command(command)
             output = "" if output is None else str(output)
@@ -8196,38 +8328,175 @@ class NVClientPool:
         except Exception:
             pass
 
-    def _background_refresh(self, interval_seconds: float = 1.0):
-        """Background thread: fetch stats periodically so UI thread stays responsive."""
+    def _request_secret(self, prompt):
+        """Workers request credentials; only the UI thread reads the terminal."""
+        ready = threading.Event()
+        response = []
+        self._secret_requests.put((prompt, response, ready))
+        self.refresh_needed.set()
         while not self.quit_flag.is_set():
-            fetch_started_at = time.time()
-            try:
-                stats_list, raw_stats_by_client = self.get_client_gpus_info(return_raw=True)
-                fetch_error = None
-            except Exception as e:
-                stats_list, raw_stats_by_client = None, {}
-                fetch_error = e
-            fetch_duration = time.time() - fetch_started_at
+            if ready.wait(0.1):
+                if response:
+                    return response.pop()
+                break
+        raise EOFError("Authentication cancelled")
 
-            if stats_list is not None:
-                self._record_unified_gpu_history(raw_stats_by_client)
-            with self._cache_lock:
-                if stats_list is not None:
-                    self.cached_stats = stats_list
-                    self.cached_raw_stats = raw_stats_by_client
-                    self._last_update_time = time.time()
-                    self._last_fetch_error = None
-                else:
-                    self._last_fetch_error = fetch_error
-                self._last_fetch_duration = fetch_duration
-
-            # Trigger UI refresh (both for new data and errors)
+    def _answer_secret_request(self):
+        try:
+            prompt, response, ready = self._secret_requests.get_nowait()
+        except Empty:
+            return
+        self._stop_mouse_reporting()
+        self._cbreak_context.__exit__(None, None, None)
+        try:
+            # No keyboard listener or repaint can consume/echo the secret.
+            print(self.term.normal_cursor + self.term.move_y(self.term.height - 1) + self.term.clear_eol)
+            response.append(_prompt_secret(prompt))
+        except EOFError:
+            pass
+        finally:
+            ready.set()
+            sys.stdout.write(self.term.hide_cursor)
+            self._cbreak_context = self.term.cbreak()
+            self._cbreak_context.__enter__()
+            self._start_mouse_reporting()
+            self._tui_diff_screen = None
             self.refresh_needed.set()
 
-            # Keep a minimum idle interval between refreshes to avoid hammering remote hosts
-            sleep_seconds = max(0.0, interval_seconds)
-            end_time = time.time() + sleep_seconds
-            while time.time() < end_time and not self.quit_flag.is_set():
-                time.sleep(0.1)
+    def _publish_node_sample(self, idx, sample, *, phase, started, timings, record=False, sampled_at=None):
+        stats, info, users, processes = sample
+        info = dict(info)
+        now = time.time()
+        sampled_at = now if sampled_at is None else sampled_at
+        info["_monitor"] = {
+            "phase": phase,
+            "started": started,
+            "updated": sampled_at,
+            "timings": dict(timings),
+        }
+        sample = (stats, info, users, processes)
+        # Record only the node that produced this sample, never replay cached
+        # samples from other nodes into their history.
+        if record and not self.quit_flag.is_set():
+            self._record_unified_gpu_history({
+                idx: (stats, info),
+                "_nvidb": self._sample_metadata({idx: sample}),
+            }, timestamp=sampled_at)
+        with self._cache_lock:
+            if self.quit_flag.is_set():
+                return
+            self._node_samples[idx] = sample
+            raw = {i: (value[0], value[1]) for i, value in self._node_samples.items()}
+            raw["_nvidb"] = self._sample_metadata(self._node_samples)
+            self.cached_raw_stats = raw
+            # Formatting belongs to the UI thread, not concurrent workers.
+            self.cached_stats = [""] * len(self.pool)
+            self._last_update_time = now
+            self._last_fetch_duration = None
+            self._last_fetch_error = None
+        self.refresh_needed.set()
+
+    def _set_node_phase(self, idx, phase):
+        with self._cache_lock:
+            if self.quit_flag.is_set():
+                return
+            stats, info, users, processes = self._node_samples.get(
+                idx, (pd.DataFrame(), {"loading": True}, {}, {})
+            )
+            info = dict(info)
+            monitor = dict(info.get("_monitor", {}))
+            monitor.update(phase=phase, started=time.time())
+            info["_monitor"] = monitor
+            self._node_samples[idx] = (stats, info, users, processes)
+            raw = dict(self.cached_raw_stats)
+            raw[idx] = (stats, info)
+            self.cached_raw_stats = raw
+        # Phase-only transitions do not change the normal frame. Actual data
+        # publications still wake the UI immediately.
+        if getattr(self, "debug", False):
+            self.refresh_needed.set()
+
+    def _refresh_node(self, idx, interval_seconds):
+        """One serial worker per node; a slow host never gates other hosts."""
+        client = self.pool[idx]
+        timings = {}
+        if isinstance(client, RemoteClient):
+            client.secret_prompt = self._request_secret
+        try:
+            if not client.connected:
+                self._set_node_phase(idx, "connecting")
+                start = time.monotonic()
+                try:
+                    client.connect(announce=False)
+                except Exception as error:
+                    client._set_connect_error(str(error), error_type="connect")
+                timings["ssh"] = time.monotonic() - start
+            first_sample = True
+            while not self.quit_flag.is_set():
+                started = time.time()
+                try:
+                    self._set_node_phase(idx, "collecting")
+                    start = time.monotonic()
+                    base = client.get_full_gpu_info(include_advanced=False)
+                    sampled_at = time.time()
+                    timings["gpu"] = time.monotonic() - start
+                    if self.quit_flag.is_set():
+                        break
+                    # The first GPU rows need neither DCGM, system stats nor ps.
+                    if first_sample:
+                        quick = self._collect_client_gpu_info(client, snapshot=base, enrich=False)
+                        self._publish_node_sample(
+                            idx, quick, phase="details", started=started, timings=timings, sampled_at=sampled_at,
+                        )
+                        first_sample = False
+                    self._set_node_phase(idx, "details")
+                    start = time.monotonic()
+                    sample = self._collect_client_gpu_info(
+                        client, snapshot=base,
+                        want_process_details=self._process_panel_visible(),
+                    )
+                    stats, info, users, processes = sample
+                    # Do not even probe DCGM in the default live monitor.
+                    if self.dcgm:
+                        _, info = client._add_advanced_gpu_info(stats, info)
+                    stats, info = self._apply_gpu_allowlist(client, stats, info)
+                    timings["details"] = time.monotonic() - start
+                    phase = "error" if info.get("error") else "ready"
+                    self._publish_node_sample(
+                        idx, (stats, info, users, processes),
+                        phase=phase, started=started, timings=timings, record=True, sampled_at=sampled_at,
+                    )
+                except Exception as error:
+                    self._publish_node_sample(
+                        idx, (pd.DataFrame(), {
+                            "error": f"{type(error).__name__}: {error}",
+                            "error_type": "collect",
+                        }, {}, {}),
+                        phase="error", started=started, timings=timings,
+                    )
+                if self.quit_flag.wait(max(0.05, interval_seconds)):
+                    break
+        finally:
+            if isinstance(client, RemoteClient):
+                client.secret_prompt = _prompt_secret
+                with client._connect_lock:
+                    client._close_link_locked()
+
+    def _background_refresh(self, interval_seconds: float = 1.0):
+        """Start independent daemon workers; quitting never waits for SSH."""
+        if self._node_workers:
+            return
+        # One worker per node also prevents overlapping commands on the same
+        # persistent NVML channel. There is no all-nodes completion barrier.
+        for idx in range(len(self.pool)):
+            if self.quit_flag.is_set():
+                break
+            worker = threading.Thread(
+                target=self._refresh_node, args=(idx, interval_seconds),
+                name=f"nvidb-node-{idx}", daemon=True,
+            )
+            self._node_workers.append(worker)
+            worker.start()
     
     def print_refresh(self):
         """Real-time GPU status display with global keyboard monitoring"""
@@ -8259,8 +8528,8 @@ class NVClientPool:
         print("=" * 60)
 
         # Use cbreak context in main thread for proper cleanup on Ctrl+C
-        cbreak_ctx = self.term.cbreak()
-        cbreak_ctx.__enter__()
+        self._cbreak_context = self.term.cbreak()
+        self._cbreak_context.__enter__()
         self._start_mouse_reporting()
 
         # Background threads (auto-reconnect, etc.) call logging.error/warning/info
@@ -8271,25 +8540,31 @@ class NVClientPool:
         logging.disable(logging.CRITICAL)
 
         try:
-            # Start keyboard listener thread (uses cbreak mode from main thread)
-            keyboard_thread = threading.Thread(target=self._keyboard_listener, args=(cbreak_ctx,), daemon=True)
-            keyboard_thread.start()
-
-            # Start background data refresh thread (prevents remote SSH calls from blocking UI)
-            refresh_thread = threading.Thread(target=self._background_refresh, daemon=True)
-            refresh_thread.start()
-            
             with self.term.hidden_cursor():
-                # Initial draw (may show "Loading..." until first background refresh completes)
+                # Draw before starting any network I/O. Input and painting have
+                # one owner, so credential prompts cannot race a key listener.
                 self.print_stats(use_cache=True)
+                self._background_refresh()
+                parser = MouseSequenceParser()
+                next_draw = time.monotonic() + 1.0
 
                 while not self.quit_flag.is_set():
-                    # Event-driven redraw: avoids back-to-back full redraws (less flicker)
-                    self.refresh_needed.wait(timeout=1.0)
-                    self.refresh_needed.clear()
+                    key = self.term.inkey(timeout=0.1)
+                    if key:
+                        events, keys = parser.feed(key)
+                        for event in events:
+                            self._handle_mouse_event(event)
+                    else:
+                        keys = parser.flush()
+                    for pending in keys:
+                        self._handle_keypress(pending)
                     if self.quit_flag.is_set():
                         break
-                    self.print_stats(use_cache=True)
+                    if self.refresh_needed.is_set() or time.monotonic() >= next_draw:
+                        self.refresh_needed.clear()
+                        self.print_stats(use_cache=True)
+                        next_draw = time.monotonic() + 1.0
+                    self._answer_secret_request()
                 
         except KeyboardInterrupt:
             pass  # Silently exit on Ctrl+C
@@ -8301,7 +8576,7 @@ class NVClientPool:
             logging.disable(logging.NOTSET)
             # Explicitly exit cbreak mode to restore terminal state
             try:
-                cbreak_ctx.__exit__(None, None, None)
+                self._cbreak_context.__exit__(None, None, None)
             except Exception:
                 pass
             # Print newline to ensure clean prompt
