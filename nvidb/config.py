@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 # Package version
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 # Default working directory for nvidb data (config, logs, database)
 # Can be overridden by NVIDB_HOME environment variable
