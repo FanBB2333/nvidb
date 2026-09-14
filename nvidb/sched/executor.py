@@ -27,10 +27,15 @@ VALID_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _process_guard(pid_expr: str, script_expr: str) -> str:
-    """Return the shell predicate that proves a pid still owns ``run.sh``."""
+    """Return the shell predicate that proves a pid still owns ``run.sh``.
+
+    `-ww` matters: procps trims a command line to the terminal width, which it
+    takes from ``$COLUMNS`` even when writing to a pipe, and a run.sh path cut
+    off at 80 columns reads as a process that is not ours.
+    """
     return (
         f'[ -n "{pid_expr}" ] && kill -0 "{pid_expr}" 2>/dev/null && '
-        f'ps -o command= -p "{pid_expr}" 2>/dev/null | '
+        f'ps -ww -o command= -p "{pid_expr}" 2>/dev/null | '
         f'grep -F -q -- "{script_expr}"'
     )
 

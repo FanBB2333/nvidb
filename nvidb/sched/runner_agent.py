@@ -100,7 +100,8 @@ def pid_runs(pid, run_dir):
         return False
     try:
         result = subprocess.Popen(
-            ["ps", "-o", "command=", "-p", str(pid)],
+            # -ww: procps otherwise trims the line to $COLUMNS, pipe or not.
+            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -578,7 +579,7 @@ def build_sync_command(
                 'p=$(cat "$d/runner.pid" 2>/dev/null | tr -d " \\n\\r")',
                 "alive=0",
                 'if [ -n "$p" ] && kill -0 "$p" 2>/dev/null && '
-                'ps -o command= -p "$p" 2>/dev/null | '
+                'ps -ww -o command= -p "$p" 2>/dev/null | '
                 f'grep -F -q -- {shlex.quote(marker)}; then alive=1; fi',
                 'v=$(cat "$d/runner.version" 2>/dev/null | tr -d " \\n\\r")',
                 # A runner whose code is out of date is replaced rather than

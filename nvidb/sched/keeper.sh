@@ -35,7 +35,7 @@ read_pid() {
 alive() {
   nvidb_pid=$(read_pid) || return 1
   kill -0 "$nvidb_pid" 2>/dev/null || return 1
-  nvidb_command=$(ps -p "$nvidb_pid" -o command= 2>/dev/null) || return 1
+  nvidb_command=$(ps -ww -p "$nvidb_pid" -o command= 2>/dev/null) || return 1
   nvidb_token=$(cat "$TOKENFILE" 2>/dev/null) || nvidb_token=""
   if [ -n "$nvidb_token" ]; then
     case "$nvidb_command" in
@@ -75,7 +75,7 @@ start_owner_alive() {
   esac
   [ "$nvidb_owner_pid" -gt 0 ] 2>/dev/null || return 1
   kill -0 "$nvidb_owner_pid" 2>/dev/null || return 1
-  nvidb_owner_command=$(ps -p "$nvidb_owner_pid" -o command= 2>/dev/null) || return 1
+  nvidb_owner_command=$(ps -ww -p "$nvidb_owner_pid" -o command= 2>/dev/null) || return 1
   case "$nvidb_owner_command" in
     *"$SCRIPT start"*|*"$SCRIPT ensure"*|*"$SCRIPT") return 0 ;;
     *) return 1 ;;
