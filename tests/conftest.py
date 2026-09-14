@@ -17,22 +17,31 @@ def isolated_nvidb_config(tmp_path, monkeypatch):
     monkeypatch.setenv(remote_mod.NO_REMOTE_ENV, "1")
 
 
-@pytest.fixture(autouse=True)
-def fresh_colour_decision():
-    """Let each test decide for itself whether termcolor may emit colour.
+@pytest.fixture(autouse=True, scope="session")
+def colour_decided_per_call():
+    """Make termcolor decide afresh, on every call, whether it may colour.
 
-    termcolor 3 remembers its first answer to "can this process colour?" for
+    termcolor 3 memoises its first answer to "can this process colour?" for
     the life of the interpreter. Under pytest that first answer is taken with
     stdout captured - no colour - and a later test that sets `FORCE_COLOR`
-    would be stuck with it. Clearing the memo restores the pre-3.0 behaviour
-    the colour assertions were written against.
+    would be stuck with it. Clearing the memo around each test turned out not
+    to be enough: on CI the colour tests still failed on some jobs and not
+    others, so something can fill it again before a test sets the variable.
+    Swapping in the undecorated function restores the pre-3.0 behaviour the
+    colour assertions were written against, whatever the timing.
     """
     try:
-        from termcolor.termcolor import can_colorize
-    except ImportError:  # termcolor < 3 keeps no memo
-        can_colorize = None
-    if can_colorize is not None and hasattr(can_colorize, "cache_clear"):
-        can_colorize.cache_clear()
-    yield
-    if can_colorize is not None and hasattr(can_colorize, "cache_clear"):
-        can_colorize.cache_clear()
+        from termcolor import termcolor as impl
+    except ImportError:
+        yield
+        return
+    cached = getattr(impl, "can_colorize", None)
+    plain = getattr(cached, "__wrapped__", None)
+    if plain is None:  # termcolor < 3 keeps no memo
+        yield
+        return
+    impl.can_colorize = plain
+    try:
+        yield
+    finally:
+        impl.can_colorize = cached
