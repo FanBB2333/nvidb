@@ -1,10 +1,11 @@
 """SGR mouse reporting helpers for the nvidb TUI.
 
 blessed resolves only the escape sequences in the terminfo database, so an SGR
-mouse report (``ESC [ < button ; column ; row M|m``) arrives from ``inkey()`` as
-a ``KEY_ESCAPE`` keystroke followed by its individual characters. The parser
-here reassembles those keystrokes into mouse events and hands anything that is
-not a mouse report back to the caller untouched.
+mouse report (``ESC [ < button ; column ; row M|m``) arrives from ``inkey()`` in
+pieces: a ``KEY_ESCAPE`` keystroke followed by its individual characters, or -
+from blessed 1.20 on - a single ``CSI`` keystroke for the ``ESC [`` and then the
+characters. The parser here reassembles those keystrokes into mouse events and
+hands anything that is not a mouse report back to the caller untouched.
 """
 
 from __future__ import annotations
@@ -66,7 +67,11 @@ class MouseSequenceParser:
         """
         text = str(key)
         if not self._pending:
-            if text != "\x1b":
+            # Whatever blessed made of the report's first bytes - a bare
+            # escape, or the whole `ESC [` - it must still be a prefix of one.
+            # A keystroke it resolved further than that, such as an alt-chord,
+            # is a key in its own right and goes straight back.
+            if not _PARTIAL.match(text):
                 return [], [key]
             self._pending.append((key, text))
             return [], []

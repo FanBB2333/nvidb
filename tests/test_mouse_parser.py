@@ -66,7 +66,9 @@ def test_escape_followed_by_a_normal_key_replays_both():
     events, keys = _drive("\x1bZ")
 
     assert events == []
-    assert [str(key) for key in keys] == ["\x1b", "Z"]
+    # Older blessed hands this over as ESC then Z; newer blessed resolves it to
+    # one alt-shift-Z keystroke. Either way nothing may be swallowed.
+    assert "".join(str(key) for key in keys) == "\x1bZ"
 
 
 def test_truncated_report_does_not_wedge_the_parser():
