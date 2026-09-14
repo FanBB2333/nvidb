@@ -330,10 +330,15 @@ class JobExecutor:
             '  _id="$1"; _d="$2"',
             '  _pid=$(cat "$_d/pid" 2>/dev/null | tr -d " \\n\\r")',
             '  _pgid=$(cat "$_d/pgid" 2>/dev/null | tr -d " \\n\\r")',
-            '  _ec=$(cat "$_d/exit_code" 2>/dev/null | tr -d "\\n\\r")',
-            '  _st=$(cat "$_d/started" 2>/dev/null | tr -d " \\n\\r")',
+            # Liveness is checked *before* the exit code is read. A job publishes
+            # its code from an EXIT trap and is gone a moment later, so reading
+            # the file first and then finding no process reports "vanished" for
+            # a job that finished normally in between. In this order a process
+            # seen dead has already written whatever it was going to write.
             "  _alive=0",
             f'  if {_process_guard("$_pid", "$_d/run.sh")}; then _alive=1; fi',
+            '  _ec=$(cat "$_d/exit_code" 2>/dev/null | tr -d "\\n\\r")',
+            '  _st=$(cat "$_d/started" 2>/dev/null | tr -d " \\n\\r")',
             '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive|$_st"',
             # The status line is free-form text, so it travels on its own line
             # where only the first two fields need splitting.

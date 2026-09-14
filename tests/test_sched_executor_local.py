@@ -9,7 +9,7 @@ import time
 import pytest
 
 from nvidb.sched.executor import JobExecutor
-from nvidb.sched.transport import LocalTransport
+from nvidb.sched.transport import CommandResult, LocalTransport
 
 
 def _wait_for_exit(executor, job_id, run_dir, timeout=15.0):
@@ -97,6 +97,33 @@ def test_a_status_is_published_even_when_it_cannot_be_written_atomically(
         job_id=12, job_name="nospace", command="exit 7", node_name="test-local"
     )
     assert _wait_for_exit(executor, 12, launched.run_dir).exit_code == 7
+
+
+def test_the_probe_checks_liveness_before_it_reads_the_exit_code(tmp_path):
+    """The order inside one probe is what keeps a finishing job from being lost.
+
+    A job publishes its exit code from an EXIT trap and is gone a moment later.
+    Read the file first and check the process second, and a job that finished
+    between the two reads as "no exit code, no process" - the definition of
+    vanished. Checked the other way round, a process seen dead has already
+    written whatever it was going to write.
+    """
+
+    class RecordingTransport:
+        name = "recorder"
+
+        def __init__(self):
+            self.commands = []
+
+        def run(self, command, timeout=None):
+            self.commands.append(command)
+            return CommandResult(0, "", "")
+
+    transport = RecordingTransport()
+    JobExecutor(transport, job_root=str(tmp_path)).probe([(1, str(tmp_path / "1"))])
+
+    script = transport.commands[-1]
+    assert script.index("kill -0") < script.index("exit_code")
 
 
 def test_the_probe_reports_free_space_where_jobs_are_written(executor):
