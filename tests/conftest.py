@@ -35,13 +35,18 @@ def colour_decided_per_call():
     except ImportError:
         yield
         return
-    cached = getattr(impl, "can_colorize", None)
-    plain = getattr(cached, "__wrapped__", None)
-    if plain is None:  # termcolor < 3 keeps no memo
-        yield
-        return
-    impl.can_colorize = plain
+    # The memoised predicate was renamed part-way through the 3.x line:
+    # `_can_do_colour` up to 3.1, `can_colorize` from 3.2 on. termcolor < 3
+    # keeps no memo and has nothing to swap.
+    swapped = {}
+    for name in ("can_colorize", "_can_do_colour"):
+        cached = getattr(impl, name, None)
+        plain = getattr(cached, "__wrapped__", None)
+        if plain is not None:
+            swapped[name] = cached
+            setattr(impl, name, plain)
     try:
         yield
     finally:
-        impl.can_colorize = cached
+        for name, cached in swapped.items():
+            setattr(impl, name, cached)
