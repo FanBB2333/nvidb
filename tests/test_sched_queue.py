@@ -520,6 +520,53 @@ def test_a_vanished_process_is_retried_when_retries_remain(scheduler, cluster):
     assert job.attempt == 2
 
 
+def test_a_lost_job_records_why_it_died(scheduler, cluster):
+    """The reason is in the job's own log, so it belongs on the job's record.
+
+    Without it `job show` says only that the process vanished, and the disk
+    that filled up, or the OOM kill that did it, has to be dug out by hand.
+    """
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("python train.py", vram="1G", node="small-node")
+    scheduler.tick(force=True)
+    node = cluster["small-node"]
+    node.logs[node.jobs[job_id]["run_dir"]] = (
+        "Traceback (most recent call last):\n"
+        "OSError: [Errno 28] No space left on device\n"
+    )
+    node.vanish_job(job_id)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "lost"
+    assert "No space left on device" in job.last_error
+
+
+def test_a_job_whose_group_outlives_it_is_reported_not_retried(scheduler, cluster):
+    """A dead wrapper does not mean the work stopped.
+
+    Its children keep the process group - and the GPU - so starting another
+    attempt would run a second copy alongside the first.
+    """
+    scheduler.tick(force=True)
+    job_id = scheduler.submit(
+        "python train.py", vram="1G", node="small-node", max_retries=2
+    )
+    scheduler.tick(force=True)
+    cluster["small-node"].job_allocates(job_id, 0, 1024)
+    cluster["small-node"].vanish_job(job_id, leaves_group_behind=True)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "lost"
+    assert job.attempt == 1
+    leftover = cluster["small-node"].jobs[job_id]["gpu_pid"]
+    assert str(leftover) in job.last_error
+    kinds = [row["kind"] for row in dbm.list_events(scheduler.conn, job_id=job_id)]
+    assert "job_lost" in kinds
+    assert "job_requeued" not in kinds
+
+
 def test_cancel_kills_a_running_job(scheduler, cluster):
     scheduler.tick(force=True)
     job_id = scheduler.submit("sleep 999", vram="1G", node="small-node")

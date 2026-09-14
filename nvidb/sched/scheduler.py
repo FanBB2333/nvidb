@@ -68,6 +68,11 @@ DEFAULT_SETTINGS = {
     # many of them a node runs at once. This does.
     "max_cpu_jobs_per_node": 4,
     "probe_timeout": 25,
+    # A node whose job directories have no room left silently stops reporting:
+    # exit codes, logs and results all live there. Below this much free space
+    # the queue says so once, rather than letting jobs look as if they vanish.
+    # Zero switches the check off.
+    "min_disk_free_mb": 512,
     "launch_timeout": 60,
     "tick_min_interval": 3,
     "lock_ttl": 180,
@@ -1321,6 +1326,7 @@ class Scheduler:
         self._reconcile_jobs(node, backend, running, probe, summary)
         self._reconcile_staged(node, backend, staged, probe, summary)
         self._reap_orphans(node, backend, summary)
+        self._check_disk_space(node, probe, summary)
 
         gpus = self._build_gpu_states(
             node, payload, probe, dbm.live_jobs(self.conn, node.name)
@@ -1352,6 +1358,42 @@ class Scheduler:
                 message=f"{node.name} is online ({len(gpus)} GPU)",
             )
         return True
+
+    def _check_disk_space(
+        self, node: Node, probe: NodeProbe, summary: Dict[str, Any]
+    ) -> None:
+        """Alert when the filesystem holding a node's job directories fills up.
+
+        A job's exit code, logs and result are all files under the job root. A
+        node with nothing left keeps accepting work and then reports none of
+        it, which from here is indistinguishable from jobs dying for no reason
+        - so the queue says which it is, once per crossing rather than once per
+        tick.
+        """
+        floor_mb = int(self.settings.get("min_disk_free_mb") or 0)
+        free_mb = probe.disk_free_mb
+        if not floor_mb or free_mb is None:
+            return
+        key = f"disk_low:{node.name}"
+        low = free_mb < floor_mb
+        if low == (dbm.get_meta(self.conn, key) == "1"):
+            return  # nothing changed since the last pass
+        dbm.set_meta(self.conn, key, "1" if low else "0")
+        if not low:
+            return
+        message = f"{free_mb} MB free where jobs are written (below {floor_mb} MB)"
+        dbm.add_event(self.conn, "node_disk_low", node=node.name, message=message)
+        self._raise_alert(
+            "node_disk_low",
+            f"{node.name} is nearly out of disk space: {message}",
+            severity="warning",
+            node=node.name,
+            detail=(
+                "Jobs on this node can no longer write their exit code, logs "
+                "or result, so finished work is reported as having vanished."
+            ),
+            summary=summary,
+        )
 
     def _ensure_lanes(self, node: Node, gpus: List[dict]) -> None:
         """Give every card this queue may schedule onto a lane of its own.
@@ -1482,7 +1524,34 @@ class Scheduler:
                 continue
 
             # Neither alive nor holding an exit code: the process vanished.
-            if job.attempt <= job.max_retries and job.max_retries > 0:
+            # Why is usually sitting in the job's own stderr - a full disk, an
+            # OOM kill - so it is read once here and carried onto the record
+            # rather than left in an alert nobody correlates with the job.
+            detail = self._failure_detail(backend, job)
+            reason = (detail or "").strip().splitlines()
+            leftovers = _leftover_group_pids(job, probe)
+
+            if leftovers:
+                # The wrapper is gone but its work is not: processes it started
+                # are still in the group it created, reparented to init. No
+                # exit code is ever coming, so the record has to close - but
+                # starting another attempt now would run a second copy beside
+                # the first, and closing quietly would leave the node holding
+                # work this queue no longer mentions.
+                pids = ", ".join(str(pid) for pid in leftovers[:8])
+                if len(leftovers) > 8:
+                    pids += ", ..."
+                left_behind = (
+                    f"{len(leftovers)} process(es) from its group are still "
+                    f"running (pgid {job.remote_pgid}: {pids})"
+                )
+            else:
+                left_behind = None
+
+            if job.attempt <= job.max_retries and job.max_retries > 0 and not leftovers:
+                last_error = "process vanished; retrying"
+                if reason:
+                    last_error += f": {reason[-1][:200]}"
                 dbm.update_job(
                     self.conn,
                     job.id,
@@ -1494,7 +1563,7 @@ class Scheduler:
                     run_dir=None,
                     started_at=None,
                     heartbeat_at=None,
-                    last_error="process vanished; retrying",
+                    last_error=last_error,
                     # The next attempt starts fresh, so the old status line
                     # must not linger as if it were current.
                     progress=None,
@@ -1514,16 +1583,21 @@ class Scheduler:
                     severity="warning",
                     job_id=job.id,
                     node=node.name,
-                    detail=self._failure_detail(backend, job),
+                    detail=detail,
                     summary=summary,
                 )
             else:
+                last_error = "process vanished without an exit code"
+                if left_behind:
+                    last_error += f"; {left_behind}"
+                if reason:
+                    last_error += f": {reason[-1][:200]}"
                 dbm.update_job(
                     self.conn,
                     job.id,
                     state="lost",
                     finished_at=utcnow(),
-                    last_error="process vanished without an exit code",
+                    last_error=last_error,
                     # Whatever the job last reported is the best clue about how
                     # far it got, so it is kept on the record.
                     **progress_updates,
@@ -1533,14 +1607,21 @@ class Scheduler:
                     "job_lost",
                     job_id=job.id,
                     node=node.name,
-                    message="process vanished without an exit code",
+                    message=last_error[:200],
+                    data={"leftover_pids": leftovers} if leftovers else None,
                 )
+                title = f"{job.name or 'job'} vanished on {node.name} without an exit code"
+                if left_behind:
+                    title += f"; {len(leftovers)} of its processes are still running"
+                    # The pids lead the detail because acting on them - looking,
+                    # then killing - is the only thing left to decide.
+                    detail = f"{left_behind}\n\n{detail or ''}".strip()
                 self._raise_alert(
                     "job_lost",
-                    f"{job.name or 'job'} vanished on {node.name} without an exit code",
+                    title,
                     job_id=job.id,
                     node=node.name,
-                    detail=self._failure_detail(backend, job),
+                    detail=detail,
                     summary=summary,
                 )
                 summary["finished"].append({"id": job.id, "state": "lost"})
@@ -2955,6 +3036,29 @@ class Scheduler:
 def _lane_order(job: Job):
     """A lane's running order. A job with no place yet goes to the back."""
     return (job.lane_seq is None, job.lane_seq or 0, job.id)
+
+
+def _leftover_group_pids(job: Job, probe: NodeProbe) -> List[int]:
+    """Live pids still in the process group of a job whose wrapper is gone.
+
+    A wrapper can die on its own - a full disk taking down the shell that
+    publishes the exit code, an OOM kill that picks the parent - and leave the
+    work it started reparented to init but still in the process group it
+    created. The group is therefore the evidence that a job outlived the
+    process this queue was watching.
+
+    A group id can be recycled the way a pid can, so a stale match is possible.
+    This only ever reports, never signals, which is what makes that acceptable:
+    the cost is a wrong sentence in an alert rather than someone else's job.
+    """
+    pgid = job.remote_pgid
+    if not pgid:
+        return []
+    return sorted(
+        pid
+        for pid, group in probe.process_groups.items()
+        if group == pgid and pid != job.remote_pid
+    )
 
 
 def _bytes_to_mb(value) -> int:

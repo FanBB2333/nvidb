@@ -51,6 +51,8 @@ class FakeNode:
         self.killed: List[int] = []
         # Jobs whose leftover process was cleaned up after the fact.
         self.reaped: List[int] = []
+        # Free space where jobs are written; None when the node cannot say.
+        self.disk_free_mb: Optional[int] = 100_000
         self._next_pid = 1000
 
     # --- test-facing helpers ---------------------------------------------
@@ -90,11 +92,18 @@ class FakeNode:
         if result is not None:
             self.results[record["run_dir"]] = result
 
-    def vanish_job(self, job_id: int) -> None:
-        """The process disappears with no exit code (reboot, OOM killer, ...)."""
+    def vanish_job(self, job_id: int, *, leaves_group_behind: bool = False) -> None:
+        """The process disappears with no exit code (reboot, OOM killer, ...).
+
+        `leaves_group_behind` models the wrapper dying on its own: the shell
+        the queue was watching is gone, but what it started is still running in
+        the process group it created, reparented to init.
+        """
         record = self.jobs[job_id]
         record["alive"] = False
-        self._release_job_memory(record)
+        record["group_alive"] = leaves_group_behind
+        if not leaves_group_behind:
+            self._release_job_memory(record)
 
     def _release_job_memory(self, record: dict) -> None:
         for gpu in self.gpus:
@@ -170,10 +179,12 @@ class FakeNode:
     def process_groups(self) -> Dict[int, int]:
         table: Dict[int, int] = {}
         for record in self.jobs.values():
-            if not record["alive"]:
+            if record["alive"]:
+                table[record["pid"]] = record["pgid"]
+            elif not record.get("group_alive"):
                 continue
-            table[record["pid"]] = record["pgid"]
-            # The GPU process is a child of run.sh, sharing its process group.
+            # The GPU process is a child of run.sh, sharing its process group,
+            # which is why it is still listed once the wrapper itself is gone.
             table[record["gpu_pid"]] = record["pgid"]
         return table
 
@@ -254,6 +265,7 @@ class FakeExecutor:
                 progress=record.get("progress"),
             )
         probe.process_groups = self.node.process_groups()
+        probe.disk_free_mb = self.node.disk_free_mb
         return probe
 
     def kill(self, *, pid, pgid, signal="TERM"):

@@ -50,6 +50,10 @@ queue:
   probe_timeout: 25      # seconds allowed for one node probe
   launch_timeout: 60     # seconds allowed to start a job
   job_root: ".nvidb/jobs"  # per-job directory on each node (relative to $HOME)
+  # Free space on the filesystem holding job_root below which the queue warns.
+  # Every exit code, log and result is written there, so a node with no room
+  # left runs jobs it can then report nothing about. 0 switches the check off.
+  min_disk_free_mb: 512
   include_local: false   # also schedule onto this machine
 
   # Optional consistent SQLite backups made by `nvidb queue daemon`.

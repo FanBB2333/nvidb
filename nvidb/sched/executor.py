@@ -19,6 +19,7 @@ from .transport import CommandResult, Transport, TransportError
 
 PROBE_MARKER = "NVIDB_PROBE_V1"
 PS_MARKER = "PSTABLE"
+DISK_MARKER = "DISKFREE"
 DEFAULT_JOB_ROOT = ".nvidb/jobs"
 
 # What a POSIX shell will accept on the left of `export NAME=value`.
@@ -70,6 +71,10 @@ class JobProbe:
 class NodeProbe:
     jobs: Dict[int, JobProbe] = field(default_factory=dict)
     process_groups: Dict[int, int] = field(default_factory=dict)
+    # Free space where this node keeps its job directories, or None when the
+    # node could not say. Everything the queue learns about a job is written
+    # there, so a filesystem with nothing left is a queue that stops reporting.
+    disk_free_mb: Optional[int] = None
 
 
 def build_run_script(
@@ -106,11 +111,28 @@ def build_run_script(
         'date +%s > "$NVIDB_JOB_DIR/started" 2>/dev/null || true',
         "nvidb_finish() {",
         "  nvidb_rc=$?",
+        # The job command runs in this same shell, so whatever it switched on
+        # is still in force here. Under its `set -e` a single failed write -
+        # a full disk being the usual reason - abandons the rest of this
+        # function, no status is published, and a job that merely failed is
+        # reported as having vanished. Publishing the status outranks any
+        # option the command left behind.
+        "  set +e +u",
         # The wall-clock finish time is recorded here rather than inferred from
         # whenever a client next looks, so elapsed times stay honest even if
         # nobody polls for an hour.
-        '  printf "%s %s" "$nvidb_rc" "$(date +%s)" > "$NVIDB_JOB_DIR/exit_code.tmp"',
-        '  mv "$NVIDB_JOB_DIR/exit_code.tmp" "$NVIDB_JOB_DIR/exit_code"',
+        '  nvidb_status="$nvidb_rc $(date +%s 2>/dev/null)"',
+        '  if printf "%s" "$nvidb_status" > "$NVIDB_JOB_DIR/exit_code.tmp" &&'
+        ' [ -s "$NVIDB_JOB_DIR/exit_code.tmp" ]; then',
+        '    mv "$NVIDB_JOB_DIR/exit_code.tmp" "$NVIDB_JOB_DIR/exit_code"'
+        " 2>/dev/null && return",
+        "  fi",
+        # The two-step publish produced nothing worth moving into place.
+        # Dropping the temporary usually frees the block the direct write then
+        # needs, and a status a probe could catch half-written still beats the
+        # job looking as though it disappeared.
+        '  rm -f "$NVIDB_JOB_DIR/exit_code.tmp" 2>/dev/null',
+        '  printf "%s" "$nvidb_status" > "$NVIDB_JOB_DIR/exit_code" 2>/dev/null',
         "}",
         "trap nvidb_finish EXIT",
         # Handling the signals explicitly is what lets the EXIT trap run when a
@@ -221,6 +243,17 @@ class JobExecutor:
             self._home = home.rstrip("/")
         return self._home
 
+    def job_root_expr(self) -> str:
+        """Shell for the job root, without spending a round trip to resolve it.
+
+        `$HOME` is left outside the quoting or it travels as five literal
+        characters and the node grows a directory actually named `$HOME`.
+        """
+        root = self.job_root.rstrip("/")
+        if root.startswith("/"):
+            return shlex.quote(root)
+        return '"$HOME"/' + shlex.quote(root.strip("/") or ".")
+
     def run_dir(self, job_id: int, attempt: int = 1) -> str:
         root = self.job_root
         if not root.startswith("/"):
@@ -313,6 +346,13 @@ class JobExecutor:
             lines.append(f"nvidb_probe {job_id} {shlex.quote(run_dir)}")
         lines.append(f"echo {PS_MARKER}")
         lines.append("ps -eo pid=,pgid= 2>/dev/null || true")
+        lines.append(f"echo {DISK_MARKER}")
+        # The job root may not exist yet on a node that has never run anything,
+        # and $HOME is on the same filesystem in every layout that matters.
+        lines.append(
+            f"df -Pk {self.job_root_expr()} 2>/dev/null || "
+            'df -Pk "$HOME" 2>/dev/null || true'
+        )
 
         result = self.transport.run("\n".join(lines), timeout=timeout)
         return parse_probe_output(result.stdout)
@@ -441,6 +481,9 @@ def parse_probe_output(text: str) -> NodeProbe:
         if line == PS_MARKER:
             section = "ps"
             continue
+        if line == DISK_MARKER:
+            section = "disk"
+            continue
         if section == "jobs" and line.startswith("STAT|"):
             # Only the id is delimited; the rest is the status text verbatim.
             parts = line.split("|", 2)
@@ -486,6 +529,17 @@ def parse_probe_output(text: str) -> NodeProbe:
             pgid = _maybe_int(parts[1])
             if pid is not None and pgid is not None:
                 probe.process_groups[pid] = pgid
+        elif section == "disk" and probe.disk_free_mb is None:
+            # `df -P` guarantees one line per filesystem, with blocks, used and
+            # available as fields 2 to 4. Requiring all three to be numbers is
+            # what skips the header without having to recognise its wording.
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            blocks, used, available = (_maybe_int(part) for part in parts[1:4])
+            if None in (blocks, used, available):
+                continue
+            probe.disk_free_mb = available // 1024
     return probe
 
 

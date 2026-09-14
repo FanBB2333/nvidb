@@ -43,6 +43,7 @@ def scheduler(tmp_path, cluster):
             "default_vram": "0",
             "placement": "spread",
             "include_local": False,
+            "min_disk_free_mb": 512,
         },
         backend_factory=cluster.backend_factory,
         owner="test",
@@ -174,6 +175,36 @@ def test_a_node_coming_back_lets_the_next_outage_alert_again(scheduler, cluster)
     scheduler.tick(force=True)
 
     assert len([a for a in _open_alerts(scheduler) if a["kind"] == "node_down"]) == 2
+
+
+def test_a_node_with_no_room_left_to_write_in_raises_one_warning(scheduler, cluster):
+    """The queue writes every exit code, log and result under the job root.
+
+    A node that has run out of space there keeps taking work and then reports
+    nothing about it, so the shortage is worth saying once - and only once,
+    because it will still be true on every pass until someone clears it.
+    """
+    scheduler.tick(force=True)
+    cluster["small-node"].disk_free_mb = 12
+    scheduler.tick(force=True)
+    scheduler.tick(force=True)
+
+    alerts = [a for a in _open_alerts(scheduler) if a["kind"] == "node_disk_low"]
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "warning"
+    assert "12 MB free" in alerts[0]["title"]
+
+
+def test_space_being_freed_lets_the_next_shortage_alert_again(scheduler, cluster):
+    scheduler.tick(force=True)
+    cluster["small-node"].disk_free_mb = 12
+    scheduler.tick(force=True)
+    cluster["small-node"].disk_free_mb = 50_000
+    scheduler.tick(force=True)
+    cluster["small-node"].disk_free_mb = 12
+    scheduler.tick(force=True)
+
+    assert len([a for a in _open_alerts(scheduler) if a["kind"] == "node_disk_low"]) == 2
 
 
 def test_a_launch_failure_raises_a_warning(scheduler, cluster):

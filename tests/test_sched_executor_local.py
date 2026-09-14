@@ -55,6 +55,56 @@ def test_a_failing_command_propagates_its_status(executor):
     assert abs(probe.finished_epoch - time.time()) < 60
 
 
+def _block_the_atomic_publish(run_dir) -> None:
+    """Stand where the exit code's temporary file goes.
+
+    The redirect into it then fails the way it does on a filesystem with no
+    room left, which is the failure that used to cost a job its status.
+    """
+    (run_dir / "exit_code.tmp").mkdir(parents=True)
+
+
+def test_a_command_that_leaves_errexit_on_still_reports_its_status(
+    executor, tmp_path
+):
+    """`set -e` in the job command must not follow it into the exit trap.
+
+    The trap runs in that same shell, so an option the command switched on is
+    still in force there: one failed write used to abandon the rest of the
+    trap, and a job that had merely failed was reported as having vanished.
+    """
+    _block_the_atomic_publish(tmp_path / "jobs" / "11")
+    launched = executor.launch(
+        job_id=11,
+        job_name="strict",
+        command="set -e\nfalse\necho never",
+        node_name="test-local",
+    )
+    assert _wait_for_exit(executor, 11, launched.run_dir).exit_code == 1
+
+
+def test_a_status_is_published_even_when_it_cannot_be_written_atomically(
+    executor, tmp_path
+):
+    """A full disk breaks the write, not the reporting.
+
+    The two-step publish is what a probe relies on to never read half a value,
+    but when it cannot happen at all, an exit code written directly still beats
+    the job looking as though its process disappeared.
+    """
+    _block_the_atomic_publish(tmp_path / "jobs" / "12")
+    launched = executor.launch(
+        job_id=12, job_name="nospace", command="exit 7", node_name="test-local"
+    )
+    assert _wait_for_exit(executor, 12, launched.run_dir).exit_code == 7
+
+
+def test_the_probe_reports_free_space_where_jobs_are_written(executor):
+    probe = executor.probe([])
+    assert probe.disk_free_mb is not None
+    assert probe.disk_free_mb > 0
+
+
 def test_a_job_can_hand_back_a_result_payload(executor):
     command = (
         'printf \'{"accuracy": 0.91, "note": "done"}\' > "$NVIDB_JOB_DIR/result.json"'

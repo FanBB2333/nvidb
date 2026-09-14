@@ -216,7 +216,13 @@ Failures become **alerts** in the queue, classified by what happened:
 `job_failed` (non-zero exit), `job_lost` (process vanished), `job_timeout`,
 `job_held` (a prerequisite ended badly, so this job is parked for a decision),
 `job_unschedulable` (no GPU in the cluster could ever hold it), `launch_failed`,
-`node_down`, `job_retried`.
+`node_down`, `node_disk_low` (the node cannot write job output any more),
+`job_retried`.
+
+A `job_lost` alert says whether processes from the job's own process group are
+still running: its wrapper died, but the work it started did not. Nothing is
+killed for you - look before deciding, because that is usually a training run
+still making progress.
 
 ```bash
 nvidb queue alerts --json            # what needs attention
