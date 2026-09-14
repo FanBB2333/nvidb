@@ -15,3 +15,24 @@ from nvidb.sched import remote as remote_mod
 def isolated_nvidb_config(tmp_path, monkeypatch):
     monkeypatch.setenv("NVIDB_QUEUE_CONFIG", str(tmp_path / "absent-queue.yml"))
     monkeypatch.setenv(remote_mod.NO_REMOTE_ENV, "1")
+
+
+@pytest.fixture(autouse=True)
+def fresh_colour_decision():
+    """Let each test decide for itself whether termcolor may emit colour.
+
+    termcolor 3 remembers its first answer to "can this process colour?" for
+    the life of the interpreter. Under pytest that first answer is taken with
+    stdout captured - no colour - and a later test that sets `FORCE_COLOR`
+    would be stuck with it. Clearing the memo restores the pre-3.0 behaviour
+    the colour assertions were written against.
+    """
+    try:
+        from termcolor.termcolor import can_colorize
+    except ImportError:  # termcolor < 3 keeps no memo
+        can_colorize = None
+    if can_colorize is not None and hasattr(can_colorize, "cache_clear"):
+        can_colorize.cache_clear()
+    yield
+    if can_colorize is not None and hasattr(can_colorize, "cache_clear"):
+        can_colorize.cache_clear()
