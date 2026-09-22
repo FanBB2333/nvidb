@@ -22,7 +22,7 @@ from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
 
 from nvidb.sched import db as dbm  # noqa: E402
 from nvidb.sched import runner_agent  # noqa: E402
-from nvidb.sched.scheduler import Scheduler  # noqa: E402
+from nvidb.sched.scheduler import Scheduler, TICK_LOCK, UNSTAGED_CANCEL_OWNER  # noqa: E402
 
 
 # --- the shipped program ---------------------------------------------------
@@ -402,6 +402,115 @@ def scheduler(tmp_path, cluster):
 
 def _runner(cluster):
     return cluster.backends["box"].runner
+
+
+@pytest.fixture
+def cancel_client(scheduler, cluster):
+    conn = dbm.open_db(dbm.connection_path(scheduler.conn))
+    client = Scheduler(conn, cfg=cluster.config(), settings=scheduler.settings,
+                       backend_factory=cluster.backend_factory, owner="cancel-client")
+    yield client
+    client.close()
+    conn.close()
+
+
+def test_unstaged_cancellation_does_not_wait_for_a_tick_probe(
+    scheduler, cluster, cancel_client, monkeypatch
+):
+    ids = [scheduler.submit(name, lane="box:0", vram="1G")
+           for name in ("cancel-a", "cancel-b", "keep")]
+    kept = dbm.get_job(scheduler.conn, ids[2])
+    probe = cluster.backend_factory(dbm.get_node(scheduler.conn, "box")).probe_gpus
+
+    def blocked_probe():
+        assert dbm.lock_holder(cancel_client.conn, TICK_LOCK)["owner"] == scheduler.owner
+        assert cancel_client.cancel(ids[0]) is True
+        assert cancel_client.cancel(ids[1]) is True
+        assert dbm.lock_holder(cancel_client.conn, TICK_LOCK)["owner"] == scheduler.owner
+        return probe()
+
+    def no_remote_cancel(*args, **kwargs):
+        pytest.fail("an unstaged cancellation must not contact a node")
+
+    monkeypatch.setattr(cancel_client, "backend", no_remote_cancel)
+    monkeypatch.setattr(cluster.backends["box"], "probe_gpus", blocked_probe)
+    assert scheduler.tick(force=True)["errors"] == []
+    assert [dbm.get_job(scheduler.conn, i).state for i in ids] == [
+        "cancelled", "cancelled", "running"
+    ]
+    assert not set(ids[:2]).intersection(cluster["box"].jobs)
+    assert dbm.get_job(scheduler.conn, ids[2]).lane_seq == kept.lane_seq
+    assert dbm.get_job(scheduler.conn, ids[2]).command == kept.command
+
+
+def test_cancel_wins_before_a_stale_lane_snapshot_is_reserved(
+    scheduler, cluster, cancel_client, monkeypatch
+):
+    cancelled = scheduler.submit("cancel", lane="box:0", vram="1G")
+    kept = scheduler.submit("keep", lane="box:0", vram="1G")
+    run_dir = scheduler._lane_run_dir
+
+    def cancel_before_reservation(lane, job, attempt):
+        if job.id == cancelled:
+            assert cancel_client.cancel(cancelled) is True
+        return run_dir(lane, job, attempt)
+
+    monkeypatch.setattr(scheduler, "_lane_run_dir", cancel_before_reservation)
+    summary = scheduler.tick(force=True)
+    assert summary["errors"] == []
+    assert dbm.get_job(scheduler.conn, cancelled).state == "cancelled"
+    assert dbm.get_job(scheduler.conn, cancelled).run_dir is None
+    assert cancelled not in cluster["box"].jobs
+    assert dbm.get_job(scheduler.conn, kept).state == "running"
+
+
+def test_a_reserved_lane_job_cannot_use_unstaged_cancellation(
+    scheduler, cluster, cancel_client, monkeypatch
+):
+    job_id = scheduler.submit("keep", lane="box:0", vram="1G")
+    backend = cluster.backend_factory(dbm.get_node(scheduler.conn, "box"))
+    sync = backend.lane_sync
+
+    def cancel_after_reservation(**kwargs):
+        assert dbm.get_job(cancel_client.conn, job_id).run_dir
+        with pytest.raises(RuntimeError, match="scheduler is busy"):
+            cancel_client.cancel(job_id)
+        return sync(**kwargs)
+
+    monkeypatch.setattr(backend, "lane_sync", cancel_after_reservation)
+    assert scheduler.tick(force=True)["errors"] == []
+    assert dbm.get_job(scheduler.conn, job_id).state == "running"
+    assert "job_cancelled" not in [e["kind"] for e in dbm.list_events(scheduler.conn, job_id=job_id)]
+
+
+@pytest.mark.parametrize("operation", [False, True])
+def test_old_ticks_and_administrative_leases_keep_exclusive_cancellation(
+    scheduler, cancel_client, operation
+):
+    job_id = scheduler.submit("keep", lane="box:0", vram="1G")
+    owner = "old-tick" if not operation else "new-tick:job-edit"
+    dbm.set_meta(scheduler.conn, UNSTAGED_CANCEL_OWNER, "new-tick")
+    dbm.acquire_lock(scheduler.conn, TICK_LOCK, owner, 60)
+    try:
+        with pytest.raises(RuntimeError, match="scheduler is busy"):
+            cancel_client.cancel(job_id)
+        assert dbm.get_job(scheduler.conn, job_id).state == "pending"
+    finally:
+        dbm.release_lock(scheduler.conn, TICK_LOCK, owner)
+
+
+def test_cancelled_snapshot_cannot_be_failed_or_held(scheduler, cancel_client):
+    job_id = scheduler.submit("cancel", lane="box:0", vram="100G")
+    dbm.update_job(scheduler.conn, job_id, held_reason="obsolete hold")
+    stale = dbm.get_job(scheduler.conn, job_id)
+    assert cancel_client.cancel(job_id)
+    scheduler._hold(stale, "stale dependency", {})
+    scheduler._unhold(stale)
+    assert scheduler._gate(stale, [], 0, {}) == "gone"
+    assert dbm.get_job(scheduler.conn, job_id).state == "cancelled"
+    assert [e["kind"] for e in dbm.list_events(scheduler.conn, job_id=job_id)] == [
+        "job_submitted", "job_cancelled"
+    ]
 
 
 def test_only_the_head_of_the_lane_is_handed_over(scheduler, cluster):

@@ -12,7 +12,7 @@ import pytest
 
 from nvidb.sched import cli as sched_cli
 from nvidb.sched import db as dbm
-from nvidb.sched.scheduler import TICK_LOCK, Scheduler
+from nvidb.sched.scheduler import TICK_LOCK, UNSTAGED_CANCEL_OWNER, Scheduler
 from nvidb.tui_theme import display_width
 
 
@@ -733,6 +733,35 @@ def test_cancel_accepts_no_tick_and_preserves_other_queued_jobs(parser, queue_db
     conn = dbm.open_db(queue_db)
     assert dbm.get_job(conn, 2).state == "pending"
     conn.close()
+
+
+def test_cancel_no_tick_batch_succeeds_while_a_guarded_tick_holds_the_lease(
+    parser, queue_db, capsys, monkeypatch
+):
+    conn = dbm.open_db(queue_db)
+    dbm.upsert_node(conn, "box", hostname="localhost")
+    dbm.ensure_lane(conn, "box:0", node="box", gpu_ids=[0])
+    for index in range(3):
+        dbm.insert_job(conn, command="keep", lane="box:0", lane_seq=index + 1)
+    dbm.acquire_lock(conn, TICK_LOCK, "guarded-tick", 60)
+    dbm.set_meta(conn, UNSTAGED_CANCEL_OWNER, "guarded-tick")
+
+    def no_tick_or_ssh(*args, **kwargs):
+        pytest.fail("--no-tick unstaged cancellation must stay local")
+
+    monkeypatch.setattr(Scheduler, "tick", no_tick_or_ssh)
+    monkeypatch.setattr(Scheduler, "backend", no_tick_or_ssh)
+    try:
+        assert _run(parser, ["job", "cancel", "1", "2", "--no-tick", "--json"], queue_db) == 0
+        assert json.loads(capsys.readouterr().out)["results"] == [
+            {"id": 1, "cancelled": True, "holds": []},
+            {"id": 2, "cancelled": True, "holds": []},
+        ]
+        assert dbm.get_job(conn, 3).state == "pending"
+        assert dbm.lock_holder(conn, TICK_LOCK)["owner"] == "guarded-tick"
+    finally:
+        dbm.release_lock(conn, TICK_LOCK, "guarded-tick")
+        conn.close()
 
 
 def test_job_command_json_flag_does_not_change_parser_error_format(parser, capsys):

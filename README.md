@@ -965,3 +965,17 @@ This release adds only an optional `overdue_at` column. Automatic historical
 correction is limited to a matching timeout orphan for the same attempt and
 run directory, with a recorded earlier node completion and no node timeout
 marker. It never rewrites a requeued attempt or a user cancellation.
+
+### Cancelling queued lane jobs in v1.9.4
+
+`nvidb job cancel ID... --no-tick --json` can immediately cancel pending runner
+lane jobs that have not been staged, even while another tick is waiting on SSH.
+This path changes only the named jobs and makes no node connections. Reserving
+a run directory and cancelling both check the current record in a short database
+transaction, so a stale tick cannot publish a successfully cancelled job.
+
+Staged jobs, running jobs, free-pool jobs and lanes without a runner retain the
+exclusive cancellation path and can still report `scheduler is busy`.
+An active older controller also retains that protection: restart or let it exit
+before relying on concurrent cancellation. The patch changes neither the runner
+script nor lane settings, and requires no schema migration.

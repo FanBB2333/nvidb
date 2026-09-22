@@ -46,6 +46,9 @@ from .model import (
 from .transport import LocalTransport, SSHTransport, Transport, TransportError
 
 TICK_LOCK = "scheduler"
+# Only this exact tick owner promises to recheck pending jobs before staging.
+# An older daemon or an administrative operation must keep exclusive access.
+UNSTAGED_CANCEL_OWNER = "scheduler_unstaged_cancel_owner"
 
 
 class SchedulerLeaseLost(RuntimeError):
@@ -1147,6 +1150,9 @@ class Scheduler:
 
     def cancel(self, job_id: int, *, reason: str = "cancelled by user") -> bool:
         """Cancel a job, killing its process group when it is already running."""
+        immediate = self._cancel_unstaged_lane_job(job_id, reason)
+        if immediate is not None:
+            return immediate
         with self._operation_lease("cancel"):
             job = dbm.get_job(self.conn, job_id)
             if job is None or job.is_terminal:
@@ -1176,6 +1182,33 @@ class Scheduler:
                 dbm.add_event(
                     self.conn, "job_cancelled", job_id=job_id, message=reason
                 )
+            return True
+
+    def _cancel_unstaged_lane_job(self, job_id: int, reason: str) -> Optional[bool]:
+        """Cancel local-only runner work without waiting for unrelated SSH.
+
+        None means the existing exclusive cancellation path is required.
+        The transaction races only with _lane_specs' reservation: either this
+        cancellation wins, or the run directory exists and we take the lease.
+        Free-pool and legacy-lane launches still require the scheduler lease.
+        """
+        with dbm.transaction(self.conn):
+            job = dbm.get_job(self.conn, job_id)
+            if job is None or job.is_terminal:
+                return False
+            if (job.state != "pending" or not job.lane or job.run_dir
+                    or job.node or job.remote_pid or job.remote_pgid or job.started_at):
+                return None
+            lane = dbm.get_lane(self.conn, job.lane)
+            if lane is None or not lane.runner:
+                return None
+            holder = dbm.lock_holder(self.conn, TICK_LOCK)
+            if (holder is not None and holder["owner"]
+                    and holder["owner"] != dbm.get_meta(self.conn, UNSTAGED_CANCEL_OWNER)):
+                return None
+            dbm.update_job(self.conn, job_id, state="cancelled", finished_at=utcnow(),
+                           last_error=reason)
+            dbm.add_event(self.conn, "job_cancelled", job_id=job_id, message=reason)
             return True
 
     def requeue(self, job_id: int) -> bool:
@@ -1240,13 +1273,15 @@ class Scheduler:
                 summary["skipped"] = "rate_limited"
                 return summary
 
-        if not dbm.acquire_lock(
-            self.conn, TICK_LOCK, self.owner, self._lease_ttl()
-        ):
-            holder = dbm.lock_holder(self.conn, TICK_LOCK)
-            summary["skipped"] = "locked"
-            summary["lock_owner"] = holder["owner"] if holder else None
-            return summary
+        with dbm.transaction(self.conn):
+            if not dbm.acquire_lock(
+                self.conn, TICK_LOCK, self.owner, self._lease_ttl()
+            ):
+                holder = dbm.lock_holder(self.conn, TICK_LOCK)
+                summary["skipped"] = "locked"
+                summary["lock_owner"] = holder["owner"] if holder else None
+                return summary
+            dbm.set_meta(self.conn, UNSTAGED_CANCEL_OWNER, self.owner)
         self._last_lease_renewal = time.monotonic()
 
         try:
@@ -2228,35 +2263,41 @@ class Scheduler:
 
         Returns None when it may, or why not: `impossible` (the job was just
         failed, nothing could ever host it), `held` (a dependency ended badly)
-        or `waiting` (a dependency has not finished yet). Lanes and the free
-        pool share this so a job means the same thing in both.
+        or `waiting` (a dependency has not finished yet). `gone` means the
+        pending snapshot is stale. Lanes and the free pool share this gate.
         """
-        impossible = self._impossible_reason(job, inventory, headroom)
-        if impossible:
-            dbm.update_job(
-                self.conn,
-                job.id,
-                state="failed",
-                finished_at=utcnow(),
-                last_error=impossible,
-            )
-            dbm.add_event(
-                self.conn, "job_failed", job_id=job.id, message=impossible
-            )
-            self._raise_alert(
-                "job_unschedulable",
-                f"{job.name or 'job'} will never run: {impossible}",
-                job_id=job.id,
-                summary=summary,
-            )
-            return "impossible"
+        with dbm.transaction(self.conn):
+            current = dbm.get_job(self.conn, job.id)
+            if (current is None or current.state != "pending"
+                    or current.attempt != job.attempt or current.lane != job.lane):
+                return "gone"
+            job = current
+            impossible = self._impossible_reason(job, inventory, headroom)
+            if impossible:
+                dbm.update_job(
+                    self.conn,
+                    job.id,
+                    state="failed",
+                    finished_at=utcnow(),
+                    last_error=impossible,
+                )
+                dbm.add_event(
+                    self.conn, "job_failed", job_id=job.id, message=impossible
+                )
+                self._raise_alert(
+                    "job_unschedulable",
+                    f"{job.name or 'job'} will never run: {impossible}",
+                    job_id=job.id,
+                    summary=summary,
+                )
+                return "impossible"
 
-        ready, hold_reason = self._dependencies_ready(job)
-        if hold_reason:
-            self._hold(job, hold_reason, summary)
-            return "held"
-        self._unhold(job)
-        return None if ready else "waiting"
+            ready, hold_reason = self._dependencies_ready(job)
+            if hold_reason:
+                self._hold(job, hold_reason, summary)
+                return "held"
+            self._unhold(job)
+            return None if ready else "waiting"
 
     def _report_launch_failure(
         self,
@@ -2316,7 +2357,7 @@ class Scheduler:
                 break
             if inventory is not None and summary is not None:
                 blocked = self._gate(job, inventory, headroom, summary)
-                if blocked == "impossible":
+                if blocked in ("impossible", "gone"):
                     # Just failed and out of the queue; the lane carries on.
                     continue
                 if blocked:
@@ -2331,12 +2372,20 @@ class Scheduler:
             run_dir = self._lane_run_dir(lane, job, attempt)
             if run_dir is None:
                 break
-            if job.run_dir != run_dir:
+            with dbm.transaction(self.conn):
+                current = dbm.get_job(self.conn, job.id)
+                if (current is None or current.state != "pending"
+                        or current.attempt != job.attempt or current.lane != lane.name
+                        or current.run_dir != job.run_dir):
+                    continue
                 # Recorded before the job can possibly start. A job that runs
                 # and exits between two ticks is never seen in the runner's
                 # `current`, so this is what lets the next probe find its exit
-                # code instead of staging the job again for ever.
-                dbm.update_job(self.conn, job.id, run_dir=run_dir)
+                # code instead of staging the job again for ever. Reserving
+                # the directory also prevents local-only cancellation from
+                # succeeding after we have committed to publishing this spec.
+                if job.run_dir != run_dir:
+                    dbm.update_job(self.conn, job.id, run_dir=run_dir)
             specs.append(
                 {
                     "job_id": job.id,
@@ -2564,7 +2613,7 @@ class Scheduler:
         the spec anyway; doing it now closes the window in which the runner
         starts a job that has just been called off.
         """
-        if not job.lane:
+        if not job.lane or not job.run_dir:
             return
         lane = dbm.get_lane(self.conn, job.lane)
         if lane is None or not lane.runner:
@@ -2623,14 +2672,15 @@ class Scheduler:
         Turning it off leaves the lane working - the order is kept either way -
         but it then only advances when a client runs a scheduler pass.
         """
-        target = self.resolve_lane(lane)
-        dbm.update_lane(self.conn, target.name, runner=enabled)
-        if not enabled:
-            try:
-                self.stop_lane_runner(target.name)
-            except (TransportError, ValueError):
-                pass  # it times itself out with nothing staged
-        return dbm.get_lane(self.conn, target.name)
+        with self._operation_lease("lane-runner"):
+            target = self.resolve_lane(lane)
+            dbm.update_lane(self.conn, target.name, runner=enabled)
+            if not enabled:
+                try:
+                    self.stop_lane_runner(target.name)
+                except (TransportError, ValueError):
+                    pass  # it times itself out with nothing staged
+            return dbm.get_lane(self.conn, target.name)
 
     # --- lane dispatch ----------------------------------------------------
 
@@ -2677,7 +2727,7 @@ class Scheduler:
                 if running.get(lane_name, 0) >= max(1, lane.concurrency):
                     break
                 blocked = self._gate(job, inventory, headroom, summary)
-                if blocked == "impossible":
+                if blocked in ("impossible", "gone"):
                     # It was just failed, so it has left the queue. Carrying on
                     # is right: a job nothing can host must not wedge the lane.
                     continue
@@ -2880,6 +2930,9 @@ class Scheduler:
         if job.held_reason == reason:
             return
         with dbm.transaction(self.conn):
+            current = dbm.get_job(self.conn, job.id)
+            if current is None or current.state != "pending" or current.attempt != job.attempt:
+                return
             dbm.update_job(self.conn, job.id, held_reason=reason)
             dbm.add_event(
                 self.conn, "job_held", job_id=job.id, message=reason
@@ -2904,6 +2957,9 @@ class Scheduler:
         if not job.held_reason:
             return
         with dbm.transaction(self.conn):
+            current = dbm.get_job(self.conn, job.id)
+            if current is None or current.state != "pending" or current.attempt != job.attempt:
+                return
             dbm.update_job(self.conn, job.id, held_reason=None)
             dbm.resolve_job_alerts(self.conn, job.id, "job_held")
             dbm.add_event(

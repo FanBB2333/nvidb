@@ -374,3 +374,9 @@ manager is separate from editing the queue.
 Lane concurrency changes apply to future starts without stopping current jobs.
 Runner restarts adopt existing processes after stopping dispatch safely.
 Lookahead remains 1 by default; v1.9.3 does not enable `all` or `auto`.
+
+In v1.9.4, `job cancel ID... --no-tick --json` can cancel unstaged runner lane
+jobs locally during a tick. It does not contact nodes or change other jobs.
+Staged/running jobs, free-pool jobs and lanes without a runner still need the
+scheduler lease. An older active controller also requires that lease until it
+exits or is restarted; `--no-tick` does not bypass this protection.
