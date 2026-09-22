@@ -14,6 +14,7 @@ commands can manage a user service that returns after reboot.
 from __future__ import annotations
 
 import os
+import plistlib
 import secrets
 import shlex
 import shutil
@@ -32,11 +33,13 @@ SESSION_NAME = "queue-keeper.session"
 LOCK_NAME = "queue-keeper.lock"
 TOKEN_NAME = "queue-keeper.token"
 MANAGER_NAME = "queue-keeper.manager"
+STOPPED_NAME = "queue-keeper.stopped"
 SYSTEMD_UNIT_NAME = "nvidb-queue.service"
+LAUNCHD_LABEL = "com.nvidb.queue-keeper"
 
 DEFAULT_INTERVAL = 15
 ACTIONS = ("start", "ensure", "stop", "restart", "status", "logs")
-MANAGERS = ("shell", "systemd")
+MANAGERS = ("shell", "systemd", "launchd")
 
 TEMPLATE_PATH = Path(__file__).with_name("keeper.sh")
 
@@ -63,6 +66,28 @@ def token_file() -> Path:
 
 def manager_file() -> Path:
     return home() / MANAGER_NAME
+
+
+def stopped_file() -> Path:
+    return home() / STOPPED_NAME
+
+
+def launchd_unit_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def default_manager() -> str:
+    if manager_file().exists():
+        return manager()
+    if sys.platform == "darwin":
+        return "launchd"
+    if shutil.which("systemctl"):
+        try:
+            if _systemctl("show-environment").returncode == 0:
+                return "systemd"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "shell"
 
 
 def systemd_unit_path() -> Path:
@@ -142,7 +167,23 @@ def render(
         .replace("__MANAGER__", shlex.quote(manager_name))
         .replace("__KEEPER_TOKEN__", shlex.quote(token or secrets.token_hex(16)))
         .replace("__SYSTEMD_UNIT__", shlex.quote(SYSTEMD_UNIT_NAME))
+        .replace("__LAUNCHD_LABEL__", shlex.quote(LAUNCHD_LABEL))
+        .replace("__LAUNCHD_PLIST__", shlex.quote(str(launchd_unit_path())))
     )
+
+
+def render_launchd_unit(*, nvidb_bin: str, interval: int) -> str:
+    return plistlib.dumps({
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [nvidb_bin, "queue", "daemon", "--interval", str(int(interval))],
+        "EnvironmentVariables": {"NVIDB_HOME": str(home()), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        "KeepAlive": True,
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "ThrottleInterval": 5,
+        "StandardOutPath": str(log_file()),
+        "StandardErrorPath": str(log_file()),
+    }).decode("utf-8")
 
 
 def render_systemd_unit(*, nvidb_bin: str, interval: int) -> str:
@@ -202,6 +243,8 @@ def install(
         raise ValueError(f"unknown keeper manager: {manager_name}")
     if manager_name == "systemd" and not shutil.which("systemctl"):
         raise ValueError("systemctl is not available; install the shell keeper instead")
+    if manager_name == "launchd" and (sys.platform != "darwin" or not shutil.which("launchctl")):
+        raise ValueError("launchd requires macOS and launchctl")
 
     resolved = resolve_nvidb_binary(nvidb_bin)
     target = script_path()
@@ -234,6 +277,10 @@ def install(
     _write_atomic(manager_file(), f"{manager_name}\n", mode=0o600)
 
     unit = systemd_unit_path()
+    if manager_name == "launchd":
+        _write_atomic(launchd_unit_path(), render_launchd_unit(nvidb_bin=resolved, interval=interval), mode=0o644)
+    elif previous_manager == "launchd" and launchd_unit_path().exists():
+        launchd_unit_path().unlink()
     if manager_name == "systemd":
         _write_atomic(
             unit,
@@ -259,13 +306,15 @@ def install(
         if manager_name == "systemd"
         else str(log_file())
     )
+    _reset_status_cache()
     return {
         "script": str(target),
         "nvidb": resolved,
         "interval": int(interval),
         "replaced": existed,
         "manager": manager_name,
-        "unit": str(unit) if manager_name == "systemd" else None,
+        "unit": (str(unit) if manager_name == "systemd" else
+                 str(launchd_unit_path()) if manager_name == "launchd" else None),
         "log": log,
     }
 
@@ -331,6 +380,21 @@ def _systemd_status() -> tuple:
     return True, pid or None
 
 
+def _launchd_status() -> tuple:
+    try:
+        result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    for line in (result.stdout or "").splitlines():
+        key, sep, value = line.strip().partition(" = ")
+        if key == "pid" and sep and value.isdigit():
+            return True, int(value)
+    return False, None
+
+
 _STATUS_CACHE_TTL = 10.0
 _status_cache: Dict[str, Any] = {"at": 0.0, "value": None}
 
@@ -355,6 +419,8 @@ def status() -> Dict[str, Any]:
     manager_name = manager()
     if manager_name == "systemd":
         running, pid = _systemd_status()
+    elif manager_name == "launchd":
+        running, pid = _launchd_status()
     else:
         pid = _pid()
         running = bool(pid and _shell_process_matches(pid, _token()))
@@ -368,8 +434,10 @@ def status() -> Dict[str, Any]:
         "running": running,
         "pid": pid if running else None,
         "manager": manager_name,
+        "stopped": stopped_file().exists(),
         "script": str(script_path()),
-        "unit": str(systemd_unit_path()) if manager_name == "systemd" else None,
+        "unit": (str(systemd_unit_path()) if manager_name == "systemd" else
+                 str(launchd_unit_path()) if manager_name == "launchd" else None),
         "log": log,
     }
     _status_cache["at"] = now
@@ -382,8 +450,31 @@ def run(action: str, *extra: str) -> subprocess.CompletedProcess:
     target = script_path()
     if not target.exists():
         raise FileNotFoundError(str(target))
-    return subprocess.run(
+    if action == "ensure" and stopped_file().exists():
+        return subprocess.CompletedProcess([], 0, "explicitly stopped\n", "")
+    if action == "stop":
+        _write_atomic(stopped_file(), "stopped\n", mode=0o600)
+    elif action in ("start", "restart"):
+        stopped_file().unlink(missing_ok=True)
+    _reset_status_cache()
+    result = subprocess.run(
         ["sh", str(target), action, *[str(item) for item in extra]],
         capture_output=True,
         text=True,
     )
+    _reset_status_cache()
+    return result
+
+
+def ensure_local() -> Optional[str]:
+    """Recover an installed keeper after a crash, respecting an explicit stop."""
+    if not manager_file().exists() or stopped_file().exists():
+        return None
+    state = status()
+    if not state["installed"] or state["running"]:
+        return None
+    try:
+        result = run("ensure")
+        return _command_error(result) if result.returncode else None
+    except (OSError, subprocess.SubprocessError) as error:
+        return str(error)

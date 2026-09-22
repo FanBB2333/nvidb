@@ -379,3 +379,19 @@ def test_the_run_directory_can_be_removed(executor):
     _wait_for_exit(executor, 10, launched.run_dir)
     executor.remove_run_dir(launched.run_dir)
     assert executor.read_log(launched.run_dir) == ""
+
+
+def test_timeout_request_is_recorded_and_does_not_reclassify_a_finished_job(executor):
+    from pathlib import Path
+    launched = executor.launch(job_id=71, job_name="timeout", command="sleep 30")
+    try:
+        assert executor.request_timeout(run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid)
+        probe = _wait_for_exit(executor, 71, launched.run_dir)
+        assert probe.timed_out
+        assert probe.exit_code != 0
+    finally:
+        executor.terminate(run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid)
+    finished = executor.launch(job_id=72, job_name="finished", command="true")
+    _wait_for_exit(executor, 72, finished.run_dir)
+    assert not executor.request_timeout(run_dir=finished.run_dir, pid=finished.pid, pgid=finished.pgid)
+    assert not (Path(finished.run_dir) / "timeout").exists()

@@ -184,6 +184,7 @@ def test_status_reports_a_dead_pid_as_stopped(nvidb_home, tmp_path):
         "running": False,
         "pid": None,
         "manager": "shell",
+        "stopped": False,
         "script": str(nvidb_home / keeper_mod.SCRIPT_NAME),
         "unit": None,
         "log": str(nvidb_home / keeper_mod.LOG_NAME),
@@ -604,3 +605,92 @@ def test_ssh_arguments_carry_the_port_and_user(target):
         "ssh", "-t", "-p", "2222", "-o", "ConnectTimeout=8",
         "alice@queue-host", "true",
     ]
+
+
+def test_launchd_install_renders_an_agent_without_starting_it(nvidb_home, tmp_path, monkeypatch):
+    import plistlib
+    fake = tmp_path / "nvidb bin"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    unit = tmp_path / "LaunchAgents" / "keeper.plist"
+    monkeypatch.setattr(keeper_mod, "launchd_unit_path", lambda: unit)
+    monkeypatch.setattr(keeper_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(keeper_mod.shutil, "which", lambda name: "/bin/" + name)
+    monkeypatch.setattr(keeper_mod.subprocess, "run", lambda *a, **k: pytest.fail("install must not start a service"))
+    info = keeper_mod.install(nvidb_bin=str(fake), interval=7, manager_name="launchd")
+    data = plistlib.loads(unit.read_bytes())
+    assert data["ProgramArguments"] == [str(fake), "queue", "daemon", "--interval", "7"]
+    assert data["EnvironmentVariables"]["NVIDB_HOME"] == str(nvidb_home)
+    assert data["KeepAlive"] is True
+    assert info["unit"] == str(unit)
+
+
+def test_ensure_respects_an_explicit_stop_in_python_and_shell(nvidb_home, tmp_path, monkeypatch):
+    fake = tmp_path / "nvidb-bin"
+    fake.write_text("#!/bin/sh\nexit 99\n")
+    fake.chmod(0o755)
+    keeper_mod.install(nvidb_bin=str(fake))
+    assert keeper_mod.run("stop").returncode == 0
+    monkeypatch.setattr(keeper_mod, "status", lambda: pytest.fail("explicit stop must be checked first"))
+    assert keeper_mod.ensure_local() is None
+    assert keeper_mod.run("ensure").returncode == 0
+    result = subprocess.run(["sh", str(keeper_mod.script_path()), "ensure"],
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0
+    assert not keeper_mod.pid_file().exists()
+
+
+def test_local_ensure_only_recovers_an_installed_down_keeper(nvidb_home, monkeypatch):
+    calls = []
+    monkeypatch.setattr(keeper_mod, "run", lambda action: calls.append(action) or subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(keeper_mod, "status", lambda: {"installed": True, "running": False})
+    keeper_mod.ensure_local()
+    assert calls == []
+    keeper_mod.manager_file().write_text("shell")
+    keeper_mod.ensure_local()
+    assert calls == ["ensure"]
+    monkeypatch.setattr(keeper_mod, "status", lambda: {"installed": True, "running": True})
+    keeper_mod.ensure_local()
+    assert calls == ["ensure"]
+
+
+def test_remote_no_tick_does_not_ensure_keeper():
+    target = {"host": "queue-box", "nvidb": "nvidb", "keeper": "ensure"}
+    command = remote_mod.build_command(target, ["job", "ls", "--no-tick", "--json"])
+    assert "nvidb_keeper=" not in command
+
+
+def test_launchd_lifecycle_uses_only_the_installed_agent(nvidb_home, tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    state = tmp_path / "loaded"
+    calls = tmp_path / "launchctl-calls"
+    fake_ctl = bin_dir / "launchctl"
+    fake_ctl.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> '{calls}'\n"
+        "case \"$1\" in\n"
+        f"bootstrap) touch '{state}';;\n"
+        f"print) [ -f '{state}' ] || exit 1; echo 'pid = 123';;\n"
+        f"bootout) rm -f '{state}';;\n"
+        "enable|disable|kickstart) :;;\n"
+        "*) exit 1;;\nesac\n"
+    )
+    fake_ctl.chmod(0o755)
+    fake = bin_dir / "nvidb"
+    fake.write_text("#!/bin/sh\nexit 99\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(keeper_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(keeper_mod, "launchd_unit_path", lambda: tmp_path / "agent.plist")
+    keeper_mod.install(nvidb_bin=str(fake), manager_name="launchd")
+    assert keeper_mod.run("start").returncode == 0
+    assert keeper_mod.status()["pid"] == 123
+    assert keeper_mod.run("stop").returncode == 0
+    before = calls.read_text()
+    assert keeper_mod.run("ensure").returncode == 0
+    assert calls.read_text() == before
+    assert keeper_mod.run("restart").returncode == 0
+    assert state.exists()
+    assert "bootstrap gui/" in calls.read_text()
+    assert keeper_mod.LAUNCHD_LABEL in calls.read_text()

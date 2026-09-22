@@ -254,7 +254,7 @@ class FakeExecutor:
         probe = NodeProbe()
         for job_id, _run_dir in specs:
             record = self.node.jobs.get(job_id)
-            if record is None:
+            if record is None or record["run_dir"] != _run_dir:
                 continue
             probe.jobs[job_id] = JobProbe(
                 job_id=job_id,
@@ -263,6 +263,8 @@ class FakeExecutor:
                 exit_code=record["exit_code"],
                 alive=record["alive"],
                 progress=record.get("progress"),
+                timed_out=record.get("timed_out", False),
+                finished_epoch=record.get("finished_epoch"),
             )
         probe.process_groups = self.node.process_groups()
         probe.disk_free_mb = self.node.disk_free_mb
@@ -308,6 +310,15 @@ class FakeExecutor:
             return True
         return False
 
+    def request_timeout(self, *, run_dir, pid, pgid=None):
+        if not self.node.online:
+            raise TransportError(f"{self.node.name}: unreachable")
+        for record in self.node.jobs.values():
+            if record["run_dir"] == run_dir and record["pid"] == pid and record["alive"]:
+                record["timed_out"] = True
+                return self.terminate(run_dir=run_dir, pid=pid, pgid=pgid)
+        return False
+
     def read_result(self, run_dir):
         return self.node.results.get(run_dir)
 
@@ -339,8 +350,10 @@ class FakeLaneRunner:
             lane_name, {"queued": [], "current": [], "finished": [], "up": False}
         )
 
-    def sync(self, lane_name: str, specs, want_runner: bool):
+    def sync(self, lane_name: str, specs, want_runner: bool, lane_config=None):
         lane = self._lane(lane_name)
+        if lane_config is not None:
+            lane["config"] = lane_config
         self.syncs.append((lane_name, [spec["job_id"] for spec in specs], want_runner))
 
         # A claimed spec is gone from the staging area, so withdrawing it is
@@ -395,8 +408,10 @@ class FakeLaneRunner:
         lane["current"] = still
 
         while lane["queued"]:
+            if lane.get("config", {}).get("paused"):
+                break
             spec = lane["queued"][0]
-            concurrency = max(1, int(spec.get("concurrency") or 1))
+            concurrency = max(1, int(lane.get("config", {}).get("concurrency") or spec.get("concurrency") or 1))
             if len(lane["current"]) >= concurrency:
                 break
             needed = int(spec.get("vram_mb") or 0)
@@ -439,10 +454,11 @@ class FakeBackend:
         idle_exit=None,
         want_runner=True,
         timeout=None,
+        lane_config=None,
     ):
         if not self.node.online:
             raise TransportError(f"{self.name}: unreachable")
-        return self.runner.sync(lane_name, list(specs), want_runner)
+        return self.runner.sync(lane_name, list(specs), want_runner, lane_config)
 
     def lane_stop(self, *, lane_name, spool_root=None, hard=False, timeout=None):
         if not self.node.online:

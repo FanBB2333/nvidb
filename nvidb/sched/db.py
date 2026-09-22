@@ -286,6 +286,7 @@ _ADDED_COLUMNS = {
         "held_reason": "TEXT",
         "lane": "TEXT",
         "lane_seq": "INTEGER",
+        "overdue_at": "TEXT",
     },
     "lanes": {
         "runner": "INTEGER NOT NULL DEFAULT 1",
@@ -559,6 +560,16 @@ def acknowledge_alerts(
         else:
             return 0
         return int(cursor.rowcount or 0)
+
+
+def resolve_job_alerts(conn: sqlite3.Connection, job_id: int, kind: str) -> None:
+    """Resolve only the obsolete alert, leaving unrelated warnings open."""
+    with transaction(conn):
+        conn.execute(
+            "UPDATE alerts SET acknowledged_at = ? WHERE job_id = ? "
+            "AND kind = ? AND acknowledged_at IS NULL",
+            (utcnow(), job_id, kind),
+        )
 
 
 def undelivered_alerts(conn: sqlite3.Connection, limit: int = 50) -> List[dict]:

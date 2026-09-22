@@ -204,6 +204,7 @@ class Job:
     # that ended badly holds its dependents instead of failing them, so one
     # cancelled job can never take a whole chain down with it.
     held_reason: Optional[str] = None
+    overdue_at: Optional[str] = None
 
     @classmethod
     def from_row(cls, row) -> "Job":
@@ -246,6 +247,7 @@ class Job:
             progress=data.get("progress"),
             progress_at=data.get("progress_at"),
             held_reason=data.get("held_reason"),
+            overdue_at=data.get("overdue_at"),
         )
 
     @property
@@ -313,6 +315,7 @@ class Job:
             "progress": self.progress,
             "progress_at": self.progress_at,
             "held_reason": self.held_reason,
+            "overdue_at": self.overdue_at,
             "held": self.is_held,
         }
 

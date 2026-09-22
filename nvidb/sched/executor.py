@@ -66,6 +66,7 @@ class JobProbe:
     started_epoch: Optional[int] = None
     finished_epoch: Optional[int] = None
     progress: Optional[str] = None
+    timed_out: bool = False
 
     @property
     def finished(self) -> bool:
@@ -335,6 +336,9 @@ class JobExecutor:
             '  _id="$1"; _d="$2"',
             '  _pid=$(cat "$_d/pid" 2>/dev/null | tr -d " \\n\\r")',
             '  _pgid=$(cat "$_d/pgid" 2>/dev/null | tr -d " \\n\\r")',
+            # A nohup launch on macOS shares its caller's group. Preserve the
+            # launcher's explicit decision not to signal that group on refresh.
+            '  if [ -f "$_d/session" ] && [ "$(cat "$_d/session")" != 1 ]; then _pgid=""; fi',
             # Liveness is checked *before* the exit code is read. A job publishes
             # its code from an EXIT trap and is gone a moment later, so reading
             # the file first and then finding no process reports "vanished" for
@@ -344,7 +348,8 @@ class JobExecutor:
             f'  if {_process_guard("$_pid", "$_d/run.sh")}; then _alive=1; fi',
             '  _ec=$(cat "$_d/exit_code" 2>/dev/null | tr -d "\\n\\r")',
             '  _st=$(cat "$_d/started" 2>/dev/null | tr -d " \\n\\r")',
-            '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive|$_st"',
+            '  _timeout=0; [ ! -f "$_d/timeout" ] || _timeout=1',
+            '  echo "JOB|$_id|$_pid|$_pgid|$_ec|$_alive|$_st|$_timeout"',
             # The status line is free-form text, so it travels on its own line
             # where only the first two fields need splitting.
             '  _line=$(tail -n 1 "$_d/status" 2>/dev/null | tr -d "\\n\\r")',
@@ -382,6 +387,7 @@ class JobExecutor:
         pid: Optional[int],
         pgid: Optional[int] = None,
         grace: int = 5,
+        timed_out: bool = False,
     ) -> bool:
         """Kill a process left behind by a job whose record is already final.
 
@@ -397,7 +403,12 @@ class JobExecutor:
             [
                 f"d={quoted_dir}",
                 f"pid={int(pid)}",
-                f'if {_process_guard("$pid", "$d/run.sh")}; then',
+                f'if {_process_guard("$pid", "$d/run.sh")}'
+                + (' && [ ! -f "$d/exit_code" ]' if timed_out else '') + '; then',
+                # Persist intent on this attempt before signalling. A lost SSH
+                # reply must not turn a genuine timeout into an ordinary failure.
+                ('  date +%s > "$d/timeout.tmp" && mv "$d/timeout.tmp" "$d/timeout" || exit 1'
+                 if timed_out else ':'),
                 f"  {self._signal_command(pid=pid, pgid=pgid, signal='TERM')}",
                 # The wrapper only runs its EXIT trap once the work it is
                 # waiting on returns, so the escalation has to reach the same
@@ -414,6 +425,11 @@ class JobExecutor:
         )
         result = self.transport.run(script, timeout=20)
         return _parse_marker_int(result.stdout, "NVIDB_REAPED=") == 1
+
+    def request_timeout(self, *, run_dir: str, pid: Optional[int],
+                        pgid: Optional[int] = None) -> bool:
+        """Request termination; a later probe, not this reply, proves its outcome."""
+        return self.reap(run_dir=run_dir, pid=pid, pgid=pgid, timed_out=True)
 
     def terminate(
         self,
@@ -527,6 +543,7 @@ def parse_probe_output(text: str) -> NodeProbe:
                 # Written by run.sh, and absent from jobs started before it was.
                 started_epoch=_maybe_int(parts[6]) if len(parts) > 6 else None,
                 finished_epoch=_maybe_int(status_parts[1]) if len(status_parts) > 1 else None,
+                timed_out=len(parts) > 7 and parts[7] == "1",
                 # Section order puts JOB before STAT, but do not lose a status
                 # line if that ever changes.
                 progress=existing.progress if existing else None,

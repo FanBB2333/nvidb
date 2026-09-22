@@ -34,6 +34,7 @@ RUNNER_SCRIPT = r'''
 """nvidb lane runner - runs one lane's jobs, in order, one after another."""
 import base64
 import errno
+import fcntl
 import json
 import os
 import signal
@@ -53,6 +54,7 @@ CLAIMED = os.path.join(SPOOL, "claimed")
 STATE = os.path.join(SPOOL, "state.json")
 PIDFILE = os.path.join(SPOOL, "runner.pid")
 STOPFILE = os.path.join(SPOOL, "stop")
+CONFIG = os.path.join(SPOOL, "lane.json")
 
 # Jobs kept in the state file after they finish. Enough for a controller that
 # missed a few passes to see what happened without reading every run directory.
@@ -274,6 +276,9 @@ class Runner(object):
 
     def concurrency(self):
         """How many jobs this lane may run at once, as last staged."""
+        config = read_json(CONFIG, {})
+        if isinstance(config, dict) and config.get("concurrency"):
+            return max(1, int(config["concurrency"]))
         for job in self.current:
             value = job.spec.get("concurrency")
             if value:
@@ -364,11 +369,23 @@ class Runner(object):
             if now - job.started_at <= float(limit):
                 continue
             log("job %s exceeded %ss; stopping it" % (job.job_id, limit))
+            # The controller may be offline; leave attempt-scoped evidence.
+            write_atomic(os.path.join(job.run_dir, "timeout"), str(now))
             job.kill(signal.SIGTERM)
             job.spec["max_runtime_s"] = None  # do not signal it every pass
 
     def maybe_start(self):
+        # Sync and claim share this lock, including the gap before run.sh has
+        # written its pid. Replayed syncs cannot stage a second copy there.
+        with open(os.path.join(SPOOL, "queue.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._maybe_start_locked()
+
+    def _maybe_start_locked(self):
         while len(self.current) < self.concurrency():
+            config = read_json(CONFIG, {})
+            if os.path.exists(STOPFILE) or not isinstance(config, dict) or config.get("paused"):
+                return
             specs = self.pending_specs()
             if not specs:
                 return
@@ -423,13 +440,18 @@ class Runner(object):
 
     def run(self):
         self.ensure_dirs()
+        # A second launcher must never recover or retire this runner's claims.
+        self.runner_lock = open(os.path.join(SPOOL, "runner.lock"), "a")
+        try:
+            fcntl.flock(self.runner_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            return
         write_atomic(PIDFILE, "%d\n" % os.getpid())
         self.recover()
         log("lane runner %s up (version %s, pid %d)" % (LANE, VERSION, os.getpid()))
 
         while True:
-            if os.path.exists(STOPFILE):
-                self.stopping = True
+            self.stopping = os.path.exists(STOPFILE)
 
             still = []
             for job in self.current:
@@ -444,6 +466,9 @@ class Runner(object):
                 self.maybe_start()
             self.publish()
 
+            if self.stopping and not self.current:
+                log("stopping: no running jobs")
+                break
             if self.current or self.pending_specs():
                 self.idle_since = time.time()
             elif self.stopping:
@@ -528,6 +553,97 @@ def _write_file(path_expr: str, text: str) -> str:
     )
 
 
+
+# Runs while a runner is active, or after an old runner acknowledged stop.
+# Both participants use queue.lock; file identity is the attempt, not its seq.
+_SYNC_SCRIPT = r"""
+import fcntl, json, os, sys
+d = sys.argv[1]
+payload = json.loads(sys.argv[2])
+with open(os.path.join(d, "queue.lock"), "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    claimed = set()
+    for name in os.listdir(os.path.join(d, "claimed")):
+        try:
+            with open(os.path.join(d, "claimed", name)) as f:
+                claimed.add(json.load(f).get("run_dir"))
+        except (OSError, ValueError):
+            raise SystemExit("cannot safely read a claimed job")
+    keep = set()
+    for spec in payload["specs"]:
+        run_dir = spec.get("run_dir")
+        if run_dir and (run_dir in claimed or
+                any(os.path.exists(os.path.join(run_dir, name))
+                    for name in ("started", "pid", "exit_code"))):
+            continue
+        name = "%012d-%d.json" % (int(spec["seq"]), int(spec["job_id"]))
+        keep.add(name)
+        path = os.path.join(d, "queue", name)
+        with open(path + ".tmp", "w") as f:
+            json.dump(spec, f)
+        os.replace(path + ".tmp", path)
+    for name in os.listdir(os.path.join(d, "queue")):
+        if name.endswith(".json") and name not in keep:
+            os.unlink(os.path.join(d, "queue", name))
+    if payload["config"] is not None:
+        path = os.path.join(d, "lane.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(payload["config"], f)
+        os.replace(path + ".tmp", path)
+"""
+
+_QUIESCE_SCRIPT = r"""
+import json, os, signal, subprocess, sys, time
+d, pid, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def alive():
+    result = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return result.returncode == 0 and marker in result.stdout.decode("utf-8", "replace")
+open(os.path.join(d, "stop"), "a").close()
+deadline = time.monotonic() + float(sys.argv[4])
+while alive():
+    try:
+        with open(os.path.join(d, "state.json")) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    if state.get("pid") == pid and state.get("stopping"):
+        os.kill(pid, signal.SIGTERM)
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("runner did not acknowledge stop; leaving jobs untouched")
+    time.sleep(.05)
+while alive():
+    if time.monotonic() >= deadline:
+        raise SystemExit("runner did not exit; refusing a second runner")
+    time.sleep(.05)
+"""
+
+_READY_SCRIPT = r"""
+import json, os, sys, time
+d, version = sys.argv[1:3]
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        with open(os.path.join(d, "state.json")) as f:
+            state = json.load(f)
+        with open(os.path.join(d, "runner.pid")) as f:
+            pid = int(f.read())
+        if state.get("version") == version and state.get("pid") == pid:
+            break
+    except (OSError, ValueError):
+        pass
+    time.sleep(.05)
+else:
+    raise SystemExit("runner did not publish its new state")
+"""
+
+
+def _python_command(script: str, python_exe: str, *args: str) -> str:
+    program = "import base64; exec(base64.b64decode(%r))" % _b64(script)
+    return " ".join([shlex.quote(python_exe), "-c", shlex.quote(program), *args])
+
+
 def build_sync_command(
     *,
     lane_name: str,
@@ -537,108 +653,76 @@ def build_sync_command(
     interval: float = DEFAULT_INTERVAL,
     idle_exit: float = DEFAULT_IDLE_EXIT,
     want_runner: bool = True,
+    lane_config: Optional[dict] = None,
 ) -> str:
-    """One round trip that stages work, keeps the runner up, and reads state.
-
-    Staging, withdrawal, starting the runner and reading back what it is doing
-    are all the same conversation on purpose: a lane that needed three round
-    trips per tick would cost more than the scheduling it replaces.
-    """
+    """Synchronize compatible specs without replaying an already claimed attempt."""
     slug = lane_slug(lane_name)
     marker = runner_marker(lane_name)
-
     lines = [
         f"d={spool_path_expr(spool_root, slug)}",
         'mkdir -p "$d/queue" "$d/claimed" || exit 1',
+        'p=$(cat "$d/runner.pid" 2>/dev/null | tr -d " \\n\\r")',
+        "alive=0",
+        'if [ -n "$p" ] && kill -0 "$p" 2>/dev/null && '
+        'ps -ww -o command= -p "$p" 2>/dev/null | '
+        f'grep -F -q -- {shlex.quote(marker)}; then alive=1; fi',
+        'v=$(cat "$d/runner.version" 2>/dev/null | tr -d " \\n\\r")',
     ]
-
-    # 1. Stage the specs the controller wants queued, newest content winning.
-    keep = []
-    for spec in specs:
-        name = f"{int(spec['seq']):012d}-{int(spec['job_id'])}.json"
-        keep.append(name)
-        payload = json.dumps(spec, ensure_ascii=False)
-        lines.append(_write_file(f'"$d/queue/{name}"', payload))
-
-    # 2. Withdraw anything staged earlier that is no longer wanted. A spec the
-    #    runner has already claimed is not here to remove, which is the point:
-    #    withdrawal and claiming cannot both win.
-    if keep:
-        pattern = "|".join(keep)
-        lines.append(
-            'for f in "$d"/queue/*.json; do [ -e "$f" ] || continue; '
-            f'case "$(basename "$f")" in {pattern}) ;; *) rm -f "$f";; esac; done'
-        )
-    else:
-        lines.append('rm -f "$d"/queue/*.json 2>/dev/null || true')
-
     if want_runner:
-        lines.append('rm -f "$d/stop"')
-        lines.extend(
-            [
-                'p=$(cat "$d/runner.pid" 2>/dev/null | tr -d " \\n\\r")',
-                "alive=0",
-                'if [ -n "$p" ] && kill -0 "$p" 2>/dev/null && '
-                'ps -ww -o command= -p "$p" 2>/dev/null | '
-                f'grep -F -q -- {shlex.quote(marker)}; then alive=1; fi',
-                'v=$(cat "$d/runner.version" 2>/dev/null | tr -d " \\n\\r")',
-                # A runner whose code is out of date is replaced rather than
-                # left alone: its jobs are in their own sessions, so they
-                # survive the swap and the new runner adopts them.
-                f'if [ "$alive" = 1 ] && [ "$v" != {shlex.quote(RUNNER_VERSION)} ]; then',
-                '  kill -TERM "$p" 2>/dev/null || true',
-                "  alive=0",
-                "fi",
-                'if [ "$alive" = 0 ]; then',
-                "  " + _write_file('"$d/runner.py"', RUNNER_SCRIPT),
-                f'  echo {shlex.quote(RUNNER_VERSION)} > "$d/runner.version"',
-                "  if command -v setsid >/dev/null 2>&1; then",
-                f'    ( setsid {python_exe} -u "$d/runner.py" "$d" {shlex.quote(lane_name)} '
-                f"{shlex.quote(marker)} {shlex.quote(RUNNER_VERSION)} {float(interval)} "
-                f'{float(idle_exit)} >> "$d/runner.log" 2>&1 < /dev/null & )',
-                "  else",
-                f'    ( nohup {python_exe} -u "$d/runner.py" "$d" {shlex.quote(lane_name)} '
-                f"{shlex.quote(marker)} {shlex.quote(RUNNER_VERSION)} {float(interval)} "
-                f'{float(idle_exit)} >> "$d/runner.log" 2>&1 < /dev/null & )',
-                "  fi",
-                "  i=0",
-                '  while [ "$i" -lt 40 ]; do',
-                '    [ -s "$d/state.json" ] && break',
-                "    sleep 0.05",
-                "    i=$((i+1))",
-                "  done",
-                "fi",
-            ]
+        lines += [
+            f'if [ "$alive" = 1 ] && [ "$v" != {shlex.quote(RUNNER_VERSION)} ]; then',
+            "  " + _python_command(
+                _QUIESCE_SCRIPT, python_exe, '"$d"', '"$p"', shlex.quote(marker),
+                str(max(10.0, 2 * float(interval) + 5)),
+            ) + " || exit 1",
+            "  alive=0",
+            "fi",
+        ]
+    payload = json.dumps({"specs": list(specs), "config": lane_config})
+    lines.append(_python_command(_SYNC_SCRIPT, python_exe, '"$d"', shlex.quote(payload)) + " || exit 1")
+    if want_runner:
+        lines += [
+            'rm -f "$d/stop"',
+            'if [ "$alive" = 0 ]; then',
+            "  " + _write_file('"$d/runner.py"', RUNNER_SCRIPT) + " || exit 1",
+            f'  echo {shlex.quote(RUNNER_VERSION)} > "$d/runner.version"',
+        ]
+        arguments = (
+            f'{shlex.quote(python_exe)} -u "$d/runner.py" "$d" {shlex.quote(lane_name)} '
+            f'{shlex.quote(marker)} {shlex.quote(RUNNER_VERSION)} {float(interval)} {float(idle_exit)}'
+            ' >> "$d/runner.log" 2>&1 < /dev/null &'
         )
+        lines += [
+            "  if command -v setsid >/dev/null 2>&1; then",
+            f"    ( setsid {arguments} )",
+            "  else",
+            f"    ( nohup {arguments} )",
+            "  fi",
+            "  " + _python_command(_READY_SCRIPT, python_exe, '"$d"', shlex.quote(RUNNER_VERSION)) + " || exit 1",
+            "fi",
+        ]
     else:
-        # Ask the runner to finish what it has and go, without touching the
-        # job it is running.
         lines.append('[ -f "$d/runner.pid" ] && : > "$d/stop" || true')
-
-    lines.append(f"echo {STATE_MARKER}")
-    lines.append('cat "$d/state.json" 2>/dev/null || true')
+    lines += [f"echo {STATE_MARKER}", 'cat "$d/state.json" 2>/dev/null || true']
     return "\n".join(lines)
 
 
 def build_stop_command(*, lane_name: str, spool_root: str, hard: bool = False) -> str:
-    """Ask a lane's runner to stop; `hard` does not wait for the current job.
-
-    Neither form signals the job itself. Stopping the scheduler and stopping
-    the work are separate decisions, and conflating them would make upgrading
-    the runner a reason to lose a training run.
-    """
+    """Stop dispatch; a restart waits for a safe handover without signalling jobs."""
+    marker = runner_marker(lane_name)
     lines = [
         f"d={spool_path_expr(spool_root, lane_slug(lane_name))}",
         '[ -d "$d" ] || exit 0',
         ': > "$d/stop"',
     ]
     if hard:
-        lines.extend(
-            [
-                'p=$(cat "$d/runner.pid" 2>/dev/null | tr -d " \\n\\r")',
-                '[ -n "$p" ] && kill -TERM "$p" 2>/dev/null || true',
-            ]
-        )
+        lines += [
+            'p=$(cat "$d/runner.pid" 2>/dev/null | tr -d " \\n\\r")',
+            'if [ -n "$p" ]; then',
+            "  " + _python_command(_QUIESCE_SCRIPT, "python3", '"$d"', '"$p"',
+                                     shlex.quote(marker), "15") + " || exit 1",
+            "fi",
+        ]
     lines.append("echo NVIDB_LANE_STOPPED")
     return "\n".join(lines)
 

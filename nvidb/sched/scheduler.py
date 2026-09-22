@@ -40,6 +40,7 @@ from .model import (
     make_lane_name,
     parse_lane_name,
     parse_size_mb,
+    parse_ts,
     utcnow,
 )
 from .transport import LocalTransport, SSHTransport, Transport, TransportError
@@ -170,6 +171,7 @@ class NodeBackend:
         idle_exit: float,
         want_runner: bool,
         timeout: float,
+        lane_config: Optional[dict] = None,
     ) -> Optional[dict]:
         """Stage a lane's next jobs, keep its runner up, and read its state.
 
@@ -183,20 +185,25 @@ class NodeBackend:
             interval=interval,
             idle_exit=idle_exit,
             want_runner=want_runner,
+            lane_config=lane_config,
         )
         result = self.transport.run(command, timeout=timeout)
+        if result.exit_status != 0:
+            raise TransportError(result.stderr or "lane sync failed")
         return runner_agent.parse_state(result.stdout)
 
     def lane_stop(
         self, *, lane_name: str, spool_root: str, hard: bool = False, timeout: float = 20.0
     ) -> None:
         """Ask a lane's runner to exit, without touching the job it started."""
-        self.transport.run(
+        result = self.transport.run(
             runner_agent.build_stop_command(
                 lane_name=lane_name, spool_root=spool_root, hard=hard
             ),
             timeout=timeout,
         )
+        if result.exit_status != 0:
+            raise TransportError(result.stderr or "runner did not stop safely")
 
     def probe_gpus(self) -> dict:
         """Run the bundled NVML agent once and return its JSON payload.
@@ -1194,6 +1201,7 @@ class Scheduler:
                     gpu_mem_mb=None,
                     last_error=None,
                     held_reason=None,
+                    overdue_at=None,
                     attempt=job.attempt,
                     # The annotation survives a re-run; the previous attempt's
                     # status line does not.
@@ -1203,6 +1211,8 @@ class Scheduler:
                 dbm.add_event(
                     self.conn, "job_requeued", job_id=job_id, message="requeued"
                 )
+                dbm.resolve_job_alerts(self.conn, job_id, "job_overdue")
+                self._refresh_holds({}, dbm.dependents_of(self.conn, job_id))
             return True
 
     # --- the tick ---------------------------------------------------------
@@ -1241,6 +1251,7 @@ class Scheduler:
 
         try:
             summary["ran"] = True
+            observations = {}
             self._reload_config()
             self._renew_tick_lease()
             self.sync_nodes_from_config()
@@ -1263,7 +1274,7 @@ class Scheduler:
                 ):
                     continue
                 try:
-                    up = self._refresh_node(node, summary)
+                    up = self._refresh_node(node, summary, observations)
                 except SchedulerLeaseLost:
                     raise
                 except TransportError as error:
@@ -1278,7 +1289,8 @@ class Scheduler:
                 summary["nodes_up" if up else "nodes_down"] += 1
 
             self._renew_tick_lease()
-            self._enforce_timeouts(summary)
+            self._enforce_timeouts(summary, observations)
+            self._refresh_holds(summary)
             self._renew_tick_lease()
             self._dispatch(summary)
             dbm.set_meta(self.conn, "last_tick_at", utcnow())
@@ -1303,7 +1315,7 @@ class Scheduler:
             if job.run_dir
         ]
 
-    def _refresh_node(self, node: Node, summary: Dict[str, Any]) -> bool:
+    def _refresh_node(self, node: Node, summary: Dict[str, Any], observations: dict) -> bool:
         backend = self.backend(node)
         running = dbm.live_jobs(self.conn, node.name)
         staged = self._staged_jobs(node)
@@ -1321,6 +1333,10 @@ class Scheduler:
             ],
             timeout=float(self.settings["probe_timeout"]),
         )
+        for job in running:
+            observed = probe.jobs.get(job.id)
+            if observed is not None:
+                observations[(job.id, job.attempt, job.run_dir, node.name)] = observed
         self._renew_tick_lease()
 
         self._reconcile_jobs(node, backend, running, probe, summary)
@@ -1452,6 +1468,11 @@ class Scheduler:
             if observed is None:
                 continue  # nothing learned this round; leave the job alone
 
+            if observed.timed_out and observed.exit_code != 0:
+                if not observed.alive and not _leftover_group_pids(job, probe):
+                    self._finish_timeout(job, observed, summary)
+                continue
+
             # The job's own status line is picked up whatever else happened, so
             # the last thing a job said survives into its finished record.
             progress_updates: Dict[str, Any] = {}
@@ -1462,6 +1483,7 @@ class Scheduler:
                 }
 
             if observed.finished:
+                dbm.resolve_job_alerts(self.conn, job.id, "job_overdue")
                 exit_code = observed.exit_code
                 state = "completed" if exit_code == 0 else "failed"
                 result = None
@@ -1564,6 +1586,7 @@ class Scheduler:
                     started_at=None,
                     heartbeat_at=None,
                     last_error=last_error,
+                    overdue_at=None,
                     # The next attempt starts fresh, so the old status line
                     # must not linger as if it were current.
                     progress=None,
@@ -1650,6 +1673,18 @@ class Scheduler:
             self._renew_tick_lease()
             observed = probe.jobs.get(job.id)
             if observed is None:
+                continue
+
+            if observed.timed_out and observed.exit_code != 0 and not observed.alive:
+                job.remote_pid = observed.pid
+                job.remote_pgid = observed.pgid
+                if not _leftover_group_pids(job, probe):
+                    dbm.update_job(self.conn, job.id, node=node.name,
+                                   attempt=job.attempt + 1,
+                                   remote_pid=observed.pid, remote_pgid=observed.pgid,
+                                   gpu_ids=self._lane_gpu_ids(job),
+                                   started_at=_epoch_to_iso(observed.started_epoch) or utcnow())
+                    self._finish_timeout(dbm.get_job(self.conn, job.id), observed, summary)
                 continue
 
             if observed.finished:
@@ -1770,6 +1805,9 @@ class Scheduler:
         for orphan in dbm.list_orphans(self.conn, node.name):
             self._renew_tick_lease()
             try:
+                if self._correct_timeout_orphan(orphan, backend, summary):
+                    dbm.drop_orphan(self.conn, orphan["id"])
+                    continue
                 killed = backend.executor.reap(
                     run_dir=orphan["run_dir"],
                     pid=orphan["pid"],
@@ -1792,7 +1830,80 @@ class Scheduler:
                 {"job": orphan["job_id"], "node": node.name, "pid": orphan["pid"]}
             )
 
-    def _enforce_timeouts(self, summary: Dict[str, Any]) -> None:
+    def _correct_timeout_orphan(self, orphan: dict, backend: NodeBackend,
+                                summary: Dict[str, Any]) -> bool:
+        """Repair only an unreachable timeout belonging to the current attempt."""
+        if orphan["reason"] not in (
+            "timed out while unreachable", "timed out with its node gone"
+        ):
+            return False
+        job = dbm.get_job(self.conn, orphan["job_id"])
+        if (job is None or job.state != "timeout" or not job.run_dir
+                or job.run_dir != orphan["run_dir"] or job.node != orphan["node"]
+                or job.remote_pid != orphan["pid"]):
+            return False
+        probe = backend.executor.probe([(job.id, job.run_dir)],
+                                       timeout=float(self.settings["probe_timeout"]))
+        observed = probe.jobs.get(job.id)
+        if observed is None or not observed.finished or observed.timed_out:
+            return False
+        # Old runners did not leave a timeout marker. A nonzero exit at the
+        # runtime limit may be a real runner timeout, so correct it only when
+        # the node's own start/finish timestamps prove it ended before the limit.
+        if observed.exit_code != 0 and (
+            not job.max_runtime_s or observed.started_epoch is None
+            or observed.finished_epoch is None
+            or not 0 <= observed.finished_epoch - observed.started_epoch < job.max_runtime_s
+        ):
+            return False
+        finished = _epoch_to_iso(observed.finished_epoch)
+        recorded_at = parse_ts(job.finished_at)
+        if not finished or recorded_at is None or parse_ts(finished) > recorded_at:
+            return False
+        result = backend.executor.read_result(job.run_dir)
+        self._renew_tick_lease()
+        state = "completed" if observed.exit_code == 0 else "failed"
+        with dbm.transaction(self.conn):
+            current = dbm.get_job(self.conn, job.id)
+            if (current is None or current.state != "timeout"
+                    or current.attempt != job.attempt or current.run_dir != job.run_dir):
+                return False
+            dbm.update_job(self.conn, job.id, state=state, exit_code=observed.exit_code,
+                           finished_at=finished, result=result,
+                           last_error=None if state == "completed" else f"exit code {observed.exit_code}")
+            dbm.resolve_job_alerts(self.conn, job.id, "job_timeout")
+            dbm.add_event(self.conn, "job_corrected", job_id=job.id, node=job.node,
+                          message=f"unreachable timeout corrected to {state}",
+                          data={"attempt": job.attempt, "run_dir": job.run_dir,
+                                "previous_state": "timeout", "state": state})
+        summary.setdefault("corrected", []).append({"id": job.id, "state": state})
+        return True
+
+    def _record_overdue(self, job: Job, summary: Dict[str, Any]) -> None:
+        if job.overdue_at:
+            return
+        message = "Runtime limit exceeded; outcome is unconfirmed. Waiting for node evidence."
+        with dbm.transaction(self.conn):
+            dbm.update_job(self.conn, job.id, overdue_at=utcnow())
+            dbm.add_event(self.conn, "job_overdue", job_id=job.id, node=job.node,
+                          message=message, data={"attempt": job.attempt, "run_dir": job.run_dir})
+            self._raise_alert("job_overdue", message, severity="warning", job_id=job.id,
+                              node=job.node, summary=summary)
+
+    def _finish_timeout(self, job: Job, observed, summary: Dict[str, Any]) -> None:
+        with dbm.transaction(self.conn):
+            dbm.update_job(self.conn, job.id, state="timeout", exit_code=observed.exit_code,
+                           finished_at=_epoch_to_iso(observed.finished_epoch) or utcnow(),
+                           last_error=f"exceeded max runtime of {job.max_runtime_s}s")
+            dbm.resolve_job_alerts(self.conn, job.id, "job_overdue")
+            dbm.add_event(self.conn, "job_timeout", job_id=job.id, node=job.node,
+                          message="node confirmed timeout termination",
+                          data={"attempt": job.attempt, "run_dir": job.run_dir})
+            self._raise_alert("job_timeout", f"{job.name or 'job'} exceeded its runtime limit (limit {job.max_runtime_s}s)",
+                              job_id=job.id, node=job.node, summary=summary)
+        summary["finished"].append({"id": job.id, "state": "timeout"})
+
+    def _enforce_timeouts(self, summary: Dict[str, Any], observations: dict) -> None:
         for job in dbm.live_jobs(self.conn):
             self._renew_tick_lease()
             if not job.max_runtime_s:
@@ -1800,42 +1911,21 @@ class Scheduler:
             elapsed = job.elapsed_seconds()
             if elapsed is None or elapsed <= job.max_runtime_s:
                 continue
+            observed = observations.get((job.id, job.attempt, job.run_dir, job.node))
             node = dbm.get_node(self.conn, job.node) if job.node else None
-            detail = None
-            if node is None:
-                self._remember_orphan(job, reason="timed out with its node gone")
-            else:
-                backend = self.backend(node)
-                try:
-                    detail = self._failure_detail(backend, job)
-                    self._terminate(backend, job)
-                except TransportError:
-                    # Unreachable: the kill is retried on the reap pass.
-                    self._remember_orphan(job, reason="timed out while unreachable")
-            dbm.update_job(
-                self.conn,
-                job.id,
-                state="timeout",
-                finished_at=utcnow(),
-                last_error=f"exceeded max runtime of {job.max_runtime_s}s",
-            )
-            dbm.add_event(
-                self.conn,
-                "job_timeout",
-                job_id=job.id,
-                node=job.node,
-                message=f"killed after {int(elapsed)}s",
-            )
-            self._raise_alert(
-                "job_timeout",
-                f"{job.name or 'job'} killed after {int(elapsed)}s "
-                f"(limit {job.max_runtime_s}s)",
-                job_id=job.id,
-                node=job.node,
-                detail=detail,
-                summary=summary,
-            )
-            summary["finished"].append({"id": job.id, "state": "timeout"})
+            if node is None or observed is None or not observed.alive:
+                self._record_overdue(job, summary)
+                continue
+            backend = self.backend(node)
+            try:
+                backend.executor.request_timeout(run_dir=job.run_dir,
+                                                 pid=job.remote_pid, pgid=job.remote_pgid)
+                probe = backend.executor.probe([(job.id, job.run_dir)],
+                                               timeout=float(self.settings["probe_timeout"]))
+                self._renew_tick_lease()
+                self._reconcile_jobs(node, backend, [job], probe, summary)
+            except TransportError:
+                self._record_overdue(job, summary)
 
     def _failure_detail(self, backend: NodeBackend, job: Job) -> Optional[str]:
         """Fetch why a job died, so the reason is readable without a second trip.
@@ -2335,6 +2425,9 @@ class Scheduler:
                         or runner_agent.DEFAULT_IDLE_EXIT
                     ),
                     want_runner=want_runner,
+                    lane_config={"concurrency": max(1, int(lane.concurrency)),
+                                 "paused": bool(lane.paused or not node.enabled or node.ignored
+                                                or node.name not in self._configured_nodes)},
                     timeout=float(self.settings["launch_timeout"]),
                 )
             except TransportError as error:
@@ -2375,6 +2468,11 @@ class Scheduler:
                 # Cancelled or timed out after it was staged, and the runner
                 # claimed it before the withdrawal landed. Stop it now rather
                 # than leaving work nobody is tracking on the card.
+                self._stop_unwanted(node, job, entry, summary)
+                continue
+            if job.run_dir != entry.get("run_dir") or job.lane != lane.name:
+                # A delayed report can belong to an attempt requeued or moved
+                # since its spec was staged. Never adopt it into the new row.
                 self._stop_unwanted(node, job, entry, summary)
                 continue
             if job.state == "running":
@@ -2757,6 +2855,7 @@ class Scheduler:
         job in the chain over a decision that only concerned the first one.
         Holding keeps all of that and asks a person what they meant.
         """
+        ready = True
         for dep_id in job.depends_on:
             dep = dbm.get_job(self.conn, dep_id)
             if dep is None:
@@ -2765,7 +2864,7 @@ class Scheduler:
                 continue
             if dep.is_terminal:
                 return False, f"dependency {dep_id} ended as {dep.state}"
-            return False, None
+            ready = False
         for dep_id in job.depends_any:
             dep = dbm.get_job(self.conn, dep_id)
             if dep is None:
@@ -2773,8 +2872,8 @@ class Scheduler:
             # This form waits for an outcome, not for a good one.
             if dep.is_terminal:
                 continue
-            return False, None
-        return True, None
+            ready = False
+        return ready, None
 
     def _hold(self, job: Job, reason: str, summary: Dict[str, Any]) -> None:
         """Park a pending job and say so once, not once per tick."""
@@ -2806,12 +2905,24 @@ class Scheduler:
             return
         with dbm.transaction(self.conn):
             dbm.update_job(self.conn, job.id, held_reason=None)
+            dbm.resolve_job_alerts(self.conn, job.id, "job_held")
             dbm.add_event(
                 self.conn,
                 "job_unheld",
                 job_id=job.id,
                 message="dependencies are satisfiable again",
             )
+
+    def _refresh_holds(self, summary: Dict[str, Any], jobs=None) -> None:
+        """Re-evaluate holds even when the job is outside its lane's window."""
+        for job in dbm.held_jobs(self.conn) if jobs is None else jobs:
+            if job.state != "pending" or not job.held_reason:
+                continue
+            _ready, reason = self._dependencies_ready(job)
+            if reason is None:
+                self._unhold(job)
+            elif reason != job.held_reason:
+                self._hold(job, reason, summary)
 
     def _find_placement(
         self,

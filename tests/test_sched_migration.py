@@ -166,3 +166,23 @@ def test_nodes_without_a_stored_position_still_list_by_name(legacy_db):
         assert [node.name for node in dbm.get_nodes(conn)] == ["alpha", "zeta"]
     finally:
         conn.close()
+
+
+def test_upgrade_preserves_existing_jobs_and_lane_configuration(tmp_path):
+    path = tmp_path / "existing.db"
+    conn = dbm.open_db(path)
+    dbm.ensure_lane(conn, "box:0", node="box", gpu_ids=[0])
+    dbm.update_lane(conn, "box:0", concurrency=4, paused=True)
+    # Populate through SQL so the assertion covers every persisted column,
+    # including columns not yet represented by a future Job model.
+    conn.execute(
+        "INSERT INTO jobs(id,name,command,state,created_at,updated_at,attempt,run_dir,lane,lane_seq,depends_on) "
+        "VALUES(42,'existing','train','running','2026-01-01','2026-01-01',3,'/jobs/42-3','box:0',1000,'[40]')"
+    )
+    jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+    lanes = [dict(r) for r in conn.execute("SELECT * FROM lanes")]
+    conn.close()
+    conn = dbm.open_db(path)
+    assert [dict(r) for r in conn.execute("SELECT * FROM jobs")] == jobs
+    assert [dict(r) for r in conn.execute("SELECT * FROM lanes")] == lanes
+    conn.close()

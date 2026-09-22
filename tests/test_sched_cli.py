@@ -3,7 +3,6 @@
 These run the real parser and handlers against a temporary database with node
 probing disabled, so they cover the command surface without touching a network.
 """
-import argparse
 import json
 import logging
 import os
@@ -19,7 +18,7 @@ from nvidb.tui_theme import display_width
 
 @pytest.fixture
 def parser():
-    root = argparse.ArgumentParser(prog="nvidb")
+    root = sched_cli.ArgumentParser(prog="nvidb")
     subparsers = root.add_subparsers(dest="command")
     sched_cli.register_parsers(subparsers)
     return root
@@ -709,3 +708,62 @@ def test_submitting_against_an_unknown_node_is_refused(parser, queue_db, capsys)
     assert _run(parser, ["job", "submit", "--node", "nowhere", "--", "true"],
                 queue_db) == 1
     assert "Unknown node" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["job", "cancel", "--json"],
+    ["job", "show", "not-an-id", "--json"],
+    ["job", "cancel", "123", "--json", "--unknown"],
+])
+def test_argument_errors_are_json(parser, argv, capsys):
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(argv)
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert json.loads(output.out)["ok"] is False
+    assert output.err == ""
+
+
+def test_cancel_accepts_no_tick_and_preserves_other_queued_jobs(parser, queue_db, capsys):
+    _submit(parser, queue_db, "--no-tick", "--", "first")
+    _submit(parser, queue_db, "--no-tick", "--", "second")
+    capsys.readouterr()
+    assert _run(parser, ["job", "cancel", "1", "--no-tick", "--json"], queue_db) == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["cancelled"]
+    conn = dbm.open_db(queue_db)
+    assert dbm.get_job(conn, 2).state == "pending"
+    conn.close()
+
+
+def test_job_command_json_flag_does_not_change_parser_error_format(parser, capsys):
+    with pytest.raises(SystemExit):
+        parser.parse_args(["job", "submit", "--gpus", "bad", "--", "app", "--json"])
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "error:" in output.err
+
+
+def test_daemon_survives_a_lost_scheduler_lease(parser, monkeypatch, capsys):
+    from nvidb.sched.scheduler import SchedulerLeaseLost
+    class FakeScheduler:
+        cfg = {}
+        calls = 0
+        closed = False
+
+        def tick(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise SchedulerLeaseLost("test")
+            raise KeyboardInterrupt
+
+        def close(self):
+            self.closed = True
+
+    scheduler = FakeScheduler()
+    monkeypatch.setattr(sched_cli, "_open", lambda args: scheduler)
+    monkeypatch.setattr(sched_cli.time, "sleep", lambda seconds: None)
+    args = parser.parse_args(["queue", "daemon", "--no-notify", "--no-backup", "--json"])
+    assert sched_cli.cmd_daemon(args) == 0
+    assert scheduler.calls == 2
+    assert scheduler.closed
+    assert json.loads(capsys.readouterr().out)["tick"]["skipped"] == "lease_lost"

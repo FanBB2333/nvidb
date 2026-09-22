@@ -152,7 +152,8 @@ def build_command(
         head = _point_script_at_temp_file(head)
 
     lines: List[str] = []
-    if target.get("keeper") == "ensure" and not _manages_keeper(head):
+    if (target.get("keeper") == "ensure" and not _manages_keeper(head)
+            and "--no-tick" not in head and head[:2] != ["queue", "daemon"]):
         # Folded into the same command, so keeping the queue alive costs no
         # extra round trip. Warnings stay on stderr so JSON stdout remains
         # machine-readable, while a missing or broken keeper is no longer
@@ -170,6 +171,7 @@ def build_command(
                 'if [ ! -f "$nvidb_keeper" ]; then',
                 '  printf \'%s\\n\' "warning: queue keeper is not installed at '
                 '$nvidb_keeper; run nvidb queue keeper install --start" >&2',
+                'elif [ -f "$(dirname "$nvidb_keeper")/queue-keeper.stopped" ]; then :',
                 'elif ! nvidb_keeper_error=$(sh "$nvidb_keeper" ensure 2>&1); then',
                 '  printf \'%s\\n\' "warning: queue keeper could not be started: '
                 '$nvidb_keeper" >&2',

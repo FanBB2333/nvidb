@@ -805,10 +805,10 @@ queue:
   local_node_name: "queue-host"
 ```
 
-The **keeper** keeps that machine scheduling. Its default shell supervisor is
-written into `~/.nvidb`, restarts `nvidb queue daemon` whenever it stops, and
-detaches from the session that installed it — no root, cron entry, or service
-manager:
+The **keeper** keeps that machine scheduling. A new installation selects launchd
+on macOS, systemd where a Linux user session supports it, or the portable shell
+supervisor otherwise. Reinstalling preserves the existing manager unless an
+explicit manager flag is supplied:
 
 ```bash
 nvidb queue keeper install --start   # write ~/.nvidb/queue-keeper.sh and run it
@@ -833,8 +833,16 @@ requires lingering where the host permits it:
 loginctl enable-linger "$USER"
 ```
 
-The shell supervisor does not survive a reboot. Any later client command starts
-it again. A client configured with `remote:` opens no database of its own and
+On macOS, install a LaunchAgent with
+`nvidb queue keeper install --launchd --start`. It runs while the user is logged
+in and does not keep a sleeping computer awake. Use `--shell` to request the
+portable supervisor explicitly.
+
+The shell supervisor does not survive a reboot. Ordinary local and remote
+commands can recover an installed keeper after an unexpected exit.
+`keeper stop` persists an explicit stop: automatic ensure respects it until
+`keeper start` or `keeper restart`. Commands using `--no-tick` skip automatic
+ensure as well. A client configured with `remote:` opens no database of its own and
 forwards the whole command line to the queue host, running the keeper's `ensure`
 in the same round trip. A missing or failed keeper is reported on stderr rather
 than silently leaving the queue idle:
@@ -929,3 +937,31 @@ Remote info:
 - Thanks to [blessed](https://github.com/jquast/blessed) for building the interactive terminal UI.
 - Thanks to [termcolor](https://github.com/termcolor/termcolor) for colored terminal output.
 - Thanks to [Dash](https://github.com/plotly/dash) and [Plotly](https://github.com/plotly/plotly.py) for powering the web dashboard.
+
+### Upgrading an existing queue to v1.9.3
+
+Existing job IDs, attempts, dependencies, lane positions, concurrency values and
+`lane_lookahead` settings are retained. The default lookahead remains 1; this
+release does not enable `all`, `auto`, ready-first dispatch or candidate lanes.
+
+- An unreachable job that exceeds its runtime limit stays `running` and raises
+  one `job_overdue` warning per attempt. Reconnection settles the job from the
+  node's result. A timeout request is recorded on that attempt before signalling;
+  the controller waits for evidence that the process has stopped.
+- Dependency holds are re-evaluated outside the staging window. Requeueing a
+  prerequisite clears obsolete holds without removing dependencies or changing
+  queue positions.
+- Lane concurrency and pause settings live in `lane.json`. Lowering concurrency
+  lets existing work finish and limits subsequent starts. A runner upgrade or
+  `runner restart` waits for a safe handover and adopts the same job processes.
+  Replayed syncs do not recreate claimed or completed attempts.
+- Parse errors requested with `--json` are JSON with exit status 2.
+  `job cancel --no-tick --json` is accepted; `--no-tick` skips automatic
+  scheduling, not cancellation of the named jobs.
+
+Before changing an installed service, create a queue backup. Restart the
+controller to load the new code; running jobs retain their own process sessions.
+This release adds only an optional `overdue_at` column. Automatic historical
+correction is limited to a matching timeout orphan for the same attempt and
+run directory, with a recorded earlier node completion and no node timeout
+marker. It never rewrites a requeued attempt or a user cancellation.

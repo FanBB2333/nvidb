@@ -357,7 +357,7 @@ def test_a_job_cancelled_during_an_outage_is_killed_when_the_node_returns(
     assert dbm.get_node(scheduler.conn, "small-node").gpus[0].external_mem_mb == 0
 
 
-def test_a_timeout_that_could_not_kill_is_finished_off_later(scheduler, cluster):
+def test_an_unreachable_timeout_waits_for_evidence(scheduler, cluster):
     scheduler.tick(force=True)
     job_id = scheduler.submit("slow", vram="1G", node="small-node", max_runtime_s=1)
     scheduler.tick(force=True)
@@ -365,12 +365,13 @@ def test_a_timeout_that_could_not_kill_is_finished_off_later(scheduler, cluster)
 
     cluster["small-node"].online = False
     scheduler.tick(force=True)
-    assert dbm.get_job(scheduler.conn, job_id).state == "timeout"
+    assert dbm.get_job(scheduler.conn, job_id).state == "running"
     assert cluster["small-node"].jobs[job_id]["alive"] is True
 
     cluster["small-node"].online = True
     scheduler.tick(force=True)
-    assert cluster["small-node"].reaped == [job_id]
+    assert cluster["small-node"].killed == [job_id]
+    assert dbm.get_job(scheduler.conn, job_id).state == "timeout"
 
 
 def test_a_process_that_died_on_its_own_is_simply_forgotten(scheduler, cluster):
@@ -534,3 +535,138 @@ def test_a_schema_upgrade_racing_another_client_is_not_an_error(tmp_path):
             assert "ignored" in node_columns
         finally:
             conn.close()
+
+
+def _overrun(scheduler, job_id):
+    from datetime import datetime, timedelta, timezone
+    dbm.update_job(scheduler.conn, job_id,
+                   started_at=(datetime.now(timezone.utc) - timedelta(hours=2)).isoformat())
+
+
+def test_offline_completion_never_becomes_timeout_or_holds_dependents(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("work", node="small-node", max_runtime_s=60)
+    child = scheduler.submit("next", node="small-node", depends_on=[job_id])
+    scheduler.tick(force=True)
+    _overrun(scheduler, job_id)
+    cluster["small-node"].online = False
+    cluster["small-node"].finish_job(job_id, result={"accuracy": .9})
+    scheduler.tick(force=True)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "running"
+    assert not dbm.get_job(scheduler.conn, child).held_reason
+    events = dbm.list_events(scheduler.conn, limit=100)
+    assert sum(e["kind"] == "job_overdue" for e in events) == 1
+    assert not any(e["kind"] == "job_timeout" for e in events)
+    assert not dbm.list_orphans(scheduler.conn)
+    cluster["small-node"].online = True
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "completed"
+    assert dbm.get_job(scheduler.conn, job_id).result == {"accuracy": .9}
+    assert dbm.get_job(scheduler.conn, child).state == "running"
+    assert not cluster["small-node"].killed
+
+
+@pytest.mark.parametrize("signal_delivered", [False, True])
+def test_timeout_transport_failure_preserves_running_until_reconciled(scheduler, cluster, monkeypatch, signal_delivered):
+    from nvidb.sched.transport import TransportError
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("work", node="small-node", max_runtime_s=60)
+    scheduler.tick(force=True)
+    _overrun(scheduler, job_id)
+    executor = cluster.backends["small-node"].executor
+    original = executor.request_timeout
+
+    def interrupted(**kwargs):
+        if signal_delivered:
+            original(**kwargs)
+        raise TransportError("connection lost during termination")
+
+    monkeypatch.setattr(executor, "request_timeout", interrupted)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "running"
+    assert not dbm.list_orphans(scheduler.conn)
+    monkeypatch.setattr(executor, "request_timeout", original)
+    if not signal_delivered:
+        cluster["small-node"].finish_job(job_id)
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == ("timeout" if signal_delivered else "completed")
+
+
+def test_previous_tick_observation_cannot_authorize_a_timeout(scheduler, cluster, monkeypatch):
+    from nvidb.sched.executor import NodeProbe
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("work", node="small-node", max_runtime_s=60)
+    scheduler.tick(force=True)
+    _overrun(scheduler, job_id)
+    executor = cluster.backends["small-node"].executor
+    monkeypatch.setattr(executor, "probe", lambda *a, **k: NodeProbe())
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "running"
+    assert not cluster["small-node"].killed
+
+
+@pytest.mark.parametrize("new_attempt,cancelled", [(False, False), (True, False), (False, True)])
+def test_old_timeout_correction_is_scoped_to_its_attempt(scheduler, cluster, new_attempt, cancelled):
+    from nvidb.sched.model import utcnow
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("old work", node="small-node")
+    scheduler.tick(force=True)
+    old = dbm.get_job(scheduler.conn, job_id)
+    scheduler._remember_orphan(old, reason="cancelled while unreachable" if cancelled else "timed out while unreachable")
+    dbm.update_job(scheduler.conn, job_id, state="cancelled" if cancelled else "timeout",
+                   finished_at=utcnow())
+    cluster["small-node"].finish_job(job_id, result={"old": True})
+    cluster["small-node"].jobs[job_id]["finished_epoch"] = int(time.time()) - 10
+    if new_attempt:
+        scheduler.requeue(job_id)
+        scheduler.tick(force=True)
+        current = dbm.get_job(scheduler.conn, job_id)
+        assert current.attempt == old.attempt + 1
+        assert current.state == "running"
+    else:
+        scheduler.tick(force=True)
+        current = dbm.get_job(scheduler.conn, job_id)
+        assert current.state == ("cancelled" if cancelled else "completed")
+        if not cancelled:
+            assert current.result == {"old": True}
+    assert not dbm.list_orphans(scheduler.conn)
+
+
+def test_requeue_unholds_jobs_beyond_the_lane_window_without_dropping_dependencies(scheduler):
+    from nvidb.sched.model import utcnow
+    scheduler.tick(force=True)
+    dep = scheduler.submit("dependency", node="big-node")
+    dbm.update_job(scheduler.conn, dep, state="failed", finished_at=utcnow())
+    for i in range(3):
+        scheduler.submit(f"earlier {i}", lane="small-node:0")
+    child = scheduler.submit("waiting", lane="small-node:0", depends_on=[dep])
+    job = dbm.get_job(scheduler.conn, child)
+    scheduler._hold(job, f"dependency {dep} ended as failed", {})
+    original_seq = job.lane_seq
+    scheduler.requeue(dep)
+    job = dbm.get_job(scheduler.conn, child)
+    assert job.held_reason is None
+    assert job.depends_on == [dep]
+    assert job.lane_seq == original_seq
+    assert all(a["acknowledged_at"] for a in dbm.list_alerts(scheduler.conn)
+               if a["job_id"] == child and a["kind"] == "job_held")
+    # Correction/recovery can also happen outside requeue().
+    scheduler._hold(job, "stale dependency failure", {})
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, child).held_reason is None
+
+
+def test_legacy_runner_timeout_is_not_corrected_to_failure(scheduler, cluster):
+    from nvidb.sched.model import utcnow
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("old runner", node="small-node", max_runtime_s=60)
+    scheduler.tick(force=True)
+    job = dbm.get_job(scheduler.conn, job_id)
+    scheduler._remember_orphan(job, reason="timed out while unreachable")
+    dbm.update_job(scheduler.conn, job_id, state="timeout", finished_at=utcnow())
+    cluster["small-node"].finish_job(job_id, exit_code=143)
+    cluster["small-node"].jobs[job_id]["finished_epoch"] = int(time.time()) - 10
+    scheduler.tick(force=True)
+    assert dbm.get_job(scheduler.conn, job_id).state == "timeout"
+    assert not any(e["kind"] == "job_corrected" for e in dbm.list_events(scheduler.conn))

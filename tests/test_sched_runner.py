@@ -170,6 +170,7 @@ def test_the_runner_enforces_a_time_limit(spool, tmp_path):
     # run.sh traps TERM and reports it, so the outcome is recorded rather than
     # vanishing with the process.
     assert (run_dir / "exit_code").exists()
+    assert (run_dir / "timeout").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the runner targets POSIX nodes")
@@ -283,11 +284,17 @@ def test_the_sync_command_carries_the_specs_and_the_runner():
     assert "setsid" in command and "nohup" in command
 
 
-def test_the_sync_command_withdraws_everything_when_nothing_is_staged():
+def test_the_sync_command_withdraws_everything_when_nothing_is_staged(tmp_path):
+    lane = tmp_path / runner_agent.lane_slug("box:0")
+    (lane / "queue").mkdir(parents=True)
+    (lane / "queue" / "0001-1.json").write_text("{}")
     command = runner_agent.build_sync_command(
-        lane_name="box:0", spool_root=".nvidb/lanes", specs=[], want_runner=False
+        lane_name="box:0", spool_root=str(tmp_path), specs=[], want_runner=False,
+        python_exe=sys.executable,
     )
-    assert 'rm -f "$d"/queue/*.json' in command
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert list((lane / "queue").glob("*.json")) == []
     assert ': > "$d/stop"' in command
 
 
@@ -624,3 +631,129 @@ def test_the_lane_view_reports_the_runner(scheduler, cluster):
     assert view["runner"] is True
     assert view["runner_up"] is True
     assert view["blocked"] is None
+
+
+def _wait_for(predicate, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if predicate():
+                return
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(.05)
+    pytest.fail("runner did not reach the expected state")
+
+
+def _sync_real(root, specs, config=None, want_runner=True):
+    command = runner_agent.build_sync_command(
+        lane_name="test:0", spool_root=str(root), specs=specs,
+        lane_config=config, want_runner=want_runner, python_exe=sys.executable,
+        interval=.05, idle_exit=.2,
+    )
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    return runner_agent.parse_state(result.stdout)
+
+
+def test_real_sync_hot_updates_and_restart_preserve_attempts(tmp_path):
+    root = tmp_path / "spools with spaces"
+    spool = root / runner_agent.lane_slug("test:0")
+    (spool / "queue").mkdir(parents=True)
+    (spool / "claimed").mkdir()
+    command = 'echo started; while [ ! -f "$NVIDB_JOB_DIR/release" ]; do sleep .05; done; echo done'
+    dirs = [_stage(spool, tmp_path, job_id=i, seq=i * 1000, command=command) for i in (1, 2, 3)]
+    specs = [json.loads(p.read_text()) for p in sorted((spool / "queue").glob("*.json"))]
+    try:
+        _sync_real(root, specs, {"concurrency": 1, "paused": False})
+        _wait_for(lambda: len(_state(spool)["current"]) == 1)
+        first_pid = _state(spool)["current"][0]["pid"]
+        _sync_real(root, specs, {"concurrency": 2, "paused": False})
+        _wait_for(lambda: len(_state(spool)["current"]) == 2)
+        pids = {j["job_id"]: j["pid"] for j in _state(spool)["current"]}
+        assert pids[1] == first_pid
+        # Replaying a stale controller snapshot (and a changed seq) must not
+        # recreate claimed jobs. A lower limit never terminates current jobs.
+        specs[0]["seq"] = 9000
+        _sync_real(root, specs, {"concurrency": 1, "paused": True})
+        assert len(_state(spool)["current"]) == 2
+        assert len(list((spool / "queue").glob("*.json"))) == 1
+        stop = runner_agent.build_stop_command(lane_name="test:0", spool_root=str(root), hard=True)
+        result = subprocess.run(stop, shell=True, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+        _sync_real(root, specs, {"concurrency": 1, "paused": True})
+        _wait_for(lambda: len(_state(spool)["current"]) == 2)
+        assert {j["job_id"]: j["pid"] for j in _state(spool)["current"]} == pids
+        for d in dirs[:2]:
+            (d / "release").touch()
+        _wait_for(lambda: not _state(spool)["current"])
+        assert not (dirs[2] / "started").exists()
+        _sync_real(root, specs, {"concurrency": 1, "paused": False})
+        _wait_for(lambda: (dirs[2] / "started").exists())
+        (dirs[2] / "release").touch()
+        _wait_for(lambda: (dirs[2] / "exit_code").exists())
+        # A finished attempt must not run again either.
+        _sync_real(root, specs, {"concurrency": 1, "paused": False})
+        for d in dirs:
+            assert (d / "stdout.log").read_text().splitlines() == ["started", "done"]
+    finally:
+        for d in dirs:
+            d.mkdir(exist_ok=True)
+            (d / "release").touch()
+        (spool / "stop").touch()
+
+
+def test_version_replacement_waits_for_stop_and_adopts_the_same_pid(tmp_path):
+    root = tmp_path / "upgrade"
+    spool = root / runner_agent.lane_slug("test:0")
+    (spool / "queue").mkdir(parents=True)
+    (spool / "claimed").mkdir()
+    run_dir = _stage(spool, tmp_path, job_id=1, seq=1000,
+                     command='echo once; while [ ! -f "$NVIDB_JOB_DIR/release" ]; do sleep .05; done')
+    spec = json.loads(next((spool / "queue").glob("*.json")).read_text())
+    script = _runner_file(tmp_path)
+    first = subprocess.Popen(
+        [sys.executable, "-u", str(script), str(spool), "test:0",
+         runner_agent.runner_marker("test:0"), "previous-version", ".05", "10"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    (spool / "runner.version").write_text("previous-version")
+    try:
+        _wait_for(lambda: _state(spool)["current"] and (run_dir / "pid").exists())
+        pid = int((run_dir / "pid").read_text())
+        _sync_real(root, [spec], {"concurrency": 1, "paused": False})
+        first.wait(timeout=10)
+        _wait_for(lambda: _state(spool)["version"] == runner_agent.RUNNER_VERSION)
+        assert _state(spool)["current"][0]["pid"] == pid
+        assert (run_dir / "stdout.log").read_text().splitlines() == ["once"]
+    finally:
+        run_dir.mkdir(exist_ok=True)
+        (run_dir / "release").touch()
+        (spool / "stop").touch()
+        if first.poll() is None:
+            first.terminate()
+        first.wait(timeout=10)
+
+
+def test_removing_stop_resumes_a_busy_runner(spool, tmp_path):
+    run_dir = _stage(spool, tmp_path, job_id=1, seq=1000,
+                     command='while [ ! -f "$NVIDB_JOB_DIR/release" ]; do sleep .05; done')
+    script = _runner_file(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(spool), "test:0", "NVIDB_LANE=test", "v", ".05", ".2"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for(lambda: _state(spool)["current"])
+        (spool / "stop").touch()
+        _wait_for(lambda: _state(spool)["stopping"])
+        second = _stage(spool, tmp_path, job_id=2, seq=2000, command="echo next")
+        (spool / "stop").unlink()
+        _wait_for(lambda: not _state(spool)["stopping"])
+        (run_dir / "release").touch()
+        _wait_for(lambda: (second / "exit_code").exists())
+    finally:
+        run_dir.mkdir(exist_ok=True)
+        (run_dir / "release").touch()
+        (spool / "stop").touch()
+        proc.wait(timeout=10)

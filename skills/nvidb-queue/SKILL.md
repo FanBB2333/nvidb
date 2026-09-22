@@ -355,3 +355,22 @@ catching up on what happened while you were not running), the keeper that keeps
 a queue host scheduling (`nvidb queue keeper status`), consistent database
 snapshots (`nvidb queue backup --json`), and the `queue:` settings in
 `~/.nvidb/config.yml` or `~/.nvidb/queue.yml`.
+
+## v1.9.3 recovery behavior
+
+An unreachable job past its runtime limit remains `running` with a deduplicated
+`job_overdue` warning until node evidence arrives. Do not requeue it merely
+because its wall-clock runtime exceeded the limit. Obsolete dependency holds
+clear automatically, including outside a lane's staging window; dependencies
+and positions are preserved.
+
+`nvidb job cancel ID --no-tick --json` cancels only the requested jobs without
+an extra scheduling tick. JSON parse errors also return JSON (exit status 2).
+`keeper stop` disables automatic ensure until an explicit start/restart.
+`--no-tick` reads do not restart the keeper. macOS supports
+`nvidb queue keeper install --launchd --start --json`; changing the installed
+manager is separate from editing the queue.
+
+Lane concurrency changes apply to future starts without stopping current jobs.
+Runner restarts adopt existing processes after stopping dispatch safely.
+Lookahead remains 1 by default; v1.9.3 does not enable `all` or `auto`.

@@ -14,6 +14,8 @@ INTERVAL="${NVIDB_QUEUE_INTERVAL:-__INTERVAL__}"
 MANAGER=__MANAGER__
 KEEPER_TOKEN=__KEEPER_TOKEN__
 UNIT=__SYSTEMD_UNIT__
+LAUNCHD_LABEL=__LAUNCHD_LABEL__
+LAUNCHD_PLIST=__LAUNCHD_PLIST__
 
 PIDFILE="$NVIDB_HOME/queue-keeper.pid"
 TOKENFILE="$NVIDB_HOME/queue-keeper.token"
@@ -22,6 +24,7 @@ LOCKOWNER="$LOCKDIR/owner"
 SCRIPT="$NVIDB_HOME/queue-keeper.sh"
 SESSION="$NVIDB_HOME/queue-keeper.session"
 LOG="$NVIDB_HOME/queue-keeper.log"
+STOPPED="$NVIDB_HOME/queue-keeper.stopped"
 
 read_pid() {
   [ -f "$PIDFILE" ] || return 1
@@ -180,7 +183,42 @@ systemd_action() {
   esac
 }
 
+launchd_action() {
+  domain="gui/$(id -u)"
+  service="$domain/$LAUNCHD_LABEL"
+  case "$1" in
+    start|ensure)
+      launchctl enable "$service" || return 1
+      if ! launchctl print "$service" >/dev/null 2>&1; then
+        launchctl bootstrap "$domain" "$LAUNCHD_PLIST" || return 1
+      fi
+      launchctl kickstart "$service"
+      ;;
+    stop)
+      launchctl disable "$service" || return 1
+      if launchctl print "$service" >/dev/null 2>&1; then
+        launchctl bootout "$service" || return 1
+      fi
+      ;;
+    restart)
+      launchd_action stop && launchd_action start
+      ;;
+    status) launchctl print "$service" ;;
+    logs) tail -n "${2:-50}" "$LOG" 2>/dev/null ;;
+    *) return 2 ;;
+  esac
+}
+
 action="${1:-start}"
+case "$action" in
+  ensure) [ ! -f "$STOPPED" ] || exit 0 ;;
+  stop) mkdir -p "$NVIDB_HOME" && : > "$STOPPED" || exit 1 ;;
+  start|restart) rm -f "$STOPPED" || exit 1 ;;
+esac
+if [ "$MANAGER" = "launchd" ]; then
+  launchd_action "$action" "${2:-}"
+  exit $?
+fi
 if [ "$MANAGER" = "systemd" ]; then
   systemd_action "$action" "${2:-}" && exit 0
   rc=$?

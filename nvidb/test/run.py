@@ -904,7 +904,8 @@ def main():
     logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     # 创建主解析器
-    parser = argparse.ArgumentParser(prog="nvidb", description="A simple tool to manage NVIDIA GPU servers.")
+    from ..sched import cli as sched_cli
+    parser = sched_cli.ArgumentParser(prog="nvidb", description="A simple tool to manage NVIDIA GPU servers.")
     parser.add_argument('--version', action='version', version=f'nvidb {config.VERSION}')
     parser.add_argument('--remote', action='store_true', help='Use remote servers')
     parser.add_argument('--no-remote', action='store_true', help='Ignore `basic.remote` in config and use local machine only')

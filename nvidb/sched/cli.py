@@ -8,6 +8,7 @@ way out, which is what keeps the queue moving without a daemon.
 from __future__ import annotations
 
 import argparse
+from contextvars import ContextVar
 import getpass
 import json
 import os
@@ -35,7 +36,29 @@ from .model import (
     format_duration,
     format_mb,
 )
-from .scheduler import Scheduler
+from .scheduler import Scheduler, SchedulerLeaseLost
+
+
+_json_parse_errors = ContextVar("nvidb_json_parse_errors", default=False)
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """Keep parse failures machine-readable, including failures in subparsers."""
+
+    def parse_args(self, args=None, namespace=None):
+        argv = list(sys.argv[1:] if args is None else args)
+        options = argv[:argv.index("--")] if "--" in argv else argv
+        token = _json_parse_errors.set("--json" in options)
+        try:
+            return super().parse_args(argv, namespace)
+        finally:
+            _json_parse_errors.reset(token)
+
+    def error(self, message):
+        if _json_parse_errors.get():
+            _print_json({"ok": False, "error": message})
+            self.exit(2)
+        super().error(message)
 
 STATE_ORDER = ["running", "pending"] + [
     state for state in JOB_STATES if state in TERMINAL_JOB_STATES
@@ -160,6 +183,16 @@ def _open(args) -> Scheduler:
     conn = dbm.open_db(getattr(args, "db_path", None))
     scheduler = Scheduler(conn)
     scheduler.sync_nodes_from_config()
+    # Explicit database/config overrides can be tests or a second queue. They
+    # must never start the keeper installed for the user's default queue.
+    if (getattr(args, "func", None) not in (cmd_daemon, cmd_keeper)
+            and not getattr(args, "no_tick", False)
+            and not getattr(args, "db_path", None)
+            and not os.environ.get("NVIDB_QUEUE_DB")
+            and not os.environ.get("NVIDB_QUEUE_CONFIG")):
+        warning = keeper_mod.ensure_local()
+        if warning:
+            print(f"warning: keeper ensure failed: {warning}", file=sys.stderr)
     return scheduler
 
 
@@ -638,7 +671,12 @@ def cmd_daemon(args) -> int:
         print("Press Ctrl+C to stop.", file=sys.stderr)
     try:
         while True:
-            summary = scheduler.tick(force=True)
+            try:
+                summary = scheduler.tick(force=True)
+            except SchedulerLeaseLost as error:
+                summary = {"ran": False, "skipped": "lease_lost", "error": str(error)}
+                if not args.json:
+                    print(f"scheduler lease lost: {error}; retrying next pass", file=sys.stderr)
             sent = 0 if args.no_notify else scheduler.deliver_alerts(notifier)
             backup = None
             backup_error = None
@@ -691,7 +729,8 @@ def cmd_keeper(args) -> int:
     action = getattr(args, "keeper_action", None) or "status"
 
     if action == "install":
-        manager_name = "systemd" if args.systemd else "shell"
+        manager_name = ("systemd" if args.systemd else "launchd" if args.launchd else
+                        "shell" if args.shell else keeper_mod.default_manager())
         try:
             info = keeper_mod.install(
                 nvidb_bin=args.nvidb,
@@ -1102,7 +1141,7 @@ def cmd_lane_runner(args) -> int:
                     )
                 return 0
 
-            outcome = scheduler.stop_lane_runner(args.lane, hard=args.hard)
+            outcome = scheduler.stop_lane_runner(args.lane, hard=args.hard or action == "restart")
             if action == "restart":
                 summary = _maybe_tick(scheduler, args, force=True)
                 if args.json:
@@ -1860,11 +1899,14 @@ def register_parsers(subparsers) -> None:
     keeper.add_argument(
         "--start", action="store_true", help="Start it straight after installing"
     )
-    keeper.add_argument(
+    keeper_managers = keeper.add_mutually_exclusive_group()
+    keeper_managers.add_argument(
         "--systemd",
         action="store_true",
         help="Install a systemd user service instead of the detached shell supervisor",
     )
+    keeper_managers.add_argument("--launchd", action="store_true", help="Install a macOS LaunchAgent")
+    keeper_managers.add_argument("--shell", action="store_true", help="Install the portable shell supervisor")
     keeper.add_argument("-n", "--number", type=int, default=50, help="Log lines to show")
     keeper.set_defaults(func=cmd_keeper)
 
@@ -2125,6 +2167,7 @@ def register_parsers(subparsers) -> None:
     _add_common(cancel)
     cancel.add_argument("ids", nargs="+")
     cancel.set_defaults(func=cmd_cancel)
+    cancel.add_argument("--no-tick", action="store_true", help="Skip keeper ensure and scheduling; still cancel the requested jobs")
 
     release = job_sub.add_parser(
         "release",
