@@ -1,8 +1,12 @@
-<img src="resources/nvidb-icon.png" alt="nvidb logo" width="96">
+<p align="center">
+  <img src="resources/nvidb-icon.png" alt="nvidb logo" width="160" height="160">
+</p>
 
-# nvidb
+<h1 align="center">nvidb</h1>
 
+<p align="center">
 A package that provides an aggregated view of the NVIDIA GPU information on several hosts.
+</p>
 
 ## 1. Installation
 
