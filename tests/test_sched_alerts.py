@@ -472,3 +472,110 @@ def test_the_alert_summary_names_the_job_and_the_node():
         "node down [big-node]"
     )
     assert format_alert({"title": "something"}) == "something"
+
+
+def test_desktop_failure_is_logged_without_blocking_other_alert_channels(monkeypatch, tmp_path, caplog):
+    import subprocess
+
+    monkeypatch.setattr("nvidb.sched.notify.alert_log_path", lambda: tmp_path / "alerts.log")
+    notifier = Notifier()
+    notifier._desktop_command = lambda *args: ["notification-helper"]
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "notification-helper")
+
+    monkeypatch.setattr("nvidb.sched.notify.subprocess.run", fail)
+    assert notifier.deliver([{"id": 1, "kind": "node_down", "title": "unreachable"}]) == [1]
+    assert json.loads((tmp_path / "alerts.log").read_text())["id"] == 1
+    assert "to_desktop channel failed" in caplog.text
+
+
+def test_macos_app_build_failure_falls_back_and_is_not_retried_for_every_alert(monkeypatch):
+    from nvidb.sched.notify import _find_desktop_command
+
+    attempts = []
+    monkeypatch.setattr("nvidb.sched.notify.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("nvidb.sched.notify.shutil.which", lambda cmd: None if cmd == "terminal-notifier" else cmd)
+
+    def fail(*args):
+        attempts.append(args)
+        raise OSError("cannot build helper")
+
+    monkeypatch.setattr("nvidb.sched.macos_notify.notification_command", fail)
+    command = _find_desktop_command()
+    for _ in range(2):
+        result = command("nvidb", "Job #12", 'train "A" failed')
+        assert result[0] == "osascript"
+        assert 'subtitle "Job #12"' in result[2]
+        assert 'train \\"A\\" failed' in result[2]
+    assert len(attempts) == 1
+
+
+def test_native_notification_command_preserves_arguments_without_a_shell(tmp_path, monkeypatch):
+    from nvidb.sched import macos_notify
+
+    app = tmp_path / "nvidb.app"
+    monkeypatch.setattr(macos_notify, "ensure_app", lambda: app)
+    body = 'Job "A" failed: \\path\n$(not a shell command)'
+    assert macos_notify.notification_command("nvidb", "Job #12", body) == [
+        str(app / "Contents/MacOS/nvidb-notify"), "--notify", "nvidb", "Job #12", body,
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS app compilation tools")
+def test_compiled_notification_app_uses_its_custom_icon_and_reuses_the_signed_bundle(tmp_path):
+    import plistlib
+    import subprocess
+
+    from nvidb.sched import macos_notify
+
+    if subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True).returncode:
+        pytest.skip("Apple Command Line Tools are not installed")
+    app = macos_notify.ensure_app(tmp_path)
+    info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    assert info["CFBundleIdentifier"] == macos_notify.BUNDLE_ID
+    assert info["CFBundleDisplayName"] == "nvidb"
+    assert info["LSUIElement"] is True
+    assert "CFBundleIconName" not in info
+    assert info["CFBundleIconFile"] == "nvidb.icns"
+    assert info["CFBundleVersion"] == "6"
+    resources = app / "Contents/Resources"
+    assert not (resources / "Assets.car").exists()
+    assert (resources / info["CFBundleIconFile"]).read_bytes() == (
+        macos_notify.ASSETS / "nvidb.icns"
+    ).read_bytes()
+    subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(app)], check=True)
+    executable = app / "Contents/MacOS/nvidb-notify"
+    mtime = executable.stat().st_mtime_ns
+    assert macos_notify.ensure_app(tmp_path) == app
+    assert executable.stat().st_mtime_ns == mtime
+
+    # Reopening an alert must not deliver it again, and incomplete requests must
+    # fail before contacting Notification Center (no test desktop popups).
+    subprocess.run([str(executable)], capture_output=True, check=True, timeout=5)
+    invalid = subprocess.run([str(executable), "--notify", "missing body"],
+                             capture_output=True, timeout=5)
+    assert invalid.returncode == 2
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="uses the macOS helper builder")
+def test_failed_notification_rebuild_keeps_the_previous_app(tmp_path, monkeypatch):
+    import subprocess
+
+    from nvidb.sched import macos_notify
+
+    app = tmp_path / "nvidb.app"
+    resources = app / "Contents/Resources"
+    resources.mkdir(parents=True)
+    (resources / "nvidb-version").write_text("previous-version")
+    (resources / "nvidb.icns").write_bytes(b"previous icon")
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+
+    monkeypatch.setattr(macos_notify.subprocess, "run", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        macos_notify.ensure_app(tmp_path)
+    assert (resources / "nvidb-version").read_text() == "previous-version"
+    assert (resources / "nvidb.icns").read_bytes() == b"previous icon"
+    assert not list(tmp_path.glob(".nvidb-notify-*"))

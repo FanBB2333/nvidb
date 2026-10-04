@@ -1,3 +1,5 @@
+<img src="resources/nvidb-icon.png" alt="nvidb logo" width="96">
+
 # nvidb
 
 A package that provides an aggregated view of the NVIDIA GPU information on several hosts.
@@ -633,6 +635,18 @@ Each alert is delivered once, whether or not the daemon restarts. Channels are
 configured under `queue.notify`: a desktop notification, a JSON-lines file at
 `$NVIDB_HOME/alerts.log`, and a `command` hook that receives the alert as JSON
 on stdin — which is how you route failures to anything else.
+
+On macOS, alerts use native notifications with a dedicated **nvidb** app name
+and icon. On macOS 11 or later, the small notification helper is built with
+Apple's Command Line Tools (`xcode-select --install`) and cached at
+`$NVIDB_HOME/nvidb.app`. Allow notifications for nvidb when macOS
+first asks; its banner/alert style and other options are managed in
+System Settings → Notifications → nvidb. Notifications retain the system's
+dismiss button, Focus behavior and Notification Center history. The daemon
+must run in a logged-in graphical session. Restart the daemon or keeper after
+updating nvidb to load the new notification code.
+If the helper cannot be built, nvidb logs the error and falls back to
+`terminal-notifier` or `osascript`, which uses that tool's icon instead.
 
 ### 3.6 Driving the queue from other programs
 

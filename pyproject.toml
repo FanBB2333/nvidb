@@ -52,6 +52,5 @@ version = { attr = "nvidb.config.VERSION" }
 include = ["nvidb*"]
 
 [tool.setuptools.package-data]
-# The keeper is shipped as a shell script and copied into the working directory
-# by `nvidb queue keeper install`, so it has to survive packaging.
-nvidb = ["sched/keeper.sh"]
+# The keeper and native macOS notification helper must survive packaging.
+nvidb = ["sched/keeper.sh", "sched/macos_notify.m", "sched/nvidb.icns"]

@@ -13,10 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import config as nvidb_config
 
@@ -59,6 +60,44 @@ def format_alert(alert: Dict[str, Any]) -> str:
         where.append(alert["node"])
     location = f" [{' on '.join(where)}]" if where else ""
     return f"{alert['title']}{location}"
+
+
+def desktop_content(alert: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Keep the event, its location, and the explanation on separate lines."""
+    kind = str(alert["kind"])
+    labels = {
+        "node_down": "Node unreachable",
+        "node_disk_low": "Disk space low",
+        "job_lost": "Job process lost",
+        "job_retried": "Retrying job",
+        "job_unschedulable": "Job cannot be scheduled",
+        "job_held": "Job needs attention",
+        "job_overdue": "Job overdue",
+        "job_timeout": "Job timed out",
+        "launch_failed": "Job could not start",
+    }
+    title = f"nvidb · {labels.get(kind, kind.replace('_', ' ').capitalize())}"
+    body = str(alert["title"])
+    node = str(alert.get("node") or "")
+    location = []
+    if alert.get("job_id"):
+        location.append(f"Job #{alert['job_id']}")
+    if kind == "node_down" and node:
+        match = re.fullmatch(
+            re.escape(node) + r" is unreachable(?:; (\d+) running job\(s\) cannot be checked)?",
+            body,
+        )
+        if match:
+            count = match.group(1)
+            if count:
+                noun = "job" if count == "1" else "jobs"
+                body = f"Cannot check {count} running {noun}."
+            else:
+                body = "Connection to this node failed."
+    # Some existing alert titles already include the node; do not repeat it.
+    if node and not re.search(r"(?<![\w.-])" + re.escape(node) + r"(?![\w.-])", body):
+        location.append(node)
+    return title, " · ".join(location), body
 
 
 class Notifier:
@@ -116,11 +155,10 @@ class Notifier:
     def _to_desktop(self, alert: Dict[str, Any]) -> None:
         if not self._desktop_command:
             return
-        title = f"nvidb: {alert['kind'].replace('_', ' ')}"
-        body = format_alert(alert)
+        title, subtitle, body = desktop_content(alert)
         subprocess.run(
-            self._desktop_command(title, body),
-            check=False,
+            self._desktop_command(title, subtitle, body),
+            check=True,
             capture_output=True,
             timeout=10,
         )
@@ -144,21 +182,44 @@ def _find_desktop_command():
     """Return a builder for the platform's notification command, or None."""
     system = platform.system()
     if system == "Darwin":
+        from .macos_notify import notification_command
+
+        fallback = None
         if shutil.which("terminal-notifier"):
-            return lambda title, body: [
-                "terminal-notifier", "-title", title, "-message", body
+            fallback = lambda title, subtitle, body: [
+                "terminal-notifier", "-title", title, "-subtitle", subtitle, "-message", body
             ]
-        if shutil.which("osascript"):
-            return lambda title, body: [
+        elif shutil.which("osascript"):
+            fallback = lambda title, subtitle, body: [
                 "osascript",
                 "-e",
                 # display notification takes AppleScript string literals.
                 f'display notification {_applescript_string(body)} '
-                f'with title {_applescript_string(title)}',
+                f'with title {_applescript_string(title)} '
+                f'subtitle {_applescript_string(subtitle)}',
             ]
-        return None
+        if not shutil.which("xcrun") or not shutil.which("codesign"):
+            return fallback
+
+        build_failed = False
+
+        def macos_command(title, subtitle, body):
+            nonlocal build_failed
+            if not build_failed:
+                try:
+                    return notification_command(title, subtitle, body)
+                except (OSError, subprocess.SubprocessError) as error:
+                    if fallback is None:
+                        raise
+                    build_failed = True
+                    LOGGER.warning("could not build nvidb notification app; using fallback: %s", error)
+            return fallback(title, subtitle, body)
+
+        return macos_command
     if shutil.which("notify-send"):
-        return lambda title, body: ["notify-send", title, body]
+        return lambda title, subtitle, body: [
+            "notify-send", title, "\n".join(part for part in (subtitle, body) if part)
+        ]
     return None
 
 
