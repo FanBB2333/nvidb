@@ -186,18 +186,20 @@ def _find_desktop_command():
 
         fallback = None
         if shutil.which("terminal-notifier"):
-            fallback = lambda title, subtitle, body: [
-                "terminal-notifier", "-title", title, "-subtitle", subtitle, "-message", body
-            ]
+            def fallback(title, subtitle, body):
+                return [
+                    "terminal-notifier", "-title", title, "-subtitle", subtitle, "-message", body
+                ]
         elif shutil.which("osascript"):
-            fallback = lambda title, subtitle, body: [
-                "osascript",
-                "-e",
-                # display notification takes AppleScript string literals.
-                f'display notification {_applescript_string(body)} '
-                f'with title {_applescript_string(title)} '
-                f'subtitle {_applescript_string(subtitle)}',
-            ]
+            def fallback(title, subtitle, body):
+                return [
+                    "osascript",
+                    "-e",
+                    # display notification takes AppleScript string literals.
+                    f'display notification {_applescript_string(body)} '
+                    f'with title {_applescript_string(title)} '
+                    f'subtitle {_applescript_string(subtitle)}',
+                ]
         if not shutil.which("xcrun") or not shutil.which("codesign"):
             return fallback
 
