@@ -287,6 +287,25 @@ def test_a_vram_edit_replaces_the_spec_staged_with_a_lane_runner(
     assert job.state == "running"
 
 
+def test_an_edited_command_is_delivered_to_the_lane_runner(scheduler, cluster):
+    import base64
+
+    scheduler.tick(force=True)
+    cluster["small-node"].add_foreign_process(0, 22000)
+    job_id = scheduler.submit("python old_eval.py", lane="small-node:0", vram="4G")
+    replacement = "python new_eval.py --limit 20\nprintf '%s\\n' '评测完成'\n"
+    scheduler.edit_job(job_id, command=replacement)
+
+    scheduler.tick(force=True)
+
+    runner = cluster.backends["small-node"].runner
+    spec = runner.lanes["small-node:0"]["queued"][0]
+    script = base64.b64decode(spec["script_b64"]).decode("utf-8")
+    assert spec["job_id"] == job_id
+    assert replacement in script
+    assert "python old_eval.py" not in script
+
+
 def test_a_lane_on_an_unreachable_node_just_waits(scheduler, cluster):
     scheduler.tick(force=True)
     job_id = scheduler.submit("x", lane="small-node:0", vram="1G")

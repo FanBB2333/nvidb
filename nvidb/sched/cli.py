@@ -91,6 +91,15 @@ def _error(message: str, *, as_json: bool = False) -> int:
     return 1
 
 
+def _read_script(path: str) -> str:
+    """Read a command body on the invoking machine, before remote forwarding."""
+    script_path = Path(path).expanduser()
+    try:
+        return script_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"could not read {script_path}: {error}") from error
+
+
 def _table(
     rows: List[Sequence[str]],
     headers: Sequence[str],
@@ -1227,10 +1236,10 @@ def cmd_submit(args) -> int:
     scheduler = _open(args)
     try:
         if args.script:
-            script_path = Path(args.script).expanduser()
-            if not script_path.exists():
-                return _error(f"script not found: {script_path}", as_json=args.json)
-            command = script_path.read_text(encoding="utf-8")
+            try:
+                command = _read_script(args.script)
+            except ValueError as error:
+                return _error(str(error), as_json=args.json)
         elif len(args.command_parts) == 1:
             command = args.command_parts[0]
         else:
@@ -1534,7 +1543,13 @@ def cmd_release(args) -> int:
 
 
 def cmd_edit(args) -> int:
-    """Change a queued job's reservation or dependencies in place."""
+    """Change a queued job's command, reservation or dependencies in place."""
+    command = args.new_command
+    if args.script is not None:
+        try:
+            command = _read_script(args.script)
+        except ValueError as error:
+            return _error(str(error), as_json=args.json)
     scheduler = _open(args)
     try:
         changes = {
@@ -1543,14 +1558,14 @@ def cmd_edit(args) -> int:
             "add_any": _resolve_ids(scheduler, args.add_after_any or []),
             "drop_any": _resolve_ids(scheduler, args.drop_after_any or []),
         }
-        if args.vram is None and not any(changes.values()):
+        if command is None and args.vram is None and not any(changes.values()):
             return _error(
-                "nothing to change (pass --vram, --add-after, --drop-after, "
+                "nothing to change (pass --command, --script, --vram, --add-after, --drop-after, "
                 "--add-after-any or --drop-after-any)",
                 as_json=args.json,
             )
         try:
-            job = scheduler.edit_job(args.id, vram=args.vram, **changes)
+            job = scheduler.edit_job(args.id, vram=args.vram, command=command, **changes)
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
         summary = _maybe_tick(scheduler, args, force=True)
@@ -1564,6 +1579,8 @@ def cmd_edit(args) -> int:
                 f"job {job.id} ({job.display_state}): "
                 f"vram={format_mb(job.vram_mb)} after={after} after-any={after_any}"
             )
+            if command is not None:
+                print(f"  command: {job.command}")
             if job.held_reason:
                 print(f"  still held: {job.held_reason}")
         return 0
@@ -2187,12 +2204,18 @@ def register_parsers(subparsers) -> None:
         "edit",
         help="Change a queued job's request",
         description=(
-            "Change a queued job's VRAM reservation or repoint it at different "
-            "prerequisites without losing its queue position or metadata."
+            "Change a queued job's command, VRAM reservation or prerequisites "
+            "without losing its queue position or metadata. Commands can only "
+            "change before the job has been staged on its node."
         ),
     )
     _add_common(edit)
     edit.add_argument("id", type=int)
+    command_source = edit.add_mutually_exclusive_group()
+    command_source.add_argument("--command", dest="new_command", default=None,
+                                help="Replace the command with this shell string")
+    command_source.add_argument("--script", default=None, metavar="FILE",
+                                help="Replace the command with a local UTF-8 file's contents")
     edit.add_argument("--vram", default=None, help="New VRAM reservation, e.g. 39G")
     edit.add_argument("--add-after", action="append", default=[], metavar="ID",
                       help="Also wait for this job to complete successfully")
@@ -2280,14 +2303,13 @@ def quiet_transport_logging() -> None:
 def _forward_to_queue_host(target: Dict[str, Any], args) -> int:
     """Hand this invocation to the machine that owns the queue."""
     script_text = None
-    if getattr(args, "func", None) is cmd_submit and getattr(args, "script", None):
+    if getattr(args, "func", None) in (cmd_submit, cmd_edit) and getattr(args, "script", None):
         # `--script` names a file on *this* machine, so it is read here and the
         # contents travel with the command.
-        script_path = Path(args.script).expanduser()
         try:
-            script_text = script_path.read_text(encoding="utf-8")
-        except OSError as error:
-            return _error(f"could not read {script_path}: {error}", as_json=getattr(args, "json", False))
+            script_text = _read_script(args.script)
+        except ValueError as error:
+            return _error(str(error), as_json=getattr(args, "json", False))
     return remote_mod.forward(
         target,
         sys.argv[1:],

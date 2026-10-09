@@ -871,6 +871,7 @@ class Scheduler:
         job_id: int,
         *,
         vram: Any = None,
+        command: Optional[str] = None,
         add: Optional[Sequence[int]] = None,
         drop: Optional[Sequence[int]] = None,
         add_any: Optional[Sequence[int]] = None,
@@ -878,12 +879,16 @@ class Scheduler:
     ) -> Job:
         """Edit a queued job without losing its place or submission metadata.
 
-        The VRAM reservation may only change while the job is pending. The
+        Commands and VRAM reservations may only change while the job is pending.
+        A command already handed to a runner cannot be replaced: the runner may
+        have started it before the controller has observed that start. The
         scheduler lease keeps a concurrent tick from launching the job between
         that state check and the update. Dependency edits retain their existing
         behaviour: they may also reattach a held job to a replacement upstream.
         """
         vram_mb = parse_size_mb(vram) if vram is not None else None
+        if command is not None and not command.strip():
+            raise ValueError("A job needs a non-empty command")
         with self._operation_lease("job-edit"):
             with dbm.transaction(self.conn):
                 job = dbm.get_job(self.conn, job_id)
@@ -899,6 +904,18 @@ class Scheduler:
                         f"Job {job_id} is {job.state}; only pending jobs can change "
                         "their VRAM reservation"
                     )
+                if command is not None:
+                    if job.state != "pending":
+                        raise ValueError(
+                            f"Job {job_id} is {job.state}; only pending jobs can "
+                            "change their command"
+                        )
+                    if command != job.command and job.run_dir:
+                        raise ValueError(
+                            f"Job {job_id} has already been staged on its node; "
+                            "its command cannot be changed safely because the "
+                            "runner may already have started it"
+                        )
 
                 wanted = {
                     "depends_on": (list(job.depends_on), add or [], drop or []),
@@ -937,6 +954,9 @@ class Scheduler:
                 vram_changed = vram_mb is not None and vram_mb != job.vram_mb
                 if vram_changed:
                     updates["vram_mb"] = vram_mb
+                command_changed = command is not None and command != job.command
+                if command_changed:
+                    updates["command"] = command
                 if not updates:
                     return job
 
@@ -972,6 +992,14 @@ class Scheduler:
                             f"vram {format_mb(job.vram_mb)} -> {format_mb(vram_mb)}"
                         ),
                         data={"before_mb": job.vram_mb, "after_mb": vram_mb},
+                    )
+                if command_changed:
+                    dbm.add_event(
+                        self.conn,
+                        "job_command",
+                        job_id=job_id,
+                        message="updated queued command",
+                        data={"before": job.command, "after": command},
                     )
                 return dbm.get_job(self.conn, job_id)
 

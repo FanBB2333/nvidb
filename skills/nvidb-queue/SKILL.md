@@ -309,6 +309,8 @@ measured, so treat it as approximate.
 nvidb job cancel 12          # kill the remote process group
 nvidb job requeue 12         # run a finished job again
 nvidb job edit 12 --vram 19G # change a pending job's reservation in place
+nvidb job edit 12 --command 'python evaluate.py --limit 200' --no-tick --json
+nvidb job edit 12 --script evaluate.sh --no-tick --json
 nvidb job note 12 --append "loss plateaued at epoch 30"
 nvidb job priority 12 5      # dispatch earlier (bare number sets, +1/-2 adjust)
 nvidb job priority 12 --up 2 # move a pending job two slots earlier instead
@@ -333,6 +335,19 @@ Draining and ignoring are different. A drained node is still probed so jobs
 already running there can finish. Ignore an unavailable node only when it has no
 running queue jobs; it then disappears from normal status/TUI views and makes no
 SSH connections until it is unignored.
+
+Use `job edit --command '...'` or `job edit --script FILE` to replace an
+unstaged pending job's command. `--script` reads a local UTF-8 file, including
+when the queue host is remote. The two options are mutually exclusive. The job
+keeps its ID, dependencies, lane position, environment, working directory and
+notes; a command-only edit also keeps any dependency hold. `--no-tick` avoids
+starting a scheduling pass after the edit. The command change is recorded in a
+`job_command` event with the previous and replacement text.
+
+Running and finished jobs refuse command edits. A pending job with a `run_dir`
+has already been staged for a runner and also refuses a changed command: it may
+have started on the node before the controller observed it. Do not work around
+this guard by changing the database directly.
 
 ## Things to avoid
 
