@@ -6,3 +6,26 @@ dist/
 *.xml
 .vscode
 .claude
+
+# Local review notes, exports, and design drafts
+/.local-notes/
+/artifacts/
+/resources/branding/
+
+# Local queue configuration and runtime state
+**/queue.yml
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+!.env.example
+
+# Development caches
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

@@ -1,7 +1,7 @@
 """Package the selected nvidb logo as ICNS (development only; requires Pillow).
 
 Run from any directory with ``python resources/generate_notification_icon.py``.
-The canonical PNG preserves candidate D exactly; only the ICNS sizes are derived.
+The canonical PNG is unchanged; only the ICNS sizes are derived.
 """
 from pathlib import Path
 

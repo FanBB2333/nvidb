@@ -987,16 +987,6 @@ database is atomically published without replacing an existing path.
 
 ![nvidb remote](resources/nvidb_remote.png)
 
-- Monitor on web panel with `nvidb web`:
-
-Local info:
-
-![nvidb web local](resources/nvidb_web_local.png)
-
-Remote info:
-
-![nvidb web remote](resources/nvidb_web_remote.png)
-
 ---
 
 ## 7. Acknowledgements
