@@ -276,23 +276,12 @@ class Runner(object):
                 if error.errno != errno.EEXIST:
                     raise
 
-    def concurrency(self):
-        """How many jobs this lane may run at once, as last staged."""
-        config = read_json(CONFIG, {})
-        if isinstance(config, dict) and config.get("gpu_mode") == "exclusive":
+    def concurrency(self, config):
+        """Lane configuration is the authority for the current start limit."""
+        if config.get("gpu_mode") == "exclusive":
             return 1
-        if isinstance(config, dict) and config.get("concurrency"):
-            return min(max(1, int(config["concurrency"])),
-                       max(1, int(config.get("max_jobs_per_gpu", config["concurrency"]))))
-        for job in self.current:
-            value = job.spec.get("concurrency")
-            if value:
-                return max(1, int(value))
-        for spec in self.pending_specs():
-            value = spec[1].get("concurrency")
-            if value:
-                return max(1, int(value))
-        return 1
+        limit = int(config.get("concurrency", 1))
+        return max(1, min(limit, int(config.get("max_jobs_per_gpu", limit))))
 
     def pending_specs(self):
         """Staged specs not yet claimed, in the order the lane runs them."""
@@ -387,9 +376,11 @@ class Runner(object):
             self._maybe_start_locked()
 
     def _maybe_start_locked(self):
-        while len(self.current) < self.concurrency():
+        while True:
             config = read_json(CONFIG, {})
             if os.path.exists(STOPFILE) or not isinstance(config, dict) or config.get("paused"):
+                return
+            if len(self.current) >= self.concurrency(config):
                 return
             specs = self.pending_specs()
             if not specs:

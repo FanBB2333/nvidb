@@ -1442,16 +1442,10 @@ class Scheduler:
 
         # The lane runners are driven once the node's capacity is on record,
         # because staging a job asks whether its lane could ever hold it.
-        self._sync_lane_runners(dbm.get_node(self.conn, node.name) or node, summary,
-                                payload=payload, probe=probe)
+        self._sync_lane_runners(
+            dbm.get_node(self.conn, node.name), summary, payload=payload, probe=probe
+        )
         self._renew_tick_lease()
-
-        # Anything the runners have just started is this queue's own memory, so
-        # capacity is written again rather than left crediting it to work
-        # nobody submitted.
-        still_running = dbm.live_jobs(self.conn, node.name)
-        gpus = self._build_gpu_states(node, payload, probe, still_running)
-        dbm.replace_node_gpus(self.conn, node.name, gpus)
 
         error = None if payload.get("ok") else str(payload.get("error") or "")[:300]
         previous = dbm.set_node_state(
@@ -2201,6 +2195,15 @@ class Scheduler:
     def _max_gpu_jobs(self) -> int:
         return 1 if self._gpu_mode() == "exclusive" else int(self.settings["max_jobs_per_gpu"])
 
+    def _needs_vram_estimate(self, job: Job) -> bool:
+        """Existing exclusive grants remain valid when shared mode is enabled."""
+        return (
+            self._gpu_mode() == "shared"
+            and job.gpus > 0
+            and job.vram_mb <= 0
+            and not (job.run_dir and job.allocation_mode == "exclusive")
+        )
+
     def _gpu_budgets(self, node: Node, *, staging_lane: Optional[str] = None) -> List[GpuBudget]:
         """Include starts not yet seen by NVML and promises made to runners.
 
@@ -2210,32 +2213,26 @@ class Scheduler:
         """
         live = dbm.live_jobs(self.conn, node.name)
         staged = self._staged_jobs(node)
+        staged_gpu_ids = {j.id: self._lane_gpu_ids(j) for j in staged}
         headroom = int(self.settings["headroom_mb"])
+        exclusive = self._gpu_mode() == "exclusive"
         out = []
         for gpu in self._schedulable_gpus(node):
             active = [j for j in live if gpu.index in j.gpu_ids]
-            promised = [j for j in staged if j.gpus > 0 and gpu.index in self._lane_gpu_ids(j)]
+            promised = [j for j in staged if gpu.index in staged_gpu_ids[j.id]]
             reserved = max(gpu.reserved_mb, sum(j.vram_mb for j in active))
             reserved += sum(j.vram_mb for j in promised)
             jobs = max(gpu.queue_jobs, len(active)) + len(promised)
-            exclusive_owners = {
-                j.lane or ("job", j.id) for j in active + promised
-                if j.allocation_mode == "exclusive"
-            }
-            if self._gpu_mode() == "shared" and exclusive_owners:
-                jobs = max(jobs, self._max_gpu_jobs())
-            if self._gpu_mode() == "exclusive":
+            if exclusive:
                 # An exclusive runner lane owns the card across its staged
                 # sequence. It may prefetch its successor without promising
                 # that card to another lane or to the ordinary queue.
-                owners = {j.lane or ("job", j.id) for j in active + promised}
-                if staging_lane is not None:
-                    owners.discard(staging_lane)
-                jobs = len(owners)
-                if gpu.external_procs:
-                    jobs = max(jobs, 1)
+                occupied = any(not j.lane or j.lane != staging_lane for j in active + promised)
+                jobs = int(occupied or bool(gpu.external_procs))
                 if staging_lane is not None:
                     reserved = 0  # same-lane jobs run serially, never together
+            elif any(j.allocation_mode == "exclusive" for j in active + promised):
+                jobs = max(jobs, self._max_gpu_jobs())
             out.append(GpuBudget(
                 node=node.name, index=gpu.index,
                 free_mb=max(0, gpu.mem_total_mb - gpu.external_mem_mb - reserved - headroom),
@@ -2369,8 +2366,7 @@ class Scheduler:
                     or current.attempt != job.attempt or current.lane != job.lane):
                 return "gone"
             job = current
-            if (job.gpus > 0 and self._gpu_mode() == "shared" and job.vram_mb <= 0
-                    and not (job.run_dir and job.allocation_mode == "exclusive")):
+            if self._needs_vram_estimate(job):
                 reason = "shared GPU mode requires a positive --vram estimate per GPU; use job edit --vram"
                 if job.held_reason != reason:
                     dbm.update_job(self.conn, job.id, held_reason=reason)
@@ -2498,18 +2494,18 @@ class Scheduler:
                 if job.run_dir != run_dir:
                     dbm.update_job(self.conn, job.id, run_dir=run_dir,
                                    allocation_mode=self._gpu_mode())
+            gpu_ids = list(lane.gpu_ids) if job.gpus > 0 else []
             specs.append(
                 {
                     "job_id": job.id,
                     "lane": lane.name,
                     "seq": job.lane_seq or job.id,
                     "run_dir": run_dir,
-                    "gpu_ids": self._lane_gpu_ids(job),
+                    "gpu_ids": gpu_ids,
                     "vram_mb": int(job.vram_mb or 0),
                     "gpu_mode": (job.allocation_mode or "shared") if job.run_dir else self._gpu_mode(),
                     "headroom_mb": headroom,
                     "max_runtime_s": job.max_runtime_s,
-                    "concurrency": max(1, int(lane.concurrency)),
                     "attempt": attempt,
                     "script_b64": base64.b64encode(
                         build_run_script(
@@ -2519,7 +2515,7 @@ class Scheduler:
                             run_dir=run_dir,
                             workdir=job.workdir,
                             env=job.env,
-                            gpu_ids=self._lane_gpu_ids(job),
+                            gpu_ids=gpu_ids,
                             node_name=lane.node,
                         ).encode("utf-8")
                     ).decode("ascii"),
@@ -2536,8 +2532,9 @@ class Scheduler:
         except TransportError:
             return None
 
-    def _sync_lane_runners(self, node: Node, summary: Dict[str, Any], *,
-                           payload=None, probe=None) -> None:
+    def _sync_lane_runners(
+        self, node: Node, summary: Dict[str, Any], *, payload: dict, probe: NodeProbe
+    ) -> None:
         """Keep each of this node's runner lanes stocked, alive and observed."""
         backend = self.backend(node)
         spool_root = str(self.settings.get("lane_spool_root") or runner_agent.DEFAULT_SPOOL_ROOT)
@@ -2614,10 +2611,10 @@ class Scheduler:
             )
             if state:
                 self._adopt_runner_state(lane, node, state, summary)
-                if payload is not None and probe is not None:
-                    dbm.replace_node_gpus(self.conn, node.name, self._build_gpu_states(
-                        node, payload, probe, dbm.live_jobs(self.conn, node.name)
-                    ))
+                # Refresh after each lane so the next lane sees its allocations.
+                dbm.replace_node_gpus(self.conn, node.name, self._build_gpu_states(
+                    node, payload, probe, dbm.live_jobs(self.conn, node.name)
+                ))
 
     def _adopt_runner_state(
         self,
@@ -2655,13 +2652,14 @@ class Scheduler:
                 continue
 
             started = _epoch_to_iso(entry.get("started_at")) or utcnow()
+            gpu_ids = list(lane.gpu_ids) if job.gpus > 0 else []
             with dbm.transaction(self.conn):
                 dbm.update_job(
                     self.conn,
                     job.id,
                     state="running",
                     node=lane.node,
-                    gpu_ids=self._lane_gpu_ids(job),
+                    gpu_ids=gpu_ids,
                     remote_pid=entry.get("pid"),
                     remote_pgid=entry.get("pid"),
                     run_dir=entry.get("run_dir"),
@@ -2677,12 +2675,12 @@ class Scheduler:
                     node=lane.node,
                     message=(
                         f"pid {entry.get('pid')} on GPU "
-                        f"{','.join(str(i) for i in lane.gpu_ids) or '-'} "
+                        f"{','.join(str(i) for i in gpu_ids) or '-'} "
                         f"(lane {lane.name})"
                     ),
                     data={
                         "pid": entry.get("pid"),
-                        "gpu_ids": list(lane.gpu_ids),
+                        "gpu_ids": gpu_ids,
                         "lane": lane.name,
                         "vram_mb": job.vram_mb,
                         "runner": True,
@@ -2692,7 +2690,7 @@ class Scheduler:
                 {
                     "id": job.id,
                     "node": lane.node,
-                    "gpu_ids": self._lane_gpu_ids(job),
+                    "gpu_ids": gpu_ids,
                     "lane": lane.name,
                     "runner": True,
                 }
@@ -2867,7 +2865,7 @@ class Scheduler:
                 if not self._lane_has_room(lane, node, budgets, job, max_jobs):
                     break
 
-                gpu_ids = self._lane_gpu_ids(job)
+                gpu_ids = list(lane.gpu_ids) if job.gpus > 0 else []
                 launched, errors = self._attempt_launch(job, node, gpu_ids, summary)
                 if not launched:
                     if errors:
@@ -3104,8 +3102,7 @@ class Scheduler:
         for job in dbm.held_jobs(self.conn) if jobs is None else jobs:
             if job.state != "pending" or not job.held_reason:
                 continue
-            if (job.gpus > 0 and self._gpu_mode() == "shared" and job.vram_mb <= 0
-                    and not (job.run_dir and job.allocation_mode == "exclusive")):
+            if self._needs_vram_estimate(job):
                 continue
             _ready, reason = self._dependencies_ready(job)
             if reason is None:

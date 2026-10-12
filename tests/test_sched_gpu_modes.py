@@ -64,6 +64,8 @@ def test_cpu_lane_jobs_do_not_receive_or_reserve_gpus(queue, runner):
     assert db.get_job(sched.conn, job).state == "running"
     assert db.get_job(sched.conn, job).gpu_ids == []
     assert sched._gpu_budgets(db.get_node(sched.conn, "box"))[0].jobs == 0
+    started = next(e for e in db.list_events(sched.conn, job_id=job) if e["kind"] == "job_started")
+    assert started["data"]["gpu_ids"] == []
 
 
 @pytest.mark.parametrize("runner", [False, True])
