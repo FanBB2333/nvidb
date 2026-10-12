@@ -40,6 +40,7 @@ def scheduler(tmp_path, cluster):
         cfg=cluster.config(),
         settings={
             "headroom_mb": 512,
+            "gpu_mode": "shared",
             "max_jobs_per_gpu": 4,
             "probe_timeout": 5,
             "launch_timeout": 5,
@@ -229,6 +230,7 @@ def cli(tmp_path, monkeypatch, cluster):
             "settings",
             {
                 "headroom_mb": 512,
+                "gpu_mode": "shared",
                 "max_jobs_per_gpu": 4,
                 "probe_timeout": 5,
                 "launch_timeout": 5,

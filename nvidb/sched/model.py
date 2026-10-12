@@ -205,6 +205,8 @@ class Job:
     # cancelled job can never take a whole chain down with it.
     held_reason: Optional[str] = None
     overdue_at: Optional[str] = None
+    # Policy promised to this attempt; config changes affect new allocations.
+    allocation_mode: Optional[str] = None
 
     @classmethod
     def from_row(cls, row) -> "Job":
@@ -248,6 +250,7 @@ class Job:
             progress_at=data.get("progress_at"),
             held_reason=data.get("held_reason"),
             overdue_at=data.get("overdue_at"),
+            allocation_mode=data.get("allocation_mode"),
         )
 
     @property
@@ -316,6 +319,7 @@ class Job:
             "progress_at": self.progress_at,
             "held_reason": self.held_reason,
             "overdue_at": self.overdue_at,
+            "allocation_mode": self.allocation_mode,
             "held": self.is_held,
         }
 

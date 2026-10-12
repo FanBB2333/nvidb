@@ -146,7 +146,9 @@ def gpu_free_mb(indices):
             free[int(parts[0])] = int(float(parts[1]))
         except ValueError:
             continue
-    values = [free[index] for index in indices if index in free]
+    if any(index not in free for index in indices):
+        return None
+    values = [free[index] for index in indices]
     return min(values) if values else None
 
 
@@ -277,8 +279,11 @@ class Runner(object):
     def concurrency(self):
         """How many jobs this lane may run at once, as last staged."""
         config = read_json(CONFIG, {})
+        if isinstance(config, dict) and config.get("gpu_mode") == "exclusive":
+            return 1
         if isinstance(config, dict) and config.get("concurrency"):
-            return max(1, int(config["concurrency"]))
+            return min(max(1, int(config["concurrency"])),
+                       max(1, int(config.get("max_jobs_per_gpu", config["concurrency"]))))
         for job in self.current:
             value = job.spec.get("concurrency")
             if value:
@@ -391,9 +396,18 @@ class Runner(object):
                 return
             head = specs[0][1]
             needed = int(head.get("vram_mb") or 0)
-            if needed:
-                free = gpu_free_mb([int(i) for i in head.get("gpu_ids") or []])
-                if free is not None and free < needed:
+            indices = [int(i) for i in head.get("gpu_ids") or []]
+            mode = head.get("gpu_mode", config.get("gpu_mode"))
+            if indices and self.current and (
+                mode == "exclusive" or any(j.spec.get("gpu_mode") == "exclusive" for j in self.current)
+            ):
+                return
+            if mode == "shared" and indices and needed <= 0:
+                return
+            if indices and (needed or mode):
+                free = gpu_free_mb(indices)
+                headroom = int(config.get("headroom_mb", head.get("headroom_mb", 0)))
+                if (free is None and mode) or (free is not None and free < needed + headroom):
                     # The card filled up with work this queue did not start.
                     # Waiting is right: the lane's order is still the order.
                     return

@@ -9,12 +9,10 @@ from __future__ import annotations
 
 import argparse
 from contextvars import ContextVar
-import getpass
 import json
 import os
 import shlex
 import shutil
-import socket
 import sqlite3
 import sys
 import time
@@ -27,6 +25,7 @@ from . import db as dbm
 from . import keeper as keeper_mod
 from . import remote as remote_mod
 from .executor import VALID_ENV_KEY
+from .identity import default_submitter as _default_submitter
 from .model import (
     JOB_STATES,
     TERMINAL_JOB_STATES,
@@ -66,17 +65,6 @@ STATE_ORDER = ["running", "pending"] + [
 
 
 # --- helpers ---------------------------------------------------------------
-
-def _default_submitter() -> str:
-    explicit = os.environ.get("NVIDB_SUBMITTER")
-    if explicit:
-        return explicit
-    try:
-        user = getpass.getuser()
-    except Exception:
-        user = "unknown"
-    return f"{user}@{socket.gethostname()}:{os.getpid()}"
-
 
 def _print_json(payload: Any) -> None:
     json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, default=str)
@@ -2102,7 +2090,7 @@ def register_parsers(subparsers) -> None:
     )
     _add_common(submit)
     submit.add_argument("-n", "--name", default="", help="Human-readable job name")
-    submit.add_argument("--vram", default=None, help="VRAM to reserve, e.g. 20G")
+    submit.add_argument("--vram", default=None, help="Estimated peak VRAM per GPU, e.g. 20G; required and positive in shared mode")
     submit.add_argument("--gpus", type=int, default=1, help="GPUs required (0 for CPU-only)")
     submit.add_argument("--node", default=None, help="Pin to one node (prefix match)")
     submit.add_argument(

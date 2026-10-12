@@ -39,12 +39,13 @@ view:
 # the values shown here are the defaults.
 queue:
   headroom_mb: 512       # VRAM never handed out, so a job cannot starve the driver
-  max_jobs_per_gpu: 4    # concurrent queue jobs allowed on one card
+  gpu_mode: exclusive   # exclusive (default) | shared; shared requires --vram
+  max_jobs_per_gpu: 4    # concurrent queue jobs per card in shared mode only
   # CPU-only jobs (`--gpus 0`) reserve no VRAM, so this count is the only thing
   # bounding them. Set to 0 to allow any number.
   max_cpu_jobs_per_node: 4
   placement: spread      # spread: emptiest GPU first | pack: fullest GPU that fits
-  default_vram: "0"      # assumed reservation when `--vram` is omitted
+  default_vram: "0"      # exclusive mode only; shared jobs must specify --vram
   tick_min_interval: 3   # seconds between automatic scheduler passes
   lock_ttl: 180          # seconds a client may hold the scheduler lease
   probe_timeout: 25      # seconds allowed for one node probe

@@ -287,6 +287,7 @@ _ADDED_COLUMNS = {
         "lane": "TEXT",
         "lane_seq": "INTEGER",
         "overdue_at": "TEXT",
+        "allocation_mode": "TEXT",
     },
     "lanes": {
         "runner": "INTEGER NOT NULL DEFAULT 1",

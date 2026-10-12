@@ -412,10 +412,15 @@ class FakeLaneRunner:
                 break
             spec = lane["queued"][0]
             concurrency = max(1, int(lane.get("config", {}).get("concurrency") or spec.get("concurrency") or 1))
+            config = lane.get("config", {})
+            if config.get("gpu_mode") == "exclusive":
+                concurrency = 1
+            elif "max_jobs_per_gpu" in config:
+                concurrency = min(concurrency, config["max_jobs_per_gpu"])
             if len(lane["current"]) >= concurrency:
                 break
             needed = int(spec.get("vram_mb") or 0)
-            if needed and self._free_mb(spec.get("gpu_ids") or []) < needed:
+            if needed and self._free_mb(spec.get("gpu_ids") or []) < needed + int(config.get("headroom_mb", 0)):
                 break  # the card filled up with work the queue did not start
             lane["queued"].pop(0)
             lane["current"].append(self.node.start_lane_job(spec))

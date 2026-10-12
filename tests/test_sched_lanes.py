@@ -265,9 +265,10 @@ def test_a_lane_waits_when_foreign_work_fills_its_card(scheduler, cluster):
     assert dbm.get_job(scheduler.conn, job_id).state == "running"
 
 
-def test_a_vram_edit_replaces_the_spec_staged_with_a_lane_runner(
+def test_a_vram_edit_allows_an_unstaged_lane_job_to_fit(
     scheduler, cluster
 ):
+    scheduler.settings["gpu_mode"] = "shared"
     scheduler.tick(force=True)
     cluster["small-node"].add_foreign_process(0, 22000)
     job_id = scheduler.submit("waiting", lane="small-node:0", vram="4G")
@@ -275,9 +276,7 @@ def test_a_vram_edit_replaces_the_spec_staged_with_a_lane_runner(
 
     job = dbm.get_job(scheduler.conn, job_id)
     assert job.state == "pending"
-    assert job.run_dir  # the old 4G spec has already been staged remotely
-    runner = cluster.backends["small-node"].runner
-    assert runner.lanes["small-node:0"]["queued"][0]["vram_mb"] == 4096
+    assert job.run_dir is None  # no grant until the reservation fits
 
     scheduler.edit_job(job_id, vram="2G")
     scheduler.tick(force=True)
@@ -287,18 +286,18 @@ def test_a_vram_edit_replaces_the_spec_staged_with_a_lane_runner(
     assert job.state == "running"
 
 
-def test_an_edited_command_is_delivered_to_the_lane_runner(scheduler, cluster):
+def test_an_edited_command_is_delivered_to_the_lane_runner(scheduler, cluster, monkeypatch):
     import base64
 
     scheduler.tick(force=True)
-    cluster["small-node"].add_foreign_process(0, 22000)
+    runner = cluster.backends["small-node"].runner
+    monkeypatch.setattr(runner, "_advance", lambda lane_name: None)
     job_id = scheduler.submit("python old_eval.py", lane="small-node:0", vram="4G")
     replacement = "python new_eval.py --limit 20\nprintf '%s\\n' '评测完成'\n"
     scheduler.edit_job(job_id, command=replacement)
 
     scheduler.tick(force=True)
 
-    runner = cluster.backends["small-node"].runner
     spec = runner.lanes["small-node:0"]["queued"][0]
     script = base64.b64decode(spec["script_b64"]).decode("utf-8")
     assert spec["job_id"] == job_id
@@ -447,6 +446,7 @@ def test_a_job_can_be_moved_to_another_lane(scheduler):
 
 
 def test_a_job_can_leave_its_lane_for_the_free_pool(scheduler):
+    scheduler.settings["gpu_mode"] = "shared"
     scheduler.tick(force=True)
     scheduler.submit("head", lane="big-node:0", vram="1G")
     queued = scheduler.submit("queued", lane="big-node:0", vram="1G")
@@ -525,6 +525,7 @@ def test_priority_moves_do_not_touch_lane_jobs(scheduler):
 # --- concurrency -----------------------------------------------------------
 
 def test_raising_concurrency_lets_a_lane_run_two_at_once(scheduler):
+    scheduler.settings["gpu_mode"] = "shared"
     scheduler.tick(force=True)
     ids = _fill(scheduler, "big-node:0", 3)
     scheduler.set_lane_concurrency("big-node:0", 2)

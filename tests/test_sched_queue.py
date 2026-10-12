@@ -901,6 +901,7 @@ def test_editing_dependencies_reattaches_a_held_job(scheduler, cluster):
 def test_editing_vram_lets_a_pending_job_fit_without_resubmitting(
     scheduler, cluster
 ):
+    scheduler.settings["gpu_mode"] = "shared"
     # 73,415 total - 32,455 external - 512 headroom = 40,448 MiB free:
     # just below a 40 GiB reservation, but enough for 39 GiB.
     cluster["big-node"].add_foreign_process(0, 32455)
@@ -1142,6 +1143,7 @@ def test_a_cpu_only_job_needs_no_gpu_budget(scheduler, cluster):
 
 
 def test_max_jobs_per_gpu_is_enforced(scheduler, cluster):
+    scheduler.settings["gpu_mode"] = "shared"
     scheduler.settings["max_jobs_per_gpu"] = 2
     scheduler.tick(force=True)
     ids = [

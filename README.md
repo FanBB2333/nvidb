@@ -446,7 +446,36 @@ one round of SSH traffic rather than one per client. The open TUI ticks on a
 timer, and `nvidb queue tick --watch 10` gives you a background ticker if you
 want one.
 
-GPUs are allocated by **VRAM budget**, not whole cards:
+GPUs default to **exclusive** allocation: each card runs at most one queue
+job, regardless of `max_jobs_per_gpu` or lane concurrency. Cards with detected
+external GPU processes are not offered to new exclusive jobs. This is queue
+coordination, not OS-level isolation from processes started outside nvidb.
+
+For your own workloads that benefit from sharing, configure the queue host:
+
+```yaml
+queue:
+  gpu_mode: shared       # default: exclusive
+  max_jobs_per_gpu: 4
+  headroom_mb: 512
+```
+
+In shared mode every GPU submission **must explicitly supply a positive
+`--vram`**, estimating the maximum memory it will use **on each GPU**:
+
+```bash
+nvidb job submit --gpus 2 --vram 20G -- python train.py
+```
+
+This reserves 20 GiB on each of two cards. Missing or zero estimates are
+rejected, even if `default_vram` is configured. CPU-only jobs (`--gpus 0`)
+are exempt. Existing pending jobs without a positive estimate wait until
+their request is corrected. Running jobs are not stopped by a mode change.
+Already issued allocations retain their mode until that attempt finishes;
+in particular, switching to shared does not take away an existing exclusive
+allocation. `allocation_mode` in job JSON shows the mode of that allocation.
+
+Shared GPUs are allocated by **VRAM budget**:
 
 ```
 free = total − memory used by non-queue processes − reservations of queue jobs − headroom
@@ -455,9 +484,24 @@ free = total − memory used by non-queue processes − reservations of queue jo
 Counting foreign processes is what lets the queue share machines with work you
 started by hand: a card that someone else has filled simply reports no capacity,
 and jobs go elsewhere until it frees up. A job is charged the larger of what it
-reserved and what it actually uses, so understating `--vram` cannot oversubscribe
-a card. CPU-only jobs (`--gpus 0`) reserve nothing, so they are bounded by a
+reserved and what it actually uses. An estimate is a scheduling reservation,
+not a hard memory limit: underestimating a later peak can still cause OOM.
+CPU-only jobs (`--gpus 0`) reserve nothing, so they are bounded by a
 count instead: `max_cpu_jobs_per_node`, four by default.
+
+Jobs staged for a lane runner reserve capacity before they start, so the
+ordinary queue cannot reuse that capacity. An exclusive lane may prefetch its
+next job while retaining ownership of its cards; the runner executes that
+sequence one job at a time. Shared-mode prefetch reserves each staged job's
+memory and a per-GPU slot, and is limited by available resources.
+Runners pause new GPU starts when memory probing fails. A staged job's memory
+request cannot be edited because it may already have started; cancel and
+resubmit it instead.
+
+Job attribution defaults to the submitting computer's global Git `user.name`
+and `user.email` (`Name <email>`). Remote submissions carry this identity to
+the queue host. `--submitter` and `NVIDB_SUBMITTER` override it; when Git identity
+is unavailable nvidb falls back to the local user, hostname and process ID.
 
 A job cancelled or timed out while its node was unreachable keeps its record
 final but its process alive. The pid is remembered separately from the job — it

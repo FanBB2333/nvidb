@@ -29,7 +29,10 @@ queue:
   # Everything under `queue:` in config.example.yml is accepted here and wins
   # over the value there.
   headroom_mb: 512
-  max_jobs_per_gpu: 4
+  gpu_mode: exclusive    # exclusive (default) | shared
+  # Shared mode requires an explicit positive --vram peak estimate per GPU
+  # on every GPU job submission. CPU-only jobs are exempt.
+  max_jobs_per_gpu: 4     # applies only in shared mode
   backup:
     enabled: true
     interval_hours: 24

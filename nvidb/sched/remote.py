@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import config as nvidb_config
 from . import keeper as keeper_mod
+from .identity import default_submitter
 
 # Set on the far side so a misconfigured remote pointing at itself fails as a
 # plain command instead of looping forever.
@@ -191,6 +192,8 @@ def build_command(
         )
 
     env = [f"{NO_REMOTE_ENV}=1"]
+    if head[:2] == ["job", "submit"]:
+        env.append(f"NVIDB_SUBMITTER={shlex.quote(default_submitter())}")
     if target.get("nvidb_home"):
         env.append(f"NVIDB_HOME={shlex.quote(str(target['nvidb_home']))}")
     command = " ".join(
