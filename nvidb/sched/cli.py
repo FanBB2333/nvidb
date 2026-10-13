@@ -1785,7 +1785,12 @@ def _add_ignored_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def register_parsers(subparsers) -> None:
-    """Attach the `queue` and `job` command trees to the main nvidb parser."""
+    """Attach the queue and job command trees to the main parser."""
+    _register_queue_parsers(subparsers)
+    _register_job_parsers(subparsers)
+
+def _register_queue_parsers(subparsers) -> None:
+    """Queue monitoring, lifecycle, and node administration commands."""
     queue = subparsers.add_parser(
         "queue",
         aliases=["q"],
@@ -1941,6 +1946,16 @@ def register_parsers(subparsers) -> None:
     lanes.add_argument("--node", default=None, help="Only lanes on this node")
     lanes.set_defaults(func=cmd_lanes)
 
+    _register_lane_parser(queue_sub)
+    _register_node_actions(queue_sub)
+
+    tui = queue_sub.add_parser("tui", help="Open the interactive queue TUI")
+    _add_common(tui, json_flag=False)
+    tui.add_argument("--refresh", type=float, default=3.0)
+    tui.set_defaults(func=cmd_tui)
+
+def _register_lane_parser(queue_sub) -> None:
+    """Lane ordering and resident runner controls."""
     lane = queue_sub.add_parser(
         "lane",
         help="Inspect and reorder one GPU's serial queue",
@@ -2042,6 +2057,7 @@ def register_parsers(subparsers) -> None:
     lane_concurrency.add_argument("value", type=int)
     lane_concurrency.set_defaults(func=cmd_lane_concurrency)
 
+def _register_node_actions(queue_sub) -> None:
     drain = queue_sub.add_parser("drain", help="Stop scheduling new jobs onto a node")
     _add_common(drain)
     drain.add_argument("name")
@@ -2068,11 +2084,7 @@ def register_parsers(subparsers) -> None:
     unignore.add_argument("name")
     unignore.set_defaults(func=cmd_node_ignore, action="unignore")
 
-    tui = queue_sub.add_parser("tui", help="Open the interactive queue TUI")
-    _add_common(tui, json_flag=False)
-    tui.add_argument("--refresh", type=float, default=3.0)
-    tui.set_defaults(func=cmd_tui)
-
+def _register_job_parsers(subparsers) -> None:
     job = subparsers.add_parser("job", help="Submit and manage queue jobs")
     job_sub = job.add_subparsers(dest="job_command")
     job.set_defaults(
@@ -2080,6 +2092,12 @@ def register_parsers(subparsers) -> None:
         func=lambda args: _error("pick a job subcommand (submit, ls, show, wait, ...)"),
     )
 
+    _register_submit_parser(job_sub)
+    _register_job_read_parsers(job_sub)
+    _register_job_control_parsers(job_sub)
+    _register_job_metadata_parsers(job_sub)
+
+def _register_submit_parser(job_sub) -> None:
     submit = job_sub.add_parser(
         "submit",
         help="Queue a command",
@@ -2130,6 +2148,7 @@ def register_parsers(subparsers) -> None:
     )
     submit.set_defaults(func=cmd_submit)
 
+def _register_job_read_parsers(job_sub) -> None:
     listing = job_sub.add_parser("ls", help="List jobs")
     _add_common(listing)
     listing.add_argument("--state", action="append", choices=list(JOB_STATES), default=[])
@@ -2168,6 +2187,7 @@ def register_parsers(subparsers) -> None:
     wait.add_argument("--logs", type=int, nargs="?", const=40, default=0, metavar="LINES")
     wait.set_defaults(func=cmd_wait)
 
+def _register_job_control_parsers(job_sub) -> None:
     cancel = job_sub.add_parser("cancel", help="Cancel pending or running jobs")
     _add_common(cancel)
     cancel.add_argument("ids", nargs="+")
@@ -2221,6 +2241,7 @@ def register_parsers(subparsers) -> None:
     requeue.add_argument("--no-tick", action="store_true")
     requeue.set_defaults(func=cmd_requeue)
 
+def _register_job_metadata_parsers(job_sub) -> None:
     result = job_sub.add_parser(
         "result", help="Read or write a job's result payload (a channel between clients)"
     )
@@ -2271,7 +2292,6 @@ def register_parsers(subparsers) -> None:
     _add_common(purge)
     purge.add_argument("--state", action="append", choices=sorted(TERMINAL_JOB_STATES), default=[])
     purge.set_defaults(func=cmd_purge)
-
 
 def quiet_transport_logging() -> None:
     """Keep Paramiko's internal connection tracebacks out of queue output.

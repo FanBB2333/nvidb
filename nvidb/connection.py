@@ -37,6 +37,7 @@ from .mouse import (
     MouseSequenceParser,
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
+from .process_view import ProcessPanel
 from .ssh_proxy import open_proxyjump_socket
 from .tui_theme import (
     DiffScreen,
@@ -3003,6 +3004,10 @@ class NVClientPool:
             raw_stats_by_client,
             selected_row,
         )
+        return self._filter_and_sort_processes(processes)
+
+    def _filter_and_sort_processes(self, processes):
+        """Apply the active view to cached rows without mutating the source."""
         query = str(
             self.unified_process_filter or ""
         ).strip().casefold()
@@ -3311,104 +3316,18 @@ class NVClientPool:
         pane_focused = (
             self.unified_active_pane == "process"
         )
-        border_horizontal = "─" if pane_focused else "╌"
-        border_vertical = "│" if pane_focused else "┊"
         label_color = "cyan" if pane_focused else "dark_grey"
         process_line_map = process_line_map if process_line_map is not None else {}
         command_line_map = command_line_map if command_line_map is not None else {}
         action_regions = action_regions if action_regions is not None else []
 
-        def trim(text, limit):
-            text = str(text)
-            if display_width(text) <= limit:
-                return text
-            if limit <= 2:
-                return fit_display(text, limit, ellipsis="")
-            return fit_display(text, limit, ellipsis="..")
-
-        def panel_rule(label, *, bottom=False):
-            left, right = ("╰", "╯") if bottom else ("├", "┤")
-            if not label:
-                plain = (
-                    left
-                    + border_horizontal * max(0, width - 2)
-                    + right
-                )
-                return colored(plain, "dark_grey")
-            label = trim(
-                f"{border_horizontal} {label} ",
-                max(0, width - 2),
-            )
-            plain = (
-                left
-                + label
-                + border_horizontal * max(0, width - 2 - display_width(label))
-                + right
-            )
-            return colored(plain, "dark_grey")
-
-        def panel_line(plain, styled=None):
-            original_plain = str(plain)
-            plain = trim(original_plain, inner_width)
-            if styled is None or plain != original_plain:
-                styled = plain
-            padding = " " * max(0, inner_width - display_width(plain))
-            return (
-                colored(f"{border_vertical} ", "dark_grey")
-                + (styled if styled is not None else plain)
-                + padding
-                + colored(f" {border_vertical}", "dark_grey")
-            )
-
-        def pack_fields(label, fields):
-            """Pack colored detail fields onto as many panel rows as needed."""
-            prefix = f"{label:<9}"
-            continuation = " " * display_width(prefix)
-            packed = []
-            current = []
-            current_length = display_width(prefix)
-            for text, color in fields:
-                separator_length = 3 if current else 0
-                if (
-                    current
-                    and current_length + separator_length + display_width(text)
-                    > inner_width
-                ):
-                    packed.append((prefix, current))
-                    prefix = continuation
-                    current = []
-                    current_length = display_width(prefix)
-                    separator_length = 0
-                current.append((text, color))
-                current_length += separator_length + display_width(text)
-            packed.append((prefix, current))
-
-            rows = []
-            for row_prefix, row_fields in packed:
-                plain = row_prefix + " | ".join(
-                    text for text, _color in row_fields
-                )
-                styled = colored(
-                    row_prefix,
-                    label_color,
-                    attrs=["bold"] if row_prefix.strip() else None,
-                ) + " | ".join(
-                    colored(text, color)
-                    if color
-                    else text
-                    for text, color in row_fields
-                )
-                rows.append((plain, styled))
-            return rows
+        panel = ProcessPanel(width, focused=pane_focused, colorize=colored)
 
         all_processes = self._get_unified_process_details(
             raw_stats_by_client,
             selected_row,
         )
-        processes = self._get_sorted_unified_processes(
-            raw_stats_by_client,
-            selected_row,
-        )
+        processes = self._filter_and_sort_processes(all_processes)
         self._unified_process_total_count = len(all_processes)
         self._unified_process_count = len(processes)
         selected_index = int(
@@ -3483,23 +3402,7 @@ class NVClientPool:
             f"{node} ({hostname}) | GPU {gpu_index} | "
             f"sort {process_sort_label}{process_sort_arrow} | {focus_label}"
         )
-        top_label = trim(
-            f"{border_horizontal} {title} ",
-            max(0, width - 2),
-        )
-        top_tail = (
-            border_horizontal * max(0, width - 2 - len(top_label))
-            + "╮"
-        )
-        lines = [
-            colored("╭", "dark_grey")
-            + colored(
-                top_label,
-                label_color,
-                attrs=["bold"] if pane_focused else None,
-            )
-            + colored(top_tail, "dark_grey")
-        ]
+        lines = [panel.heading(title)]
 
         total_process_vram = sum(
             self._extract_metric_number(process.get("used_memory")) or 0
@@ -3528,7 +3431,7 @@ class NVClientPool:
         )
         if terminal_height >= 28:
             lines.append(
-                panel_line(
+                panel.line(
                     visible_summary,
                     colored(visible_summary, "light_grey"),
                 )
@@ -3538,14 +3441,14 @@ class NVClientPool:
             self._unified_command_line_count = 0
             self._unified_command_page_size = 0
             self.unified_command_scroll = 0
-            lines.append(panel_rule("PROCESS LIST"))
+            lines.append(panel.rule("PROCESS LIST"))
             empty = (
                 f"No processes match /{filter_query}"
                 if filter_query
                 else "No active GPU processes"
             )
-            lines.append(panel_line(empty, colored(empty, "dark_grey")))
-            lines.append(panel_rule("ACTIONS"))
+            lines.append(panel.line(empty, colored(empty, "dark_grey")))
+            lines.append(panel.rule("ACTIONS"))
             history_label = (
                 "[t] History ON"
                 if self.unified_show_trends
@@ -3563,7 +3466,7 @@ class NVClientPool:
                 )
             )
             lines.append(
-                panel_line(
+                panel.line(
                     action_plain,
                     "Actions  "
                     + colored(
@@ -3577,7 +3480,7 @@ class NVClientPool:
             if notice and notice.get("expires_at", 0) > time.monotonic():
                 message = str(notice.get("message", ""))
                 lines.append(
-                    panel_line(
+                    panel.line(
                         message,
                         colored(
                             message,
@@ -3588,7 +3491,7 @@ class NVClientPool:
                 )
             elif notice:
                 self._process_action_notice = None
-            lines.append(panel_rule("", bottom=True))
+            lines.append(panel.rule("", bottom=True))
             return "\n".join(lines)
 
         active_sort_column = self.UNIFIED_PROCESS_SORT_COLUMNS[
@@ -3684,7 +3587,7 @@ class NVClientPool:
                 column["width"] += extra_width
 
         def padded_cell(value, column):
-            value = trim(value, column["width"])
+            value = panel.trim(value, column["width"])
             if column["align"] == "right":
                 return " " * max(0, column["width"] - display_width(value)) + value
             return pad_display(value, column["width"])
@@ -3779,11 +3682,11 @@ class NVClientPool:
         if not ultra_compact:
             if compact_layout:
                 header_line_index = len(lines)
-                lines.append(panel_line(header_plain, header_styled))
+                lines.append(panel.line(header_plain, header_styled))
             else:
-                lines.append(panel_rule("PROCESS LIST"))
+                lines.append(panel.rule("PROCESS LIST"))
                 header_line_index = len(lines)
-                lines.append(panel_line(header_plain, header_styled))
+                lines.append(panel.line(header_plain, header_styled))
 
         if header_line_index is not None:
             sort_targets = {
@@ -3873,12 +3776,12 @@ class NVClientPool:
                     for cell, column in zip(cells, columns)
                 )
             process_line_map[len(lines)] = index
-            lines.append(panel_line(plain, styled))
+            lines.append(panel.line(plain, styled))
 
         if terminal_height >= 28 and (start > 0 or end < len(processes)):
             scroll_status = f"Rows {start + 1}-{end}/{len(processes)} | wheel or j/k"
             lines.append(
-                panel_line(
+                panel.line(
                     scroll_status,
                     colored(scroll_status, "dark_grey"),
                 )
@@ -3897,7 +3800,7 @@ class NVClientPool:
                     f" | {process.get('type', 'N/A')}"
                     f" | {process.get('state') or '-'}"
                 )
-            lines.append(panel_rule(selected_label))
+            lines.append(panel.rule(selected_label))
         vram_mib = self._extract_metric_number(process.get("used_memory"))
         gpu_percent = (
             vram_mib / total_gpu_mib * 100
@@ -4034,13 +3937,13 @@ class NVClientPool:
             (f"Elapsed {process.get('elapsed') or '-'}", "dark_grey"),
         ]
         if not compact_history:
-            for plain, styled in pack_fields("Usage", usage_fields):
+            for plain, styled in panel.fields("Usage", usage_fields):
                 process_line_map[len(lines)] = selected_index
-                lines.append(panel_line(plain, styled))
+                lines.append(panel.line(plain, styled))
             if not compact_layout:
-                for plain, styled in pack_fields("Details", detail_fields):
+                for plain, styled in panel.fields("Details", detail_fields):
                     process_line_map[len(lines)] = selected_index
-                    lines.append(panel_line(plain, styled))
+                    lines.append(panel.line(plain, styled))
 
         command = str(
             process.get("command") or process.get("process_name") or "N/A"
@@ -4137,16 +4040,16 @@ class NVClientPool:
                 )
                 process_line_map[len(lines)] = selected_index
                 command_line_map[len(lines)] = selected_index
-                lines.append(panel_line(plain, styled))
+                lines.append(panel.line(plain, styled))
 
         if history_rows:
             if history_rule_lines:
-                lines.append(panel_rule("SELECTED PROCESS HISTORY"))
+                lines.append(panel.rule("SELECTED PROCESS HISTORY"))
             for plain, styled in history_rows:
-                lines.append(panel_line(plain, styled))
+                lines.append(panel.line(plain, styled))
 
         if not compact_layout:
-            lines.append(panel_rule("ACTIONS"))
+            lines.append(panel.rule("ACTIONS"))
         command_paged = (
             not compact_history
             and command_page_size < len(all_command_parts)
@@ -4159,132 +4062,53 @@ class NVClientPool:
         def action_color(color):
             return color if pane_focused else "dark_grey"
 
-        history_action_label = (
-            f"t:{1 if history_enabled else 0}"
-            if tiny_actions
-            else f"[t]H:{'ON' if history_enabled else 'OFF'}"
-            if compact_actions
-            else (
-                f"[t]Hist {'ON' if history_enabled else 'OFF'}"
-                if command_paged
-                else f"[t] History {'ON' if history_enabled else 'OFF'}"
-            )
-        )
+        def action_label(tiny, compact, full):
+            if tiny_actions:
+                return tiny
+            return compact if compact_actions else full
+
+        history_state = "ON" if history_enabled else "OFF"
+        history_label = "[t]Hist" if command_paged else "[t] History"
         action_segments = []
         if not compact_actions:
             action_segments.append(("Actions", None, None))
-        action_segments.extend(
-            [
-                (
-                    (
-                        "i:INT"
-                        if tiny_actions
-                        else "[i]INT"
-                        if compact_actions
-                        else "[i] INT"
-                    ),
-                    action_color("cyan"),
-                    ("signal", "INT"),
-                ),
-                (
-                    (
-                        "T:TERM"
-                        if tiny_actions
-                        else "[T]TERM"
-                        if compact_actions
-                        else "[T] TERM"
-                    ),
-                    action_color("yellow"),
-                    ("signal", "TERM"),
-                ),
-                (
-                    (
-                        "K:KILL"
-                        if tiny_actions
-                        else "[K]KILL"
-                        if compact_actions
-                        else "[K] KILL"
-                    ),
-                    action_color("red"),
-                    ("signal", "KILL"),
-                ),
-            ]
-        )
-        action_segments.append(
-            (
-                history_action_label,
-                action_color("cyan"),
-                ("toggle_trends", None),
+        for key, signal, color in (
+            ("i", "INT", "cyan"),
+            ("T", "TERM", "yellow"),
+            ("K", "KILL", "red"),
+        ):
+            label = action_label(
+                f"{key}:{signal}", f"[{key}]{signal}", f"[{key}] {signal}",
             )
-        )
+            action_segments.append((label, action_color(color), ("signal", signal)))
+        action_segments.append((
+            action_label(
+                f"t:{int(history_enabled)}",
+                f"[t]H:{history_state}",
+                f"{history_label} {history_state}",
+            ),
+            action_color("cyan"),
+            ("toggle_trends", None),
+        ))
         if command_paged:
-            if tiny_actions:
-                action_segments.extend(
-                    [
-                        (
-                            "<",
-                            action_color("cyan"),
-                            ("command_scroll", -1),
-                        ),
-                        (
-                            f"{command_start + 1}/{len(all_command_parts)}",
-                            "dark_grey",
-                            None,
-                        ),
-                        (
-                            ">",
-                            action_color("cyan"),
-                            ("command_scroll", 1),
-                        ),
-                    ]
-                )
-            else:
-                action_segments.extend(
-                    [
-                        (
-                            "[<]Cmd",
-                            action_color("cyan"),
-                            ("command_scroll", -1),
-                        ),
-                        (
-                            f"{command_start + 1}-{command_end}/"
-                            f"{len(all_command_parts)}",
-                            "dark_grey",
-                            None,
-                        ),
-                        (
-                            "[>]Cmd",
-                            action_color("cyan"),
-                            ("command_scroll", 1),
-                        ),
-                    ]
-                )
-        action_segments.extend(
-            [
-                (
-                    (
-                        "-"
-                        if tiny_actions
-                        else "-r"
-                        if compact_actions
-                        else "[-] Rows"
-                    ),
-                    action_color("cyan"),
-                    ("process_rows", -1),
-                ),
-                (
-                    (
-                        "+"
-                        if tiny_actions
-                        else "+r"
-                        if compact_actions
-                        else "[+] Rows"
-                    ),
-                    action_color("cyan"),
-                    ("process_rows", 1),
-                ),
-            ]
-        )
+            page_label = (
+                f"{command_start + 1}/{len(all_command_parts)}"
+                if tiny_actions
+                else f"{command_start + 1}-{command_end}/{len(all_command_parts)}"
+            )
+            action_segments.extend([
+                ("<" if tiny_actions else "[<]Cmd",
+                 action_color("cyan"), ("command_scroll", -1)),
+                (page_label, "dark_grey", None),
+                (">" if tiny_actions else "[>]Cmd",
+                 action_color("cyan"), ("command_scroll", 1)),
+            ])
+        for symbol, delta in (("-", -1), ("+", 1)):
+            action_segments.append((
+                action_label(symbol, f"{symbol}r", f"[{symbol}] Rows"),
+                action_color("cyan"),
+                ("process_rows", delta),
+            ))
         action_plain = action_separator.join(
             text for text, _color, _target in action_segments
         )
@@ -4311,7 +4135,7 @@ class NVClientPool:
                         target,
                     )
                 )
-        lines.append(panel_line(action_plain, action_styled))
+        lines.append(panel.line(action_plain, action_styled))
 
         pending = self._pending_process_signal
         if pending and pending.get("expires_at", 0) <= time.monotonic():
@@ -4322,13 +4146,13 @@ class NVClientPool:
                 f"Confirm SIG{pending['signal']} -> PID {pending['pid']}: "
                 "Enter / same action again | Esc cancels"
             )
-            lines.append(panel_line(message, colored(message, "yellow", attrs=["bold"])))
+            lines.append(panel.line(message, colored(message, "yellow", attrs=["bold"])))
         else:
             notice = self._process_action_notice
             if notice and notice.get("expires_at", 0) > time.monotonic():
                 message = str(notice.get("message", ""))
                 lines.append(
-                    panel_line(
+                    panel.line(
                         message,
                         colored(
                             message,
@@ -4340,7 +4164,7 @@ class NVClientPool:
             elif notice:
                 self._process_action_notice = None
 
-        lines.append(panel_rule("", bottom=True))
+        lines.append(panel.rule("", bottom=True))
         return "\n".join(lines)
 
     @staticmethod

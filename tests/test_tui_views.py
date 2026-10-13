@@ -1635,6 +1635,21 @@ def test_detailed_process_pane_shows_the_whole_command_wrapped(monkeypatch):
     assert all(len(line) <= 90 for line in rendered.splitlines())
 
 
+@pytest.mark.parametrize("width", [60, 90, 120])
+def test_process_pane_border_measures_wide_node_names(monkeypatch, width):
+    pool = _pool()
+    pool.pool[1].description = "训练节点"
+    row = dict(_gpu_row(0, "GPU", "10 %", "1/24 GiB"),
+               Node="训练节点", Hostname="100.64.0.42")
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((width, 30)))
+
+    rendered = pool._format_unified_process_details(_focus_raw_stats("python train.py"), row)
+
+    header = _without_ansi(rendered.splitlines()[0])
+    assert "训练节点" in header
+    assert display_width(header) == width
+
+
 def test_detailed_process_actions_stay_visible_on_a_24_line_terminal(
     monkeypatch,
 ):

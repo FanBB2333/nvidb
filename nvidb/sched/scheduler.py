@@ -30,7 +30,7 @@ from .. import config as nvidb_config
 from . import db as dbm
 from . import keeper as keeper_mod
 from . import runner_agent
-from .executor import JobExecutor, LaunchRejected, NodeProbe, build_run_script
+from .executor import JobExecutor, JobProbe, LaunchRejected, NodeProbe, build_run_script
 from .model import (
     GpuProcess,
     Job,
@@ -1568,56 +1568,8 @@ class Scheduler:
                 }
 
             if observed.finished:
-                dbm.resolve_job_alerts(self.conn, job.id, "job_overdue")
-                exit_code = observed.exit_code
-                state = "completed" if exit_code == 0 else "failed"
-                result = None
-                try:
-                    result = backend.executor.read_result(job.run_dir)
-                except TransportError:
-                    pass
-                self._renew_tick_lease()
-
-                detail = None
-                last_error = None
-                if state == "failed":
-                    detail = self._failure_detail(backend, job)
-                    # The first line of the reason belongs on the job row; the
-                    # whole tail goes to the alert.
-                    reason = (detail or "").strip().splitlines()
-                    last_error = f"exit code {exit_code}"
-                    if reason:
-                        last_error += f": {reason[-1][:200]}"
-
-                dbm.update_job(
-                    self.conn,
-                    job.id,
-                    state=state,
-                    exit_code=exit_code,
-                    finished_at=_epoch_to_iso(observed.finished_epoch) or utcnow(),
-                    result=result,
-                    last_error=last_error,
-                    **progress_updates,
-                )
-                if state == "failed":
-                    self._raise_alert(
-                        "job_failed",
-                        f"{job.name or 'job'} failed with exit code {exit_code}",
-                        job_id=job.id,
-                        node=node.name,
-                        detail=detail,
-                        summary=summary,
-                    )
-                dbm.add_event(
-                    self.conn,
-                    "job_finished",
-                    job_id=job.id,
-                    node=node.name,
-                    message=f"{state} (exit {exit_code})",
-                    data={"exit_code": exit_code, "state": state},
-                )
-                summary["finished"].append(
-                    {"id": job.id, "state": state, "exit_code": exit_code}
+                self._record_finished_job(
+                    node, backend, job, observed, progress_updates, summary
                 )
                 continue
 
@@ -1630,109 +1582,187 @@ class Scheduler:
                 dbm.update_job(self.conn, job.id, **updates)
                 continue
 
-            # Neither alive nor holding an exit code: the process vanished.
-            # Why is usually sitting in the job's own stderr - a full disk, an
-            # OOM kill - so it is read once here and carried onto the record
-            # rather than left in an alert nobody correlates with the job.
+            self._reconcile_missing_job(
+                node, backend, job, probe, progress_updates, summary
+            )
+
+    def _record_finished_job(
+        self,
+        node: Node,
+        backend: NodeBackend,
+        job: Job,
+        observed: JobProbe,
+        progress_updates: Dict[str, Any],
+        summary: Dict[str, Any],
+    ) -> None:
+        """Store the exit result and publish the matching event and alert."""
+        dbm.resolve_job_alerts(self.conn, job.id, "job_overdue")
+        exit_code = observed.exit_code
+        state = "completed" if exit_code == 0 else "failed"
+        result = None
+        try:
+            result = backend.executor.read_result(job.run_dir)
+        except TransportError:
+            pass
+        self._renew_tick_lease()
+
+        detail = None
+        last_error = None
+        if state == "failed":
             detail = self._failure_detail(backend, job)
+            # The last line of the reason belongs on the job row; the
+            # whole tail goes to the alert.
             reason = (detail or "").strip().splitlines()
-            leftovers = _leftover_group_pids(job, probe)
+            last_error = f"exit code {exit_code}"
+            if reason:
+                last_error += f": {reason[-1][:200]}"
 
-            if leftovers:
-                # The wrapper is gone but its work is not: processes it started
-                # are still in the group it created, reparented to init. No
-                # exit code is ever coming, so the record has to close - but
-                # starting another attempt now would run a second copy beside
-                # the first, and closing quietly would leave the node holding
-                # work this queue no longer mentions.
-                pids = ", ".join(str(pid) for pid in leftovers[:8])
-                if len(leftovers) > 8:
-                    pids += ", ..."
-                left_behind = (
-                    f"{len(leftovers)} process(es) from its group are still "
-                    f"running (pgid {job.remote_pgid}: {pids})"
-                )
-            else:
-                left_behind = None
+        dbm.update_job(
+            self.conn,
+            job.id,
+            state=state,
+            exit_code=exit_code,
+            finished_at=_epoch_to_iso(observed.finished_epoch) or utcnow(),
+            result=result,
+            last_error=last_error,
+            **progress_updates,
+        )
+        if state == "failed":
+            self._raise_alert(
+                "job_failed",
+                f"{job.name or 'job'} failed with exit code {exit_code}",
+                job_id=job.id,
+                node=node.name,
+                detail=detail,
+                summary=summary,
+            )
+        dbm.add_event(
+            self.conn,
+            "job_finished",
+            job_id=job.id,
+            node=node.name,
+            message=f"{state} (exit {exit_code})",
+            data={"exit_code": exit_code, "state": state},
+        )
+        summary["finished"].append(
+            {"id": job.id, "state": state, "exit_code": exit_code}
+        )
 
-            if job.attempt <= job.max_retries and job.max_retries > 0 and not leftovers:
-                last_error = "process vanished; retrying"
-                if reason:
-                    last_error += f": {reason[-1][:200]}"
-                dbm.update_job(
-                    self.conn,
-                    job.id,
-                    state="pending",
-                    node=None,
-                    gpu_ids="",
-                    remote_pid=None,
-                    remote_pgid=None,
-                    run_dir=None,
-                    started_at=None,
-                    heartbeat_at=None,
-                    last_error=last_error,
-                    overdue_at=None,
-                    # The next attempt starts fresh, so the old status line
-                    # must not linger as if it were current.
-                    progress=None,
-                    progress_at=None,
-                )
-                dbm.add_event(
-                    self.conn,
-                    "job_requeued",
-                    job_id=job.id,
-                    node=node.name,
-                    message="process vanished; retrying",
-                )
-                self._raise_alert(
-                    "job_retried",
-                    f"{job.name or 'job'} vanished on {node.name}; retrying "
-                    f"(attempt {job.attempt + 1} of {job.max_retries + 1})",
-                    severity="warning",
-                    job_id=job.id,
-                    node=node.name,
-                    detail=detail,
-                    summary=summary,
-                )
-            else:
-                last_error = "process vanished without an exit code"
-                if left_behind:
-                    last_error += f"; {left_behind}"
-                if reason:
-                    last_error += f": {reason[-1][:200]}"
-                dbm.update_job(
-                    self.conn,
-                    job.id,
-                    state="lost",
-                    finished_at=utcnow(),
-                    last_error=last_error,
-                    # Whatever the job last reported is the best clue about how
-                    # far it got, so it is kept on the record.
-                    **progress_updates,
-                )
-                dbm.add_event(
-                    self.conn,
-                    "job_lost",
-                    job_id=job.id,
-                    node=node.name,
-                    message=last_error[:200],
-                    data={"leftover_pids": leftovers} if leftovers else None,
-                )
-                title = f"{job.name or 'job'} vanished on {node.name} without an exit code"
-                if left_behind:
-                    title += f"; {len(leftovers)} of its processes are still running"
-                    # The pids lead the detail because acting on them - looking,
-                    # then killing - is the only thing left to decide.
-                    detail = f"{left_behind}\n\n{detail or ''}".strip()
-                self._raise_alert(
-                    "job_lost",
-                    title,
-                    job_id=job.id,
-                    node=node.name,
-                    detail=detail,
-                    summary=summary,
-                )
-                summary["finished"].append({"id": job.id, "state": "lost"})
+    def _reconcile_missing_job(
+        self,
+        node: Node,
+        backend: NodeBackend,
+        job: Job,
+        probe: NodeProbe,
+        progress_updates: Dict[str, Any],
+        summary: Dict[str, Any],
+    ) -> None:
+        """Retry a vanished attempt only when none of its processes remain."""
+        # Neither alive nor holding an exit code: the process vanished.
+        # Why is usually sitting in the job's own stderr - a full disk, an
+        # OOM kill - so it is read once here and carried onto the record
+        # rather than left in an alert nobody correlates with the job.
+        detail = self._failure_detail(backend, job)
+        reason = (detail or "").strip().splitlines()
+        leftovers = _leftover_group_pids(job, probe)
+
+        if leftovers:
+            # The wrapper is gone but its work is not: processes it started
+            # are still in the group it created, reparented to init. No
+            # exit code is ever coming, so the record has to close - but
+            # starting another attempt now would run a second copy beside
+            # the first, and closing quietly would leave the node holding
+            # work this queue no longer mentions.
+            pids = ", ".join(str(pid) for pid in leftovers[:8])
+            if len(leftovers) > 8:
+                pids += ", ..."
+            left_behind = (
+                f"{len(leftovers)} process(es) from its group are still "
+                f"running (pgid {job.remote_pgid}: {pids})"
+            )
+        else:
+            left_behind = None
+
+        if job.attempt <= job.max_retries and job.max_retries > 0 and not leftovers:
+            last_error = "process vanished; retrying"
+            if reason:
+                last_error += f": {reason[-1][:200]}"
+            dbm.update_job(
+                self.conn,
+                job.id,
+                state="pending",
+                node=None,
+                allocation_mode=None,
+                gpu_mem_mb=None,
+                gpu_ids="",
+                remote_pid=None,
+                remote_pgid=None,
+                run_dir=None,
+                started_at=None,
+                heartbeat_at=None,
+                last_error=last_error,
+                overdue_at=None,
+                # The next attempt starts fresh, so the old status line
+                # must not linger as if it were current.
+                progress=None,
+                progress_at=None,
+            )
+            dbm.add_event(
+                self.conn,
+                "job_requeued",
+                job_id=job.id,
+                node=node.name,
+                message="process vanished; retrying",
+            )
+            self._raise_alert(
+                "job_retried",
+                f"{job.name or 'job'} vanished on {node.name}; retrying "
+                f"(attempt {job.attempt + 1} of {job.max_retries + 1})",
+                severity="warning",
+                job_id=job.id,
+                node=node.name,
+                detail=detail,
+                summary=summary,
+            )
+        else:
+            last_error = "process vanished without an exit code"
+            if left_behind:
+                last_error += f"; {left_behind}"
+            if reason:
+                last_error += f": {reason[-1][:200]}"
+            dbm.update_job(
+                self.conn,
+                job.id,
+                state="lost",
+                finished_at=utcnow(),
+                last_error=last_error,
+                # Whatever the job last reported is the best clue about how
+                # far it got, so it is kept on the record.
+                **progress_updates,
+            )
+            dbm.add_event(
+                self.conn,
+                "job_lost",
+                job_id=job.id,
+                node=node.name,
+                message=last_error[:200],
+                data={"leftover_pids": leftovers} if leftovers else None,
+            )
+            title = f"{job.name or 'job'} vanished on {node.name} without an exit code"
+            if left_behind:
+                title += f"; {len(leftovers)} of its processes are still running"
+                # The pids lead the detail because acting on them - looking,
+                # then killing - is the only thing left to decide.
+                detail = f"{left_behind}\n\n{detail or ''}".strip()
+            self._raise_alert(
+                "job_lost",
+                title,
+                job_id=job.id,
+                node=node.name,
+                detail=detail,
+                summary=summary,
+            )
+            summary["finished"].append({"id": job.id, "state": "lost"})
 
     def _reconcile_staged(
         self,

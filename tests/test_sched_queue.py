@@ -520,6 +520,29 @@ def test_a_vanished_process_is_retried_when_retries_remain(scheduler, cluster):
     assert job.attempt == 2
 
 
+def test_a_pending_retry_clears_the_previous_gpu_allocation(scheduler, cluster):
+    job_id = scheduler.submit(
+        "python train.py", vram="1G", node="small-node", max_retries=1
+    )
+    scheduler.tick(force=True)
+    cluster["small-node"].job_allocates(job_id, 0, 1024)
+    scheduler.tick(force=True)
+    previous = dbm.get_job(scheduler.conn, job_id)
+    assert previous.gpu_mem_mb == 1024
+    assert previous.allocation_mode is not None
+
+    scheduler.set_node_enabled("small-node", False)
+    cluster["small-node"].vanish_job(job_id)
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, job_id)
+    assert job.state == "pending"
+    assert job.node is None
+    assert job.gpu_ids == []
+    assert job.allocation_mode is None
+    assert job.gpu_mem_mb is None
+
+
 def test_a_lost_job_records_why_it_died(scheduler, cluster):
     """The reason is in the job's own log, so it belongs on the job's record.
 
