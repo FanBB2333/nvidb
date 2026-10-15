@@ -33,6 +33,17 @@ queue:
   # Shared mode requires an explicit positive --vram peak estimate per GPU
   # on every GPU job submission. CPU-only jobs are exempt.
   max_jobs_per_gpu: 4     # applies only in shared mode
+  # Named GPU pools. `nvidb job submit --pool experiments ...` runs on whichever
+  # member card fits when the job starts, on any of the listed nodes. Members
+  # never widen a node's `gpu_ids` allowlist; pools may overlap, and a shared
+  # card keeps one budget. A multi-GPU job still needs all its cards on one node.
+  # Editing members affects jobs still waiting, never ones already started.
+  pools:
+    experiments:
+      members:
+        - node: "gpu-node"
+          gpus: [0]
+        - node: "queue-host"   # no `gpus`: every queue GPU on that node
   backup:
     enabled: true
     interval_hours: 24

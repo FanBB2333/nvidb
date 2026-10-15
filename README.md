@@ -552,6 +552,7 @@ a `processes` list naming every process with `managed` and `job_id`.
 # Put the command last, after `--`, or pass it as one quoted string
 nvidb job submit --name train --vram 20G -- python train.py --epochs 10
 nvidb job submit --node gpu-node --vram 8G --workdir ~/proj -- python eval.py
+nvidb job submit --pool experiments --vram 16G -- python train.py  # any card in a pool
 nvidb job submit --gpus 0 -- python prepare_data.py        # CPU-only
 nvidb job submit --after 12 --vram 4G -- python report.py  # runs after job 12
 nvidb job submit --script run.sh --vram 12G                # a local file's contents
@@ -572,6 +573,7 @@ nvidb job purge                 # forget finished job records
 
 nvidb queue status              # nodes, capacity and jobs in one view
 nvidb queue status --procs      # the same, with every GPU process listed
+nvidb queue pools               # each named pool's cards, their state, and its jobs
 nvidb queue events --since 42   # replay what happened while you were away
 nvidb queue drain gpu-node        # stop scheduling onto a node (`resume` undoes it);
                                   # jobs already on it keep running and still report back
@@ -584,6 +586,35 @@ Useful `submit` options: `--priority N` (higher goes first), `--timeout SECONDS`
 (kill an overrunning job), `--retries N` (restart if the process vanishes),
 `--env KEY=VALUE`, `--tag`, `--note`, and `--wait` to block until the job
 finishes.
+
+**GPU pools** name a set of cards that may span several nodes. A job submitted
+with `--pool NAME` waits in the ordinary queue and is placed on whichever member
+card fits it when it starts, using the same budget, exclusive/shared rules and
+`placement` policy as any other job. Pools are defined on the queue host:
+
+```yaml
+queue:
+  pools:
+    experiments:
+      members:
+        - node: box406
+          gpus: [0]
+        - node: polyu-4090      # no `gpus`: every queue GPU on the node
+    large-memory: [polyu-A100]  # a bare list of members also works
+```
+
+- A member never widens the node's `gpu_ids` allowlist.
+- Pools may overlap; a card in two pools still has one budget, not two.
+- A multi-GPU job still needs all of its cards on one node. A job too wide or
+  too large for every member card the queue has seen fails at once; a pool
+  none of whose cards has been seen yet keeps its jobs waiting.
+- Membership is read on every pass: editing it moves jobs that are still
+  waiting, while running and staged jobs keep their card. A pending job whose
+  pool is removed is held, not failed, and continues when the pool returns.
+- `--pool` cannot be combined with `--node` or `--lane`; `lane assign` takes a
+  job out of its pool.
+
+Job listings show a waiting pool job's place as `pool:NAME`; JSON carries `pool`.
 
 `job edit --vram` changes the reservation of a `pending` job without replacing
 its record, so its lane/queue position, note and submitter are preserved. The
@@ -774,6 +805,7 @@ shared `ANY GPU` pool and is informational once a job has a fixed lane).
 any terminal result. Held jobs and paused or blocked lanes are called out on
 their GPU row. Pending GPU jobs without a lane are deliberately kept in the
 `ANY GPU` pool because the scheduler has not assigned them to a card yet.
+Jobs submitted with `--pool NAME` wait there too, marked `∈NAME`.
 
 The GPU activity badge distinguishes queue-managed `RUN`, `EXTERNAL` work,
 unattributed `BUSY` activity, confirmed `IDLE`, and `UNKNOWN` readings (including

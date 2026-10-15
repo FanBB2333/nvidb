@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- The serial queue this job belongs to, and its place in it.
     lane            TEXT,
     lane_seq        INTEGER,
+    -- The named GPU pool this job may run anywhere in. Resolved against the
+    -- configuration at each placement, so the job never records its members.
+    pool            TEXT,
     remote_pid      INTEGER,
     remote_pgid     INTEGER,
     run_dir         TEXT,
@@ -288,6 +291,7 @@ _ADDED_COLUMNS = {
         "lane_seq": "INTEGER",
         "overdue_at": "TEXT",
         "allocation_mode": "TEXT",
+        "pool": "TEXT",
     },
     "lanes": {
         "runner": "INTEGER NOT NULL DEFAULT 1",
@@ -953,6 +957,7 @@ def insert_job(conn: sqlite3.Connection, **fields) -> int:
         "notes": fields.get("notes") or None,
         "lane": fields.get("lane") or None,
         "lane_seq": fields.get("lane_seq"),
+        "pool": fields.get("pool") or None,
     }
     columns = ", ".join(payload)
     placeholders = ", ".join("?" for _ in payload)

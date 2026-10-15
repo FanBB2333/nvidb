@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -33,6 +34,7 @@ from . import runner_agent
 from .executor import JobExecutor, JobProbe, LaunchRejected, NodeProbe, build_run_script
 from .model import (
     GpuProcess,
+    GpuState,
     Job,
     Lane,
     Node,
@@ -165,6 +167,76 @@ def gpu_allowlists(cfg: Optional[dict]) -> Dict[str, Set[int]]:
     return out
 
 
+_POOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def gpu_pools(cfg: Optional[dict]) -> Dict[str, Dict[str, Optional[List[int]]]]:
+    """Named GPU pools from the `queue.pools:` key: pool -> node -> GPU indices.
+
+    A pool is a logical set of cards that may span machines. A job submitted
+    to it runs on whichever member card fits it when it starts:
+
+        queue:
+          pools:
+            experiments:
+              members:
+                - node: box406
+                  gpus: [0]
+                - node: polyu-4090      # no `gpus`: every queue GPU on it
+            big: [polyu-A100]           # a bare list of members also works
+
+    Indices are the node's own, and a member never widens the node's
+    `gpu_ids:` allowlist. Pools may overlap; a card in two of them is still
+    one card with one budget. A node listed as None stands for all its GPUs.
+    """
+    raw = ((cfg or {}).get("queue") or {}).get("pools")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("queue.pools must map pool names to their members")
+    out: Dict[str, Dict[str, Optional[List[int]]]] = {}
+    for name, spec in raw.items():
+        name = str(name)
+        context = f"queue.pools.{name}"
+        if not _POOL_NAME.match(name):
+            raise ValueError(
+                f"{context}: pool names use letters, digits, '.', '_' and '-'"
+            )
+        members = spec.get("members") if isinstance(spec, dict) else spec
+        if not isinstance(members, list) or not members:
+            raise ValueError(f"{context} needs a non-empty `members` list")
+        nodes: Dict[str, Optional[List[int]]] = {}
+        for member in members:
+            if isinstance(member, str):
+                node_name, indices = member, None
+            elif isinstance(member, dict):
+                node_name = member.get("node")
+                indices = nvidb_config.normalize_gpu_indices(
+                    member.get("gpus"), label=f"{context} gpus"
+                )
+                if indices == []:
+                    raise ValueError(
+                        f"{context}: `gpus: []` names no card; leave the key "
+                        "out to take every GPU on the node"
+                    )
+            else:
+                raise ValueError(
+                    f"{context}: a member is a node name or {{node, gpus}}"
+                )
+            if not isinstance(node_name, str) or not node_name.strip():
+                raise ValueError(f"{context}: every member needs a `node`")
+            node_name = node_name.strip()
+            # Listing a node twice adds its cards up; once it is whole, it stays whole.
+            if node_name in nodes and (nodes[node_name] is None or indices is None):
+                nodes[node_name] = None
+            elif node_name in nodes:
+                nodes[node_name] = sorted(set(nodes[node_name]) | set(indices))
+            else:
+                nodes[node_name] = indices
+        out[name] = nodes
+    return out
+
+
 class NodeBackend:
     """Everything the scheduler needs to talk to one node."""
 
@@ -280,6 +352,7 @@ class Scheduler:
         self.settings = settings or load_settings(self.cfg)
         validate_gpu_mode(self.settings)
         self._gpu_allowlists = gpu_allowlists(self.cfg)
+        self._pools = gpu_pools(self.cfg)
         self._configured_nodes = self._configured_node_names()
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
         self._last_lease_renewal = 0.0
@@ -356,6 +429,7 @@ class Scheduler:
         if self._settings_from_config:
             self.settings = load_settings(fresh)
         self._gpu_allowlists = gpu_allowlists(fresh)
+        self._pools = gpu_pools(fresh)
         # Connection details may have changed alongside the allowlist. Closing
         # an SSH client does not touch detached jobs; the next probe reconnects.
         self.close()
@@ -368,6 +442,7 @@ class Scheduler:
         are skipped rather than repeated verbatim.
         """
         self._gpu_allowlists = gpu_allowlists(self.cfg)
+        self._pools = gpu_pools(self.cfg)
         servers = self.cfg.get("servers") or []
         signature = (
             json.dumps(servers, sort_keys=True),
@@ -480,10 +555,16 @@ class Scheduler:
         notes: Optional[str] = None,
         lane: Optional[str] = None,
         at: Any = "tail",
+        pool: Optional[str] = None,
     ) -> int:
         """Add a job to the queue and return its id."""
         if not command or not command.strip():
             raise ValueError("A job needs a command")
+        if pool and (node or lane):
+            # A pool already says where the job may run; a pin on top of it
+            # would leave two answers to that question.
+            raise ValueError("--pool cannot be combined with --node or --lane")
+        resolved_pool = self.resolve_pool(pool) if pool else None
         vram_mb = parse_size_mb(
             vram if vram is not None else self.settings.get("default_vram", 0)
         )
@@ -547,6 +628,7 @@ class Scheduler:
                 lane_seq=(
                     dbm.next_lane_seq(self.conn, lane_row.name) if lane_row else None
                 ),
+                pool=resolved_pool,
             )
             dbm.add_event(
                 self.conn,
@@ -558,6 +640,7 @@ class Scheduler:
                     "vram_mb": vram_mb,
                     "node": resolved_node,
                     "lane": lane_row.name if lane_row else None,
+                    "pool": resolved_pool,
                     "submitter": submitter,
                 },
             )
@@ -567,6 +650,100 @@ class Scheduler:
             if lane_row and str(at) not in ("tail", "", "None"):
                 self._reorder_lane(lane_row.name, job_id, to=at)
         return job_id
+
+    # --- pools ------------------------------------------------------------
+
+    def resolve_pool(self, query: str) -> str:
+        """Find a configured pool by name, case-insensitively, or by prefix."""
+        names = list(self._pools)
+        text = str(query or "").strip()
+        if text in self._pools:
+            return text
+        lowered = text.lower()
+        for candidates in (
+            [name for name in names if name.lower() == lowered],
+            [name for name in names if name.lower().startswith(lowered)],
+        ):
+            if len(candidates) == 1:
+                return candidates[0]
+        raise ValueError(
+            f"Unknown pool {query!r}. Configured pools: "
+            f"{', '.join(names) or '(none; define them under queue.pools)'}"
+        )
+
+    def _pool_members(self, pool: Optional[str]) -> Optional[Dict[str, Optional[Set[int]]]]:
+        """Where a pool's jobs may go: node -> GPU indices, None meaning all.
+
+        None outside any pool, so such a job's placement is left alone. Read
+        from the configuration on every pass, which is what lets a pool's
+        membership change under the jobs still waiting in it while those
+        already started keep the card they were given.
+        """
+        if not pool:
+            return None
+        return {
+            node: None if indices is None else set(indices)
+            for node, indices in (self._pools.get(pool) or {}).items()
+        }
+
+    def _placeable_gpus(self, node: Node, pool: Optional[str]) -> List[GpuState]:
+        """The node's queue GPUs open to a job in this pool (or in none)."""
+        gpus = self._schedulable_gpus(node)
+        members = self._pool_members(pool)
+        if members is None:
+            return gpus
+        if node.name not in members:
+            return []
+        allowed = members[node.name]
+        return gpus if allowed is None else [gpu for gpu in gpus if gpu.index in allowed]
+
+    def pool_view(self, name: str, active: Optional[List[Job]] = None) -> Dict[str, Any]:
+        """One pool as reported to the UIs: its cards, their state, its jobs."""
+        if active is None:
+            active = dbm.list_jobs(self.conn, states=["pending", "running"])
+        headroom = int(self.settings["headroom_mb"])
+        members = []
+        for node_name, indices in self._pools[name].items():
+            node = dbm.get_node(self.conn, node_name)
+            if node_name not in self._configured_nodes or node is None:
+                state = "unconfigured"
+            elif node.ignored:
+                state = "ignored"
+            elif not node.enabled:
+                state = "drained"
+            else:
+                state = node.state
+            gpus = []
+            if node is not None and state != "unconfigured":
+                gpus = [
+                    {
+                        "index": gpu.index,
+                        "name": gpu.name,
+                        "mem_total_mb": gpu.mem_total_mb,
+                        "free_mb": gpu.free_mb(headroom),
+                        "queue_jobs": gpu.queue_jobs,
+                    }
+                    for gpu in self._placeable_gpus(node, name)
+                ]
+            members.append({
+                "node": node_name,
+                # As configured: None means every queue GPU on the node.
+                "gpu_ids": indices,
+                "state": state,
+                "gpus": gpus,
+            })
+        jobs = [job for job in active if job.pool == name]
+        return {
+            "name": name,
+            "members": members,
+            "gpus_up": sum(len(m["gpus"]) for m in members if m["state"] == "up"),
+            "running": [job.id for job in jobs if job.state == "running"],
+            "pending": [job.id for job in jobs if job.state == "pending"],
+        }
+
+    def pools(self) -> List[Dict[str, Any]]:
+        active = dbm.list_jobs(self.conn, states=["pending", "running"]) if self._pools else []
+        return [self.pool_view(name, active) for name in self._pools]
 
     # --- lanes ------------------------------------------------------------
 
@@ -752,6 +929,7 @@ class Scheduler:
             if job.run_dir:
                 raise ValueError(f"Job {job_id} has already been staged; cancel and resubmit to change its lane")
             previous = job.lane
+            origin = previous or (f"pool {job.pool}" if job.pool else "-")
             if lane is None:
                 dbm.update_job(self.conn, job_id, lane=None, lane_seq=None)
                 dbm.add_event(
@@ -774,6 +952,8 @@ class Scheduler:
                 lane=target.name,
                 lane_seq=dbm.next_lane_seq(self.conn, target.name),
                 node_constraint=target.node,
+                # A lane names the card itself, so the job leaves its pool.
+                pool=None,
             )
             position = None
             if str(at) not in ("tail", "", "None"):
@@ -782,7 +962,7 @@ class Scheduler:
                 self.conn,
                 "lane_assigned",
                 job_id=job_id,
-                message=f"{previous or '-'} -> {target.name}",
+                message=f"{origin} -> {target.name}",
             )
             return {"lane": target.name, "previous": previous, "position": position}
 
@@ -2376,6 +2556,20 @@ class Scheduler:
                 continue
             self._report_launch_failure(job, launch_errors, summary)
 
+    def _request_hold_reason(self, job: Job) -> Optional[str]:
+        """Why the job's own request cannot be placed until someone edits it.
+
+        These holds are lifted by changing the job or the configuration, not
+        by a dependency finishing, so the dependency pass leaves them alone.
+        """
+        if self._needs_vram_estimate(job):
+            return "shared GPU mode requires a positive --vram estimate per GPU; use job edit --vram"
+        if job.pool and job.pool not in self._pools:
+            # Removed or renamed in the configuration. Failing the job would
+            # destroy it over an edit that may be undone; it waits instead.
+            return f"pool {job.pool} is no longer configured; restore it under queue.pools or cancel the job"
+        return None
+
     def _gate(
         self,
         job: Job,
@@ -2396,8 +2590,8 @@ class Scheduler:
                     or current.attempt != job.attempt or current.lane != job.lane):
                 return "gone"
             job = current
-            if self._needs_vram_estimate(job):
-                reason = "shared GPU mode requires a positive --vram estimate per GPU; use job edit --vram"
+            reason = self._request_hold_reason(job)
+            if reason:
                 if job.held_reason != reason:
                     dbm.update_job(self.conn, job.id, held_reason=reason)
                     dbm.add_event(self.conn, "job_held", job_id=job.id, message=reason)
@@ -2991,6 +3185,7 @@ class Scheduler:
             candidates = [node for node in inventory if node.name == job.node_constraint]
         if not candidates:
             return None
+        pool_scope = f"pool {job.pool}" if job.pool else None
 
         if job.lane:
             # A lane job is pinned to named cards, so it is judged against
@@ -3008,11 +3203,20 @@ class Scheduler:
                 return None  # the lane's cards are not in view yet
         else:
             gpu_inventory = [
-                (node, self._schedulable_gpus(node)) for node in candidates
+                (node, self._placeable_gpus(node, job.pool)) for node in candidates
             ]
+            if job.pool:
+                # Judged against the pool's cards in view, as a lane is
+                # against its own; none in view yet means wait, not fail.
+                gpu_inventory = [(node, gpus) for node, gpus in gpu_inventory if gpus]
+                if not gpu_inventory:
+                    return None
         widest = max((len(gpus) for _node, gpus in gpu_inventory), default=0)
         if job.gpus > widest:
-            where = job.node_constraint or "the largest known node"
+            where = (
+                f"the largest node in {pool_scope}" if pool_scope
+                else job.node_constraint or "the largest known node"
+            )
             requested_unit = "GPU" if job.gpus == 1 else "GPUs"
             available_unit = "GPU" if widest == 1 else "GPUs"
             return (
@@ -3025,11 +3229,12 @@ class Scheduler:
         )
         usable = max(0, biggest - headroom_mb)
         if job.vram_mb > usable:
-            where = (
-                f"the largest schedulable GPU on {job.node_constraint}"
-                if job.node_constraint
-                else "the largest schedulable GPU the queue knows of"
-            )
+            if pool_scope:
+                where = f"the largest schedulable GPU in {pool_scope}"
+            elif job.node_constraint:
+                where = f"the largest schedulable GPU on {job.node_constraint}"
+            else:
+                where = "the largest schedulable GPU the queue knows of"
             return (
                 f"reserves {format_mb(job.vram_mb)}; {where} holds "
                 f"{format_mb(usable)} at most"
@@ -3047,7 +3252,7 @@ class Scheduler:
             default=0,
         )
         if job.gpus > fitting_width:
-            where = job.node_constraint or "any known node"
+            where = pool_scope or job.node_constraint or "any known node"
             return (
                 f"needs {job.gpus} GPUs each reserving {format_mb(job.vram_mb)}; "
                 f"{where} has at most {fitting_width} matching GPUs"
@@ -3132,7 +3337,7 @@ class Scheduler:
         for job in dbm.held_jobs(self.conn) if jobs is None else jobs:
             if job.state != "pending" or not job.held_reason:
                 continue
-            if self._needs_vram_estimate(job):
+            if self._request_hold_reason(job):
                 continue
             _ready, reason = self._dependencies_ready(job)
             if reason is None:
@@ -3156,6 +3361,9 @@ class Scheduler:
             candidates = [
                 node for node in candidates if node.name == job.node_constraint
             ]
+        members = self._pool_members(job.pool)
+        if members is not None:
+            candidates = [node for node in candidates if node.name in members]
         if not candidates:
             return None
 
@@ -3177,10 +3385,12 @@ class Scheduler:
         best_choice: Optional[Tuple[Any, str, List[int]]] = None
 
         for node in candidates:
+            allowed = members.get(node.name) if members is not None else None
             usable = [
                 budget
                 for budget in budgets.get(node.name, [])
-                if budget.fits(job.vram_mb, max_jobs)
+                if (allowed is None or budget.index in allowed)
+                and budget.fits(job.vram_mb, max_jobs)
             ]
             if len(usable) < job.gpus:
                 continue
@@ -3326,6 +3536,7 @@ class Scheduler:
             "held": [job.to_dict() for job in dbm.held_jobs(self.conn)],
             "nodes": [self._node_view(node, headroom) for node in nodes],
             "lanes": self.lanes(),
+            "pools": self.pools(),
             "jobs": [job.to_dict() for job in jobs],
             "recent": [job.to_dict() for job in recent_terminal],
             "dependencies": dependencies,

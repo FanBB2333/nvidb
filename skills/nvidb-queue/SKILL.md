@@ -66,6 +66,12 @@ Key options:
   it needs that GPU's memory); the scheduler places it better than you can.
   A server-level `gpus: [0, 1]` allowlist is applied automatically to new
   placements and must not be treated as hiding the node's other cards.
+- `--pool <name>` — run on any card in a named GPU pool, across nodes; the card
+  is chosen when the job starts. Use it instead of `--node` when the job needs
+  "one of these machines" (its environment or data exists on each of them).
+  `nvidb queue pools --json` lists the pools, their member cards and their jobs.
+  It cannot be combined with `--node` or `--lane`. Pools are configured by the
+  user under `queue.pools`; do not invent one.
 - `--note "..."` — **write one.** Say what the job is for and what would make it
   a success. Another session, or the user in a week, reads this to understand
   why the job exists. `--name` is a label; the note is the explanation.
@@ -356,7 +362,8 @@ this guard by changing the database directly.
 - Submitting without `--vram`. The job reserves nothing and can oversubscribe a
   GPU that looked free.
 - Pinning with `--node` out of habit. It defeats the scheduler and leaves jobs
-  queued behind a busy machine while another sits idle.
+  queued behind a busy machine while another sits idle. If the job only needs
+  one of a few machines, submit it to a `--pool` that covers them.
 - Polling `nvidb job ls` in a tight loop. Use `nvidb job wait`, or poll with
   `--no-tick` and a sleep.
 - Acknowledging alerts to make the output look clean.

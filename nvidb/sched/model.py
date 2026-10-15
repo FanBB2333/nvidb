@@ -185,6 +185,9 @@ class Job:
     # `lane_seq` *is* the schedule rather than a hint the scheduler may ignore.
     lane: Optional[str] = None
     lane_seq: Optional[int] = None
+    # A named set of GPUs across nodes, any one of which may run this job. The
+    # card is chosen at launch, and `node`/`gpu_ids` record the choice.
+    pool: Optional[str] = None
     remote_pid: Optional[int] = None
     remote_pgid: Optional[int] = None
     run_dir: Optional[str] = None
@@ -235,6 +238,7 @@ class Job:
             gpu_ids=_csv_ints(data.get("gpu_ids")),
             lane=data.get("lane"),
             lane_seq=data.get("lane_seq"),
+            pool=data.get("pool"),
             remote_pid=data.get("remote_pid"),
             remote_pgid=data.get("remote_pgid"),
             run_dir=data.get("run_dir"),
@@ -305,6 +309,7 @@ class Job:
             "gpu_ids": self.gpu_ids,
             "lane": self.lane,
             "lane_seq": self.lane_seq,
+            "pool": self.pool,
             "remote_pid": self.remote_pid,
             "run_dir": self.run_dir,
             "exit_code": self.exit_code,
@@ -322,6 +327,15 @@ class Job:
             "allocation_mode": self.allocation_mode,
             "held": self.is_held,
         }
+
+
+def requested_place(job: Dict[str, Any]) -> Optional[str]:
+    """Where a job not yet placed asked to run: its pinned node or its pool."""
+    if job.get("node_constraint"):
+        return job["node_constraint"]
+    if job.get("pool"):
+        return f"pool:{job['pool']}"
+    return None
 
 
 def make_lane_name(node: str, gpu_ids: Sequence[int]) -> str:

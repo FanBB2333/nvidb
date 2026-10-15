@@ -34,6 +34,7 @@ from .model import (
     age_seconds,
     format_duration,
     format_mb,
+    requested_place,
 )
 from .scheduler import Scheduler, SchedulerLeaseLost
 
@@ -370,7 +371,7 @@ def _job_row(job: Dict[str, Any], *, extra: Sequence[str] = ()) -> List[str]:
         # start on its own.
         "held" if job.get("held") else job["state"],
         _short(job["name"] or "-", 20),
-        job["node"] or (job["node_constraint"] or "-"),
+        job["node"] or requested_place(job) or "-",
         gpu,
         format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
         used,
@@ -459,6 +460,7 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
         f"  workdir     {job.workdir or '-'}",
         f"  request     gpus={job.gpus} vram={format_mb(job.vram_mb)}"
         + (f" node={job.node_constraint}" if job.node_constraint else "")
+        + (f" pool={job.pool}" if job.pool else "")
         + (f" priority={job.priority}" if job.priority else ""),
         f"  placement   node={job.node or '-'} gpu={','.join(str(i) for i in job.gpu_ids) or '-'} pid={job.remote_pid or '-'}"
         + (f" lane={job.lane}" if job.lane else ""),
@@ -946,6 +948,58 @@ def _render_lane_detail(lane: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_pools(pools: Sequence[Dict[str, Any]]) -> str:
+    """Each pool's member cards, one row per GPU, and how much work it holds."""
+    if not pools:
+        return "no pools configured (define them under queue.pools in queue.yml)"
+    blocks = []
+    for pool in pools:
+        header = (
+            f"POOL {pool['name']}  {pool['gpus_up']} GPU(s) up"
+            f" · running {len(pool['running'])} · pending {len(pool['pending'])}"
+        )
+        rows = []
+        for member in pool["members"]:
+            if not member["gpus"]:
+                # Down, drained or unconfigured, or none of the listed cards
+                # is one the queue may use: say what was asked for.
+                wanted = member["gpu_ids"]
+                rows.append([
+                    member["node"],
+                    member["state"],
+                    "all" if wanted is None else ",".join(str(i) for i in wanted),
+                    "-", "-", "-",
+                ])
+            for gpu in member["gpus"]:
+                rows.append([
+                    member["node"],
+                    member["state"],
+                    str(gpu["index"]),
+                    _short(gpu["name"] or "-", 26),
+                    format_mb(gpu["free_mb"]),
+                    str(gpu["queue_jobs"]),
+                ])
+        blocks.append(
+            header + "\n"
+            + _table(rows, ["NODE", "STATE", "GPU", "MODEL", "FREE", "JOBS"], indent="  ")
+        )
+    return "\n\n".join(blocks)
+
+
+def cmd_pools(args) -> int:
+    scheduler = _open(args)
+    try:
+        _refresh(scheduler, args)
+        pools = scheduler.pools()
+        if args.json:
+            _print_json({"pools": pools})
+        else:
+            print(_render_pools(pools))
+        return 0
+    finally:
+        scheduler.close()
+
+
 def cmd_lanes(args) -> int:
     scheduler = _open(args)
     try:
@@ -1279,6 +1333,7 @@ def cmd_submit(args) -> int:
                 notes=args.note,
                 lane=args.lane,
                 at=args.at,
+                pool=args.pool,
             )
         except ValueError as error:
             return _error(str(error), as_json=args.json)
@@ -1302,6 +1357,8 @@ def cmd_submit(args) -> int:
                 ]
                 position = queued.index(job_id) + 1 if job_id in queued else len(queued)
                 print(f"  queued in lane {job.lane} at #{position} of {len(queued)}")
+            elif job.state == "pending" and job.pool:
+                print(f"  waiting in pool {job.pool}; it starts on the first member GPU that fits it")
             elif job.state == "pending":
                 print("  waiting for capacity; it starts on the next tick that fits it")
         if args.wait:
@@ -1946,6 +2003,14 @@ def _register_queue_parsers(subparsers) -> None:
     lanes.add_argument("--node", default=None, help="Only lanes on this node")
     lanes.set_defaults(func=cmd_lanes)
 
+    pools = queue_sub.add_parser(
+        "pools",
+        help="Show the named GPU pools: their member cards and their jobs",
+    )
+    _add_common(pools)
+    _add_refresh_flags(pools)
+    pools.set_defaults(func=cmd_pools)
+
     _register_lane_parser(queue_sub)
     _register_node_actions(queue_sub)
 
@@ -2111,6 +2176,12 @@ def _register_submit_parser(job_sub) -> None:
     submit.add_argument("--vram", default=None, help="Estimated peak VRAM per GPU, e.g. 20G; required and positive in shared mode")
     submit.add_argument("--gpus", type=int, default=1, help="GPUs required (0 for CPU-only)")
     submit.add_argument("--node", default=None, help="Pin to one node (prefix match)")
+    submit.add_argument(
+        "--pool",
+        default=None,
+        metavar="NAME",
+        help="Run on any GPU in this named pool that fits (see `nvidb queue pools`)",
+    )
     submit.add_argument(
         "--lane",
         default=None,

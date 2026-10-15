@@ -39,6 +39,7 @@ from .model import (
     age_seconds,
     format_duration,
     format_mb,
+    requested_place,
 )
 from .scheduler import Scheduler
 
@@ -793,7 +794,7 @@ class QueueTUI:
             "pri": lambda job: (-(job.get("priority") or 0), job["id"]),
             "name": lambda job: ((job.get("name") or "").lower(), job["id"]),
             "node": lambda job: (
-                job.get("node") or job.get("node_constraint") or "~",
+                job.get("node") or requested_place(job) or "~",
                 job["id"],
             ),
             # Sizes and durations start biggest-first; S flips them.
@@ -1210,6 +1211,8 @@ class QueueTUI:
         node = ""
         if job.get("lane") is None and job.get("node_constraint"):
             node = f" @{fit_display(job['node_constraint'], 8)}"
+        elif job.get("pool"):
+            node = f" ∈{fit_display(job['pool'], 8)}"
         return (
             f"[{prefix}#{job['id']} {self._flow_priority(job)} "
             f"{name}{node}{marker_text}]"
@@ -2217,7 +2220,7 @@ class QueueTUI:
                 "ST": STATE_BADGE.get(display_state(job), display_state(job)),
                 "PRI": str(job.get("priority") or 0),
                 "NAME": job["name"] or "-",
-                "NODE": job["node"] or job["node_constraint"] or "-",
+                "NODE": job["node"] or requested_place(job) or "-",
                 "GPU": ",".join(str(i) for i in job["gpu_ids"]) or "-",
                 "VRAM": format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
                 "USED": format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-",
@@ -2326,7 +2329,7 @@ class QueueTUI:
             f"name {job['name'] or '-'}",
             f"state {display_state(job)}",
             f"request gpus={job['gpus']} vram={format_mb(job['vram_mb'])}",
-            f"node {job['node'] or job['node_constraint'] or 'any'}",
+            f"node {job['node'] or requested_place(job) or 'any'}",
             f"pid {job['remote_pid'] or '-'}",
             f"submitter {job['submitter'] or '-'}",
         ]
