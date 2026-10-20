@@ -5,6 +5,7 @@ The Dash-based UI lives in `nvidb.dashboard`; this module owns the
 UI-agnostic parsing, formatting, and SQLite log-reading helpers it imports.
 """
 
+import contextlib
 from datetime import datetime
 import math
 import re
@@ -16,124 +17,86 @@ import pandas as pd
 from . import config
 
 
-def get_db_path():
-    return config.get_db_path()
-
-
-def _as_path(value):
-    if value is None:
-        return None
-    return Path(value).expanduser()
+def _open_log_db(db_path):
+    return contextlib.closing(sqlite3.connect(db_path))
 
 
 def load_sessions(db_path):
-    db_path = _as_path(db_path)
-    conn = sqlite3.connect(str(db_path))
-    df = pd.read_sql_query(
-        """
-        SELECT
-            s.id,
-            s.start_time,
-            s.end_time,
-            s.status,
-            s.interval_seconds,
-            s.include_remote,
-            COUNT(g.id) as record_count,
-            COUNT(DISTINCT g.timestamp) as snapshot_count
-        FROM log_sessions s
-        LEFT JOIN gpu_logs g ON s.id = g.session_id
-        GROUP BY s.id
-        ORDER BY s.id ASC
-        """,
-        conn,
-    )
-    conn.close()
-    return df
+    with _open_log_db(db_path) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+                s.id,
+                s.start_time,
+                s.end_time,
+                s.status,
+                s.interval_seconds,
+                s.include_remote,
+                COUNT(g.id) as record_count,
+                COUNT(DISTINCT g.timestamp) as snapshot_count
+            FROM log_sessions s
+            LEFT JOIN gpu_logs g ON s.id = g.session_id
+            GROUP BY s.id
+            ORDER BY s.id ASC
+            """,
+            conn,
+        )
 
 
 def load_session_logs(db_path, session_id):
-    db_path = _as_path(db_path)
-    conn = sqlite3.connect(str(db_path))
-    df = pd.read_sql_query(
-        """
-        SELECT
-            timestamp,
-            node,
-            gpu_id,
-            name,
-            fan_speed,
-            util_gpu,
-            util_mem,
-            temperature,
-            rx,
-            tx,
-            power,
-            memory_used,
-            memory_total,
-            processes
-        FROM gpu_logs
-        WHERE session_id = ?
-        ORDER BY timestamp, node, gpu_id
-        """,
-        conn,
-        params=(session_id,),
-    )
-    conn.close()
+    with _open_log_db(db_path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                timestamp,
+                node,
+                gpu_id,
+                name,
+                fan_speed,
+                util_gpu,
+                util_mem,
+                temperature,
+                rx,
+                tx,
+                power,
+                memory_used,
+                memory_total,
+                processes
+            FROM gpu_logs
+            WHERE session_id = ?
+            ORDER BY timestamp, node, gpu_id
+            """,
+            conn,
+            params=(session_id,),
+        )
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     return df
 
 
+# Every parser below needs a digit, so None ("None"), "", "N/A", "-" and NaN
+# ("nan") all fall through to None without a separate check.
+_NUMBER_RE = re.compile(r"(\d+\.?\d*)")
+
+
 def _parse_percent(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in ("N/A", "-"):
-        return None
-    match = re.search(r"(\d+\.?\d*)", text)
-    if not match:
-        return None
-    try:
-        return float(match.group(1))
-    except Exception:
-        return None
+    match = _NUMBER_RE.search(str(value))
+    return float(match.group(1)) if match else None
 
 
 def _parse_mib_pair(value):
-    if value is None:
-        return None, None
-    text = str(value).strip()
-    if not text or text in ("N/A", "-"):
-        return None, None
-    parts = text.split("/", 1)
+    parts = str(value).split("/", 1)
     if len(parts) != 2:
         return None, None
     try:
-        used = float(parts[0])
-        total = float(parts[1])
-        return used, total
-    except Exception:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
         return None, None
 
 
 def _parse_temperature_c(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in ("N/A", "-"):
-        return None
-    match = re.search(r"(\d+\.?\d*)\s*C", text, flags=re.IGNORECASE)
-    if match:
-        try:
-            return float(match.group(1))
-        except Exception:
-            return None
-    match = re.search(r"(\d+\.?\d*)", text)
-    if not match:
-        return None
-    try:
-        return float(match.group(1))
-    except Exception:
-        return None
+    text = str(value)
+    match = re.search(r"(\d+\.?\d*)\s*C", text, flags=re.IGNORECASE) or _NUMBER_RE.search(text)
+    return float(match.group(1)) if match else None
 
 
 _MEM_UNIT_TO_MIB = {
@@ -150,34 +113,18 @@ _MEM_UNIT_TO_MIB = {
 
 
 def _parse_memory_gib(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in ("N/A", "-"):
-        return None
-
+    text = str(value)
     match = re.search(r"(\d+\.?\d*)\s*([a-zA-Z]+)", text)
     if match:
-        number_str, unit = match.group(1), match.group(2)
-        unit_key = unit.strip().lower()
+        number_str, unit_key = match.group(1), match.group(2).lower()
     else:
-        number_match = re.search(r"(\d+\.?\d*)", text)
+        number_match = _NUMBER_RE.search(text)
         if not number_match:
             return None
-        number_str = number_match.group(1)
-        unit_key = "mib"
+        number_str, unit_key = number_match.group(1), "mib"
 
-    try:
-        number = float(number_str)
-    except Exception:
-        return None
-
-    mib_multiplier = _MEM_UNIT_TO_MIB.get(unit_key)
-    if mib_multiplier is None:
-        mib_multiplier = _MEM_UNIT_TO_MIB.get(unit_key.replace("bytes", "b"), None)
-    if mib_multiplier is None:
-        mib_multiplier = 1
-    mib = number * mib_multiplier
+    mib_multiplier = _MEM_UNIT_TO_MIB.get(unit_key) or _MEM_UNIT_TO_MIB.get(unit_key.replace("bytes", "b"), 1)
+    mib = float(number_str) * mib_multiplier
     return mib / 1024.0
 
 
@@ -193,46 +140,21 @@ _BW_UNIT_TO_MBPS = {
 
 
 def _parse_bandwidth_mbps(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in ("N/A", "-"):
-        return None
+    text = str(value)
     match = re.search(r"(\d+\.?\d*)\s*([a-zA-Z/]+)", text)
     if match:
-        number_str, unit = match.group(1), match.group(2)
-        unit_key = unit.strip().lower()
+        number_str, unit_key = match.group(1), match.group(2).lower()
     else:
-        number_match = re.search(r"(\d+\.?\d*)", text)
+        number_match = _NUMBER_RE.search(text)
         if not number_match:
             return None
-        number_str = number_match.group(1)
-        unit_key = "mb/s"
-
-    try:
-        number = float(number_str)
-    except Exception:
-        return None
-
-    multiplier = _BW_UNIT_TO_MBPS.get(unit_key)
-    if multiplier is None:
-        multiplier = 1
-    return number * multiplier
+        number_str, unit_key = number_match.group(1), "mb/s"
+    return float(number_str) * _BW_UNIT_TO_MBPS.get(unit_key, 1)
 
 
 def _parse_power_watts(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in ("N/A", "-"):
-        return None
-    match = re.search(r"(\d+\.?\d*)\s*W", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return float(match.group(1))
-    except Exception:
-        return None
+    match = re.search(r"(\d+\.?\d*)\s*W", str(value), flags=re.IGNORECASE)
+    return float(match.group(1)) if match else None
 
 
 def _as_datetime(value):
@@ -241,23 +163,14 @@ def _as_datetime(value):
     ts = pd.to_datetime(value, errors="coerce")
     if pd.isna(ts):
         return None
-    try:
-        return ts.to_pydatetime()
-    except Exception:
-        return ts
+    return ts.to_pydatetime()
 
 
 def _format_datetime(value, *, include_seconds: bool = True):
     dt = _as_datetime(value)
     if dt is None:
         return "N/A"
-    fmt = "%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M"
-    try:
-        return dt.strftime(fmt)
-    except Exception:
-        text = str(value)
-        text = text.replace("T", " ")
-        return text[:19] if include_seconds else text[:16]
+    return dt.strftime("%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M")
 
 
 def _format_duration(start_value, end_value):
@@ -295,50 +208,45 @@ def _format_gb(mib):
     return f"{gb:.1f}GB"
 
 
-def _server_summary(table, system_info=None):
-    source = None
-    if system_info and isinstance(system_info, dict):
-        source = system_info.get("data_source")
+def _gpu_table_totals(table):
+    """(known util values, used MiB sum, total MiB sum) over a GPU table.
 
-    if table is None or table.empty:
+    Rows whose memory pair does not parse are left out of both sums.
+    """
+    util_values = []
+    used_sum = 0.0
+    total_sum = 0.0
+    for _, row in table.iterrows():
+        util = _parse_percent(row.get("util"))
+        if util is not None:
+            util_values.append(util)
+        used, total = _parse_mib_pair(row.get("memory[used/total]"))
+        if used is not None and total is not None:
+            used_sum += used
+            total_sum += total
+    return util_values, used_sum, total_sum
+
+
+def _server_summary(table, system_info=None):
+    info = system_info or {}
+    source = info.get("data_source")
+
+    if table.empty:
         if source == "unsupported":
             return "Unsupported"
         if source:
             return f"No GPUs | src:{source}"
         return "No GPUs"
 
-    utils = []
-    used_total_pairs = []
-    for _, row in table.iterrows():
-        utils.append(_parse_percent(row.get("util")))
-        used_total_pairs.append(_parse_mib_pair(row.get("memory[used/total]")))
-
-    util_values = [u for u in utils if u is not None]
+    util_values, used_sum, total_sum = _gpu_table_totals(table)
     avg_util = (sum(util_values) / len(util_values)) if util_values else 0.0
-
-    idle = 0
-    for u in util_values:
-        if u < 5:
-            idle += 1
-
-    used_sum = 0.0
-    total_sum = 0.0
-    for used, total in used_total_pairs:
-        if used is None or total is None:
-            continue
-        used_sum += used
-        total_sum += total
-
+    idle = sum(1 for u in util_values if u < 5)
     mem_str = f"{_format_gb(used_sum)}/{_format_gb(total_sum)}" if total_sum else "N/A"
 
     # Build GPU summary part
     gpu_summary = f"{len(table)} GPUs | {idle} idle | {avg_util:.0f}% avg | {mem_str}"
 
-    # Extract system stats if available
-    sys_stats = {}
-    if system_info and isinstance(system_info, dict):
-        sys_stats = system_info.get("system_stats", {})
-
+    sys_stats = info.get("system_stats", {})
     cpu_cores = sys_stats.get("cpu_cores", 0)
     cpu_percent = sys_stats.get("cpu_percent", 0.0)
     mem_used_gb = sys_stats.get("mem_used_gb", 0.0)
@@ -355,10 +263,8 @@ def _server_summary(table, system_info=None):
 
     # Memory: used/total with swap in brackets
     if mem_total_gb > 0:
-        if swap_total_gb > 0:
-            sys_parts.append(f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G(Swap:{swap_used_gb:.1f}/{swap_total_gb:.0f}G)")
-        else:
-            sys_parts.append(f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G")
+        swap = f"(Swap:{swap_used_gb:.1f}/{swap_total_gb:.0f}G)" if swap_total_gb > 0 else ""
+        sys_parts.append(f"Mem: {mem_used_gb:.0f}/{mem_total_gb:.0f}G{swap}")
 
     if sys_parts:
         summary = f"{gpu_summary} | {' | '.join(sys_parts)}"
@@ -388,10 +294,7 @@ def _format_mib(mib: int) -> str:
 def _user_summary_df(user_summary: dict) -> pd.DataFrame:
     rows = []
     for user, mib in (user_summary or {}).items():
-        try:
-            mib_int = int(mib)
-        except Exception:
-            continue
+        mib_int = int(mib)
         if mib_int <= 0:
             continue
         rows.append({"user": str(user), "vram_mib": mib_int, "vram": _format_mib(mib_int)})
@@ -405,21 +308,10 @@ _USER_MEM_RE = re.compile(r"([^\s()]+)\((\d+)\s*M\)", flags=re.IGNORECASE)
 
 
 def _parse_user_memory_compact(value) -> dict:
-    if value is None:
-        return {}
-    text = str(value).strip()
-    if not text or text in ("-", "N/A"):
-        return {}
     users = {}
-    for username, mib_str in _USER_MEM_RE.findall(text):
-        username = str(username).strip()
-        if not username or username == "N/A":
-            continue
-        try:
-            mib = int(mib_str)
-        except Exception:
-            continue
-        if mib <= 0:
+    for username, mib_str in _USER_MEM_RE.findall(str(value)):
+        mib = int(mib_str)
+        if username == "N/A" or mib <= 0:
             continue
         users[username] = users.get(username, 0) + mib
     return users
@@ -427,9 +319,7 @@ def _parse_user_memory_compact(value) -> dict:
 
 def _user_memory_from_df(df: pd.DataFrame) -> dict:
     totals = {}
-    if df is None or df.empty:
-        return totals
-    if "processes" not in df.columns:
+    if df.empty or "processes" not in df.columns:
         return totals
     for value in df["processes"]:
         for user, mib in _parse_user_memory_compact(value).items():
@@ -437,37 +327,29 @@ def _user_memory_from_df(df: pd.DataFrame) -> dict:
     return totals
 
 
-def _user_time_share_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["user", "snapshots", "share"])
-    if "timestamp" not in df.columns or "processes" not in df.columns:
-        return pd.DataFrame(columns=["user", "snapshots", "share"])
+_EMPTY_SHARE_COLUMNS = ["user", "snapshots", "share"]
 
-    timestamps = df["timestamp"].dropna().drop_duplicates().sort_values()
-    total = int(len(timestamps))
+
+def _user_time_share_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "timestamp" not in df.columns or "processes" not in df.columns:
+        return pd.DataFrame(columns=_EMPTY_SHARE_COLUMNS)
+
+    total = int(df["timestamp"].nunique())
     if total <= 0:
-        return pd.DataFrame(columns=["user", "snapshots", "share"])
+        return pd.DataFrame(columns=_EMPTY_SHARE_COLUMNS)
 
     counts = {}
-    for ts, group in df.groupby("timestamp", sort=False):
-        if pd.isna(ts):
-            continue
+    # groupby drops NaT keys, matching the nunique() total above.
+    for _ts, group in df.groupby("timestamp", sort=False):
         users = set()
         for value in group["processes"]:
             users.update(_parse_user_memory_compact(value).keys())
         for user in users:
             counts[user] = counts.get(user, 0) + 1
 
-    rows = []
-    for user, snaps in counts.items():
-        try:
-            snaps_int = int(snaps)
-        except Exception:
-            continue
-        share = (snaps_int / total) * 100.0
-        rows.append({"user": user, "snapshots": snaps_int, "share": share})
+    rows = [{"user": user, "snapshots": snaps, "share": (snaps / total) * 100.0} for user, snaps in counts.items()]
     if not rows:
-        return pd.DataFrame(columns=["user", "snapshots", "share"])
+        return pd.DataFrame(columns=_EMPTY_SHARE_COLUMNS)
     return pd.DataFrame(rows).sort_values(by="share", ascending=False, kind="stable").reset_index(drop=True)
 
 
@@ -512,92 +394,29 @@ def _build_log_snapshot_table(df):
     return table.sort_values(by="GPU", kind="stable")
 
 
+# Log viewer charts: label, value parser, shown by default, and a fixed
+# y-axis top for percentage metrics.
 _LOG_METRICS = {
-    "util_gpu": {
-        "label": "GPU Util (%)",
-        "source": "util_gpu",
-        "parser": _parse_percent,
-        "tooltip_format": ".1f",
-        "default": True,
-        "height": 220,
-    },
-    "memory_used": {
-        "label": "VRAM Used (GiB)",
-        "source": "memory_used",
-        "parser": _parse_memory_gib,
-        "tooltip_format": ".2f",
-        "default": True,
-        "height": 220,
-    },
-    "temperature": {
-        "label": "Temperature (°C)",
-        "source": "temperature",
-        "parser": _parse_temperature_c,
-        "tooltip_format": ".1f",
-        "default": True,
-        "height": 220,
-    },
-    "power": {
-        "label": "Power Draw (W)",
-        "source": "power",
-        "parser": _parse_power_watts,
-        "tooltip_format": ".1f",
-        "default": True,
-        "height": 220,
-    },
-    "util_mem": {
-        "label": "Memory Util (%)",
-        "source": "util_mem",
-        "parser": _parse_percent,
-        "tooltip_format": ".1f",
-        "default": False,
-        "height": 220,
-    },
-    "rx": {
-        "label": "PCIe RX (MB/s)",
-        "source": "rx",
-        "parser": _parse_bandwidth_mbps,
-        "tooltip_format": ".2f",
-        "default": True,
-        "height": 220,
-    },
-    "tx": {
-        "label": "PCIe TX (MB/s)",
-        "source": "tx",
-        "parser": _parse_bandwidth_mbps,
-        "tooltip_format": ".2f",
-        "default": True,
-        "height": 220,
-    },
-    "fan_speed": {
-        "label": "Fan Speed (%)",
-        "source": "fan_speed",
-        "parser": _parse_percent,
-        "tooltip_format": ".0f",
-        "default": False,
-        "height": 220,
-    },
+    "util_gpu": {"label": "GPU Util (%)", "parser": _parse_percent, "default": True, "ymax": 100},
+    "memory_used": {"label": "VRAM Used (GiB)", "parser": _parse_memory_gib, "default": True},
+    "temperature": {"label": "Temperature (°C)", "parser": _parse_temperature_c, "default": True},
+    "power": {"label": "Power Draw (W)", "parser": _parse_power_watts, "default": True},
+    "util_mem": {"label": "Memory Util (%)", "parser": _parse_percent, "default": False, "ymax": 100},
+    "rx": {"label": "PCIe RX (MB/s)", "parser": _parse_bandwidth_mbps, "default": True},
+    "tx": {"label": "PCIe TX (MB/s)", "parser": _parse_bandwidth_mbps, "default": True},
+    "fan_speed": {"label": "Fan Speed (%)", "parser": _parse_percent, "default": False, "ymax": 100},
 }
 
 
 def _downsample_per_gpu(df: pd.DataFrame, *, max_points_per_gpu: int) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    try:
-        max_points = int(max_points_per_gpu)
-    except Exception:
-        max_points = 600
-    if max_points <= 0:
-        return df
-
     frames = []
     for _gpu_id, group in df.groupby("gpu_id", sort=False):
         group_sorted = group.sort_values(by="timestamp", kind="stable")
         n = len(group_sorted)
-        if n <= max_points:
+        if n <= max_points_per_gpu:
             frames.append(group_sorted)
             continue
-        step = int(math.ceil(n / max_points))
+        step = int(math.ceil(n / max_points_per_gpu))
         frames.append(group_sorted.iloc[::step])
     if not frames:
         return df.iloc[:0]

@@ -1,9 +1,10 @@
-import sqlite3
-
+import contextlib
 import logging
-import time
-import threading
+import signal
+import sqlite3
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from .connection import NVClientPool
@@ -33,13 +34,17 @@ class NVLoggerSQLite:
         # Initialize database
         self._init_database()
     
+    def _execute(self, sql, params=(), *, many=False):
+        """Run one statement in its own committed transaction; return lastrowid."""
+        # The inner `conn` context commits, or rolls back if the statement fails.
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn, conn:
+            cursor = conn.executemany(sql, params) if many else conn.execute(sql, params)
+            return cursor.lastrowid
+    
     def _init_database(self):
         """Initialize SQLite database with required tables."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
         # Create log_sessions table
-        cursor.execute('''
+        self._execute('''
             CREATE TABLE IF NOT EXISTS log_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 start_time TEXT NOT NULL,
@@ -51,7 +56,7 @@ class NVLoggerSQLite:
         ''')
         
         # Create gpu_logs table
-        cursor.execute('''
+        self._execute('''
             CREATE TABLE IF NOT EXISTS gpu_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
@@ -72,27 +77,17 @@ class NVLoggerSQLite:
                 FOREIGN KEY (session_id) REFERENCES log_sessions(id)
             )
         ''')
-        
-        conn.commit()
-        conn.close()
         logging.info(f"Database initialized at {self.db_path}")
     
     def _start_session(self):
         """Create a new logging session and return its ID."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
         start_time = datetime.now().isoformat()
         include_remote = 1 if self.server_list is not None else 0
         
-        cursor.execute('''
+        session_id = self._execute('''
             INSERT INTO log_sessions (start_time, status, interval_seconds, include_remote)
             VALUES (?, 'running', ?, ?)
         ''', (start_time, self.interval, include_remote))
-        
-        session_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
         
         logging.info(f"Started logging session {session_id}")
         return session_id
@@ -102,16 +97,10 @@ class NVLoggerSQLite:
         if self.session_id is None:
             return
         
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
         end_time = datetime.now().isoformat()
-        cursor.execute('''
+        self._execute('''
             UPDATE log_sessions SET end_time = ?, status = ? WHERE id = ?
         ''', (end_time, status, self.session_id))
-        
-        conn.commit()
-        conn.close()
         logging.info(f"Ended logging session {self.session_id} with status: {status}")
     
     def _flush_buffer(self):
@@ -119,19 +108,13 @@ class NVLoggerSQLite:
         if not self.data_buffer:
             return
         
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.executemany('''
+        self._execute('''
             INSERT INTO gpu_logs (
                 session_id, timestamp, node, gpu_id, name, fan_speed,
                 util_gpu, util_mem, temperature, rx, tx, power,
                 memory_used, memory_total, processes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', self.data_buffer)
-        
-        conn.commit()
-        conn.close()
+        ''', self.data_buffer, many=True)
         
         buffer_count = len(self.data_buffer)
         self.data_buffer = []
@@ -180,80 +163,60 @@ class NVLoggerSQLite:
     def _logging_loop(self):
         """Main logging loop that runs in a separate thread."""
         while self.logging_active:
-            try:
-                self._collect_data()
-                time.sleep(self.interval)
-            except Exception as e:
-                logging.error(f"Error during data collection: {e}")
-                time.sleep(self.interval)
+            self._collect_data()
+            time.sleep(self.interval)
     
     def _collect_data(self):
-        """Collect data from NVClientPool and buffer it."""
-        if not self.client_pool:
-            return
-        
+        """Collect one sample from every client into the buffer."""
         timestamp = datetime.now().isoformat()
         
-        try:
-            for client in self.client_pool.pool:
-                try:
-                    stats_df, _system_info = client.get_full_gpu_info()
-                    
-                    if not stats_df.empty:
-                        self._buffer_client_data(client, stats_df, timestamp)
-                        
-                except Exception as e:
-                    logging.error(f"Error getting data from client {getattr(client, 'description', 'unknown')}: {e}")
-                    
-        except Exception as e:
-            logging.error(f"Error collecting data from client pool: {e}")
-    
-    def _buffer_client_data(self, client, stats_df, timestamp):
-        """Buffer data for a single client."""
-        node_name = getattr(client, 'description', 'unknown')
-        
-        for idx, row in stats_df.iterrows():
+        for client in self.client_pool.pool:
             try:
-                # Get process information
-                processes_info = "-"
-                processes_element = row.get('processes')
-                if processes_element is not None:
-                    try:
-                        processes, user_summary = client.get_process_summary(stats_df.iloc[[idx]])
-                        if user_summary:
-                            processes_info = client.format_user_memory_compact(user_summary)
-                    except Exception as e:
-                        logging.warning(f"Failed to get process info for GPU {idx}: {e}")
-                
-                # Create record tuple for bulk insert
-                record = (
-                    self.session_id,
-                    timestamp,
-                    node_name,
-                    row.get('gpu_index', idx),
-                    row.get('product_name', 'N/A'),
-                    row.get('fan_speed', 'N/A'),
-                    row.get('gpu_util', 'N/A'),
-                    row.get('memory_util', 'N/A'),
-                    row.get('gpu_temp', 'N/A'),
-                    row.get('rx_util', 'N/A'),
-                    row.get('tx_util', 'N/A'),
-                    f"{row.get('power_state', 'N/A')} {row.get('power_draw', 'N/A')}/{row.get('current_power_limit', 'N/A')}",
-                    row.get('used', 'N/A'),
-                    row.get('total', 'N/A'),
-                    processes_info
-                )
-                
-                self.data_buffer.append(record)
-                
+                # Advanced (DCGM) metrics live only in system_info, which is
+                # not logged, so they are not fetched.
+                stats_df, _system_info = client.get_full_gpu_info(include_advanced=False)
+                records = self._client_records(client, stats_df, timestamp)
             except Exception as e:
-                logging.error(f"Error processing GPU data for {node_name}, GPU {idx}: {e}")
+                logging.error(f"Error getting data from client {client.description}: {e}")
+                continue
+            self.data_buffer.extend(records)
+    
+    def _client_records(self, client, stats_df, timestamp):
+        """Record tuples for one client's GPUs."""
+        records = []
+        for idx, row in stats_df.iterrows():
+            # Get process information
+            processes_info = "-"
+            try:
+                _processes, user_summary = client.get_process_summary(stats_df.iloc[[idx]])
+                if user_summary:
+                    processes_info = client.format_user_memory_compact(user_summary)
+            except Exception as e:
+                logging.warning(f"Failed to get process info for GPU {idx}: {e}")
+            
+            # Create record tuple for bulk insert
+            records.append((
+                self.session_id,
+                timestamp,
+                client.description,
+                row.get('gpu_index', idx),
+                row.get('product_name', 'N/A'),
+                row.get('fan_speed', 'N/A'),
+                row.get('gpu_util', 'N/A'),
+                row.get('memory_util', 'N/A'),
+                row.get('gpu_temp', 'N/A'),
+                row.get('rx_util', 'N/A'),
+                row.get('tx_util', 'N/A'),
+                f"{row.get('power_state', 'N/A')} {row.get('power_draw', 'N/A')}/{row.get('current_power_limit', 'N/A')}",
+                row.get('used', 'N/A'),
+                row.get('total', 'N/A'),
+                processes_info
+            ))
+        return records
 
 
 def run_sqlite_logger(server_list=None, interval=5, db_path=None):
     """Run the SQLite logger as a foreground process with signal handling."""
-    import signal
-    
     logger = NVLoggerSQLite(
         db_path=db_path,
         server_list=server_list,
@@ -274,12 +237,9 @@ def run_sqlite_logger(server_list=None, interval=5, db_path=None):
     print(f"Remote servers: {'Yes' if server_list else 'No (local only)'}")
     print("Press Ctrl+C to stop and save data\n")
     
-    if logger.start_logging():
-        try:
-            while logger.logging_active:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-    else:
+    if not logger.start_logging():
         print("Failed to start logging")
         sys.exit(1)
+    # signal_handler stops the logger, saves the last rows and exits.
+    while logger.logging_active:
+        time.sleep(1)

@@ -5,13 +5,13 @@ Provides @nvidb.monitor decorator to track GPU usage statistics
 during function execution, including duration, peak memory, and utilization.
 """
 
+import contextlib
 import functools
 import inspect
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, List, Dict, Any
-import asyncio
 
 # pynvml is a hard dependency (connection.py imports it unconditionally),
 # so no availability flag is needed here.
@@ -78,7 +78,7 @@ class GPUStats:
 
 
 class GPUMonitor:
-    """GPU monitoring context manager and sampler"""
+    """Background GPU sampler"""
     
     def __init__(self, sample_interval: float = 0.1, gpu_indices: Optional[List[int]] = None):
         """
@@ -195,24 +195,19 @@ class GPUMonitor:
             for idx, snapshots in self._snapshots.items():
                 if not snapshots:
                     continue
-                
-                gpu_stats = GPUStats(
+                stats[idx] = GPUStats(
                     gpu_index=idx,
-                    gpu_name=self._gpu_names.get(idx, f"GPU {idx}"),
-                    memory_total=snapshots[0].memory_total if snapshots else 0
+                    gpu_name=self._gpu_names[idx],
+                    memory_total=snapshots[0].memory_total,
+                    memory_start=snapshots[0].memory_used,
+                    memory_end=snapshots[-1].memory_used,
+                    memory_peak=max(s.memory_used for s in snapshots),
+                    utilization_samples=[s.gpu_utilization for s in snapshots],
+                    temperature_peak=max(s.temperature for s in snapshots),
+                    temperature_samples=[s.temperature for s in snapshots],
+                    power_peak=max(s.power_usage for s in snapshots),
+                    power_samples=[s.power_usage for s in snapshots],
                 )
-                
-                gpu_stats.memory_start = snapshots[0].memory_used
-                gpu_stats.memory_end = snapshots[-1].memory_used
-                gpu_stats.memory_peak = max(s.memory_used for s in snapshots)
-                
-                gpu_stats.utilization_samples = [s.gpu_utilization for s in snapshots]
-                gpu_stats.temperature_samples = [s.temperature for s in snapshots]
-                gpu_stats.temperature_peak = max(s.temperature for s in snapshots)
-                gpu_stats.power_samples = [s.power_usage for s in snapshots]
-                gpu_stats.power_peak = max(s.power_usage for s in snapshots)
-                
-                stats[idx] = gpu_stats
         
         self._shutdown_nvml()
         return stats
@@ -328,54 +323,38 @@ def monitor(
     """
     
     def decorator(fn: Callable):
+        if not enabled:
+            return fn
+
         # Get function info at decoration time
         signature, source_file, line_number = _get_caller_info(fn)
-        
+
+        @contextlib.contextmanager
+        def _monitoring():
+            gpu_monitor = GPUMonitor(
+                sample_interval=sample_interval,
+                gpu_indices=gpu_indices
+            )
+            start_time = time.time()
+            gpu_monitor.start()
+            try:
+                yield
+            finally:
+                stats = gpu_monitor.stop()
+                duration = time.time() - start_time
+                _print_stats(fn.__name__, duration, stats, signature, source_file, line_number)
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kwargs):
+                with _monitoring():
+                    return await fn(*args, **kwargs)
+            return async_wrapper
+
         @functools.wraps(fn)
         def sync_wrapper(*args, **kwargs):
-            if not enabled:
+            with _monitoring():
                 return fn(*args, **kwargs)
-            
-            gpu_monitor = GPUMonitor(
-                sample_interval=sample_interval,
-                gpu_indices=gpu_indices
-            )
-            
-            start_time = time.time()
-            gpu_monitor.start()
-            
-            try:
-                result = fn(*args, **kwargs)
-                return result
-            finally:
-                stats = gpu_monitor.stop()
-                duration = time.time() - start_time
-                _print_stats(fn.__name__, duration, stats, signature, source_file, line_number)
-        
-        @functools.wraps(fn)
-        async def async_wrapper(*args, **kwargs):
-            if not enabled:
-                return await fn(*args, **kwargs)
-            
-            gpu_monitor = GPUMonitor(
-                sample_interval=sample_interval,
-                gpu_indices=gpu_indices
-            )
-            
-            start_time = time.time()
-            gpu_monitor.start()
-            
-            try:
-                result = await fn(*args, **kwargs)
-                return result
-            finally:
-                stats = gpu_monitor.stop()
-                duration = time.time() - start_time
-                _print_stats(fn.__name__, duration, stats, signature, source_file, line_number)
-        
-        # Return appropriate wrapper based on function type
-        if asyncio.iscoroutinefunction(fn):
-            return async_wrapper
         return sync_wrapper
     
     # Handle both @monitor and @monitor() usage

@@ -297,11 +297,6 @@ def test_downsample_per_gpu():
     assert len(webdata._downsample_per_gpu(df, max_points_per_gpu=100)) == 10
 
 
-def test_get_db_path_delegates_to_config(monkeypatch):
-    monkeypatch.setattr(webdata.config, "get_db_path", lambda: "/tmp/fake.db")
-    assert webdata.get_db_path() == "/tmp/fake.db"
-
-
 def test_load_server_list_missing_config(tmp_path, monkeypatch):
     monkeypatch.setattr(webdata.config, "get_config_path", lambda: str(tmp_path / "absent.yml"))
     with pytest.raises(FileNotFoundError):

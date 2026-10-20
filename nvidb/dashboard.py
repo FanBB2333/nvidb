@@ -8,6 +8,7 @@ Replaces the previous Streamlit UI; the data layer in `nvidb.webdata` is reused.
 """
 
 import json
+import logging
 import threading
 import time
 from collections import deque
@@ -35,17 +36,19 @@ try:
 except Exception:  # pragma: no cover
     dash = None
 
+from . import config
+from .connection import NVClientPool
 from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
 
 # Reuse the UI-agnostic data layer.
 from .webdata import (
     _LOG_METRICS,
-    _as_path,
     _build_log_snapshot_table,
     _downsample_per_gpu,
     _format_datetime,
     _format_duration,
     _format_gb,
+    _gpu_table_totals,
     _load_server_list,
     _parse_mib_pair,
     _parse_percent,
@@ -54,7 +57,6 @@ from .webdata import (
     _user_memory_from_df,
     _user_summary_df,
     _user_time_share_df,
-    get_db_path,
     load_session_logs,
     load_sessions,
 )
@@ -345,13 +347,8 @@ HISTORY_MAX_POINTS = 360  # rolling live history per GPU
 class LiveCache:
     """Background fetcher over NVClientPool with a rolling metric history."""
 
-    def __init__(self, include_remote: bool, *, interval_seconds: int = 5):
-        try:
-            from nvidb.connection import NVClientPool
-        except ImportError:  # pragma: no cover
-            from .connection import NVClientPool
-
-        self.include_remote = bool(include_remote)
+    def __init__(self, include_remote: bool):
+        self.include_remote = include_remote
         self.remote_error = None
         server_list = None
         if include_remote:
@@ -362,7 +359,7 @@ class LiveCache:
         self.pool = NVClientPool(server_list)
 
         self._lock = threading.Lock()
-        self._interval = max(0.25, float(interval_seconds))
+        self._interval = 5.0
         self._enabled = True
         self.raw = None
         self.last_updated = None
@@ -371,20 +368,16 @@ class LiveCache:
         self.fetching = False
         self.history = deque(maxlen=HISTORY_MAX_POINTS)  # [{ts, rows: [{server, gpu, util, mem_used, mem_total, power, temp}]}]
 
-        self._stop = threading.Event()
         self._kick = threading.Event()
-        self._kick.set()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def configure(self, *, interval_seconds=None, enabled=None):
+    def configure(self, *, interval_seconds, enabled):
+        # Sub-second intervals are allowed; the fetch loop is serial, so
+        # the effective period is max(interval, fetch duration).
         with self._lock:
-            if interval_seconds is not None:
-                # Sub-second intervals are allowed; the fetch loop is serial, so
-                # the effective period is max(interval, fetch duration).
-                self._interval = max(0.25, min(3600.0, float(interval_seconds)))
-            if enabled is not None:
-                self._enabled = bool(enabled)
+            self._interval = max(0.25, min(3600.0, float(interval_seconds)))
+            self._enabled = bool(enabled)
 
     def refresh_now(self):
         self._kick.set()
@@ -401,18 +394,10 @@ class LiveCache:
                 "remote_error": self.remote_error,
             }
 
-    def _record_history(self, raw, now):
+    def _history_rows(self, raw):
         rows = []
-        if not isinstance(raw, dict):
-            return
         for idx, client in enumerate(self.pool.pool):
-            entry = raw.get(idx)
-            if not entry:
-                continue
-            table, _info = entry
-            if not isinstance(table, pd.DataFrame) or table.empty:
-                continue
-            desc = getattr(client, "description", f"server {idx}")
+            table, _info = raw[idx]
             for _, r in table.iterrows():
                 used, total = _parse_mib_pair(r.get("memory[used/total]"))
                 power_txt = str(r.get("power", ""))
@@ -431,7 +416,7 @@ class LiveCache:
                     temp_c = None
                 rows.append(
                     {
-                        "server": desc,
+                        "server": client.description,
                         "gpu": f"GPU {r.get('GPU', '?')}",
                         "util": _parse_percent(r.get("util")),
                         "mem_used_gib": (used / 1024.0) if used is not None else None,
@@ -440,13 +425,12 @@ class LiveCache:
                         "temp_c": temp_c,
                     }
                 )
-        if rows:
-            self.history.append({"ts": now, "rows": rows})
+        return rows
 
     def _run(self):  # pragma: no cover - thread loop
         # `interval` is a target *period*: the fetch duration is subtracted from
         # the wait, so sub-second intervals refresh as fast as fetches allow.
-        while not self._stop.is_set():
+        while True:
             with self._lock:
                 enabled = self._enabled
                 interval = self._interval
@@ -454,8 +438,6 @@ class LiveCache:
             if not enabled:
                 self._kick.wait()
                 self._kick.clear()
-                if self._stop.is_set():
-                    break
                 continue
 
             start = time.monotonic()
@@ -464,11 +446,13 @@ class LiveCache:
             try:
                 _fmt, raw = self.pool.get_client_gpus_info(return_raw=True)
                 now = datetime.now()
+                rows = self._history_rows(raw)
                 with self._lock:
                     self.raw = raw
                     self.last_updated = now
                     self.last_error = None
-                    self._record_history(raw, now)
+                    if rows:
+                        self.history.append({"ts": now, "rows": rows})
             except Exception as e:
                 with self._lock:
                     self.last_error = str(e)
@@ -478,8 +462,6 @@ class LiveCache:
                     self.last_duration = elapsed
                     self.fetching = False
 
-            if self._stop.is_set():
-                break
             self._kick.wait(timeout=max(0.05, interval - elapsed))
             self._kick.clear()
 
@@ -502,28 +484,33 @@ def _get_live_cache(include_remote: bool) -> LiveCache:
 # Logs data (TTL cache)
 # ---------------------------------------------------------------------------
 
+_LOGS_TTL_SECONDS = 5
 _logs_cache = {}
 _logs_lock = threading.Lock()
 
 
-def _cached(key, ttl, producer):
+def _cached(key, producer):
     now = time.monotonic()
     with _logs_lock:
         hit = _logs_cache.get(key)
-        if hit and now - hit[0] < ttl:
+        if hit and now - hit[0] < _LOGS_TTL_SECONDS:
             return hit[1]
     value = producer()
     with _logs_lock:
+        # Expired entries are never served again; drop them so every session
+        # browsed does not stay in memory for the life of the server.
+        for stale in [k for k, (t, _v) in _logs_cache.items() if now - t >= _LOGS_TTL_SECONDS]:
+            del _logs_cache[stale]
         _logs_cache[key] = (now, value)
     return value
 
 
 def _sessions_df(db_path) -> pd.DataFrame:
-    return _cached(("sessions", str(db_path)), 5, lambda: load_sessions(db_path))
+    return _cached(("sessions", str(db_path)), lambda: load_sessions(db_path))
 
 
 def _session_logs_df(db_path, session_id) -> pd.DataFrame:
-    return _cached(("logs", str(db_path), int(session_id)), 5, lambda: load_session_logs(db_path, int(session_id)))
+    return _cached(("logs", str(db_path), int(session_id)), lambda: load_session_logs(db_path, int(session_id)))
 
 
 # ---------------------------------------------------------------------------
@@ -548,10 +535,10 @@ def _pct_color(p, pal):
     return pal["good"]
 
 
-def _bar(pct, pal, color=None):
+def _bar(pct, pal):
     p = max(0.0, min(100.0, float(pct or 0)))
     return html.Div(
-        html.Div(className="nv-bar", style={"width": f"{p:.0f}%", "background": color or _pct_color(p, pal)}),
+        html.Div(className="nv-bar", style={"width": f"{p:.0f}%", "background": _pct_color(p, pal)}),
         className="nv-bar-wrap",
     )
 
@@ -593,24 +580,38 @@ _TABLE_STYLE = dict(
 )
 
 
-def _gpu_datatable(table: pd.DataFrame, table_id=None):
+def _table_style(**cell):
+    """_TABLE_STYLE with some style_cell entries overridden."""
+    return {**_TABLE_STYLE, "style_cell": {**_TABLE_STYLE["style_cell"], **cell}}
+
+
+def _table_records(table: pd.DataFrame, columns):
+    """DataTable records plus per-cell tooltips for `columns`.
+
+    The records carry hidden `_util_num`/`_mem_util_num` columns that the
+    percent-bar styles filter on.
+    """
     display = table.copy()
     for col in ("util", "mem_util"):
         if col in display.columns:
-            display[f"_{col}_num"] = display[col].map(lambda v: _parse_percent(v) if v is not None else None)
-    visible = [c for c in display.columns if not c.startswith("_")]
+            display[f"_{col}_num"] = display[col].map(_parse_percent)
+    records = display.to_dict("records")
+    tooltips = [{c: {"value": str(row.get(c, "")), "type": "text"} for c in columns} for row in records]
+    return records, tooltips
+
+
+def _gpu_datatable(table: pd.DataFrame, table_id=None):
+    visible = [c for c in table.columns if not c.startswith("_")]
+    records, tooltips = _table_records(table, visible)
     id_kwargs = {"id": table_id} if table_id is not None else {}
     return dash_table.DataTable(
         **id_kwargs,
-        data=display.to_dict("records"),
+        data=records,
         columns=[{"name": c, "id": c} for c in visible],
         sort_action="native",
         cell_selectable=False,
         style_data_conditional=_PERCENT_BUCKET_STYLES,
-        tooltip_data=[
-            {c: {"value": str(row.get(c, "")), "type": "text"} for c in visible}
-            for row in display.to_dict("records")
-        ],
+        tooltip_data=tooltips,
         tooltip_duration=None,
         **_TABLE_STYLE,
     )
@@ -670,7 +671,7 @@ def _live_history_figs(history, server_desc, pal):
     mem_total = None
     for point in reversed(history):
         for row in point["rows"]:
-            if row["server"] == server_desc and row.get("mem_total_gib"):
+            if row["server"] == server_desc and row["mem_total_gib"]:
                 mem_total = row["mem_total_gib"]
                 break
         if mem_total:
@@ -704,13 +705,12 @@ def _live_signature(cache: LiveCache):
     raw = snap["raw"]
     servers = []
     for idx, client in enumerate(cache.pool.pool):
-        desc = getattr(client, "description", f"server {idx}")
-        entry = (raw.get(idx) if isinstance(raw, dict) else None) or (pd.DataFrame(), {})
-        table, info = entry
-        info = info if isinstance(info, dict) else {}
+        desc = client.description
+        # raw is None until the first fetch completes.
+        table, info = (raw or {}).get(idx) or (pd.DataFrame(), {})
         if info.get("error"):
             servers.append({"desc": desc, "kind": "error", "cols": [], "adv": False})
-        elif isinstance(table, pd.DataFrame) and not table.empty:
+        elif not table.empty:
             servers.append(
                 {
                     "desc": desc,
@@ -788,10 +788,81 @@ def _build_live_skeleton(sig):
     return children
 
 
+def _server_head(idx, desc, info, table, pal):
+    """Title badges and caption line for one server card."""
+    head = [html.Span(f"[{idx + 1}] {desc}", className="nv-server-title")]
+    if info.get("error"):
+        head.append(html.Span("error", className="nv-badge nv-badge-err"))
+        return head, html.Span(str(info.get("error")), style={"color": pal["bad"]})
+    src = info.get("data_source")
+    if src:
+        head.append(html.Span(f"src:{src}", className="nv-badge"))
+    adv_src = info.get("advanced_source")
+    if adv_src:
+        adv_ok = info.get("advanced_supported") is True
+        head.append(
+            html.Span(
+                f"advanced:{adv_src}" + ("" if adv_ok else " (profiling unavailable)"),
+                className="nv-badge " + ("nv-badge-ok" if adv_ok else ""),
+            )
+        )
+    parts = []
+    if any(k in info for k in ("driver_version", "cuda_version", "attached_gpus")):
+        parts.append(
+            f"Driver {info.get('driver_version', 'N/A')} | CUDA {info.get('cuda_version', 'N/A')} | GPUs {info.get('attached_gpus', '0')}"
+        )
+    parts.append(_server_summary(table, info))
+    return head, " — ".join(parts)
+
+
+def _server_overview(desc, info, table, pal):
+    """Overview stat tile for one server."""
+    if info.get("error"):
+        return _stat(desc, "ERROR", str(info.get("error"))[:80])
+    sys_stats = info.get("system_stats", {}) or {}
+    gpu_count = len(table)
+    utils, used_sum, total_sum = _gpu_table_totals(table)
+    avg_util = sum(utils) / len(utils) if utils else 0.0
+    mem_str = f"{_format_gb(used_sum)}/{_format_gb(total_sum)}" if total_sum else "—"
+    cpu_pct = sys_stats.get("cpu_percent")
+    cpu_str = f"CPU {cpu_pct:.0f}%" if isinstance(cpu_pct, (int, float)) and sys_stats.get("cpu_cores") else None
+    return html.Div(
+        [
+            html.Div(desc, className="k"),
+            html.Div(f"{avg_util:.0f}%" if gpu_count else "No GPUs", className="v",
+                     style={"color": _pct_color(avg_util, pal) if gpu_count else pal["muted"]}),
+            html.Div(
+                " | ".join(x for x in [f"{gpu_count} GPU" + ("s" if gpu_count != 1 else ""),
+                                       mem_str if gpu_count else None, cpu_str] if x),
+                className="s",
+            ),
+            _bar(avg_util, pal) if gpu_count else html.Div(),
+        ],
+        className="nv-stat",
+    )
+
+
+def _advanced_children(info):
+    """DCGM metric tables for the server's "Advanced" panel."""
+    adv_children = []
+    adv_df = info.get("advanced_metrics")
+    if isinstance(adv_df, pd.DataFrame) and not adv_df.empty:
+        for title, cols in ADVANCED_METRIC_GROUPS:
+            cols_present = present_columns(adv_df.columns, list(cols))
+            if len(cols_present) < 2:
+                continue
+            sub = adv_df[cols_present].rename(columns=ADVANCED_METRIC_LABELS)
+            adv_children.append(html.Div(title, className="nv-caption", style={"margin": "8px 0 4px"}))
+            adv_children.append(_gpu_datatable(sub, None))
+    return adv_children or html.Div("No data", className="nv-caption")
+
+
 def _live_update_payload(cache: LiveCache, sig, theme):
     """Per-tick prop values for the skeleton built from `sig`."""
     pal = _pal(theme)
     snap = cache.snapshot()
+    # `sig` may come from the other cache (a tick racing a remote toggle), so
+    # raw can still be None or hold fewer servers than `sig` lists.
     raw = snap["raw"] if isinstance(snap["raw"], dict) else {}
     history = snap["history"]
 
@@ -810,9 +881,9 @@ def _live_update_payload(cache: LiveCache, sig, theme):
     if snap["last_error"]:
         alerts.append(html.Div(f"Last fetch error: {snap['last_error']}", className="nv-card", style={"color": pal["warn"]}))
 
-    meta = raw.get("_nvidb", {}) or {}
-    user_mem_by_client = meta.get("user_memory_by_client", {}) or {}
-    global_user_mem = meta.get("user_memory_global", {}) or {}
+    meta = raw.get("_nvidb", {})
+    user_mem_by_client = meta.get("user_memory_by_client", {})
+    global_user_mem = meta.get("user_memory_global", {})
 
     payload = {
         "alerts": alerts,
@@ -834,106 +905,28 @@ def _live_update_payload(cache: LiveCache, sig, theme):
 
     for idx, s in enumerate(sig.get("servers") or []):
         desc = s["desc"]
-        entry = raw.get(idx) or (pd.DataFrame(), {})
-        table, info = entry
-        info = info if isinstance(info, dict) else {}
-        sys_stats = info.get("system_stats", {}) or {}
+        table, info = raw.get(idx) or (pd.DataFrame(), {})
 
-        # ---- head + caption (every server) ----
-        head = [html.Span(f"[{idx + 1}] {desc}", className="nv-server-title")]
-        if info.get("error"):
-            head.append(html.Span("error", className="nv-badge nv-badge-err"))
-            caption = html.Span(str(info.get("error")), style={"color": pal["bad"]})
-        else:
-            src = info.get("data_source")
-            if src:
-                head.append(html.Span(f"src:{src}", className="nv-badge"))
-            adv_src = info.get("advanced_source")
-            if adv_src:
-                adv_ok = info.get("advanced_supported") is True
-                head.append(
-                    html.Span(
-                        f"advanced:{adv_src}" + ("" if adv_ok else " (profiling unavailable)"),
-                        className="nv-badge " + ("nv-badge-ok" if adv_ok else ""),
-                    )
-                )
-            parts = []
-            if any(k in info for k in ("driver_version", "cuda_version", "attached_gpus")):
-                parts.append(
-                    f"Driver {info.get('driver_version', 'N/A')} | CUDA {info.get('cuda_version', 'N/A')} | GPUs {info.get('attached_gpus', '0')}"
-                )
-            summary = _server_summary(table if isinstance(table, pd.DataFrame) else pd.DataFrame(), info)
-            if summary:
-                parts.append(summary)
-            caption = " — ".join(parts)
+        head, caption = _server_head(idx, desc, info, table, pal)
         payload["heads"].append(head)
         payload["captions"].append(caption)
-
-        # ---- overview card (every server) ----
-        if info.get("error"):
-            payload["overview"].append(_stat(desc, "ERROR", str(info.get("error"))[:80]))
-        else:
-            gpu_count = 0 if not isinstance(table, pd.DataFrame) or table.empty else len(table)
-            utils = [] if not gpu_count else [u for u in (_parse_percent(r.get("util")) for _, r in table.iterrows()) if u is not None]
-            avg_util = sum(utils) / len(utils) if utils else 0.0
-            used_sum = total_sum = 0.0
-            if gpu_count:
-                for _, r in table.iterrows():
-                    used, total = _parse_mib_pair(r.get("memory[used/total]"))
-                    if used is not None and total is not None:
-                        used_sum += used
-                        total_sum += total
-            mem_str = f"{_format_gb(used_sum)}/{_format_gb(total_sum)}" if total_sum else "—"
-            cpu_pct = sys_stats.get("cpu_percent")
-            cpu_str = f"CPU {cpu_pct:.0f}%" if isinstance(cpu_pct, (int, float)) and sys_stats.get("cpu_cores") else None
-            payload["overview"].append(
-                html.Div(
-                    [
-                        html.Div(desc, className="k"),
-                        html.Div(f"{avg_util:.0f}%" if gpu_count else "No GPUs", className="v",
-                                 style={"color": _pct_color(avg_util, pal) if gpu_count else pal["muted"]}),
-                        html.Div(
-                            " | ".join(x for x in [f"{gpu_count} GPU" + ("s" if gpu_count != 1 else ""),
-                                                   mem_str if gpu_count else None, cpu_str] if x),
-                            className="s",
-                        ),
-                        _bar(avg_util, pal) if gpu_count else html.Div(),
-                    ],
-                    className="nv-stat",
-                )
-            )
+        payload["overview"].append(_server_overview(desc, info, table, pal))
 
         # ---- gpu-only slots (order matches skeleton's pattern components) ----
         if s["kind"] != "gpus":
             continue
-        display = table.copy() if isinstance(table, pd.DataFrame) else pd.DataFrame()
-        for col in ("util", "mem_util"):
-            if col in display.columns:
-                display[f"_{col}_num"] = display[col].map(lambda v: _parse_percent(v) if v is not None else None)
-        records = display.to_dict("records")
+        records, tooltips = _table_records(table, s["cols"])
         payload["tables"].append(records)
-        payload["tooltips"].append(
-            [{c: {"value": str(row.get(c, "")), "type": "text"} for c in s["cols"]} for row in records]
-        )
+        payload["tooltips"].append(tooltips)
 
         util_fig, mem_fig = _live_history_figs(history, desc, pal)
         payload["util_figs"].append(util_fig or _empty_fig(pal, "Collecting history…"))
         payload["mem_figs"].append(mem_fig or _empty_fig(pal, "Collecting history…"))
 
         if s["adv"]:
-            adv_children = []
-            adv_df = info.get("advanced_metrics")
-            if isinstance(adv_df, pd.DataFrame) and not adv_df.empty:
-                for title, cols in ADVANCED_METRIC_GROUPS:
-                    cols_present = present_columns(adv_df.columns, list(cols))
-                    if len(cols_present) < 2:
-                        continue
-                    sub = adv_df[cols_present].rename(columns=ADVANCED_METRIC_LABELS)
-                    adv_children.append(html.Div(title, className="nv-caption", style={"margin": "8px 0 4px"}))
-                    adv_children.append(_gpu_datatable(sub, None))
-            payload["adv_children"].append(adv_children or html.Div("No data", className="nv-caption"))
+            payload["adv_children"].append(_advanced_children(info))
 
-        user_fig = _user_vram_fig(user_mem_by_client.get(idx, {}) or {}, pal, title="User VRAM (this node)")
+        user_fig = _user_vram_fig(user_mem_by_client.get(idx, {}), pal, title="User VRAM (this node)")
         payload["user_figs"].append(user_fig or _empty_fig(pal, "No user processes"))
 
     return payload
@@ -1018,7 +1011,7 @@ def _session_records(db_path):
     return records
 
 
-def _logs_tab(db_path, initial_session_id):
+def _logs_tab(db_path):
     db_missing = db_path is None or not Path(db_path).exists()
     sidebar = html.Div(
         [
@@ -1045,10 +1038,7 @@ def _logs_tab(db_path, initial_session_id):
                 style_data_conditional=[
                     {"if": {"filter_query": '{status} = "running"', "column_id": "status"}, "color": "#34d399"},
                 ],
-                **{
-                    **_TABLE_STYLE,
-                    "style_cell": {**_TABLE_STYLE["style_cell"], "fontSize": "12px", "padding": "5px 8px"},
-                },
+                **_table_style(fontSize="12px", padding="5px 8px"),
             ),
         ],
         className="nv-card",
@@ -1070,7 +1060,7 @@ def _logs_tab(db_path, initial_session_id):
 
     return html.Div(
         [
-            dcc.Store(id="store-session", data=initial_session_id),
+            dcc.Store(id="store-session"),
             dcc.Store(id="store-snapshot-ts"),
             html.Div([sidebar, main], className="nv-row", style={"alignItems": "flex-start", "flexWrap": "nowrap"}),
         ]
@@ -1140,22 +1130,17 @@ def _metric_figure(node_df, metric_key, spec, gpu_label_map, pal, snapshot_ts=No
     use_gl = len(long_df) > 4000
     trace_cls = go.Scattergl if use_gl else go.Scatter
     for i, (gpu_id, g) in enumerate(long_df.groupby("gpu_id", sort=True)):
-        try:
-            label = gpu_label_map.get(int(gpu_id), f"GPU {gpu_id}")
-        except Exception:
-            label = f"GPU {gpu_id}"
         g = g.sort_values("timestamp")
         fig.add_trace(
             trace_cls(
                 x=g["timestamp"],
                 y=g["value"],
-                name=label,
+                name=gpu_label_map[int(gpu_id)],
                 mode="lines",
                 line=dict(width=2, color=CHART_COLORS[i % len(CHART_COLORS)]),
             )
         )
-    ymax = 100 if metric_key in ("util_gpu", "util_mem", "fan_speed") else None
-    _fig_layout(fig, pal, title=spec.get("label", metric_key), height=int(spec.get("height", 220) * 1.15), ymax=ymax)
+    _fig_layout(fig, pal, title=spec["label"], height=252, ymax=spec.get("ymax"))
     fig.update_xaxes(tickformat="%m-%d %H:%M")
     if snapshot_ts is not None:
         vline_color = "rgba(15,23,42,0.45)" if pal is _PALETTES["light"] else "rgba(226,232,240,0.55)"
@@ -1183,20 +1168,14 @@ def _time_share_fig(time_share_df, pal):
     return _fig_layout(fig, pal, title="User GPU-time share (selected range)", height=max(120, 44 + 26 * len(df)))
 
 
-def _render_session_body(db_path, session_id, nodes_selected, metrics_selected, range_idx, snapshot_ts_iso, theme):
-    pal = _pal(theme)
-    df_all = _session_logs_df(db_path, session_id)
-    if df_all.empty:
-        return html.Div("No logs found for this session.", className="nv-card nv-caption")
+def _node_names(df):
+    return sorted({str(n) for n in df["node"].dropna().unique()})
 
-    sessions = _sessions_df(db_path)
-    row = sessions[sessions["id"] == int(session_id)]
-    info = row.iloc[0] if not row.empty else {}
 
+def _session_kpis(info):
+    """KPI strip for the selected session (`info` is its log_sessions row)."""
     end_raw = info.get("end_time")
-    if end_raw in ("None", ""):
-        end_raw = None
-    kpis = html.Div(
+    return html.Div(
         [
             _stat("Status", str(info.get("status") or "unknown")),
             _stat("Interval", f"{info.get('interval_seconds')}s" if info.get("interval_seconds") else "N/A"),
@@ -1209,7 +1188,94 @@ def _render_session_body(db_path, session_id, nodes_selected, metrics_selected, 
         className="nv-stats",
     )
 
-    nodes_all = sorted({str(n) for n in df_all["node"].dropna().unique()})
+
+def _node_section(node, df, parsed, snapshot, snapshot_ts, metrics_selected, pal):
+    """One node's card: metric charts, user shares and the snapshot table."""
+    node_df = parsed[parsed["node"] == node]
+    node_snapshot = snapshot[snapshot["node"] == node]
+    node_table = _build_log_snapshot_table(node_snapshot)
+
+    gpu_ids = sorted({int(g) for g in node_df["gpu_id"].dropna().unique()})
+    gpu_names = {}
+    name_source = node_snapshot if not node_snapshot.empty else df[df["node"] == node]
+    for _, r in name_source[["gpu_id", "name"]].dropna().drop_duplicates().iterrows():
+        gid = int(r["gpu_id"])
+        nm = _strip_gpu_name(r["name"])
+        if nm and nm != "N/A" and gid not in gpu_names:
+            gpu_names[gid] = nm
+    gpu_label_map = {g: (f"GPU {g} ({gpu_names[g]})" if g in gpu_names else f"GPU {g}") for g in gpu_ids}
+
+    charts = []
+    for key in metrics_selected:
+        if f"_v_{key}" not in node_df.columns:
+            continue
+        fig = _metric_figure(node_df, key, _LOG_METRICS[key], gpu_label_map, pal, snapshot_ts=snapshot_ts)
+        if fig is None:
+            continue
+        charts.append(
+            dcc.Graph(
+                id={"type": "log-chart", "node": node, "metric": key},
+                figure=fig,
+                config=_GRAPH_CONFIG,
+            )
+        )
+
+    section = [html.Div([html.Span(node, className="nv-server-title"),
+                         html.Span(_server_summary(node_table), className="nv-badge")])]
+    if charts:
+        section.append(html.Div(charts, className="nv-grid", style={"marginTop": "8px"}))
+    else:
+        section.append(html.Div("No chart data (pick metrics above).", className="nv-caption", style={"margin": "8px 0"}))
+
+    share_fig = _time_share_fig(_user_time_share_df(df[df["node"] == node]), pal)
+    vram_fig = _user_vram_fig(_user_memory_from_df(node_snapshot), pal, title="User VRAM @ snapshot")
+    aux = [g for g in (
+        dcc.Graph(figure=share_fig, config=_GRAPH_CONFIG) if share_fig else None,
+        dcc.Graph(figure=vram_fig, config=_GRAPH_CONFIG) if vram_fig else None,
+    ) if g is not None]
+    if aux:
+        section.append(html.Div([html.Div(g, className="nv-flex1", style={"minWidth": "320px"}) for g in aux],
+                                className="nv-row"))
+
+    if not node_table.empty:
+        section.append(html.Div(f"Snapshot @ {_format_datetime(snapshot_ts)}", className="nv-caption",
+                                style={"margin": "8px 0 4px"}))
+        section.append(_gpu_datatable(node_table, {"type": "log-snap-table", "index": node}))
+
+    return html.Div(section, className="nv-card")
+
+
+def _raw_data_view(df):
+    return html.Details(
+        [
+            html.Summary("Raw data (filter/sort/export)", className="nv-caption", style={"cursor": "pointer"}),
+            dash_table.DataTable(
+                data=df.assign(timestamp=df["timestamp"].astype(str)).to_dict("records"),
+                columns=[{"name": c, "id": c} for c in df.columns],
+                page_size=20,
+                sort_action="native",
+                filter_action="native",
+                export_format="csv",
+                **_table_style(fontSize="12px", padding="4px 8px"),
+            ),
+        ],
+        className="nv-card nv-card-tight",
+    )
+
+
+def _render_session_body(db_path, session_id, nodes_selected, metrics_selected, range_idx, snapshot_ts_iso, theme):
+    pal = _pal(theme)
+    df_all = _session_logs_df(db_path, session_id)
+    if df_all.empty:
+        return html.Div("No logs found for this session.", className="nv-card nv-caption")
+
+    sessions = _sessions_df(db_path)
+    row = sessions[sessions["id"] == int(session_id)]
+    # The sessions and logs caches refresh independently, so the row can be
+    # missing for a moment.
+    kpis = _session_kpis(row.iloc[0] if not row.empty else {})
+
+    nodes_all = _node_names(df_all)
     nodes_selected = [n for n in (nodes_selected or nodes_all) if n in nodes_all] or nodes_all
     df = df_all[df_all["node"].isin(nodes_selected)]
 
@@ -1217,13 +1283,14 @@ def _render_session_body(db_path, session_id, nodes_selected, metrics_selected, 
     if not ts_all:
         return html.Div([kpis, html.Div("No timestamps in this session.", className="nv-card nv-caption")])
 
+    # The slider counts timestamps across all nodes; ts_all is node-filtered.
     lo, hi = 0, len(ts_all) - 1
     if isinstance(range_idx, (list, tuple)) and len(range_idx) == 2:
         lo = max(0, min(int(range_idx[0]), len(ts_all) - 1))
         hi = max(lo, min(int(range_idx[1]), len(ts_all) - 1))
     start_ts, end_ts = ts_all[lo], ts_all[hi]
     df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
-    ts_window = [t for t in ts_all if start_ts <= t <= end_ts]
+    ts_window = ts_all[lo:hi + 1]
 
     # snapshot timestamp: clicked/stored, else window end
     snapshot_ts = ts_window[-1]
@@ -1245,92 +1312,14 @@ def _render_session_body(db_path, session_id, nodes_selected, metrics_selected, 
     metrics_selected = [m for m in (metrics_selected or []) if m in _LOG_METRICS]
     parsed = df[["timestamp", "node", "gpu_id"]].copy()
     for key in metrics_selected:
-        spec = _LOG_METRICS[key]
-        src = spec.get("source", key)
-        if src in df.columns:
-            parsed[f"_v_{key}"] = df[src].map(spec["parser"])
+        if key in df.columns:
+            parsed[f"_v_{key}"] = df[key].map(_LOG_METRICS[key]["parser"])
 
     snapshot = df[df["timestamp"] == snapshot_ts]
-
-    node_sections = []
-    for node in sorted({str(n) for n in df["node"].dropna().unique()}):
-        node_df = parsed[parsed["node"] == node]
-        node_snapshot = snapshot[snapshot["node"] == node]
-        node_table = _build_log_snapshot_table(node_snapshot)
-
-        gpu_ids = sorted({int(g) for g in node_df["gpu_id"].dropna().unique()})
-        gpu_names = {}
-        name_source = node_snapshot if not node_snapshot.empty else df[df["node"] == node]
-        if not name_source.empty and "name" in name_source.columns:
-            for _, r in name_source[["gpu_id", "name"]].dropna().drop_duplicates().iterrows():
-                try:
-                    gid = int(r["gpu_id"])
-                except Exception:
-                    continue
-                nm = _strip_gpu_name(r["name"])
-                if nm and nm != "N/A" and gid not in gpu_names:
-                    gpu_names[gid] = nm
-        gpu_label_map = {g: (f"GPU {g} ({gpu_names[g]})" if g in gpu_names else f"GPU {g}") for g in gpu_ids}
-
-        charts = []
-        for key in metrics_selected:
-            if f"_v_{key}" not in node_df.columns:
-                continue
-            fig = _metric_figure(node_df, key, _LOG_METRICS[key], gpu_label_map, pal, snapshot_ts=snapshot_ts)
-            if fig is None:
-                continue
-            charts.append(
-                dcc.Graph(
-                    id={"type": "log-chart", "node": node, "metric": key},
-                    figure=fig,
-                    config=_GRAPH_CONFIG,
-                )
-            )
-
-        section = [html.Div([html.Span(node, className="nv-server-title"),
-                             html.Span(_server_summary(node_table), className="nv-badge")])]
-        if charts:
-            section.append(html.Div(charts, className="nv-grid", style={"marginTop": "8px"}))
-        else:
-            section.append(html.Div("No chart data (pick metrics above).", className="nv-caption", style={"margin": "8px 0"}))
-
-        share_fig = _time_share_fig(_user_time_share_df(df[df["node"] == node]), pal)
-        vram_fig = _user_vram_fig(_user_memory_from_df(node_snapshot), pal, title="User VRAM @ snapshot")
-        aux = [g for g in (
-            dcc.Graph(figure=share_fig, config=_GRAPH_CONFIG) if share_fig else None,
-            dcc.Graph(figure=vram_fig, config=_GRAPH_CONFIG) if vram_fig else None,
-        ) if g is not None]
-        if aux:
-            section.append(html.Div([html.Div(g, className="nv-flex1", style={"minWidth": "320px"}) for g in aux],
-                                    className="nv-row"))
-
-        if not node_table.empty:
-            section.append(html.Div(f"Snapshot @ {_format_datetime(snapshot_ts)}", className="nv-caption",
-                                    style={"margin": "8px 0 4px"}))
-            section.append(_gpu_datatable(node_table, {"type": "log-snap-table", "index": node}))
-
-        node_sections.append(html.Div(section, className="nv-card"))
-
-    raw_view = html.Details(
-        [
-            html.Summary("Raw data (filter/sort/export)", className="nv-caption", style={"cursor": "pointer"}),
-            dash_table.DataTable(
-                data=df.assign(timestamp=df["timestamp"].astype(str)).to_dict("records"),
-                columns=[{"name": c, "id": c} for c in df.columns],
-                page_size=20,
-                sort_action="native",
-                filter_action="native",
-                export_format="csv",
-                **{
-                    **_TABLE_STYLE,
-                    "style_cell": {**_TABLE_STYLE["style_cell"], "fontSize": "12px", "padding": "4px 8px"},
-                },
-            ),
-        ],
-        className="nv-card nv-card-tight",
-    )
-
-    return html.Div([kpis, range_caption, *node_sections, raw_view])
+    node_sections = [
+        _node_section(node, df, parsed, snapshot, snapshot_ts, metrics_selected, pal) for node in _node_names(df)
+    ]
+    return html.Div([kpis, range_caption, *node_sections, _raw_data_view(df)])
 
 
 # ---------------------------------------------------------------------------
@@ -1338,11 +1327,8 @@ def _render_session_body(db_path, session_id, nodes_selected, metrics_selected, 
 # ---------------------------------------------------------------------------
 
 
-def create_app(*, db_path=None, session_id=None, include_remote=False):
-    if dash is None:  # pragma: no cover
-        raise RuntimeError("dash is required for `nvidb web` (install with `pip install dash`).")
-
-    db_path = _as_path(db_path or get_db_path())
+def create_app(*, db_path=None, include_remote=False):
+    db_path = Path(db_path or config.get_db_path()).expanduser()
 
     app = Dash(__name__, title="nvidb web", update_title=None, suppress_callback_exceptions=True)
     app.index_string = _INDEX_STRING
@@ -1350,8 +1336,6 @@ def create_app(*, db_path=None, session_id=None, include_remote=False):
     # A browser tab loaded before a server restart keeps POSTing callbacks that
     # may no longer exist after a code change. Answer those with 204 (and one
     # warning) instead of a 500 traceback on every tick.
-    import logging as _logging
-
     _stale_seen = set()
 
     @app.server.errorhandler(KeyError)
@@ -1360,7 +1344,7 @@ def create_app(*, db_path=None, session_id=None, include_remote=False):
             key = str(err)
             if key not in _stale_seen:
                 _stale_seen.add(key)
-                _logging.getLogger(__name__).warning(
+                logging.getLogger(__name__).warning(
                     "Ignoring callback from a browser tab loaded before the server restart — reload that tab. (%s)",
                     key,
                 )
@@ -1391,13 +1375,13 @@ def create_app(*, db_path=None, session_id=None, include_remote=False):
             ),
             dcc.Tabs(
                 id="tabs",
-                value="tab-logs" if session_id is not None else "tab-live",
+                value="tab-live",
                 className="nv-tabs",
                 children=[
                     dcc.Tab(label="⚡ Live", value="tab-live", className="tab", selected_className="tab--selected",
                             children=_live_tab(include_remote)),
                     dcc.Tab(label="🗄 Logs", value="tab-logs", className="tab", selected_className="tab--selected",
-                            children=_logs_tab(db_path, session_id)),
+                            children=_logs_tab(db_path)),
                 ],
             ),
         ],
@@ -1425,10 +1409,7 @@ def create_app(*, db_path=None, session_id=None, include_remote=False):
     def live_settings(interval_s, auto, remote, _clicks):
         include_remote_now = "remote" in (remote or [])
         enabled = "on" in (auto or [])
-        try:
-            interval = float(interval_s)
-        except (TypeError, ValueError):
-            interval = 5.0
+        interval = float(interval_s)
         cache = _get_live_cache(include_remote_now)
         cache.configure(interval_seconds=interval, enabled=enabled)
         if ctx.triggered_id in ("live-refresh-btn", "live-remote"):
@@ -1551,7 +1532,7 @@ def create_app(*, db_path=None, session_id=None, include_remote=False):
             return no_update, no_update, no_update, no_update
 
         df = _session_logs_df(db_path, session_id)
-        nodes = sorted({str(n) for n in df["node"].dropna().unique()}) if not df.empty else []
+        nodes = _node_names(df) if not df.empty else []
         ts_count = int(df["timestamp"].dropna().nunique()) if not df.empty else 0
         body = html.Div(
             [
@@ -1592,11 +1573,8 @@ def create_app(*, db_path=None, session_id=None, include_remote=False):
     return app
 
 
-def run_dash_app(*, session_id=None, db_path=None, port=8501, include_remote=False):
-    import importlib.util
-    import logging
-
-    if importlib.util.find_spec("dash") is None:
+def run_dash_app(*, db_path=None, port=8501, include_remote=False):
+    if dash is None:
         print("dash is required for `nvidb web`.\nInstall: pip install dash")
         raise SystemExit(1)
 
@@ -1607,24 +1585,12 @@ def run_dash_app(*, session_id=None, db_path=None, port=8501, include_remote=Fal
         logging.getLogger(name).setLevel(logging.WARNING)
     # dash re-enables its INFO logging inside app.run(); a filter survives that.
     logging.getLogger("dash.dash").addFilter(lambda record: record.levelno > logging.INFO)
-    try:  # hide Flask's "Serving Flask app ..." banner
-        import flask.cli
+    # Hide Flask's "Serving Flask app ..." banner.
+    import flask.cli
 
-        flask.cli.show_server_banner = lambda *args, **kwargs: None
-    except Exception:
-        pass
+    flask.cli.show_server_banner = lambda *args, **kwargs: None
 
-    app = create_app(db_path=db_path, session_id=session_id, include_remote=include_remote)
+    app = create_app(db_path=db_path, include_remote=include_remote)
     print(f"Starting nvidb web (Dash) on port {port}...")
     print(f"Open http://localhost:{port} in your browser")
     app.run(host="127.0.0.1", port=int(port), debug=False)
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db-path", type=str, default=None)
-    parser.add_argument("--port", type=int, default=8501)
-    args = parser.parse_args()
-    run_dash_app(db_path=args.db_path, port=args.port)
