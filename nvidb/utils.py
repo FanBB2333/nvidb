@@ -1,9 +1,5 @@
-import logging
 import math
 import re
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger: logging.Logger = logging.getLogger(name=__name__)
 
 
 def units_from_str(s: str) -> str:

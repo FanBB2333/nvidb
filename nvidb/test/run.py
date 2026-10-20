@@ -213,9 +213,7 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
     print(f"\nImport complete: {added} added, {skipped} skipped (already exists).")
 
 def init(config_path=None):
-    config_path = config_path or config.get_config_path()
-    Path(config_path).parent.mkdir(parents=True, exist_ok=True)
-    return ServerListInfo.from_yaml(config_path)
+    return ServerListInfo.from_yaml(config_path or config.get_config_path())
 
 
 def interactive_add_server(config_path=None):
@@ -322,7 +320,10 @@ def interactive_add_server(config_path=None):
     if proxyjump:
         server_dict['proxyjump'] = proxyjump
 
-    cfg.setdefault('servers', []).append(server_dict)
+    # A config written with no servers may hold `servers:` (None).
+    servers = cfg.get('servers') or []
+    servers.append(server_dict)
+    cfg['servers'] = servers
     config.write_config(cfg, config_path)
 
     print(f"\nServer added successfully to {config_path}")
@@ -415,7 +416,7 @@ def show_servers(config_path=None, detail=False):
         print(f"Error reading config: {e}")
         return
 
-    servers = cfg.get('servers', [])
+    servers = cfg.get('servers') or []
     _warn_if_deprecated_config_keys(servers)
     server_count = len(servers)
     
@@ -516,7 +517,7 @@ def _clean_server(config_path):
         print(f"\nError reading config: {e}")
         return
     
-    servers = cfg.get('servers', [])
+    servers = cfg.get('servers') or []
     _warn_if_deprecated_config_keys(servers)
     if not servers:
         print("\nNo servers configured.")
@@ -541,9 +542,7 @@ def _clean_server(config_path):
             print("\nInvalid selection.")
             return
         
-        server = servers[idx]
-        server_host = server.get('hostname') or server.get('host', 'N/A')
-        nickname = server.get('nickname') or server.get('description', f"{server.get('username', 'N/A')}@{server_host}")
+        nickname = _server_label(servers[idx])[3]
         
         confirm = input(f"\nRemove server '{nickname}'? [y/N]: ").strip().lower()
         if confirm in ['y', 'yes']:
@@ -574,13 +573,7 @@ def _clean_database(db_path):
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
             session_count = conn.execute("SELECT COUNT(*) FROM log_sessions").fetchone()[0]
             log_count = conn.execute("SELECT COUNT(*) FROM gpu_logs").fetchone()[0]
-        file_size = db_path.stat().st_size
-        if file_size >= 1024 * 1024:
-            size_str = f"{file_size / (1024 * 1024):.2f} MB"
-        elif file_size >= 1024:
-            size_str = f"{file_size / 1024:.2f} KB"
-        else:
-            size_str = f"{file_size} bytes"
+        size_str = _format_size(db_path.stat().st_size)
 
         print(f"\nDatabase: {db_path}")
         print(f"  Size: {size_str}")
@@ -658,6 +651,7 @@ def list_log_sessions(db_path=None):
 def show_log_info(session_id=None, db_path=None):
     """Show statistics for a log session."""
     import sqlite3
+    from ..webdata import _parse_user_memory_compact
     
     db_path = Path(db_path or config.get_db_path())
     
@@ -734,43 +728,23 @@ def show_log_info(session_id=None, db_path=None):
         
             print(f"\n  Nodes:          {', '.join(nodes)}")
         
-            # Parse processes to get user statistics
+            # Per-user GPU time and peak memory, from the logger's compact
+            # "alice(2048M) bob(4M)" process summary.
             cursor.execute('''
                 SELECT node, processes
                 FROM gpu_logs 
                 WHERE session_id = ? AND processes != '-' AND processes != 'N/A'
             ''', (session_id,))
         
-            # Track user GPU time and memory usage
             user_time = {}  # user -> total_seconds
             user_max_memory = {}  # user -> max_memory_mb
         
             for node, processes in cursor.fetchall():
-                if not processes or processes in ('-', 'N/A'):
-                    continue
-            
-                # Parse processes string like "user1:1234MB user2:567MB"
-                for part in processes.split():
-                    if ':' in part:
-                        try:
-                            user, mem_str = part.split(':', 1)
-                            # Extract memory value
-                            mem_mb = 0
-                            if 'MB' in mem_str.upper():
-                                mem_mb = float(mem_str.upper().replace('MB', '').replace('MIB', ''))
-                            elif 'GB' in mem_str.upper():
-                                mem_mb = float(mem_str.upper().replace('GB', '').replace('GIB', '')) * 1024
-                        
-                            key = f"{user}@{node}"
-                        
-                            # Add time (interval seconds per record)
-                            user_time[key] = user_time.get(key, 0) + interval
-                        
-                            # Track max memory
-                            if key not in user_max_memory or mem_mb > user_max_memory[key]:
-                                user_max_memory[key] = mem_mb
-                        except (AttributeError, TypeError, ValueError):
-                            continue
+                for user, mem_mb in _parse_user_memory_compact(processes).items():
+                    key = f"{user}@{node}"
+                    # Add time (interval seconds per record)
+                    user_time[key] = user_time.get(key, 0) + interval
+                    user_max_memory[key] = max(user_max_memory.get(key, 0), mem_mb)
         
             # Display top users by GPU time
             if user_time:
@@ -815,7 +789,7 @@ def show_log_info(session_id=None, db_path=None):
 
 
 def main():
-    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     # 创建主解析器
     from ..sched import cli as sched_cli
@@ -847,13 +821,13 @@ def main():
     log_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
     log_subparsers = log_parser.add_subparsers(dest='log_command')
     log_ls_parser = log_subparsers.add_parser('ls', help='List all log sessions')
-    log_ls_parser.add_argument('--db-path', type=str, default=None, help='Database path')
+    log_ls_parser.add_argument('--db-path', type=str, default=argparse.SUPPRESS, help='Database path')
     log_info_parser = log_subparsers.add_parser('info', help='Show statistics for a log session')
     log_info_parser.add_argument('session_id', nargs='?', type=int, default=None, help='Session ID (default: latest)')
-    log_info_parser.add_argument('--db-path', type=str, default=None, help='Database path')
+    log_info_parser.add_argument('--db-path', type=str, default=argparse.SUPPRESS, help='Database path')
     # Deprecated alias (use `nvidb web` instead)
     log_web_parser = log_subparsers.add_parser('web', help='(deprecated) Use `nvidb web`')
-    log_web_parser.add_argument('--db-path', type=str, default=None, help='Database path')
+    log_web_parser.add_argument('--db-path', type=str, default=argparse.SUPPRESS, help='Database path')
     log_web_parser.add_argument('--port', type=int, default=8501, help='Dash server port (default: 8501)')
     web_parser = subparsers.add_parser('web', help='Open web dashboard (Live + Logs)')
     web_parser.add_argument('--db-path', type=str, default=None, help='Database path (default: $WORKING_DIR/gpu_log.db)')
