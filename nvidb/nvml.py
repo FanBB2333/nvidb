@@ -65,8 +65,9 @@ def _process_name(pid: int) -> Optional[str]:
 class PynvmlCollector:
     """Keep one local NVML context alive and return lightweight snapshots."""
 
-    def __init__(self, *, slow_metric_ttl: float = 5.0):
-        self.slow_metric_ttl = max(0.0, float(slow_metric_ttl))
+    SLOW_METRIC_TTL = 5.0
+
+    def __init__(self):
         self._lock = threading.RLock()
         self._initialized = False
         self._handles = []
@@ -90,9 +91,7 @@ class PynvmlCollector:
 
         pynvml.nvmlInit()
         self._initialized = True
-        self._driver_version = _decode(
-            self._safe(getattr(pynvml, "nvmlSystemGetDriverVersion", None))
-        )
+        self._driver_version = _decode(self._safe(pynvml.nvmlSystemGetDriverVersion))
 
         cuda_value = None
         for name in ("nvmlSystemGetCudaDriverVersion_v2", "nvmlSystemGetCudaDriverVersion"):
@@ -110,7 +109,7 @@ class PynvmlCollector:
 
         architecture_func = getattr(pynvml, "nvmlDeviceGetArchitecture", None)
         for index, handle in enumerate(self._handles):
-            name = _decode(self._safe(getattr(pynvml, "nvmlDeviceGetName", None), handle))
+            name = _decode(self._safe(pynvml.nvmlDeviceGetName, handle))
             architecture = self._safe(architecture_func, handle)
             self._device_static.append(
                 {
@@ -121,88 +120,68 @@ class PynvmlCollector:
                     # context, not a ceiling: a card in a narrower slot still
                     # reports its own maximum here.
                     "pcie_link_gen_max": self._safe(
-                        getattr(pynvml, "nvmlDeviceGetMaxPcieLinkGeneration", None),
-                        handle,
+                        pynvml.nvmlDeviceGetMaxPcieLinkGeneration, handle
                     ),
                     "pcie_link_width_max": self._safe(
-                        getattr(pynvml, "nvmlDeviceGetMaxPcieLinkWidth", None),
-                        handle,
+                        pynvml.nvmlDeviceGetMaxPcieLinkWidth, handle
                     ),
                 }
             )
 
     def _get_slow_metrics(self, index: int, handle: Any, now: float) -> dict:
         cached = self._slow_metrics.get(index)
-        if cached is not None and now - cached["timestamp"] < self.slow_metric_ttl:
+        if cached is not None and now - cached["timestamp"] < self.SLOW_METRIC_TTL:
             return cached["values"]
 
-        performance_state = self._safe(
-            getattr(pynvml, "nvmlDeviceGetPerformanceState", None), handle
-        )
         values = {
-            "fan_percent": self._safe(
-                getattr(pynvml, "nvmlDeviceGetFanSpeed", None), handle
-            ),
+            "fan_percent": self._safe(pynvml.nvmlDeviceGetFanSpeed, handle),
             "temperature_c": self._safe(
-                getattr(pynvml, "nvmlDeviceGetTemperature", None),
-                handle,
-                getattr(pynvml, "NVML_TEMPERATURE_GPU", 0),
+                pynvml.nvmlDeviceGetTemperature, handle, pynvml.NVML_TEMPERATURE_GPU
             ),
-            "power_limit_mw": self._safe(
-                getattr(pynvml, "nvmlDeviceGetPowerManagementLimit", None), handle
-            ),
-            "performance_state": (
-                int(performance_state) if isinstance(performance_state, int) else None
-            ),
+            "power_limit_mw": self._safe(pynvml.nvmlDeviceGetPowerManagementLimit, handle),
+            "performance_state": self._safe(pynvml.nvmlDeviceGetPerformanceState, handle),
         }
         self._slow_metrics[index] = {"timestamp": now, "values": values}
         return values
 
     def _get_processes(self, handle: Any) -> list[dict]:
         processes = {}
-        for process_type, function_name in (
-            ("C", "nvmlDeviceGetComputeRunningProcesses"),
-            ("G", "nvmlDeviceGetGraphicsRunningProcesses"),
+        for process_type, function in (
+            ("C", pynvml.nvmlDeviceGetComputeRunningProcesses),
+            ("G", pynvml.nvmlDeviceGetGraphicsRunningProcesses),
         ):
-            function = getattr(pynvml, function_name, None)
-            for process in self._safe(function, handle, default=()) or ():
-                try:
-                    pid = int(process.pid)
-                except (AttributeError, TypeError, ValueError):
-                    continue
-
-                used_memory = getattr(process, "usedGpuMemory", None)
-                if not isinstance(used_memory, int) or used_memory >= _ULONG_LONG_MAX:
+            for process in self._safe(function, handle, default=()):
+                pid = process.pid
+                # Old pynvml leaves NVML_VALUE_NOT_AVAILABLE as ULLONG_MAX.
+                used_memory = process.usedGpuMemory
+                if used_memory is not None and used_memory >= _ULONG_LONG_MAX:
                     used_memory = None
 
-                entry = processes.setdefault(
-                    pid,
-                    {
+                entry = processes.get(pid)
+                if entry is None:
+                    entry = processes[pid] = {
                         "pid": pid,
                         "type": "",
-                        "process_name": None,
+                        "process_name": _decode(
+                            self._safe(pynvml.nvmlSystemGetProcessName, pid)
+                        ) or _process_name(pid),
                         "username": _process_username(pid),
                         "used_gpu_memory_bytes": used_memory,
                         "gpu_instance_id": None,
                         "compute_instance_id": None,
-                    },
-                )
+                    }
                 if process_type not in entry["type"]:
                     entry["type"] += process_type
                 if entry["used_gpu_memory_bytes"] is None and used_memory is not None:
                     entry["used_gpu_memory_bytes"] = used_memory
 
+                # v1 process structs carry no MIG instance ids.
                 gpu_instance_id = getattr(process, "gpuInstanceId", _UINT_MAX)
                 compute_instance_id = getattr(process, "computeInstanceId", _UINT_MAX)
-                if isinstance(gpu_instance_id, int) and gpu_instance_id != _UINT_MAX:
+                if gpu_instance_id != _UINT_MAX:
                     entry["gpu_instance_id"] = gpu_instance_id
-                if isinstance(compute_instance_id, int) and compute_instance_id != _UINT_MAX:
+                if compute_instance_id != _UINT_MAX:
                     entry["compute_instance_id"] = compute_instance_id
-
-                process_name = self._safe(
-                    getattr(pynvml, "nvmlSystemGetProcessName", None), pid
-                )
-                entry["process_name"] = _decode(process_name) or _process_name(pid)
 
         return list(processes.values())
 
@@ -217,19 +196,14 @@ class PynvmlCollector:
                 now = time.monotonic()
                 gpus = []
                 for index, handle in enumerate(self._handles):
-                    memory_function = getattr(
-                        pynvml, "nvmlDeviceGetMemoryInfo", None
-                    )
                     memory = self._safe(
-                        memory_function,
+                        pynvml.nvmlDeviceGetMemoryInfo,
                         handle,
                         getattr(pynvml, "nvmlMemory_v2", None),
                     )
                     if memory is None:
-                        memory = self._safe(memory_function, handle)
-                    utilization = self._safe(
-                        getattr(pynvml, "nvmlDeviceGetUtilizationRates", None), handle
-                    )
+                        memory = self._safe(pynvml.nvmlDeviceGetMemoryInfo, handle)
+                    utilization = self._safe(pynvml.nvmlDeviceGetUtilizationRates, handle)
                     slow_metrics = self._get_slow_metrics(index, handle, now)
 
                     gpu = dict(self._device_static[index])
@@ -244,30 +218,26 @@ class PynvmlCollector:
                             "gpu_util_percent": getattr(utilization, "gpu", None),
                             "memory_util_percent": getattr(utilization, "memory", None),
                             "pcie_tx_kib_per_s": self._safe(
-                                getattr(pynvml, "nvmlDeviceGetPcieThroughput", None),
+                                pynvml.nvmlDeviceGetPcieThroughput,
                                 handle,
-                                getattr(pynvml, "NVML_PCIE_UTIL_TX_BYTES", 0),
+                                pynvml.NVML_PCIE_UTIL_TX_BYTES,
                             ),
                             "pcie_rx_kib_per_s": self._safe(
-                                getattr(pynvml, "nvmlDeviceGetPcieThroughput", None),
+                                pynvml.nvmlDeviceGetPcieThroughput,
                                 handle,
-                                getattr(pynvml, "NVML_PCIE_UTIL_RX_BYTES", 1),
+                                pynvml.NVML_PCIE_UTIL_RX_BYTES,
                             ),
                             # Read every tick, not cached with the slow metrics:
                             # an idle link drops to gen1 and narrows its width,
                             # and stale link state would misreport the load.
                             "pcie_link_gen_current": self._safe(
-                                getattr(
-                                    pynvml, "nvmlDeviceGetCurrPcieLinkGeneration", None
-                                ),
-                                handle,
+                                pynvml.nvmlDeviceGetCurrPcieLinkGeneration, handle
                             ),
                             "pcie_link_width_current": self._safe(
-                                getattr(pynvml, "nvmlDeviceGetCurrPcieLinkWidth", None),
-                                handle,
+                                pynvml.nvmlDeviceGetCurrPcieLinkWidth, handle
                             ),
                             "power_usage_mw": self._safe(
-                                getattr(pynvml, "nvmlDeviceGetPowerUsage", None), handle
+                                pynvml.nvmlDeviceGetPowerUsage, handle
                             ),
                             "processes": self._get_processes(handle),
                             **slow_metrics,
@@ -368,8 +338,6 @@ REMOTE_NVML_AGENT_SCRIPT = textwrap.dedent(
         return str(value)
 
     def format_cuda_version(value):
-        if value is None:
-            return None
         version = int(value)
         major = version // 1000
         minor = (version % 1000) // 10
@@ -763,7 +731,7 @@ REMOTE_NVML_AGENT_SCRIPT = textwrap.dedent(
             payload = {
                 "ok": False,
                 "backend": "ctypes",
-                "error": init_error or "NVML initialization failed",
+                "error": init_error,
             }
         else:
             try:
@@ -793,11 +761,16 @@ REMOTE_NVML_AGENT_SCRIPT = textwrap.dedent(
 ).strip()
 
 
-def make_nvml_agent_command(*, python_exe: str = "python3", once: bool = False) -> str:
-    encoded = base64.b64encode(REMOTE_NVML_AGENT_SCRIPT.encode("utf-8")).decode("ascii")
-    argument = " once" if once else ""
+def _python_exec_command(script: str, filename: str, flags: str = "") -> str:
+    """`python3 -c` command that runs `script`, base64-wrapped to survive shell quoting."""
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     return (
-        f"{python_exe} -S -u -c "
+        f"python3 {flags}-c "
         f"\"import base64; exec(compile(base64.b64decode('{encoded}').decode('utf-8'), "
-        f"'<nvidb-nvml-agent>', 'exec'))\"{argument}"
+        f"'{filename}', 'exec'))\""
     )
+
+
+def make_nvml_agent_command(*, once: bool = False) -> str:
+    command = _python_exec_command(REMOTE_NVML_AGENT_SCRIPT, "<nvidb-nvml-agent>", "-S -u ")
+    return command + " once" if once else command

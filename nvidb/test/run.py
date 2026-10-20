@@ -1,8 +1,9 @@
-import yaml
+import contextlib
 import getpass
 import logging
 import argparse
 import shutil
+from datetime import datetime
 from pathlib import Path
 from paramiko import SSHConfig
 from ..connection import NVClientPool
@@ -12,29 +13,30 @@ from .. import config
 
 
 def _warn_if_deprecated_config_keys(servers):
-    for server in servers or []:
-        try:
-            ServerListInfo._normalize_server_dict(dict(server))
-        except Exception:
-            pass
+    for server in servers:
+        ServerListInfo._normalize_server_dict(server)
 
 
 def _load_config_yaml(config_path=None) -> dict:
     return config.load_config(config_path)
 
 
-def _get_basic_compact(cfg: dict) -> bool:
-    basic = (cfg or {}).get("basic", {})
-    if not isinstance(basic, dict):
-        basic = {}
-    return bool(basic.get("compact", False))
+def _read_config_file(config_path) -> dict:
+    # Strict: a broken config.yml must raise rather than read as empty, or the
+    # add/import write-back would replace it with only the new servers.
+    return config._read_yaml(config_path, strict=True)
 
 
-def _get_basic_remote(cfg: dict) -> bool:
-    basic = (cfg or {}).get("basic", {})
-    if not isinstance(basic, dict):
-        basic = {}
-    return bool(basic.get("remote", False))
+def _basic_flag(cfg: dict, key: str) -> bool:
+    basic = cfg.get("basic")
+    return isinstance(basic, dict) and bool(basic.get(key, False))
+
+
+def _port_or_default(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 22
 
 
 def _is_specific_ssh_host(name: str) -> bool:
@@ -63,9 +65,6 @@ def _format_import_candidate(candidate: dict) -> str:
 
 
 def _prompt_import_selection(candidates):
-    if not candidates:
-        return []
-    
     from blessed import Terminal
     
     term = Terminal()
@@ -102,11 +101,8 @@ def _prompt_import_selection(candidates):
     for _ in range(total_lines):
         print()
     
-    cbreak_ctx = term.cbreak()
-    cbreak_ctx.__enter__()
-    
     try:
-        with term.hidden_cursor():
+        with term.cbreak(), term.hidden_cursor():
             draw_menu()
             
             while True:
@@ -124,7 +120,7 @@ def _prompt_import_selection(candidates):
                     selected[:] = [False] * len(candidates)
                 elif key.lower() == 'i':  # Invert selection
                     selected[:] = [not s for s in selected]
-                elif key.lower() == 's' or key.code in (term.KEY_ENTER, 10, 13) or key == '\n' or key == '\r':  # Save
+                elif key.lower() == 's' or key.code == term.KEY_ENTER:  # Save
                     return selected
                 elif key.lower() == 'q' or key.code == term.KEY_ESCAPE:  # Cancel
                     return None
@@ -133,10 +129,6 @@ def _prompt_import_selection(candidates):
     except KeyboardInterrupt:
         return None
     finally:
-        try:
-            cbreak_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
         print()  # Clean newline
 
 
@@ -158,21 +150,12 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
 
     candidates = []
     for alias in hostnames:
-        data = ssh_config.lookup(alias) or {}
-        hostname = data.get("hostname") or alias
-        port = data.get("port", 22)
-        try:
-            port = int(port)
-        except Exception:
-            port = 22
+        data = ssh_config.lookup(alias)
+        hostname = data["hostname"]
+        port = _port_or_default(data.get("port", 22))
         username = data.get("user") or getpass.getuser()
-        identityfile = None
-        identityfiles = data.get("identityfile")
-        if isinstance(identityfiles, (list, tuple)):
-            if identityfiles:
-                identityfile = identityfiles[0]
-        elif isinstance(identityfiles, str):
-            identityfile = identityfiles
+        # paramiko keeps every IdentityFile as a list; the first one wins.
+        identityfile = (data.get("identityfile") or [None])[0]
         proxyjump = data.get("proxyjump")
 
         candidate = {
@@ -204,25 +187,14 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
         return
 
     config_path = Path(config_path).expanduser()
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    if config_path.exists():
-        with open(config_path, "r") as f:
-            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
-    else:
-        cfg = {}
+    cfg = _read_config_file(config_path)
 
-    servers = cfg.get("servers", []) or []
+    servers = cfg.get("servers") or []
     existing_keys = set()
     for server in servers:
-        normalized = ServerListInfo._normalize_server_dict(dict(server))
-        host = normalized.get("host") or normalized.get("hostname")
-        port = normalized.get("port", 22)
-        try:
-            port = int(port)
-        except Exception:
-            port = 22
-        username = normalized.get("username")
-        existing_keys.add((host, port, username))
+        normalized = ServerListInfo._normalize_server_dict(server)
+        port = _port_or_default(normalized.get("port", 22))
+        existing_keys.add((normalized.get("host"), port, normalized.get("username")))
 
     added = 0
     skipped = 0
@@ -236,7 +208,7 @@ def import_ssh_config(ssh_config_path=None, config_path=None):
         added += 1
 
     cfg["servers"] = servers
-    _write_config_yaml(config_path, cfg)
+    config.write_config(cfg, config_path)
 
     print(f"\nImport complete: {added} added, {skipped} skipped (already exists).")
 
@@ -244,10 +216,6 @@ def init(config_path=None):
     config_path = config_path or config.get_config_path()
     Path(config_path).parent.mkdir(parents=True, exist_ok=True)
     return ServerListInfo.from_yaml(config_path)
-
-
-def _write_config_yaml(config_path: Path, cfg: dict):
-    config.write_config(cfg, config_path)
 
 
 def interactive_add_server(config_path=None):
@@ -311,17 +279,12 @@ def interactive_add_server(config_path=None):
 
     identityfile = None
     if auth in ("auto", "key"):
-        identityfile_input = input("IdentityFile (SSH private key path, optional): ").strip()
-        if identityfile_input:
-            identityfile = identityfile_input
+        identityfile = input("IdentityFile (SSH private key path, optional): ").strip() or None
 
     proxyjump_input = input(
         "ProxyJump (SSH host or comma-separated chain, optional): "
     ).strip()
     proxyjump = proxyjump_input or None
-    
-    # Password (optional)
-    password = None
 
     # Display summary
     print("\n" + "-" * 50)
@@ -335,60 +298,44 @@ def interactive_add_server(config_path=None):
     if auth in ("auto", "key"):
         print(f"  IdentityFile:{' (default)' if not identityfile else ' ' + identityfile}")
     print(f"  ProxyJump:  {proxyjump or '(not set)'}")
-    print(f"  Password:    {'***' if password else '(not set)'}")
+    print("  Password:    (not set)")
     print("-" * 50)
     
     # Confirm and save
     confirm = input("\nSave this server configuration? [Y/n]: ").strip().lower()
-    if confirm in ['', 'y', 'yes']:
-        config_path = Path(config_path).expanduser()
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Load existing config or create new one
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
-        else:
-            cfg = {}
-        
-        if 'servers' not in cfg:
-            cfg['servers'] = []
-        
-        # Add the new server
-        server_dict = {
-            'hostname': host,
-            'port': port,
-            'username': username,
-            'nickname': nickname,
-            'auth': auth
-        }
-        if identityfile and auth in ("auto", "key"):
-            server_dict['identityfile'] = identityfile
-        if proxyjump:
-            server_dict['proxyjump'] = proxyjump
-        if password:
-            server_dict['password'] = password
-        
-        cfg['servers'].append(server_dict)
-        
-        _write_config_yaml(config_path, cfg)
-        
-        print(f"\nServer added successfully to {config_path}")
-    else:
+    if confirm not in ['', 'y', 'yes']:
         print("\nOperation cancelled.")
+        return
+
+    config_path = Path(config_path).expanduser()
+    cfg = _read_config_file(config_path)
+
+    server_dict = {
+        'hostname': host,
+        'port': port,
+        'username': username,
+        'nickname': nickname,
+        'auth': auth
+    }
+    if identityfile:
+        server_dict['identityfile'] = identityfile
+    if proxyjump:
+        server_dict['proxyjump'] = proxyjump
+
+    cfg.setdefault('servers', []).append(server_dict)
+    config.write_config(cfg, config_path)
+
+    print(f"\nServer added successfully to {config_path}")
 
 
 def _get_directory_size(path):
     """Calculate the total size of a directory in bytes."""
     total_size = 0
-    path = Path(path)
-    if not path.exists():
-        return 0
-    for file_path in path.rglob('*'):
+    for file_path in Path(path).rglob('*'):
         if file_path.is_file():
             try:
                 total_size += file_path.stat().st_size
-            except (OSError, PermissionError):
+            except OSError:
                 pass
     return total_size
 
@@ -417,7 +364,7 @@ def show_info(config_path=None):
     print(f"Working Directory: {config.WORKING_DIR}")
     
     # Disk usage statistics
-    if Path(config.WORKING_DIR).exists():
+    if config.WORKING_DIR.exists():
         total_size = _get_directory_size(config.WORKING_DIR)
         print(f"   Disk Usage: {_format_size(total_size)}")
     else:
@@ -443,6 +390,15 @@ def show_info(config_path=None):
     print("\n" + "-" * 50)
 
 
+def _server_label(server):
+    """Display (host, port, username, nickname) of a config.yml server entry."""
+    host = server.get('hostname') or server.get('host', 'N/A')
+    port = server.get('port', 22)
+    username = server.get('username', 'N/A')
+    nickname = server.get('nickname') or server.get('description', f'{username}@{host}:{port}')
+    return host, port, username, nickname
+
+
 def show_servers(config_path=None, detail=False):
     """Show configured server list."""
     config_path = config_path or config.get_config_path()
@@ -454,12 +410,11 @@ def show_servers(config_path=None, detail=False):
     
     # Load server info
     try:
-        with open(config_path, 'r') as f:
-            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
+        cfg = _read_config_file(config_path)
     except Exception as e:
         print(f"Error reading config: {e}")
         return
-    
+
     servers = cfg.get('servers', [])
     _warn_if_deprecated_config_keys(servers)
     server_count = len(servers)
@@ -474,11 +429,8 @@ def show_servers(config_path=None, detail=False):
     print("-" * 50)
     
     for idx, server in enumerate(servers):
-        host = server.get('hostname') or server.get('host', 'N/A')
-        port = server.get('port', 22)
-        username = server.get('username', 'N/A')
-        nickname = server.get('nickname') or server.get('description', f'{username}@{host}:{port}')
-        
+        host, port, username, nickname = _server_label(server)
+
         if detail:
             auth = server.get('auth', 'auto')
             proxyjump = server.get('proxyjump')
@@ -559,8 +511,7 @@ def _clean_server(config_path):
         return
     
     try:
-        with open(config_path, 'r') as f:
-            cfg = yaml.load(f, Loader=yaml.FullLoader) or {}
+        cfg = _read_config_file(config_path)
     except Exception as e:
         print(f"\nError reading config: {e}")
         return
@@ -574,9 +525,7 @@ def _clean_server(config_path):
     print("\nConfigured servers:")
     print("-" * 50)
     for idx, server in enumerate(servers):
-        host = server.get('hostname') or server.get('host', 'N/A')
-        port = server.get('port', 22)
-        nickname = server.get('nickname') or server.get('description', f"{server.get('username', 'N/A')}@{host}:{port}")
+        host, port, _, nickname = _server_label(server)
         print(f"  [{idx + 1}] {nickname} ({host}:{port})")
     
     print("  [0] Cancel")
@@ -601,7 +550,7 @@ def _clean_server(config_path):
             servers.pop(idx)
             cfg['servers'] = servers
             
-            _write_config_yaml(config_path, cfg)
+            config.write_config(cfg, config_path)
             
             print("\nServer removed successfully.")
         else:
@@ -622,18 +571,9 @@ def _clean_database(db_path):
     # Show database info
     import sqlite3
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Get session count
-        cursor.execute("SELECT COUNT(*) FROM log_sessions")
-        session_count = cursor.fetchone()[0]
-        
-        # Get log count
-        cursor.execute("SELECT COUNT(*) FROM gpu_logs")
-        log_count = cursor.fetchone()[0]
-        
-        # Get file size
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            session_count = conn.execute("SELECT COUNT(*) FROM log_sessions").fetchone()[0]
+            log_count = conn.execute("SELECT COUNT(*) FROM gpu_logs").fetchone()[0]
         file_size = db_path.stat().st_size
         if file_size >= 1024 * 1024:
             size_str = f"{file_size / (1024 * 1024):.2f} MB"
@@ -641,9 +581,7 @@ def _clean_database(db_path):
             size_str = f"{file_size / 1024:.2f} KB"
         else:
             size_str = f"{file_size} bytes"
-        
-        conn.close()
-        
+
         print(f"\nDatabase: {db_path}")
         print(f"  Size: {size_str}")
         print(f"  Sessions: {session_count}")
@@ -661,10 +599,16 @@ def _clean_database(db_path):
         print("\nOperation cancelled.")
 
 
+def _format_session_time(value):
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return value[:19] if value else "N/A"
+
+
 def list_log_sessions(db_path=None):
     """List all log sessions from the database."""
     import sqlite3
-    from datetime import datetime
     
     db_path = Path(db_path or config.get_db_path())
     
@@ -674,26 +618,19 @@ def list_log_sessions(db_path=None):
         return
     
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                s.id,
-                s.start_time,
-                s.end_time,
-                s.status,
-                s.interval_seconds,
-                s.include_remote,
-                COUNT(g.id) as log_count
-            FROM log_sessions s
-            LEFT JOIN gpu_logs g ON s.id = g.session_id
-            GROUP BY s.id
-            ORDER BY s.id DESC
-        ''')
-        
-        sessions = cursor.fetchall()
-        conn.close()
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            sessions = conn.execute('''
+                SELECT 
+                    s.id,
+                    s.start_time,
+                    s.end_time,
+                    s.status,
+                    COUNT(g.id) as log_count
+                FROM log_sessions s
+                LEFT JOIN gpu_logs g ON s.id = g.session_id
+                GROUP BY s.id
+                ORDER BY s.id DESC
+            ''').fetchall()
         
         if not sessions:
             print("\nNo log sessions found.")
@@ -705,24 +642,9 @@ def list_log_sessions(db_path=None):
         print(f"{'ID':>4}  {'Start Time':<20}  {'End Time':<20}  {'Status':<10}  {'Records':>8}")
         print("-" * 70)
         
-        for session in sessions:
-            session_id, start_time, end_time, status, interval, include_remote, log_count = session
-            
-            # Format times
-            try:
-                start_dt = datetime.fromisoformat(start_time)
-                start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-            except (TypeError, ValueError):
-                start_str = start_time[:19] if start_time else "N/A"
-            
-            if end_time:
-                try:
-                    end_dt = datetime.fromisoformat(end_time)
-                    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-                except (TypeError, ValueError):
-                    end_str = end_time[:19] if end_time else "N/A"
-            else:
-                end_str = "(running)"
+        for session_id, start_time, end_time, status, log_count in sessions:
+            start_str = _format_session_time(start_time)
+            end_str = _format_session_time(end_time) if end_time else "(running)"
             
             print(f"{session_id:>4}  {start_str:<20}  {end_str:<20}  {status:<10}  {log_count:>8}")
         
@@ -736,7 +658,6 @@ def list_log_sessions(db_path=None):
 def show_log_info(session_id=None, db_path=None):
     """Show statistics for a log session."""
     import sqlite3
-    from datetime import datetime
     
     db_path = Path(db_path or config.get_db_path())
     
@@ -746,155 +667,148 @@ def show_log_info(session_id=None, db_path=None):
         return
     
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            cursor = conn.cursor()
+            
+            # If no session_id provided, use the latest session
+            if session_id is None:
+                cursor.execute("SELECT id FROM log_sessions ORDER BY id DESC LIMIT 1")
+                result = cursor.fetchone()
+                if not result:
+                    print("\nNo log sessions found.")
+                    return
+                session_id = result[0]
         
-        # If no session_id provided, use the latest session
-        if session_id is None:
-            cursor.execute("SELECT id FROM log_sessions ORDER BY id DESC LIMIT 1")
-            result = cursor.fetchone()
-            if not result:
-                print("\nNo log sessions found.")
-                conn.close()
+            # Get session info
+            cursor.execute('''
+                SELECT start_time, end_time, status, interval_seconds, include_remote
+                FROM log_sessions WHERE id = ?
+            ''', (session_id,))
+        
+            session = cursor.fetchone()
+            if not session:
+                print(f"\nSession {session_id} not found.")
                 return
-            session_id = result[0]
         
-        # Get session info
-        cursor.execute('''
-            SELECT id, start_time, end_time, status, interval_seconds, include_remote
-            FROM log_sessions WHERE id = ?
-        ''', (session_id,))
+            start_time, end_time, status, interval, include_remote = session
         
-        session = cursor.fetchone()
-        if not session:
-            print(f"\nSession {session_id} not found.")
-            conn.close()
-            return
+            # Get log count
+            cursor.execute("SELECT COUNT(*) FROM gpu_logs WHERE session_id = ?", (session_id,))
+            log_count = cursor.fetchone()[0]
         
-        sid, start_time, end_time, status, interval, include_remote = session
-        
-        # Get log count
-        cursor.execute("SELECT COUNT(*) FROM gpu_logs WHERE session_id = ?", (session_id,))
-        log_count = cursor.fetchone()[0]
-        
-        # Calculate duration
-        try:
-            start_dt = datetime.fromisoformat(start_time)
-            if end_time:
-                end_dt = datetime.fromisoformat(end_time)
-            else:
-                end_dt = datetime.now()
-            duration = end_dt - start_dt
-            duration_str = str(duration).split('.')[0]  # Remove microseconds
-        except (TypeError, ValueError):
-            duration_str = "N/A"
-        
-        print("\n" + "-" * 60)
-        print(f"             Session {session_id} Statistics")
-        print("-" * 60)
-        
-        # Session metadata
-        print("\nSession Info:")
-        print(f"  Start Time:     {start_time}")
-        print(f"  End Time:       {end_time or '(still running)'}")
-        print(f"  Duration:       {duration_str}")
-        print(f"  Status:         {status}")
-        print(f"  Interval:       {interval} seconds")
-        print(f"  Remote:         {'Yes' if include_remote else 'No'}")
-        print(f"  Total Records:  {log_count}")
-        
-        if log_count == 0:
-            print("\nNo log data available for analysis.")
-            conn.close()
-            return
-        
-        # Get unique nodes
-        cursor.execute('''
-            SELECT DISTINCT node FROM gpu_logs WHERE session_id = ?
-        ''', (session_id,))
-        nodes = [row[0] for row in cursor.fetchall()]
-        
-        print(f"\n  Nodes:          {', '.join(nodes)}")
-        
-        # Parse processes to get user statistics
-        cursor.execute('''
-            SELECT timestamp, node, gpu_id, processes, memory_used
-            FROM gpu_logs 
-            WHERE session_id = ? AND processes != '-' AND processes != 'N/A'
-        ''', (session_id,))
-        
-        process_rows = cursor.fetchall()
-        
-        # Track user GPU time and memory usage
-        user_time = {}  # user -> total_seconds
-        user_max_memory = {}  # user -> max_memory_mb
-        
-        for timestamp, node, gpu_id, processes, memory_used in process_rows:
-            if not processes or processes in ('-', 'N/A'):
-                continue
-            
-            # Parse processes string like "user1:1234MB user2:567MB"
-            for part in processes.split():
-                if ':' in part:
-                    try:
-                        user, mem_str = part.split(':', 1)
-                        # Extract memory value
-                        mem_mb = 0
-                        if 'MB' in mem_str.upper():
-                            mem_mb = float(mem_str.upper().replace('MB', '').replace('MIB', ''))
-                        elif 'GB' in mem_str.upper():
-                            mem_mb = float(mem_str.upper().replace('GB', '').replace('GIB', '')) * 1024
-                        
-                        key = f"{user}@{node}"
-                        
-                        # Add time (interval seconds per record)
-                        user_time[key] = user_time.get(key, 0) + interval
-                        
-                        # Track max memory
-                        if key not in user_max_memory or mem_mb > user_max_memory[key]:
-                            user_max_memory[key] = mem_mb
-                    except (AttributeError, TypeError, ValueError):
-                        continue
-        
-        # Display top users by GPU time
-        if user_time:
-            print("\n" + "-" * 60)
-            print("Top Users by GPU Time:")
-            print("-" * 60)
-            
-            sorted_by_time = sorted(user_time.items(), key=lambda x: x[1], reverse=True)[:10]
-            for user, seconds in sorted_by_time:
-                hours = seconds // 3600
-                minutes = (seconds % 3600) // 60
-                secs = seconds % 60
-                if hours > 0:
-                    time_str = f"{hours}h {minutes}m {secs}s"
-                elif minutes > 0:
-                    time_str = f"{minutes}m {secs}s"
+            # Calculate duration
+            try:
+                start_dt = datetime.fromisoformat(start_time)
+                if end_time:
+                    end_dt = datetime.fromisoformat(end_time)
                 else:
-                    time_str = f"{secs}s"
-                print(f"  {user:<30}  {time_str}")
+                    end_dt = datetime.now()
+                duration = end_dt - start_dt
+                duration_str = str(duration).split('.')[0]  # Remove microseconds
+            except (TypeError, ValueError):
+                duration_str = "N/A"
         
-        # Display top users by memory usage
-        if user_max_memory:
             print("\n" + "-" * 60)
-            print("Top Users by Max Memory Usage:")
+            print(f"             Session {session_id} Statistics")
             print("-" * 60)
+        
+            # Session metadata
+            print("\nSession Info:")
+            print(f"  Start Time:     {start_time}")
+            print(f"  End Time:       {end_time or '(still running)'}")
+            print(f"  Duration:       {duration_str}")
+            print(f"  Status:         {status}")
+            print(f"  Interval:       {interval} seconds")
+            print(f"  Remote:         {'Yes' if include_remote else 'No'}")
+            print(f"  Total Records:  {log_count}")
+        
+            if log_count == 0:
+                print("\nNo log data available for analysis.")
+                return
+        
+            # Get unique nodes
+            cursor.execute('''
+                SELECT DISTINCT node FROM gpu_logs WHERE session_id = ?
+            ''', (session_id,))
+            nodes = [row[0] for row in cursor.fetchall()]
+        
+            print(f"\n  Nodes:          {', '.join(nodes)}")
+        
+            # Parse processes to get user statistics
+            cursor.execute('''
+                SELECT node, processes
+                FROM gpu_logs 
+                WHERE session_id = ? AND processes != '-' AND processes != 'N/A'
+            ''', (session_id,))
+        
+            # Track user GPU time and memory usage
+            user_time = {}  # user -> total_seconds
+            user_max_memory = {}  # user -> max_memory_mb
+        
+            for node, processes in cursor.fetchall():
+                if not processes or processes in ('-', 'N/A'):
+                    continue
             
-            sorted_by_mem = sorted(user_max_memory.items(), key=lambda x: x[1], reverse=True)[:10]
-            for user, mem_mb in sorted_by_mem:
-                if mem_mb >= 1024:
-                    mem_str = f"{mem_mb/1024:.1f} GB"
-                else:
-                    mem_str = f"{mem_mb:.0f} MB"
-                print(f"  {user:<30}  {mem_str}")
+                # Parse processes string like "user1:1234MB user2:567MB"
+                for part in processes.split():
+                    if ':' in part:
+                        try:
+                            user, mem_str = part.split(':', 1)
+                            # Extract memory value
+                            mem_mb = 0
+                            if 'MB' in mem_str.upper():
+                                mem_mb = float(mem_str.upper().replace('MB', '').replace('MIB', ''))
+                            elif 'GB' in mem_str.upper():
+                                mem_mb = float(mem_str.upper().replace('GB', '').replace('GIB', '')) * 1024
+                        
+                            key = f"{user}@{node}"
+                        
+                            # Add time (interval seconds per record)
+                            user_time[key] = user_time.get(key, 0) + interval
+                        
+                            # Track max memory
+                            if key not in user_max_memory or mem_mb > user_max_memory[key]:
+                                user_max_memory[key] = mem_mb
+                        except (AttributeError, TypeError, ValueError):
+                            continue
         
-        if not user_time and not user_max_memory:
-            print("\n  No user process data available.")
+            # Display top users by GPU time
+            if user_time:
+                print("\n" + "-" * 60)
+                print("Top Users by GPU Time:")
+                print("-" * 60)
+            
+                sorted_by_time = sorted(user_time.items(), key=lambda x: x[1], reverse=True)[:10]
+                for user, seconds in sorted_by_time:
+                    hours = seconds // 3600
+                    minutes = (seconds % 3600) // 60
+                    secs = seconds % 60
+                    if hours > 0:
+                        time_str = f"{hours}h {minutes}m {secs}s"
+                    elif minutes > 0:
+                        time_str = f"{minutes}m {secs}s"
+                    else:
+                        time_str = f"{secs}s"
+                    print(f"  {user:<30}  {time_str}")
         
-        print("\n" + "-" * 60)
+            # Display top users by memory usage
+            if user_max_memory:
+                print("\n" + "-" * 60)
+                print("Top Users by Max Memory Usage:")
+                print("-" * 60)
+            
+                sorted_by_mem = sorted(user_max_memory.items(), key=lambda x: x[1], reverse=True)[:10]
+                for user, mem_mb in sorted_by_mem:
+                    if mem_mb >= 1024:
+                        mem_str = f"{mem_mb/1024:.1f} GB"
+                    else:
+                        mem_str = f"{mem_mb:.0f} MB"
+                    print(f"  {user:<30}  {mem_str}")
         
-        conn.close()
+            if not user_time and not user_max_memory:
+                print("\n  No user process data available.")
+        
+            print("\n" + "-" * 60)
         
     except Exception as e:
         print(f"\nError analyzing session: {e}")
@@ -947,7 +861,6 @@ def main():
     clean_parser = subparsers.add_parser('clean', help='Clean server configurations or log data')
     clean_parser.add_argument('target', nargs='?', default=None, help="'all' to delete everything")
     # Cluster job queue (`nvidb queue`, `nvidb job ...`)
-    from ..sched import cli as sched_cli
     sched_cli.register_parsers(subparsers)
     args = parser.parse_args()
 
@@ -955,18 +868,16 @@ def main():
         raise SystemExit(sched_cli.dispatch(args))
 
     cfg = _load_config_yaml()
-    compact = bool(args.compact or _get_basic_compact(cfg))
+    compact = args.compact or _basic_flag(cfg, "compact")
 
     server_list = None
-    remote_requested = bool(getattr(args, "remote", False))
-    if not remote_requested and not getattr(args, "no_remote", False):
-        # `basic.remote: true` in config makes plain `nvidb` behave like `nvidb --remote`
-        remote_requested = _get_basic_remote(cfg)
-    if remote_requested:
-        if args.command is None:
-            server_list = init()
-        elif args.command == "log" and getattr(args, "log_command", None) not in {"ls", "info", "web"}:
-            server_list = init()
+    # `basic.remote: true` in config makes plain `nvidb` behave like `nvidb --remote`
+    remote_requested = args.remote or (not args.no_remote and _basic_flag(cfg, "remote"))
+    if remote_requested and (
+        args.command is None
+        or (args.command == "log" and args.log_command not in {"ls", "info", "web"})
+    ):
+        server_list = init()
     
     if args.command == 'ls':
         show_servers(detail=args.detail)
@@ -977,7 +888,7 @@ def main():
     elif args.command == 'info':
         show_info()
     elif args.command == 'log':
-        db_path = getattr(args, 'db_path', None)
+        db_path = args.db_path
         if args.log_command == 'ls':
             list_log_sessions(db_path=db_path)
         elif args.log_command == 'info':
@@ -1000,7 +911,7 @@ def main():
     elif args.command == 'web':
         from ..dashboard import run_dash_app
         run_dash_app(
-            db_path=getattr(args, "db_path", None),
+            db_path=args.db_path,
             port=args.port,
             include_remote=remote_requested,
         )
