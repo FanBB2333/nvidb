@@ -7,6 +7,7 @@ not reuse `RemoteClient`, which is built for a human sitting at a terminal.
 """
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import threading
@@ -60,20 +61,21 @@ class LocalTransport(Transport):
         self.name = name
 
     def run(self, command: str, timeout: Optional[float] = None) -> CommandResult:
+        timeout = timeout or DEFAULT_COMMAND_TIMEOUT
         try:
             completed = subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=timeout or DEFAULT_COMMAND_TIMEOUT,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             # A hung command is a transport fault, not a command that failed:
             # returning a status here would have the scheduler read the empty
             # output as fact - no pid, no processes - instead of as "unknown".
             raise TransportError(
-                f"{self.name}: command timed out after {timeout or DEFAULT_COMMAND_TIMEOUT}s"
+                f"{self.name}: command timed out after {timeout}s"
             ) from None
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
@@ -110,8 +112,6 @@ class SSHTransport(Transport):
     # --- connection -------------------------------------------------------
 
     def _connect_locked(self):
-        import os
-
         import paramiko
 
         client = paramiko.SSHClient()
@@ -223,8 +223,6 @@ class SSHTransport(Transport):
                 except Exception as error:
                     last_error = error
                     self._close_locked()
-                    if attempt == 1:
-                        break
             raise TransportError(
                 f"{self.name}: command failed: {type(last_error).__name__}: {last_error}"
             )

@@ -15,7 +15,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional, Sequence
 
-from .transport import CommandResult, Transport, TransportError
+from .transport import Transport, TransportError
 
 PROBE_MARKER = "NVIDB_PROBE_V1"
 PS_MARKER = "PSTABLE"
@@ -317,7 +317,7 @@ class JobExecutor:
             pid=pid,
             # Without a private session the group belongs to someone else's
             # shell, so the caller only ever gets a pgid it is safe to kill.
-            pgid=pgid if (isolated and pgid is not None) else None,
+            pgid=pgid if isolated else None,
             run_dir=run_dir,
             adopted=adopted,
         )
@@ -372,14 +372,6 @@ class JobExecutor:
         result = self.transport.run("\n".join(lines), timeout=timeout)
         return parse_probe_output(result.stdout)
 
-    def kill(self, *, pid: Optional[int], pgid: Optional[int], signal: str = "TERM") -> CommandResult:
-        """Signal the job's whole process group, falling back to the bare pid."""
-        if not pid and not pgid:
-            return CommandResult(1, "", "no pid recorded")
-        return self.transport.run(
-            self._signal_command(pid=pid, pgid=pgid, signal=signal), timeout=20
-        )
-
     def reap(
         self,
         *,
@@ -398,24 +390,28 @@ class JobExecutor:
         """
         if not pid or not run_dir:
             return False
-        quoted_dir = shlex.quote(run_dir)
+        guard = _process_guard("$pid", "$d/run.sh")
+        term = self._signal_command(pid=pid, pgid=pgid, signal="TERM")
+        kill = self._signal_command(pid=pid, pgid=pgid, signal="KILL")
+        if timed_out:
+            condition = guard + ' && [ ! -f "$d/exit_code" ]'
+            # Persist intent on this attempt before signalling. A lost SSH
+            # reply must not turn a genuine timeout into an ordinary failure.
+            mark = '  date +%s > "$d/timeout.tmp" && mv "$d/timeout.tmp" "$d/timeout" || exit 1'
+        else:
+            condition = guard
+            mark = ":"
         script = "\n".join(
             [
-                f"d={quoted_dir}",
+                f"d={shlex.quote(run_dir)}",
                 f"pid={int(pid)}",
-                f'if {_process_guard("$pid", "$d/run.sh")}'
-                + (' && [ ! -f "$d/exit_code" ]' if timed_out else '') + '; then',
-                # Persist intent on this attempt before signalling. A lost SSH
-                # reply must not turn a genuine timeout into an ordinary failure.
-                ('  date +%s > "$d/timeout.tmp" && mv "$d/timeout.tmp" "$d/timeout" || exit 1'
-                 if timed_out else ':'),
-                f"  {self._signal_command(pid=pid, pgid=pgid, signal='TERM')}",
+                f"if {condition}; then",
+                mark,
+                f"  {term}",
                 # The wrapper only runs its EXIT trap once the work it is
                 # waiting on returns, so the escalation has to reach the same
                 # set of processes rather than just the wrapper again.
-                f"  ( sleep {int(grace)}; "
-                f'if {_process_guard("$pid", "$d/run.sh")}; then '
-                f"{self._signal_command(pid=pid, pgid=pgid, signal='KILL')}; fi ) "
+                f"  ( sleep {int(grace)}; if {guard}; then {kill}; fi ) "
                 ">/dev/null 2>&1 &",
                 '  echo "NVIDB_REAPED=1"',
                 "else",
@@ -443,20 +439,15 @@ class JobExecutor:
         return self.reap(run_dir=run_dir, pid=pid, pgid=pgid, grace=grace)
 
     @staticmethod
-    def _signal_command(
-        *, pid: Optional[int], pgid: Optional[int], signal: str = "TERM"
-    ) -> str:
+    def _signal_command(*, pid: int, pgid: Optional[int], signal: str) -> str:
         """Shell to signal a job: its group when it has one, its children when not."""
-        parts = []
         if pgid:
-            parts.append(f"kill -{signal} -{int(pgid)} 2>/dev/null")
-        if pid:
-            parts.append(f"kill -{signal} {int(pid)} 2>/dev/null")
-            if not pgid:
-                # No private process group, so reach the job's own children
-                # explicitly instead of leaving the real work running.
-                parts.append(f"pkill -{signal} -P {int(pid)} 2>/dev/null")
-        return " ; ".join(parts) + " ; true" if parts else "true"
+            return (f"kill -{signal} -{int(pgid)} 2>/dev/null ; "
+                    f"kill -{signal} {int(pid)} 2>/dev/null ; true")
+        # No private process group, so reach the job's own children
+        # explicitly instead of leaving the real work running.
+        return (f"kill -{signal} {int(pid)} 2>/dev/null ; "
+                f"pkill -{signal} -P {int(pid)} 2>/dev/null ; true")
 
     def read_log(
         self, run_dir: str, *, stream: str = "stdout", lines: int = 200
@@ -467,7 +458,7 @@ class JobExecutor:
     def read_result(self, run_dir: str):
         """Read the optional `result.json` a job may leave for its consumers."""
         raw = self.transport.read_file(f"{run_dir}/result.json")
-        raw = (raw or "").strip()
+        raw = raw.strip()
         if not raw:
             return None
         try:
@@ -475,21 +466,12 @@ class JobExecutor:
         except ValueError:
             return {"raw": raw[:4000]}
 
-    def remove_run_dir(self, run_dir: str) -> None:
-        if not run_dir or run_dir in ("/", "~"):
-            return
-        self.transport.run(f"rm -rf {shlex.quote(run_dir)}", timeout=20)
-
 
 def _parse_marker_int(text: str, marker: str) -> Optional[int]:
     for line in (text or "").splitlines():
         line = line.strip()
         if line.startswith(marker):
-            value = line[len(marker):].strip()
-            try:
-                return int(value)
-            except ValueError:
-                return None
+            return _maybe_int(line[len(marker):])
     return None
 
 
@@ -515,25 +497,19 @@ def parse_probe_output(text: str) -> NodeProbe:
             parts = line.split("|", 2)
             if len(parts) < 3:
                 continue
-            job_id = _maybe_int(parts[1])
-            if job_id is None:
-                continue
-            existing = probe.jobs.get(job_id)
-            if existing is None:
-                existing = probe.jobs[job_id] = JobProbe(job_id=job_id)
-            existing.progress = parts[2].strip() or None
+            job = probe.jobs.get(_maybe_int(parts[1]))
+            if job is not None:
+                job.progress = parts[2].strip() or None
         elif section == "jobs" and line.startswith("JOB|"):
             parts = line.split("|")
             if len(parts) < 6:
                 continue
-            try:
-                job_id = int(parts[1])
-            except ValueError:
+            job_id = _maybe_int(parts[1])
+            if job_id is None:
                 continue
             # The exit-code field is "<status> <epoch seconds>"; older jobs and
             # partially written files may carry only the status.
             status_parts = parts[4].split()
-            existing = probe.jobs.get(job_id)
             probe.jobs[job_id] = JobProbe(
                 job_id=job_id,
                 pid=_maybe_int(parts[2]),
@@ -544,9 +520,6 @@ def parse_probe_output(text: str) -> NodeProbe:
                 started_epoch=_maybe_int(parts[6]) if len(parts) > 6 else None,
                 finished_epoch=_maybe_int(status_parts[1]) if len(status_parts) > 1 else None,
                 timed_out=len(parts) > 7 and parts[7] == "1",
-                # Section order puts JOB before STAT, but do not lose a status
-                # line if that ever changes.
-                progress=existing.progress if existing else None,
             )
         elif section == "ps":
             parts = line.split()

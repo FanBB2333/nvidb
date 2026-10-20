@@ -41,9 +41,9 @@ def load_target(cfg: Optional[dict] = None) -> Optional[Dict[str, Any]]:
         return None
     if cfg is None:
         cfg = nvidb_config.load_queue_config()
-    raw = (cfg or {}).get("remote")
+    raw = cfg.get("remote")
     if raw is None:
-        raw = ((cfg or {}).get("queue") or {}).get("remote")
+        raw = (cfg.get("queue") or {}).get("remote")
     if not isinstance(raw, dict):
         return None
     host = raw.get("host") or raw.get("hostname")
@@ -122,19 +122,6 @@ def _quote(token: str) -> str:
     return shlex.quote(token)
 
 
-def keeper_script_path(target: Dict[str, Any]) -> str:
-    """Where the keeper lives on the far side."""
-    home = target.get("nvidb_home")
-    if home:
-        return f"{str(home).rstrip('/')}/{keeper_mod.SCRIPT_NAME}"
-    return f"$HOME/.nvidb/{keeper_mod.SCRIPT_NAME}"
-
-
-def _manages_keeper(head: Sequence[str]) -> bool:
-    """Keeper lifecycle commands must observe state without auto-starting it."""
-    return len(head) >= 2 and head[0] == "queue" and head[1] == "keeper"
-
-
 def build_command(
     target: Dict[str, Any],
     argv: Sequence[str],
@@ -153,26 +140,26 @@ def build_command(
         head = _point_script_at_temp_file(head)
 
     lines: List[str] = []
-    if (target.get("keeper") == "ensure" and not _manages_keeper(head)
-            and "--no-tick" not in head and head[:2] != ["queue", "daemon"]):
+    # Keeper lifecycle commands must observe state without auto-starting it.
+    if (target.get("keeper") == "ensure"
+            and head[:2] not in (["queue", "keeper"], ["queue", "daemon"])
+            and "--no-tick" not in head):
         # Folded into the same command, so keeping the queue alive costs no
         # extra round trip. Warnings stay on stderr so JSON stdout remains
         # machine-readable, while a missing or broken keeper is no longer
         # mistaken for a queue that will keep scheduling after disconnect.
-        if target.get("nvidb_home"):
-            lines.append(
-                f"nvidb_keeper={shlex.quote(keeper_script_path(target))}"
-            )
-        else:
-            lines.append(
-                f'nvidb_keeper="$HOME/.nvidb/{keeper_mod.SCRIPT_NAME}"'
-            )
+        home = target.get("nvidb_home")
+        keeper = (
+            shlex.quote(f"{str(home).rstrip('/')}/{keeper_mod.SCRIPT_NAME}")
+            if home else f'"$HOME/.nvidb/{keeper_mod.SCRIPT_NAME}"'
+        )
+        lines.append(f"nvidb_keeper={keeper}")
         lines.extend(
             [
                 'if [ ! -f "$nvidb_keeper" ]; then',
                 '  printf \'%s\\n\' "warning: queue keeper is not installed at '
                 '$nvidb_keeper; run nvidb queue keeper install --start" >&2',
-                'elif [ -f "$(dirname "$nvidb_keeper")/queue-keeper.stopped" ]; then :',
+                f'elif [ -f "$(dirname "$nvidb_keeper")/{keeper_mod.STOPPED_NAME}" ]; then :',
                 'elif ! nvidb_keeper_error=$(sh "$nvidb_keeper" ensure 2>&1); then',
                 '  printf \'%s\\n\' "warning: queue keeper could not be started: '
                 '$nvidb_keeper" >&2',
@@ -247,5 +234,3 @@ def forward(
     except FileNotFoundError:
         print("error: ssh not found on this machine", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        return 130

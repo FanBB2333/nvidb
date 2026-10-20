@@ -734,16 +734,11 @@ def build_stop_command(*, lane_name: str, spool_root: str, hard: bool = False) -
 
 def parse_state(stdout: str) -> Optional[dict]:
     """Pull the runner's state document out of a sync command's output."""
-    if not stdout:
-        return None
     _, marker, tail = stdout.partition(STATE_MARKER)
     if not marker:
         return None
-    text = tail.strip()
-    if not text:
-        return None
     try:
-        state = json.loads(text)
+        state = json.loads(tail)
     except ValueError:
         return None
     return state if isinstance(state, dict) else None

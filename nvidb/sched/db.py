@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -214,13 +217,8 @@ def connection_path(conn: sqlite3.Connection) -> str:
     a caller may have opened one explicitly with `--db-path`, in which case the
     default location is the wrong answer.
     """
-    try:
-        for row in conn.execute("PRAGMA database_list"):
-            if row["name"] == "main" and row["file"]:
-                return str(row["file"])
-    except sqlite3.Error:
-        pass
-    return str(default_db_path())
+    # Row 0 of the list is always the main database.
+    return str(conn.execute("PRAGMA database_list").fetchone()["file"])
 
 
 def _retry_while_locked(action, *, attempts: int = 60, delay: float = 0.05):
@@ -233,9 +231,6 @@ def _retry_while_locked(action, *, attempts: int = 60, delay: float = 0.05):
     which is exactly the moment this queue is designed for, since a burst of
     independent agent sessions is how it gets used.
     """
-    import random
-    import time
-
     for attempt in range(attempts):
         try:
             return action()
@@ -258,12 +253,8 @@ def open_db(path=None) -> sqlite3.Connection:
         isolation_level=None,  # explicit transactions only
     )
     conn.row_factory = sqlite3.Row
-    # Set the busy timeout before anything that can contend, so every statement
-    # after this point waits its turn instead of failing.
-    conn.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
     _retry_while_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     _retry_while_locked(lambda: init_schema(conn))
     return conn
 
@@ -330,12 +321,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
                     raise
     for statement in _ADDED_INDEXES:
         conn.execute(statement)
-    with transaction(conn):
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(SCHEMA_VERSION),),
-        )
+    set_meta(conn, "schema_version", SCHEMA_VERSION)
 
 
 @contextmanager
@@ -399,8 +385,6 @@ def acquire_lock(conn: sqlite3.Connection, name: str, owner: str, ttl_seconds: i
 
     A crashed client cannot wedge the queue: its lease simply ages out.
     """
-    from datetime import datetime, timedelta, timezone
-
     now = datetime.now(timezone.utc)
     expires = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
     now_text = now.isoformat(timespec="seconds")
@@ -478,28 +462,18 @@ def list_events(
     # the newest few and silently skip everything in between. Without a cursor
     # the newest rows are the interesting ones, but callers want them
     # oldest-first either way.
-    if since_id is not None:
-        rows = conn.execute(
-            f"SELECT * FROM events {where} ORDER BY id ASC LIMIT ?",
-            (*params, int(limit)),
-        ).fetchall()
-    else:
-        rows = list(
-            reversed(
-                conn.execute(
-                    f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?",
-                    (*params, int(limit)),
-                ).fetchall()
-            )
-        )
+    order = "ASC" if since_id is not None else "DESC"
+    rows = conn.execute(
+        f"SELECT * FROM events {where} ORDER BY id {order} LIMIT ?",
+        (*params, int(limit)),
+    ).fetchall()
+    if since_id is None:
+        rows.reverse()
     out = []
     for row in rows:
         item = dict(row)
         if item.get("data"):
-            try:
-                item["data"] = json.loads(item["data"])
-            except ValueError:
-                pass
+            item["data"] = json.loads(item["data"])
         out.append(item)
     return out
 
@@ -539,10 +513,9 @@ def list_alerts(
 
 
 def open_alert_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
+    return int(conn.execute(
         "SELECT COUNT(*) AS n FROM alerts WHERE acknowledged_at IS NULL"
-    ).fetchone()
-    return int(row["n"]) if row else 0
+    ).fetchone()["n"])
 
 
 def acknowledge_alerts(
@@ -567,7 +540,7 @@ def acknowledge_alerts(
             )
         else:
             return 0
-        return int(cursor.rowcount or 0)
+        return int(cursor.rowcount)
 
 
 def resolve_job_alerts(conn: sqlite3.Connection, job_id: int, kind: str) -> None:
@@ -694,20 +667,20 @@ def replace_node_gpus(conn: sqlite3.Connection, node: str, gpus: Sequence[dict])
             [
                 (
                     node,
-                    int(gpu.get("index", 0)),
-                    gpu.get("name"),
-                    int(gpu.get("mem_total_mb") or 0),
-                    int(gpu.get("mem_used_mb") or 0),
+                    gpu["index"],
+                    gpu["name"],
+                    gpu["mem_total_mb"],
+                    gpu["mem_used_mb"],
                     gpu.get("util_percent"),
                     gpu.get("mem_util_percent"),
                     gpu.get("temperature_c"),
-                    int(gpu.get("external_mem_mb") or 0),
-                    int(gpu.get("external_procs") or 0),
-                    int(gpu.get("queue_mem_mb") or 0),
-                    int(gpu.get("reserved_mb") or 0),
-                    int(gpu.get("queue_jobs") or 0),
-                    gpu.get("attribution") or "processes",
-                    json.dumps(gpu.get("processes") or [], ensure_ascii=False),
+                    gpu["external_mem_mb"],
+                    gpu["external_procs"],
+                    gpu["queue_mem_mb"],
+                    gpu["reserved_mb"],
+                    gpu["queue_jobs"],
+                    gpu["attribution"],
+                    json.dumps(gpu["processes"], ensure_ascii=False),
                     now,
                 )
                 for gpu in gpus
@@ -758,9 +731,13 @@ def resolve_node_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
 
     Lets a client say `--node lab2` instead of `lab2-workstation-tailscale`.
     """
+    return _resolve_name(conn, "nodes", query)
+
+
+def _resolve_name(conn: sqlite3.Connection, table: str, query: str) -> Optional[str]:
     if not query:
         return None
-    names = [row["name"] for row in conn.execute("SELECT name FROM nodes ORDER BY name")]
+    names = [row["name"] for row in conn.execute(f"SELECT name FROM {table} ORDER BY name")]
     if query in names:
         return query
     lowered = query.lower()
@@ -838,8 +815,6 @@ def get_lanes(conn: sqlite3.Connection, node: Optional[str] = None) -> List[Lane
 def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:
     if not fields:
         return
-    if "gpu_ids" in fields and isinstance(fields["gpu_ids"], (list, tuple)):
-        fields["gpu_ids"] = ",".join(str(int(i)) for i in fields["gpu_ids"])
     for flag in ("paused", "runner"):
         if flag in fields:
             fields[flag] = 1 if fields[flag] else 0
@@ -854,30 +829,13 @@ def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:
         )
 
 
-def delete_lane(conn: sqlite3.Connection, name: str) -> None:
-    with transaction(conn):
-        conn.execute("DELETE FROM lanes WHERE name = ?", (name,))
-
-
 def resolve_lane_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
     """Match a lane by exact name, then case-insensitively, then by substring.
 
     Lets a person say `lane 406` instead of `406-tailscale:0` when only one
     lane could be meant.
     """
-    if not query:
-        return None
-    names = [row["name"] for row in conn.execute("SELECT name FROM lanes ORDER BY name")]
-    if query in names:
-        return query
-    lowered = query.lower()
-    exact = [name for name in names if name.lower() == lowered]
-    if len(exact) == 1:
-        return exact[0]
-    partial = [name for name in names if lowered in name.lower()]
-    if len(partial) == 1:
-        return partial[0]
-    return None
+    return _resolve_name(conn, "lanes", query)
 
 
 def lane_jobs(
@@ -904,11 +862,10 @@ def next_lane_seq(conn: sqlite3.Connection, lane: str) -> int:
     Terminal jobs count: reusing a finished job's slot would silently put a new
     submission ahead of work that is already waiting.
     """
-    row = conn.execute(
+    top = conn.execute(
         "SELECT MAX(lane_seq) AS top FROM jobs WHERE lane = ?", (lane,)
-    ).fetchone()
-    top = row["top"] if row and row["top"] is not None else 0
-    return int(top) + LANE_STEP
+    ).fetchone()["top"]
+    return int(top or 0) + LANE_STEP
 
 
 def renumber_lane(conn: sqlite3.Connection, lane: str, ordered_ids: Sequence[int]) -> None:
@@ -920,12 +877,11 @@ def renumber_lane(conn: sqlite3.Connection, lane: str, ordered_ids: Sequence[int
     worked until the wrong job started.
     """
     with transaction(conn):
-        row = conn.execute(
+        base = int(conn.execute(
             "SELECT MAX(lane_seq) AS top FROM jobs "
             "WHERE lane = ? AND state = 'running'",
             (lane,),
-        ).fetchone()
-        base = int(row["top"]) if row and row["top"] is not None else 0
+        ).fetchone()["top"] or 0)
         for position, job_id in enumerate(ordered_ids, start=1):
             conn.execute(
                 "UPDATE jobs SET lane_seq = ?, updated_at = ? WHERE id = ?",
@@ -981,8 +937,6 @@ def update_job(conn: sqlite3.Connection, job_id: int, **fields) -> None:
     # Callers pass decoded values; a plain string is a result, not JSON text.
     if fields.get("result") is not None:
         fields["result"] = json.dumps(fields["result"], ensure_ascii=False)
-    if "env" in fields and isinstance(fields["env"], dict):
-        fields["env"] = json.dumps(fields["env"], ensure_ascii=False)
     fields["updated_at"] = utcnow()
     assignments = ", ".join(f"{key} = ?" for key in fields)
     with transaction(conn):
@@ -1037,15 +991,19 @@ def dependents_of(conn: sqlite3.Connection, job_id: int) -> List[Job]:
     Used to say what a cancellation is about to park, before it happens.
     """
     job_id = int(job_id)
-    out = []
-    for row in conn.execute(
+    return [
+        job for job in _waiting_jobs(conn)
+        if job_id in job.depends_on or job_id in job.depends_any
+    ]
+
+
+def _waiting_jobs(conn: sqlite3.Connection) -> List[Job]:
+    """Unfinished jobs that wait on at least one other job."""
+    rows = conn.execute(
         "SELECT * FROM jobs WHERE state IN ('pending', 'running') "
         "AND (depends_on IS NOT NULL OR depends_any IS NOT NULL) ORDER BY id"
-    ):
-        job = Job.from_row(row)
-        if job_id in job.depends_on or job_id in job.depends_any:
-            out.append(job)
-    return out
+    ).fetchall()
+    return [Job.from_row(row) for row in rows]
 
 
 def held_jobs(conn: sqlite3.Connection) -> List[Job]:
@@ -1098,22 +1056,12 @@ def drop_orphan(conn: sqlite3.Connection, orphan_id: int) -> None:
 
 
 def orphan_count(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT COUNT(*) AS n FROM orphans").fetchone()
-    return int(row["n"]) if row else 0
+    return int(conn.execute("SELECT COUNT(*) AS n FROM orphans").fetchone()["n"])
 
 
 def live_jobs(conn: sqlite3.Connection, node: Optional[str] = None) -> List[Job]:
     """Jobs currently occupying resources (running)."""
-    if node:
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE state = 'running' AND node = ? ORDER BY id",
-            (node,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM jobs WHERE state = 'running' ORDER BY id"
-        ).fetchall()
-    return [Job.from_row(row) for row in rows]
+    return list_jobs(conn, states=["running"], node=node)
 
 
 def job_counts(conn: sqlite3.Connection) -> Dict[str, int]:
@@ -1137,22 +1085,14 @@ def purge_jobs(
         # A pending/running job still needs its completed prerequisites to
         # exist so dependency checks remain meaningful. Keep those rows until
         # the dependent itself becomes terminal.
-        protected = set()
-        for row in conn.execute(
-            "SELECT depends_on, depends_any FROM jobs "
-            "WHERE state IN ('pending', 'running') "
-            "AND (depends_on IS NOT NULL OR depends_any IS NOT NULL)"
-        ):
-            for column in ("depends_on", "depends_any"):
-                protected.update(
-                    int(value)
-                    for value in (row[column] or "").split(",")
-                    if value.strip()
-                )
+        protected = {
+            dep for job in _waiting_jobs(conn)
+            for dep in (*job.depends_on, *job.depends_any)
+        }
         if protected:
             placeholders = ", ".join("?" for _ in protected)
             clauses.append(f"id NOT IN ({placeholders})")
             params.extend(sorted(protected))
         where = " AND ".join(clauses)
         cursor = conn.execute(f"DELETE FROM jobs WHERE {where}", params)
-        return int(cursor.rowcount or 0)
+        return int(cursor.rowcount)

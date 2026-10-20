@@ -162,7 +162,7 @@ def test_a_job_publishes_progress_through_its_status_file(executor):
     probe = executor.probe([(11, launched.run_dir)]).jobs[11]
     assert probe.progress == "epoch 2/3 loss 0.42"
     assert probe.alive is True
-    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="KILL")
+    executor.terminate(run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid)
 
 
 def test_only_the_last_status_line_is_reported(executor):
@@ -255,7 +255,7 @@ def test_relaunching_a_live_job_adopts_it_instead_of_running_it_twice(executor):
     log = executor.read_log(launched.run_dir)
     assert log.count("started") == 1
     assert executor.probe([(20, launched.run_dir)]).jobs[20].alive is True
-    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="KILL")
+    executor.terminate(run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid)
 
 
 def test_a_finished_job_can_still_be_launched_again(executor):
@@ -336,14 +336,16 @@ def test_a_missing_workdir_fails_the_job_instead_of_hanging(executor):
     assert _wait_for_exit(executor, 7, launched.run_dir).exit_code == 127
 
 
-def test_a_running_job_can_be_killed(executor):
+def test_a_running_job_can_be_terminated(executor):
     launched = executor.launch(
         job_id=8, job_name="sleeper", command="sleep 120", node_name="test-local"
     )
     time.sleep(0.5)
     assert executor.probe([(8, launched.run_dir)]).jobs[8].alive is True
 
-    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="TERM")
+    assert executor.terminate(
+        run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid
+    ) is True
     deadline = time.time() + 10
     while time.time() < deadline:
         if not executor.probe([(8, launched.run_dir)]).jobs[8].alive:
@@ -363,22 +365,13 @@ def test_the_probe_reports_the_process_group_table(executor):
     # The job's own pid must appear, which is what lets GPU processes be
     # attributed to the job that owns them.
     assert launched.pid in probe.process_groups
-    executor.kill(pid=launched.pid, pgid=launched.pgid, signal="KILL")
+    executor.terminate(run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid)
 
 
 def test_probing_an_unknown_job_reports_nothing_rather_than_failing(executor, tmp_path):
     probe = executor.probe([(99, str(tmp_path / "missing"))])
     assert probe.jobs[99].alive is False
     assert probe.jobs[99].exit_code is None
-
-
-def test_the_run_directory_can_be_removed(executor):
-    launched = executor.launch(
-        job_id=10, job_name="tidy", command="echo bye", node_name="test-local"
-    )
-    _wait_for_exit(executor, 10, launched.run_dir)
-    executor.remove_run_dir(launched.run_dir)
-    assert executor.read_log(launched.run_dir) == ""
 
 
 def test_timeout_request_is_recorded_and_does_not_reclassify_a_finished_job(executor):

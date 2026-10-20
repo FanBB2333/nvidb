@@ -270,18 +270,6 @@ class FakeExecutor:
         probe.disk_free_mb = self.node.disk_free_mb
         return probe
 
-    def kill(self, *, pid, pgid, signal="TERM"):
-        # An offline node cannot be signalled - the scheduler has to cope with
-        # closing a job's record while its process keeps running.
-        if not self.node.online:
-            raise TransportError(f"{self.node.name}: unreachable")
-        for job_id, record in self.node.jobs.items():
-            if record["pid"] == pid and record["alive"]:
-                record["alive"] = False
-                self.node._release_job_memory(record)
-                self.node.killed.append(job_id)
-        return CommandResult(0, "", "")
-
     def reap(self, *, run_dir, pid, pgid=None, grace=5):
         if not self.node.online:
             raise TransportError(f"{self.node.name}: unreachable")
@@ -324,9 +312,6 @@ class FakeExecutor:
 
     def read_log(self, run_dir, stream="stdout", lines=200):
         return self.node.logs.get(run_dir, "")
-
-    def remove_run_dir(self, run_dir):
-        self.node.logs.pop(run_dir, None)
 
 
 class FakeLaneRunner:
