@@ -1067,6 +1067,29 @@ def test_procs_all_still_lists_every_process_line():
     assert "unmanaged" in output
 
 
+def test_process_rows_align_columns_for_wide_process_names():
+    snapshot = _snapshot()
+    snapshot["nodes"][0]["gpus"] = [
+        _gpu(
+            0,
+            total=73415,
+            used=69000,
+            external=69000,
+            procs=2,
+            processes=[
+                _proc(100, 40000, "训练.py", "alice"),
+                _proc(101, 20000, "python train.py", "bob"),
+            ],
+        )
+    ]
+    tui = _tui(resource_view="servers")
+    tui.proc_view = "all"
+    lines = _plain(tui.render(_state(snapshot))).splitlines()
+    alice = next(line for line in lines if "alice" in line)
+    bob = next(line for line in lines if "bob" in line)
+    assert display_width(alice[:alice.index("alice")]) == display_width(bob[:bob.index("bob")])
+
+
 def test_capacity_reflects_foreign_usage():
     output = _render(_tui(resource_view="servers"))
     # The 69000MB of foreign memory shows up as the card's used total.
@@ -1852,6 +1875,24 @@ def test_status_counts_and_alert_rows_are_clickable():
     assert tui.worker.log_request == (7, "stdout")
 
 
+def test_alert_counts_use_every_open_alert_not_just_the_listed_ones():
+    snapshot = _snapshot()
+    # The scheduler lists at most 20 open alerts but counts all of them.
+    snapshot["alerts"] = [
+        {"id": index, "kind": "job_failed", "severity": "error", "job_id": None,
+         "node": None, "title": f"alert {index}", "acknowledged_at": None}
+        for index in range(20, 0, -1)
+    ]
+    snapshot["open_alerts"] = 25
+    tui = _tui(resource_view="flow")
+    output = _render(tui, _state(snapshot))
+
+    assert "⚠ 25 alert(s)" in output
+    assert "… 22 more" in output
+    acknowledge = next(command for command in COMMANDS if command.name == "acknowledge")
+    assert tui._footer_control(acknowledge, _state(snapshot))[0] == "A ack:25"
+
+
 def test_help_and_quit_buttons_are_clickable():
     tui = _tui(resource_view="flow")
     output = _render(tui)
@@ -1956,6 +1997,17 @@ def test_the_log_view_asks_the_worker_for_the_selected_job():
 
     _press(tui, "L")
     assert tui.worker.log_request is None
+
+
+def test_an_empty_fetched_log_is_not_shown_as_still_fetching():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "L")
+    assert "(fetching…)" in _render(tui, _state(log_text="", log_job=None))
+
+    output = _render(tui, _state(log_text="", log_job=1))
+    assert "(no output yet)" in output
+    assert "(fetching…)" not in output
 
 
 # --- sorting, priority and reordering --------------------------------------

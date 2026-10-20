@@ -1224,14 +1224,14 @@ class QueueTUI:
         """
         self._alert_targets = {}
         alerts = snapshot.get("alerts") or []
-        open_alerts = [alert for alert in alerts if not alert.get("acknowledged_at")]
-        if not open_alerts:
+        if not alerts:
             return []
-        shown = open_alerts[-3:]
+        total = self._open_alert_total(snapshot)
+        shown = alerts[-3:]
         lines = [
             self._compose(
                 [
-                    (f" ⚠ {len(open_alerts)} alert(s) ", "red"),
+                    (f" ⚠ {total} alert(s) ", "red"),
                     ("— click a row to inspect; A acknowledges all", "bright_black"),
                 ],
                 width,
@@ -1254,11 +1254,16 @@ class QueueTUI:
                 self._alert_targets[line_index] = ("job_log", alert["job_id"])
             elif alert.get("node"):
                 self._alert_targets[line_index] = ("node_name", alert["node"])
-        if len(open_alerts) > len(shown):
+        if total > len(shown):
             lines.append(
-                self._style(f"   … {len(open_alerts) - len(shown)} more", "bright_black")
+                self._style(f"   … {total - len(shown)} more", "bright_black")
             )
         return lines
+
+    @staticmethod
+    def _open_alert_total(snapshot: Dict[str, Any]) -> int:
+        """Every open alert; the snapshot lists only the newest few."""
+        return max(len(snapshot.get("alerts") or []), snapshot.get("open_alerts") or 0)
 
     @staticmethod
     def _node_health_dot(node: Dict[str, Any]) -> Tuple[str, str]:
@@ -2172,7 +2177,7 @@ class QueueTUI:
                     self._compose(
                         [
                             (f"        · pid {entry.pid}  ", "bright_black"),
-                            (f"{fit_display(entry.name or '-', 26):<26}  ", None),
+                            (pad_display(fit_display(entry.name or '-', 26), 26) + "  ", None),
                             (entry.owner if entry.managed else "unmanaged",
                              "cyan" if entry.managed else "yellow"),
                         ],
@@ -2188,8 +2193,8 @@ class QueueTUI:
                 self._compose(
                     [
                         (f"        · {format_mb(entry.mem_mb):>6}  ", "bright_black"),
-                        (f"{fit_display(entry.name or str(entry.pid), 26):<26}  ", None),
-                        (f"{fit_display(entry.username or '-', 10):<10}  ", "bright_black"),
+                        (pad_display(fit_display(entry.name or str(entry.pid), 26), 26) + "  ", None),
+                        (pad_display(fit_display(entry.username or '-', 10), 10) + "  ", "bright_black"),
                         (owner, "cyan" if entry.managed else "yellow"),
                     ],
                     width,
@@ -2521,7 +2526,8 @@ class QueueTUI:
         if self.show_log:
             self.detail_page = 0
             self.detail_pages = 1
-            text = state["log_text"] if state["log_job"] == job["id"] else ""
+            fetched = state["log_job"] == job["id"]
+            text = state["log_text"] if fetched else ""
             if not text:
                 self.log_offset = 0
                 self._log_max_offset = 0
@@ -2532,7 +2538,8 @@ class QueueTUI:
                         "bright_black",
                     )
                 ]
-                lines.append(self._style("  (fetching…)", "bright_black"))
+                placeholder = "  (no output yet)" if fetched else "  (fetching…)"
+                lines.append(self._style(placeholder, "bright_black"))
                 return lines
             log_lines = text.rstrip("\n").splitlines()
             self._log_page_height = max(1, height - 1)
@@ -2733,9 +2740,9 @@ class QueueTUI:
         elif name == "theme":
             label = f"T theme:{self.theme}"
         elif name == "acknowledge":
-            alerts = state["snapshot"].get("alerts") or []
-            if alerts:
-                label, style = f"A ack:{len(alerts)}", "red"
+            total = self._open_alert_total(state["snapshot"])
+            if total:
+                label, style = f"A ack:{total}", "red"
 
         if label is None:
             return None
