@@ -1,5 +1,6 @@
 from typing import Optional
 from blessed import Terminal
+import ctypes
 import functools
 import logging
 import platform
@@ -152,12 +153,15 @@ def _dcgm_metric_row(gpu):
     bounds = pipes + ([dram] if dram is not None else [])
     instruction_throughput = max(pipes) if pipes else None
     sol = max(bounds) if bounds else None
+    # The derived values are already 0-100, so they skip the ratio scaling.
     return {
         "GPU": gpu["gpu_index"],
         "sm_active": _format_dcgm_percent(gpu.get("sm_active")),
         "sm_occupancy": _format_dcgm_percent(gpu.get("sm_occupancy")),
-        "instruction_throughput": _format_dcgm_percent(instruction_throughput),
-        "sol": _format_dcgm_percent(sol),
+        "instruction_throughput": (
+            "N/A" if instruction_throughput is None else f"{instruction_throughput:.0f}%"
+        ),
+        "sol": "N/A" if sol is None else f"{sol:.0f}%",
         "tensor_active": _format_dcgm_percent(gpu.get("tensor_active")),
         "fp64_active": _format_dcgm_percent(gpu.get("fp64_active")),
         "fp32_active": _format_dcgm_percent(gpu.get("fp32_active")),
@@ -228,6 +232,27 @@ def _parse_swapusage_gb(text):
             except ValueError:
                 pass
     return swap
+
+
+@functools.lru_cache(maxsize=1)
+def _mach_host():
+    # One host port for the process: every mach_host_self() call adds a
+    # reference to it that would otherwise never be released.
+    libc = ctypes.CDLL(None)
+    libc.mach_host_self.restype = ctypes.c_uint
+    return libc, libc.mach_host_self()
+
+
+def _darwin_cpu_ticks():
+    """(busy, total) CPU ticks since boot, from Mach's HOST_CPU_LOAD_INFO."""
+    libc, host = _mach_host()
+    ticks = (ctypes.c_uint * 4)()  # user, system, idle, nice
+    count = ctypes.c_uint(len(ticks))  # HOST_CPU_LOAD_INFO_COUNT
+    if libc.host_statistics(host, 3, ticks, ctypes.byref(count)) != 0:  # HOST_CPU_LOAD_INFO
+        raise OSError("host_statistics(HOST_CPU_LOAD_INFO) failed")
+    user, system, idle, nice = ticks
+    busy = user + system + nice
+    return busy, busy + idle
 
 
 class _ConnectProgress:
@@ -340,6 +365,8 @@ class BaseClient(ABC):
         # never changes; remembering both saves one remote round trip each.
         self._dcgm_probe_failed = False
         self._cpu_cores = None
+        # (busy, total) CPU ticks of the previous sample, for a per-interval CPU%.
+        self._cpu_ticks = None
 
     def _set_connect_error(self, message: str, error_type: str = "error"):
         self.connected = False
@@ -713,15 +740,14 @@ class BaseClient(ABC):
 
     def _cpu_percent(self):
         """Total CPU utilization in percent, or None when it cannot be read."""
-        # Try Linux first
-        output = self.execute_command(
-            "grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'"
-        )
-        if output.strip():
+        # Linux: "cpu  user nice system idle ..." ticks since boot.
+        fields = self.execute_command("grep 'cpu ' /proc/stat").split()
+        if fields:
             try:
-                return float(output.strip())
+                user, system, idle = int(fields[1]), int(fields[3]), int(fields[4])
             except ValueError:
                 return None
+            return self._cpu_percent_since_last(user + system, user + system + idle)
 
         # Try macOS - use top for CPU usage (user + sys)
         parts = self.execute_command(
@@ -733,6 +759,18 @@ class BaseClient(ABC):
             except ValueError:
                 pass
         return None
+
+    def _cpu_percent_since_last(self, busy, total):
+        """Busy share of the CPU ticks counted since the previous sample.
+
+        The counters run from boot, so the first sample - or one where the
+        counters did not advance or wrapped - can only give the since-boot
+        average.
+        """
+        previous, self._cpu_ticks = self._cpu_ticks, (busy, total)
+        if previous is not None and total > previous[1]:
+            busy, total = busy - previous[0], total - previous[1]
+        return busy * 100 / total
 
     def get_process_summary(self, gpu_stats, detailed: bool = False, *, resolve_users=True):
         """Get detailed GPU processes information with user summary.
@@ -921,8 +959,16 @@ class RemoteClient(BaseClient):
             if self._proxy is not None:
                 kwargs["sock"] = self._proxy
             self.client.connect(**kwargs)
-        except Exception:
+        except Exception as error:
+            # Paramiko reports a link that dropped or stalled mid-auth as an
+            # AuthenticationException too. That is a network failure worth
+            # retrying, not credentials the server rejected.
+            link_lost = isinstance(error, AuthenticationException) and (
+                not self._transport_alive() or str(error) == "Authentication timeout."
+            )
             self._close_ssh()
+            if link_lost:
+                raise ConnectionError(f"Connection lost during authentication: {error}") from error
             raise
         transport = self.client.get_transport()
         if transport is not None:
@@ -1275,6 +1321,13 @@ class LocalClient(BaseClient):
 
     def query_nvml_snapshot(self) -> dict:
         return self._nvml_collector.collect()
+
+    def _cpu_percent(self):
+        if sys.platform != "darwin":
+            return super()._cpu_percent()
+        # `top -l 1` costs about two seconds of CPU per sample on macOS; the
+        # kernel tick counters it reports from are one Mach call away.
+        return self._cpu_percent_since_last(*_darwin_cpu_ticks())
 
     def get_system_stats(self) -> dict:
         stats = super().get_system_stats()

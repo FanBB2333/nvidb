@@ -11,6 +11,7 @@ import json
 
 import pandas as pd
 import pytest
+from paramiko import AuthenticationException
 
 from nvidb.connection import RemoteClient
 from nvidb.data_modules import ServerInfo
@@ -225,6 +226,36 @@ def test_credentials_that_only_a_human_can_supply_are_not_retried(client, monkey
     assert client.last_error_type == "auth"
     assert client.ensure_connected() is False
     assert _FakeSSHClient.connect_attempts == 0
+
+
+@pytest.mark.parametrize(
+    "link_active, message, error_type",
+    [
+        (False, "Authentication failed: transport shut down or saw EOF", "connect"),
+        (True, "Authentication timeout.", "connect"),
+        (True, "Authentication failed.", "auth"),
+    ],
+)
+def test_only_a_server_rejection_during_auth_stops_the_retries(
+    client, monkeypatch, link_active, message, error_type
+):
+    """Paramiko reports a link that dies or stalls mid-auth as an
+    AuthenticationException; that must not leave the node dead until restart."""
+
+    def fail_auth(self, **kwargs):
+        self._transport = _FakeTransport()
+        self._transport.active = link_active
+        raise AuthenticationException(message)
+
+    monkeypatch.setattr(_FakeSSHClient, "connect", fail_auth)
+    client._close_link_locked()
+
+    assert client.ensure_connected() is False
+    assert client.last_error_type == error_type
+    if error_type == "connect":
+        assert "retrying" in client.last_connect_error
+    else:
+        assert client.last_connect_error == "Key authentication failed"
 
 
 def test_a_reconnect_never_blocks_the_ui_thread_forever(client):

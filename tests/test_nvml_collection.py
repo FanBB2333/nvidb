@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 
 from nvidb.connection import BaseClient
@@ -263,3 +265,33 @@ def test_remote_agent_uses_nvml_without_nvidia_smi():
     assert "nvidia-smi" not in REMOTE_NVML_AGENT_SCRIPT
     assert command.startswith("python3 -S -u -c ")
     assert command.endswith(" once")
+
+
+def test_dcgm_derived_columns_are_not_rescaled_as_ratios():
+    """Instruction throughput and SOL are already 0-100; a 0.8% reading must
+    not be scaled up to 80% a second time."""
+    client = FakeClient({"ok": True, "gpus": [{"gpu_index": 0, "processes": []}]})
+    dcgm = {
+        "ok": True,
+        "connection": "embedded",
+        "gpus": [
+            {
+                "gpu_index": 0,
+                "sm_active": 0.004,
+                "tensor_active": 0.003,
+                "fp32_active": 0.008,
+                "dram_active": 0.006,
+            }
+        ],
+    }
+    client.execute_command = lambda command: "motd noise\n" + json.dumps(dcgm) + "\n"
+
+    _stats, system_info = client.get_full_gpu_info()
+
+    row = system_info["advanced_metrics"].iloc[0]
+    assert row["sm_active"] == "0%"
+    assert row["fp32_active"] == "1%"
+    assert row["instruction_throughput"] == "1%"
+    assert row["sol"] == "1%"
+    assert row["fp64_active"] == "N/A"
+    assert system_info["advanced_supported"] is True
