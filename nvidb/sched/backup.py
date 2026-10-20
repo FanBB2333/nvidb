@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 
 from .. import config as nvidb_config
 from . import db as dbm
+from .model import parse_ts
 
 LAST_BACKUP_META = "last_backup_at"
 BACKUP_LOCK = "database_backup"
@@ -63,18 +64,6 @@ def _utc_now() -> datetime:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
-
-
-def _parse_iso(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _generated_path(directory: Path, now: datetime) -> Path:
@@ -249,7 +238,7 @@ def maybe_create(
         # Recheck after acquiring the lease: another daemon may have completed
         # the due backup while this process was waiting for the scheduler.
         current = now or _utc_now()
-        previous = _parse_iso(dbm.get_meta(conn, LAST_BACKUP_META))
+        previous = parse_ts(dbm.get_meta(conn, LAST_BACKUP_META))
         interval_seconds = settings["interval_hours"] * 3600
         if (
             previous is not None

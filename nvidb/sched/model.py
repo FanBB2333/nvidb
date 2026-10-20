@@ -40,8 +40,8 @@ ACTIVE_JOB_STATES = frozenset({"pending", "running"})
 TERMINAL_JOB_STATES = frozenset(
     {"completed", "failed", "cancelled", "timeout", "lost"}
 )
-# Event kinds written to the append-only `events` table. Clients that were not
-# running when something happened replay this stream to catch up.
+
+
 def utcnow() -> str:
     """Current time as a timezone-aware ISO-8601 string (the storage format)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -60,13 +60,12 @@ def parse_ts(value: Optional[str]) -> Optional[datetime]:
     return parsed
 
 
-def age_seconds(value: Optional[str], now: Optional[datetime] = None) -> Optional[float]:
+def age_seconds(value: Optional[str]) -> Optional[float]:
     """Seconds elapsed since a stored timestamp, or None when unparseable."""
     parsed = parse_ts(value)
     if parsed is None:
         return None
-    reference = now or datetime.now(timezone.utc)
-    return (reference - parsed).total_seconds()
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
 
 
 _SIZE_PATTERN = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*$")
@@ -271,17 +270,13 @@ class Job:
         """What to call this job on screen; `held` is a pending job that is stuck."""
         return "held" if self.is_held else self.state
 
-    def elapsed_seconds(self, now: Optional[datetime] = None) -> Optional[float]:
+    def elapsed_seconds(self) -> Optional[float]:
         """Wall-clock runtime: since start for live jobs, start→finish once done."""
         started = parse_ts(self.started_at)
         if started is None:
             return None
-        if self.finished_at:
-            finished = parse_ts(self.finished_at)
-            if finished is not None:
-                return (finished - started).total_seconds()
-        reference = now or datetime.now(timezone.utc)
-        return (reference - started).total_seconds()
+        end = parse_ts(self.finished_at) or datetime.now(timezone.utc)
+        return (end - started).total_seconds()
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-friendly view; this is the schema other tools consume."""
@@ -338,6 +333,31 @@ def requested_place(job: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def display_state(job: Dict[str, Any]) -> str:
+    """What to call a job on screen. A held job is pending but stuck, and
+    drawing it as plain `pending` is how someone waits for a job that will
+    never start until they act."""
+    return "held" if job.get("held") else job["state"]
+
+
+def job_cells(job: Dict[str, Any]) -> Dict[str, str]:
+    """The placement and outcome cells the CLI and TUI job tables share."""
+    return {
+        "NODE": job["node"] or requested_place(job) or "-",
+        "GPU": ",".join(str(i) for i in job["gpu_ids"]) or "-",
+        "VRAM": format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
+        "USED": format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-",
+        "TIME": format_duration(job.get("elapsed_s")),
+        "RC": "-" if job["exit_code"] is None else str(job["exit_code"]),
+    }
+
+
+def gpu_source_label(gpu: Dict[str, Any]) -> str:
+    """How a card's foreign usage was measured: "blind" means the driver named
+    no processes, so the split between foreign work and ours is inferred."""
+    return "blind" if gpu.get("attribution") == "blind" else f"{gpu['external_procs']}p"
+
+
 def make_lane_name(node: str, gpu_ids: Sequence[int]) -> str:
     """The stable name of a lane: `<node>:<gpu indices>`, e.g. `box406:0`."""
     return f"{node}:{','.join(str(int(index)) for index in gpu_ids)}"
@@ -371,6 +391,10 @@ def parse_lane_name(name: str) -> Tuple[str, List[int]]:
             f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. box406:0"
         )
     return node, gpu_ids
+
+
+# Seconds since its last heartbeat after which a lane runner counts as gone.
+RUNNER_STALE_AFTER = 120.0
 
 
 @dataclass
@@ -415,12 +439,12 @@ class Lane:
             updated_at=data.get("updated_at"),
         )
 
-    def runner_up(self, *, stale_after: float = 120.0) -> bool:
+    def runner_up(self) -> bool:
         """Whether a runner was seen alive recently enough to be believed."""
         if not self.runner_state or not self.runner_seen_at:
             return False
         age = age_seconds(self.runner_seen_at)
-        return age is not None and age <= stale_after
+        return age is not None and age <= RUNNER_STALE_AFTER
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -479,8 +503,8 @@ class GpuProcess:
             pid=int(data.get("pid") or 0),
             mem_mb=int(data.get("mem_mb") or 0),
             name=data.get("name"),
-            username=data.get("user") or data.get("username"),
-            kind=data.get("type") or data.get("kind"),
+            username=data.get("user"),
+            kind=data.get("type"),
             job_id=data.get("job_id"),
             job_name=data.get("job_name"),
         )
@@ -547,11 +571,6 @@ class GpuState:
             ],
             updated_at=data.get("updated_at"),
         )
-
-    @property
-    def external_processes(self) -> List["GpuProcess"]:
-        """The processes the queue does not manage - the ones it schedules around."""
-        return [process for process in self.processes if not process.managed]
 
     def mem_used_percent(self) -> Optional[int]:
         if not self.mem_total_mb:

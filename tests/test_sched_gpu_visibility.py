@@ -95,7 +95,7 @@ def test_a_queue_job_is_labelled_with_the_job_it_belongs_to(scheduler, cluster):
     assert [process.job_id for process in gpu.processes] == [job_id]
     assert gpu.processes[0].owner == f"job {job_id} train"
     assert gpu.processes[0].managed is True
-    assert gpu.external_processes == []
+    assert all(process.managed for process in gpu.processes)
     # Our own usage is reported separately from foreign usage.
     assert gpu.queue_mem_mb == 4000
     assert gpu.external_mem_mb == 0

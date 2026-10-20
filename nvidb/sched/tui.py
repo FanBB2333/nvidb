@@ -51,8 +51,11 @@ from .model import (
     TERMINAL_JOB_STATES,
     GpuProcess,
     age_seconds,
+    display_state,
     format_duration,
     format_mb,
+    gpu_source_label,
+    job_cells,
     requested_place,
 )
 from .scheduler import Scheduler
@@ -436,13 +439,6 @@ FOOTER_COMMANDS = tuple(sorted(
     (command for command in COMMANDS if command.footer_order is not None),
     key=lambda command: command.footer_order,
 ))
-
-
-def display_state(job: Dict[str, Any]) -> str:
-    """What to call a job on screen. A held job is pending but stuck, and
-    drawing it as plain `pending` is how someone waits for a job that will
-    never start until they act."""
-    return "held" if job.get("held") else job["state"]
 
 
 # Queue order keeps running work first and respects independent lane ordering.
@@ -2115,11 +2111,7 @@ class QueueTUI:
             else "bright_black"
         )
         free_style = _free_style(gpu["free_mb"])
-        source = (
-            "blind"
-            if gpu.get("attribution") == "blind"
-            else f"{gpu['external_procs']}p"
-        )
+        source = gpu_source_label(gpu)
         name_width = 20 if width >= 100 else 14
         segments: List[Tuple[str, Optional[str]]] = [
             (f"    GPU{gpu['index']} ", "cyan" if selected else "bright_black"),
@@ -2454,14 +2446,7 @@ class QueueTUI:
                 "ST": STATE_BADGE.get(display_state(job), display_state(job)),
                 "PRI": str(job.get("priority") or 0),
                 "NAME": job["name"] or "-",
-                "NODE": job["node"] or requested_place(job) or "-",
-                "GPU": ",".join(str(i) for i in job["gpu_ids"]) or "-",
-                "VRAM": format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
-                "USED": format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-",
-                "TIME": format_duration(job["elapsed_s"])
-                if job.get("elapsed_s") is not None
-                else "-",
-                "RC": "-" if job["exit_code"] is None else str(job["exit_code"]),
+                **job_cells(job),
             }
             # What the job says about itself beats the command line it was
             # started with; `▸` marks which one is on screen.

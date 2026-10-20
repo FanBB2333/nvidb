@@ -8,6 +8,7 @@ way out, which is what keeps the queue moving without a daemon.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from contextvars import ContextVar
 import json
 import os
@@ -31,10 +32,13 @@ from .model import (
     TERMINAL_JOB_STATES,
     GpuProcess,
     Job,
+    Lane,
     age_seconds,
+    display_state,
     format_duration,
     format_mb,
-    requested_place,
+    gpu_source_label,
+    job_cells,
 )
 from .scheduler import Scheduler, SchedulerLeaseLost
 
@@ -60,9 +64,9 @@ class ArgumentParser(argparse.ArgumentParser):
             self.exit(2)
         super().error(message)
 
-STATE_ORDER = ["running", "pending"] + [
+SUMMARY_STATES = ("running", "pending", "held") + tuple(
     state for state in JOB_STATES if state in TERMINAL_JOB_STATES
-]
+)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -170,6 +174,15 @@ def _short(text: Optional[str], limit: int = 60) -> str:
     return fit_display(text, limit) if text else "-"
 
 
+def _csv(values: Sequence[Any]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def _clock(ts: Optional[str]) -> str:
+    """A stored timestamp as `YYYY-MM-DD HH:MM:SS`."""
+    return (ts or "")[:19].replace("T", " ")
+
+
 def _age(value: Optional[str]) -> str:
     seconds = age_seconds(value)
     if seconds is None:
@@ -178,14 +191,14 @@ def _age(value: Optional[str]) -> str:
 
 
 def _open(args) -> Scheduler:
-    conn = dbm.open_db(getattr(args, "db_path", None))
+    conn = dbm.open_db(args.db_path)
     scheduler = Scheduler(conn)
     scheduler.sync_nodes_from_config()
     # Explicit database/config overrides can be tests or a second queue. They
     # must never start the keeper installed for the user's default queue.
-    if (getattr(args, "func", None) not in (cmd_daemon, cmd_keeper)
-            and not getattr(args, "no_tick", False)
-            and not getattr(args, "db_path", None)
+    if (args.func is not cmd_daemon
+            and not args.no_tick
+            and not args.db_path
             and not os.environ.get("NVIDB_QUEUE_DB")
             and not os.environ.get("NVIDB_QUEUE_CONFIG")):
         warning = keeper_mod.ensure_local()
@@ -194,8 +207,8 @@ def _open(args) -> Scheduler:
     return scheduler
 
 
-def _maybe_tick(scheduler: Scheduler, args, *, force: bool = False) -> Dict[str, Any]:
-    if getattr(args, "no_tick", False):
+def _maybe_tick(scheduler: Scheduler, args, *, force: bool = True) -> Dict[str, Any]:
+    if args.no_tick:
         return {"skipped": "disabled"}
     return scheduler.tick(force=force)
 
@@ -208,15 +221,13 @@ def _refresh(scheduler: Scheduler, args) -> Dict[str, Any]:
     rate-limited, so a client polling in a loop still only reaches the nodes
     every few seconds; `--tick` forces it and `--no-tick` skips it entirely.
     """
-    if getattr(args, "no_tick", False):
-        return {"skipped": "disabled"}
-    return scheduler.tick(force=bool(getattr(args, "tick", False)))
+    return _maybe_tick(scheduler, args, force=args.tick)
 
 
-def _resolve_ids(scheduler: Scheduler, raw_ids: Sequence[str]) -> List[int]:
+def _resolve_ids(raw_ids: Sequence[str]) -> List[int]:
     ids: List[int] = []
     for value in raw_ids:
-        for part in str(value).split(","):
+        for part in value.split(","):
             part = part.strip()
             if not part:
                 continue
@@ -235,10 +246,10 @@ def _gpu_process_lines(gpu: Dict[str, Any], *, detail: bool) -> List[str]:
     Capacity numbers alone cannot answer "why is this GPU full"; the answer is
     usually a process nobody submitted through the queue.
     """
-    processes = gpu.get("processes") or []
-    external = [process for process in processes if not process.get("managed")]
+    processes = gpu["processes"]
+    external = [process for process in processes if not process["managed"]]
 
-    if gpu.get("attribution") == "blind":
+    if gpu["attribution"] == "blind":
         # The driver accounts for none of the memory in use (WSL), so say that
         # rather than implying the card is idle or that the split is measured.
         lines = [
@@ -290,25 +301,18 @@ def _render_nodes(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
         flags = [node["state"]]
         if not node["enabled"]:
             flags.append("disabled")
-        if node.get("ignored"):
+        if node["ignored"]:
             flags.append("ignored")
         header = f"  {node['name']}  [{'/'.join(flags)}]  {node['hostname'] or ''}"
-        if node["state"] != "up" and node.get("last_error"):
+        if node["state"] != "up" and node["last_error"]:
             header += f"  ! {_short(node['last_error'], 70)}"
-        elif node.get("last_seen"):
+        elif node["last_seen"]:
             header += f"  seen {_age(node['last_seen'])}"
         lines.append(header)
         rows = []
         for gpu in node["gpus"]:
-            # "blind" means the driver named no processes, so the split between
-            # foreign work and our own is inferred rather than measured.
-            source = (
-                "blind"
-                if gpu.get("attribution") == "blind"
-                else f"{gpu['external_procs']}p"
-            )
             used = f"{format_mb(gpu['mem_used_mb'])}/{format_mb(gpu['mem_total_mb'])}"
-            if gpu.get("mem_used_percent") is not None:
+            if gpu["mem_used_percent"] is not None:
                 used += f" {gpu['mem_used_percent']}%"
             rows.append(
                 [
@@ -316,8 +320,8 @@ def _render_nodes(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
                     _short(gpu["name"], 26),
                     f"{gpu['util_percent'] if gpu['util_percent'] is not None else '-'}%",
                     used,
-                    f"{format_mb(gpu['external_mem_mb'])} ({source})",
-                    format_mb(gpu.get("queue_mem_mb") or 0),
+                    f"{format_mb(gpu['external_mem_mb'])} ({gpu_source_label(gpu)})",
+                    format_mb(gpu["queue_mem_mb"]),
                     format_mb(gpu["reserved_mb"]),
                     f"{gpu['queue_jobs']}",
                     format_mb(gpu["free_mb"]),
@@ -362,24 +366,15 @@ JOB_HEADERS = [
 
 
 def _job_row(job: Dict[str, Any], *, extra: Sequence[str] = ()) -> List[str]:
-    gpu = ",".join(str(index) for index in job["gpu_ids"]) or "-"
-    used = format_mb(job["gpu_mem_mb"]) if job.get("gpu_mem_mb") else "-"
+    cells = job_cells(job)
     row = [
         str(job["id"]),
-        # A held job is pending in the database but stuck in practice, and
-        # calling it "pending" is how someone waits for a job that will never
-        # start on its own.
-        "held" if job.get("held") else job["state"],
+        display_state(job),
         _short(job["name"] or "-", 20),
-        job["node"] or requested_place(job) or "-",
-        gpu,
-        format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
-        used,
-        format_duration(job["elapsed_s"]) if job.get("elapsed_s") is not None else "-",
-        "-" if job["exit_code"] is None else str(job["exit_code"]),
+        *(cells[key] for key in ("NODE", "GPU", "VRAM", "USED", "TIME", "RC")),
         _short(job["command"], 44),
     ]
-    row.extend(_short(job.get(key), 40) for key in extra)
+    row.extend(_short(job[key], 40) for key in extra)
     return row
 
 
@@ -390,7 +385,7 @@ def _job_table(jobs: Sequence[Dict[str, Any]], indent: str = "  ") -> str:
     command out of a normal terminal.
     """
     optional = {"held_reason": "HELD BY", "progress": "PROGRESS", "notes": "NOTE"}
-    extra = [key for key in optional if any(job.get(key) for job in jobs)]
+    extra = [key for key in optional if any(job[key] for job in jobs)]
     headers = JOB_HEADERS + [optional[key] for key in extra]
     return _table(
         [_job_row(job, extra=extra) for job in jobs],
@@ -403,18 +398,14 @@ def _job_table(jobs: Sequence[Dict[str, Any]], indent: str = "  ") -> str:
 
 def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
     counts = dict(snapshot["counts"])
-    held = snapshot.get("held") or []
+    held = snapshot["held"]
     if held:
         # Held jobs are stored as pending; counting them in both places would
         # overstate what the queue is actually going to get to.
         counts["pending"] = max(0, counts.get("pending", 0) - len(held))
         counts["held"] = len(held)
     summary = " · ".join(
-        f"{state} {counts[state]}"
-        for state in ["running", "pending", "held"] + [
-            state for state in STATE_ORDER if state in TERMINAL_JOB_STATES
-        ]
-        if counts.get(state)
+        f"{state} {counts[state]}" for state in SUMMARY_STATES if counts.get(state)
     ) or "empty"
     lock = snapshot.get("tick_lock") or {}
     header = (
@@ -422,20 +413,20 @@ def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
     )
     if lock.get("owner"):
         header += f"  (tick held by {lock['owner']})"
-    if snapshot.get("last_backup_at"):
+    if snapshot["last_backup_at"]:
         header += f"  backup {_age(snapshot['last_backup_at'])}"
-    keeper_state = snapshot.get("keeper") or {}
+    keeper_state = snapshot["keeper"]
     # Only worth a word where a keeper is meant to exist: on a laptop driving a
     # remote queue there is nothing here to report.
-    if keeper_state.get("installed") or keeper_state.get("running"):
-        header += f"  keeper {'up' if keeper_state.get('running') else 'DOWN'}"
+    if keeper_state["installed"] or keeper_state["running"]:
+        header += f"  keeper {'up' if keeper_state['running'] else 'DOWN'}"
     parts = [header]
-    if snapshot.get("open_alerts"):
+    if snapshot["open_alerts"]:
         # The first thing to say about a queue with failures in it is that it
         # has failures in it.
         parts.append("")
         parts.append(f"ALERTS  {snapshot['open_alerts']} open (nvidb queue alerts)")
-        parts.append(_render_alerts(snapshot.get("alerts") or []))
+        parts.append(_render_alerts(snapshot["alerts"]))
     parts += [
         "",
         _render_nodes(snapshot, procs=procs),
@@ -451,7 +442,6 @@ def _render_status(snapshot: Dict[str, Any], *, procs: bool = False) -> str:
 
 
 def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
-    data = job.to_dict()
     lines = [
         f"JOB {job.id}  {job.display_state}"
         + (f"  (exit {job.exit_code})" if job.exit_code is not None else ""),
@@ -462,11 +452,11 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
         + (f" node={job.node_constraint}" if job.node_constraint else "")
         + (f" pool={job.pool}" if job.pool else "")
         + (f" priority={job.priority}" if job.priority else ""),
-        f"  placement   node={job.node or '-'} gpu={','.join(str(i) for i in job.gpu_ids) or '-'} pid={job.remote_pid or '-'}"
+        f"  placement   node={job.node or '-'} gpu={_csv(job.gpu_ids) or '-'} pid={job.remote_pid or '-'}"
         + (f" lane={job.lane}" if job.lane else ""),
         f"  vram used   {format_mb(job.gpu_mem_mb) if job.gpu_mem_mb else '-'}",
         f"  timing      created={job.created_at or '-'} started={job.started_at or '-'} finished={job.finished_at or '-'}",
-        f"  elapsed     {format_duration(data['elapsed_s']) if data['elapsed_s'] is not None else '-'}",
+        f"  elapsed     {format_duration(job.elapsed_seconds())}",
         f"  attempt     {job.attempt}/{job.max_retries + 1}",
         f"  submitter   {job.submitter or '-'}",
         f"  run_dir     {job.run_dir or '-'}",
@@ -482,10 +472,10 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
             f"repoint it with `nvidb job edit {job.id} --add-after ID`"
         )
     if job.depends_on:
-        lines.append(f"  depends_on  {','.join(str(i) for i in job.depends_on)}")
+        lines.append(f"  depends_on  {_csv(job.depends_on)}")
     if job.depends_any:
         lines.append(
-            f"  after_any   {','.join(str(i) for i in job.depends_any)}"
+            f"  after_any   {_csv(job.depends_any)}"
             "   (any outcome counts)"
         )
     if job.tags:
@@ -506,52 +496,45 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
 # --- command handlers ------------------------------------------------------
 
 def cmd_status(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
-        snapshot = scheduler.snapshot(
-            include_ignored=bool(getattr(args, "include_ignored", False))
-        )
+        snapshot = scheduler.snapshot(include_ignored=args.include_ignored)
         if args.json:
             _print_json(snapshot)
         else:
-            print(_render_status(snapshot, procs=bool(getattr(args, "procs", False))))
+            print(_render_status(snapshot, procs=args.procs))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_tick(args) -> int:
-    scheduler = _open(args)
-    try:
-        while True:
-            summary = scheduler.tick(force=True)
-            if args.json:
-                _print_json(summary)
-            else:
-                bits = [
-                    f"nodes up={summary['nodes_up']} down={summary['nodes_down']}",
-                    f"dispatched={len(summary['dispatched'])}",
-                    f"finished={len(summary['finished'])}",
-                ]
-                if summary.get("nodes_ignored"):
-                    bits.insert(1, f"ignored={summary['nodes_ignored']}")
-                if summary["skipped"]:
-                    bits.insert(0, f"skipped={summary['skipped']}")
-                print("tick: " + "  ".join(bits))
-                for item in summary["dispatched"]:
-                    print(f"  -> job {item['id']} started on {item['node']} GPU {item['gpu_ids']}")
-                for item in summary["finished"]:
-                    print(f"  <- job {item['id']} {item['state']}")
-                for item in summary["errors"]:
-                    print(f"  !! {item}")
-            if not args.watch:
-                return 0
-            time.sleep(max(1, int(args.watch)))
-    except KeyboardInterrupt:
-        return 0
-    finally:
-        scheduler.close()
+    with closing(_open(args)) as scheduler:
+        try:
+            while True:
+                summary = scheduler.tick(force=True)
+                if args.json:
+                    _print_json(summary)
+                else:
+                    bits = [
+                        f"nodes up={summary['nodes_up']} down={summary['nodes_down']}",
+                        f"dispatched={len(summary['dispatched'])}",
+                        f"finished={len(summary['finished'])}",
+                    ]
+                    if summary["nodes_ignored"]:
+                        bits.insert(1, f"ignored={summary['nodes_ignored']}")
+                    if summary["skipped"]:
+                        bits.insert(0, f"skipped={summary['skipped']}")
+                    print("tick: " + "  ".join(bits))
+                    for item in summary["dispatched"]:
+                        print(f"  -> job {item['id']} started on {item['node']} GPU {item['gpu_ids']}")
+                    for item in summary["finished"]:
+                        print(f"  <- job {item['id']} {item['state']}")
+                    for item in summary["errors"]:
+                        print(f"  !! {item}")
+                if not args.watch:
+                    return 0
+                time.sleep(max(1, args.watch))
+        except KeyboardInterrupt:
+            return 0
 
 
 def _render_alerts(alerts: Sequence[Dict[str, Any]], *, detail: bool = False) -> str:
@@ -560,7 +543,7 @@ def _render_alerts(alerts: Sequence[Dict[str, Any]], *, detail: bool = False) ->
     rows = [
         [
             str(alert["id"]),
-            (alert["ts"] or "")[:19].replace("T", " "),
+            _clock(alert["ts"]),
             alert["severity"],
             alert["kind"],
             str(alert["job_id"] or "-"),
@@ -581,8 +564,7 @@ def _render_alerts(alerts: Sequence[Dict[str, Any]], *, detail: bool = False) ->
 
 
 def cmd_alerts(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         alerts = dbm.list_alerts(
             scheduler.conn, open_only=not args.all, limit=args.number
@@ -597,28 +579,22 @@ def cmd_alerts(args) -> int:
         # show: `--all -n 5` must not report a clean queue because the five
         # newest alerts were acknowledged.
         return 1 if open_count else 0
-    finally:
-        scheduler.close()
 
 
 def cmd_ack(args) -> int:
-    scheduler = _open(args)
-    try:
-        ids = _resolve_ids(scheduler, args.ids) if args.ids else None
+    with closing(_open(args)) as scheduler:
+        ids = _resolve_ids(args.ids)
         count = dbm.acknowledge_alerts(scheduler.conn, ids, all_open=args.all)
         if args.json:
             _print_json({"ok": True, "acknowledged": count})
         else:
             print(f"acknowledged {count} alert(s)")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_backup(args) -> int:
     """Write a verified SQLite snapshot without stopping the queue."""
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         if args.keep < 0:
             return _error("--keep cannot be negative", as_json=args.json)
         try:
@@ -638,94 +614,88 @@ def cmd_backup(args) -> int:
             if info["pruned"]:
                 print(f"  pruned    {len(info['pruned'])} older backup(s)")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_daemon(args) -> int:
     """Keep the queue moving and push failures out as they happen."""
     from .notify import Notifier
 
-    scheduler = _open(args)
-    queue_settings = ((scheduler.cfg or {}).get("queue") or {})
-    if not isinstance(queue_settings, dict):
-        queue_settings = {}
-    notifier = Notifier(queue_settings)
-    interval = max(2, int(args.interval))
-    if not args.json:
-        channels = [
-            name
-            for name, on in (
-                ("desktop", notifier.settings["desktop"] and notifier._desktop_command),
-                ("log", notifier.settings["log"]),
-                ("command", bool(notifier.settings["command"])),
-            )
-            if on
-        ]
-        print(
-            f"nvidb queue daemon: every {interval}s, "
-            f"notifying via {', '.join(channels) or 'nothing (disabled)'}",
-            file=sys.stderr,
-        )
-        print("Press Ctrl+C to stop.", file=sys.stderr)
-    try:
-        while True:
-            try:
-                summary = scheduler.tick(force=True)
-            except SchedulerLeaseLost as error:
-                summary = {"ran": False, "skipped": "lease_lost", "error": str(error)}
-                if not args.json:
-                    print(f"scheduler lease lost: {error}; retrying next pass", file=sys.stderr)
-            sent = 0 if args.no_notify else scheduler.deliver_alerts(notifier)
-            backup = None
-            backup_error = None
-            if not args.no_backup:
-                try:
-                    backup = backup_mod.maybe_create(
-                        scheduler.conn, queue_settings
-                    )
-                except (OSError, ValueError, sqlite3.Error) as error:
-                    # A backup failure needs attention, but it must not stop
-                    # scheduling and timeout enforcement.
-                    backup_error = str(error)
-            if args.json:
-                _print_json(
-                    {
-                        "tick": summary,
-                        "notified": sent,
-                        "backup": backup,
-                        "backup_error": backup_error,
-                    }
+    with closing(_open(args)) as scheduler:
+        queue_settings = scheduler.cfg.get("queue") or {}
+        notifier = Notifier(queue_settings)
+        interval = max(2, args.interval)
+        if not args.json:
+            channels = [
+                name
+                for name, on in (
+                    ("desktop", notifier.settings["desktop"] and notifier._desktop_command),
+                    ("log", notifier.settings["log"]),
+                    ("command", bool(notifier.settings["command"])),
                 )
-                sys.stdout.flush()
-            else:
-                for item in summary.get("alerts") or []:
-                    print(f"  ! {item['kind']}: {item['title']}", file=sys.stderr)
-                if backup:
-                    print(f"  backup: {backup['path']}", file=sys.stderr)
-                if backup_error:
-                    print(f"  ! backup failed: {backup_error}", file=sys.stderr)
-            if args.once:
-                return 0
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        return 0
-    finally:
-        scheduler.close()
+                if on
+            ]
+            print(
+                f"nvidb queue daemon: every {interval}s, "
+                f"notifying via {', '.join(channels) or 'nothing (disabled)'}",
+                file=sys.stderr,
+            )
+            print("Press Ctrl+C to stop.", file=sys.stderr)
+        try:
+            while True:
+                try:
+                    summary = scheduler.tick(force=True)
+                except SchedulerLeaseLost as error:
+                    summary = {"ran": False, "skipped": "lease_lost", "error": str(error)}
+                    if not args.json:
+                        print(f"scheduler lease lost: {error}; retrying next pass", file=sys.stderr)
+                sent = 0 if args.no_notify else scheduler.deliver_alerts(notifier)
+                backup = None
+                backup_error = None
+                if not args.no_backup:
+                    try:
+                        backup = backup_mod.maybe_create(
+                            scheduler.conn, queue_settings
+                        )
+                    except (OSError, ValueError, sqlite3.Error) as error:
+                        # A backup failure needs attention, but it must not stop
+                        # scheduling and timeout enforcement.
+                        backup_error = str(error)
+                if args.json:
+                    _print_json(
+                        {
+                            "tick": summary,
+                            "notified": sent,
+                            "backup": backup,
+                            "backup_error": backup_error,
+                        }
+                    )
+                    sys.stdout.flush()
+                else:
+                    for item in summary.get("alerts") or []:
+                        print(f"  ! {item['kind']}: {item['title']}", file=sys.stderr)
+                    if backup:
+                        print(f"  backup: {backup['path']}", file=sys.stderr)
+                    if backup_error:
+                        print(f"  ! backup failed: {backup_error}", file=sys.stderr)
+                if args.once:
+                    return 0
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return 0
 
 
 def _render_keeper(state: Dict[str, Any]) -> str:
-    if state.get("running"):
-        pid = f", pid {state['pid']}" if state.get("pid") else ""
-        return f"running ({state.get('manager', 'shell')}{pid})"
-    if state.get("installed"):
-        return f"stopped ({state.get('manager', 'shell')})"
+    if state["running"]:
+        pid = f", pid {state['pid']}" if state["pid"] else ""
+        return f"running ({state['manager']}{pid})"
+    if state["installed"]:
+        return f"stopped ({state['manager']})"
     return "not installed"
 
 
 def cmd_keeper(args) -> int:
     """Install and drive the shell script that keeps this queue moving."""
-    action = getattr(args, "keeper_action", None) or "status"
+    action = args.keeper_action
 
     if action == "install":
         manager_name = ("systemd" if args.systemd else "launchd" if args.launchd else
@@ -746,9 +716,7 @@ def cmd_keeper(args) -> int:
             result = keeper_mod.run("restart" if info["replaced"] else "start")
             started = result.returncode == 0
             if not started:
-                start_error = (
-                    result.stderr or result.stdout or f"exit {result.returncode}"
-                ).strip()
+                start_error = keeper_mod._command_error(result)
         if args.json:
             _print_json(
                 {
@@ -797,7 +765,7 @@ def cmd_keeper(args) -> int:
             f"no keeper installed at {error} (run `nvidb queue keeper install`)",
             as_json=args.json,
         )
-    output = (result.stdout or "").rstrip("\n")
+    output = result.stdout.rstrip("\n")
     if args.json:
         _print_json(
             {
@@ -816,8 +784,7 @@ def cmd_keeper(args) -> int:
 
 
 def cmd_events(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         events = dbm.list_events(
             scheduler.conn,
             since_id=args.since,
@@ -830,7 +797,7 @@ def cmd_events(args) -> int:
             rows = [
                 [
                     str(event["id"]),
-                    (event["ts"] or "")[:19].replace("T", " "),
+                    _clock(event["ts"]),
                     event["kind"],
                     str(event["job_id"] or "-"),
                     event["node"] or "-",
@@ -840,24 +807,17 @@ def cmd_events(args) -> int:
             ]
             print(_table(rows, ["ID", "TIME", "KIND", "JOB", "NODE", "MESSAGE"], indent=""))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_nodes(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
-        nodes = scheduler.node_views(
-            include_ignored=bool(getattr(args, "include_ignored", False))
-        )
+        nodes = scheduler.node_views(include_ignored=args.include_ignored)
         if args.json:
             _print_json({"nodes": nodes})
         else:
-            print(_render_nodes({"nodes": nodes}, procs=bool(args.procs)))
+            print(_render_nodes({"nodes": nodes}, procs=args.procs))
         return 0
-    finally:
-        scheduler.close()
 
 
 def _render_lanes(lanes: Sequence[Dict[str, Any]]) -> str:
@@ -911,7 +871,7 @@ def _render_lane_detail(lane: Dict[str, Any]) -> str:
         runner = "no runner"
     lines = [
         f"LANE {lane['name']}  [{'paused' if lane['paused'] else lane['node_state']}]"
-        f"  node={lane['node']} gpu={','.join(str(i) for i in lane['gpu_ids'])}"
+        f"  node={lane['node']} gpu={_csv(lane['gpu_ids'])}"
         f"  {runner}"
         + (f"  concurrency={lane['concurrency']}" if lane["concurrency"] != 1 else "")
     ]
@@ -925,21 +885,18 @@ def _render_lane_detail(lane: Dict[str, Any]) -> str:
     # The queue is printed in the order it will run, numbered, because the
     # number is what `lane move --to N` takes.
     lines.append("QUEUED (in order)")
-    if not lane["queued"]:
-        lines.append("  (none)")
-    else:
-        rows = [
-            [
-                str(position),
-                str(job["id"]),
-                "held" if job.get("held") else "pending",
-                _short(job["name"] or "-", 24),
-                format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
-                _short(job.get("held_reason") or job["command"], 50),
-            ]
-            for position, job in enumerate(lane["queued"], start=1)
+    rows = [
+        [
+            str(position),
+            str(job["id"]),
+            "held" if job["held"] else "pending",
+            _short(job["name"] or "-", 24),
+            format_mb(job["vram_mb"]) if job["vram_mb"] else "-",
+            _short(job["held_reason"] or job["command"], 50),
         ]
-        lines.append(_table(rows, ["#", "ID", "STATE", "NAME", "VRAM", "WHAT"]))
+        for position, job in enumerate(lane["queued"], start=1)
+    ]
+    lines.append(_table(rows, ["#", "ID", "STATE", "NAME", "VRAM", "WHAT"]))
     return "\n".join(lines)
 
 
@@ -962,7 +919,7 @@ def _render_pools(pools: Sequence[Dict[str, Any]]) -> str:
                 rows.append([
                     member["node"],
                     member["state"],
-                    "all" if wanted is None else ",".join(str(i) for i in wanted),
+                    "all" if wanted is None else _csv(wanted),
                     "-", "-", "-",
                 ])
             for gpu in member["gpus"]:
@@ -982,8 +939,7 @@ def _render_pools(pools: Sequence[Dict[str, Any]]) -> str:
 
 
 def cmd_pools(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         pools = scheduler.pools()
         if args.json:
@@ -991,13 +947,10 @@ def cmd_pools(args) -> int:
         else:
             print(_render_pools(pools))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lanes(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         # An unknown or ambiguous name filters on itself and matches nothing,
         # rather than resolving to None and listing every node's lanes.
@@ -1008,13 +961,10 @@ def cmd_lanes(args) -> int:
         else:
             print(_render_lanes(lanes))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_show(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         try:
             lane = scheduler.resolve_lane(args.lane)
@@ -1026,13 +976,10 @@ def cmd_lane_show(args) -> int:
         else:
             print(_render_lane_detail(view))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_move(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         try:
             outcome = scheduler.lane_move(
                 args.id, to=args.to, before=args.before, after=args.after
@@ -1046,13 +993,10 @@ def cmd_lane_move(args) -> int:
                 f"job {args.id} is now #{outcome['position']} in {outcome['lane']}"
             )
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_swap(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         try:
             outcome = scheduler.lane_swap(args.first, args.second)
         except (ValueError, RuntimeError) as error:
@@ -1062,20 +1006,17 @@ def cmd_lane_swap(args) -> int:
         else:
             print(f"swapped jobs {args.first} and {args.second} in {outcome['lane']}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_assign(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         try:
             outcome = scheduler.lane_assign(
                 args.id, None if args.none else args.lane, at=args.at
             )
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
-        summary = _maybe_tick(scheduler, args, force=True)
+        summary = _maybe_tick(scheduler, args)
         if args.json:
             _print_json({"ok": True, "id": args.id, **outcome, "tick": summary})
         elif outcome["lane"] is None:
@@ -1084,19 +1025,16 @@ def cmd_lane_assign(args) -> int:
             where = f" at #{outcome['position']}" if outcome.get("position") else ""
             print(f"job {args.id} queued in {outcome['lane']}{where}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_pause(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         paused = args.action == "pause"
         try:
             lane = scheduler.set_lane_paused(args.lane, paused)
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
-        summary = {} if paused else _maybe_tick(scheduler, args, force=True)
+        summary = {} if paused else _maybe_tick(scheduler, args)
         if args.json:
             _print_json({"ok": True, "lane": lane.to_dict(), "tick": summary})
         else:
@@ -1109,18 +1047,15 @@ def cmd_lane_pause(args) -> int:
                 )
             )
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_skip(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         try:
             outcome = scheduler.lane_skip(args.lane)
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
-        summary = _maybe_tick(scheduler, args, force=True)
+        summary = _maybe_tick(scheduler, args)
         if args.json:
             _print_json({"ok": True, **outcome, "tick": summary})
         elif outcome["skipped"] is None:
@@ -1128,20 +1063,34 @@ def cmd_lane_skip(args) -> int:
         else:
             print(f"job {outcome['skipped']} moved to the back of {outcome['lane']}")
         return 0
-    finally:
-        scheduler.close()
+
+
+def _render_runner_status(lane: Lane) -> str:
+    """Whether a lane's runner is off, up (and what it holds), or missing."""
+    if not lane.runner:
+        return f"lane {lane.name}: runner disabled"
+    if not lane.runner_up():
+        return f"lane {lane.name}: no runner (it starts when work is queued)"
+    # Written by the runner agent on the node: read it as partial.
+    state = lane.runner_state
+    current = ", ".join(str(item.get("job_id")) for item in state.get("current") or [])
+    staged = ", ".join(str(i) for i in state.get("queued") or [])
+    return "\n".join([
+        f"lane {lane.name}: runner up (pid {state.get('pid', '?')}, "
+        f"seen {_age(lane.runner_seen_at)})",
+        f"  running  {current or '-'}",
+        f"  staged   {staged or '-'}",
+    ])
 
 
 def cmd_lane_runner(args) -> int:
     """Inspect or control the resident process that drives one lane."""
-    scheduler = _open(args)
-    try:
-        action = getattr(args, "runner_action", None) or "status"
+    with closing(_open(args)) as scheduler:
+        action = args.runner_action
         try:
             if action == "status":
                 _refresh(scheduler, args)
                 lane = scheduler.resolve_lane(args.lane)
-                view = scheduler.lane_view(lane)
                 if args.json:
                     _print_json(
                         {
@@ -1150,36 +1099,16 @@ def cmd_lane_runner(args) -> int:
                             "up": lane.runner_up(),
                             "seen": lane.runner_seen_at,
                             "state": lane.runner_state,
-                            "blocked": view["blocked"],
+                            "blocked": scheduler.lane_view(lane)["blocked"],
                         }
                     )
                 else:
-                    if not lane.runner:
-                        print(f"lane {lane.name}: runner disabled")
-                    elif lane.runner_up():
-                        state = lane.runner_state or {}
-                        current = ", ".join(
-                            str(item.get("job_id")) for item in state.get("current") or []
-                        )
-                        print(
-                            f"lane {lane.name}: runner up (pid {state.get('pid', '?')}, "
-                            f"seen {_age(lane.runner_seen_at)})"
-                        )
-                        print(f"  running  {current or '-'}")
-                        print(
-                            "  staged   "
-                            + (
-                                ", ".join(str(i) for i in state.get("queued") or [])
-                                or "-"
-                            )
-                        )
-                    else:
-                        print(f"lane {lane.name}: no runner (it starts when work is queued)")
+                    print(_render_runner_status(lane))
                 return 0 if lane.runner_up() or not lane.runner else 1
 
             if action in ("on", "off"):
                 lane = scheduler.set_lane_runner(args.lane, action == "on")
-                summary = _maybe_tick(scheduler, args, force=True) if action == "on" else {}
+                summary = _maybe_tick(scheduler, args) if action == "on" else {}
                 if args.json:
                     _print_json({"ok": True, "lane": lane.to_dict(), "tick": summary})
                 else:
@@ -1191,7 +1120,7 @@ def cmd_lane_runner(args) -> int:
 
             outcome = scheduler.stop_lane_runner(args.lane, hard=args.hard or action == "restart")
             if action == "restart":
-                summary = _maybe_tick(scheduler, args, force=True)
+                summary = _maybe_tick(scheduler, args)
                 if args.json:
                     _print_json({"ok": True, **outcome, "tick": summary})
                 else:
@@ -1207,15 +1136,10 @@ def cmd_lane_runner(args) -> int:
             return 0
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
-        except Exception as error:  # a node that will not answer is not a crash
-            return _error(f"{type(error).__name__}: {error}", as_json=args.json)
-    finally:
-        scheduler.close()
 
 
 def cmd_lane_concurrency(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         try:
             lane = scheduler.set_lane_concurrency(args.lane, args.value)
         except (ValueError, RuntimeError) as error:
@@ -1225,55 +1149,37 @@ def cmd_lane_concurrency(args) -> int:
         else:
             print(f"lane {lane.name} runs up to {lane.concurrency} job(s) at once")
         return 0
-    finally:
-        scheduler.close()
+
+
+# action -> (the node field it sets, the value, how to report it)
+NODE_ACTIONS = {
+    "drain": ("enabled", False, "drained"),
+    "resume": ("enabled", True, "resumed"),
+    "ignore": ("ignored", True, "ignored"),
+    "unignore": ("ignored", False, "unignored"),
+}
 
 
 def cmd_node_set(args) -> int:
-    scheduler = _open(args)
-    try:
+    field, value, done = NODE_ACTIONS[args.action]
+    with closing(_open(args)) as scheduler:
         name = dbm.resolve_node_name(scheduler.conn, args.name)
         if name is None:
             return _error(f"unknown node {args.name!r}", as_json=args.json)
-        enabled = args.action == "resume"
+        setter = scheduler.set_node_enabled if field == "enabled" else scheduler.set_node_ignored
         try:
-            scheduler.set_node_enabled(name, enabled)
-        except RuntimeError as error:
-            return _error(str(error), as_json=args.json)
-        payload = {"ok": True, "node": name, "enabled": enabled}
-        if args.json:
-            _print_json(payload)
-        else:
-            print(f"node {name} {'resumed' if enabled else 'drained'}")
-        return 0
-    finally:
-        scheduler.close()
-
-
-def cmd_node_ignore(args) -> int:
-    scheduler = _open(args)
-    try:
-        name = dbm.resolve_node_name(scheduler.conn, args.name)
-        if name is None:
-            return _error(f"unknown node {args.name!r}", as_json=args.json)
-        ignored = args.action == "ignore"
-        try:
-            scheduler.set_node_ignored(name, ignored)
+            setter(name, value)
         except (RuntimeError, ValueError) as error:
             return _error(str(error), as_json=args.json)
-        payload = {"ok": True, "node": name, "ignored": ignored}
         if args.json:
-            _print_json(payload)
+            _print_json({"ok": True, "node": name, field: value})
         else:
-            print(f"node {name} {'ignored' if ignored else 'unignored'}")
+            print(f"node {name} {done}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_submit(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         if args.script:
             try:
                 command = _read_script(args.script)
@@ -1282,12 +1188,12 @@ def cmd_submit(args) -> int:
         elif len(args.command_parts) == 1:
             command = args.command_parts[0]
         else:
-            command = shlex.join(args.command_parts) if args.command_parts else ""
+            command = shlex.join(args.command_parts)
         if not command.strip():
             return _error("nothing to run (pass a command, or --script FILE)", as_json=args.json)
 
         env = {}
-        for item in args.env or []:
+        for item in args.env:
             if "=" not in item:
                 return _error(f"--env expects KEY=VALUE, got {item!r}", as_json=args.json)
             key, value = item.split("=", 1)
@@ -1314,18 +1220,18 @@ def cmd_submit(args) -> int:
         try:
             job_id = scheduler.submit(
                 command,
-                name=args.name or "",
+                name=args.name,
                 workdir=str(Path(args.workdir).expanduser()) if args.workdir else None,
                 env=env,
                 gpus=args.gpus,
                 vram=args.vram,
                 priority=args.priority,
                 node=args.node,
-                depends_on=_resolve_ids(scheduler, args.after or []),
-                depends_any=_resolve_ids(scheduler, args.after_any or []),
+                depends_on=_resolve_ids(args.after),
+                depends_any=_resolve_ids(args.after_any),
                 max_runtime_s=args.timeout,
                 submitter=args.submitter or _default_submitter(),
-                tags=args.tag or [],
+                tags=args.tag,
                 max_retries=args.retries,
                 notes=args.note,
                 lane=args.lane,
@@ -1335,7 +1241,7 @@ def cmd_submit(args) -> int:
         except ValueError as error:
             return _error(str(error), as_json=args.json)
 
-        summary = _maybe_tick(scheduler, args, force=True)
+        summary = _maybe_tick(scheduler, args)
         job = dbm.get_job(scheduler.conn, job_id)
 
         if args.wait:
@@ -1346,7 +1252,7 @@ def cmd_submit(args) -> int:
         else:
             print(f"submitted job {job_id} ({job.display_state})")
             if job.node and job.state == "running":
-                print(f"  running on {job.node} GPU {','.join(str(i) for i in job.gpu_ids) or '-'}")
+                print(f"  running on {job.node} GPU {_csv(job.gpu_ids) or '-'}")
             elif job.lane:
                 queued = [
                     item.id
@@ -1364,18 +1270,15 @@ def cmd_submit(args) -> int:
                 return 2
             return 0 if job.state == "completed" else 1
         return 0 if job.state != "failed" else 1
-    finally:
-        scheduler.close()
 
 
 def cmd_list(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         states = args.state or None
         if args.active:
             states = ["pending", "running"]
-        if getattr(args, "held", False):
+        if args.held:
             jobs = dbm.held_jobs(scheduler.conn)
         else:
             jobs = dbm.list_jobs(
@@ -1392,13 +1295,10 @@ def cmd_list(args) -> int:
         else:
             print(_job_table([job.to_dict() for job in jobs], indent=""))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_show(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         job = dbm.get_job(scheduler.conn, args.id)
         if job is None:
@@ -1418,13 +1318,10 @@ def cmd_show(args) -> int:
         else:
             print(_render_job_detail(job, logs=logs))
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_logs(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         _refresh(scheduler, args)
         job = dbm.get_job(scheduler.conn, args.id)
         if job is None:
@@ -1460,8 +1357,6 @@ def cmd_logs(args) -> int:
         except KeyboardInterrupt:
             pass
         return 0
-    finally:
-        scheduler.close()
 
 
 def _unseen(seen: str, text: str) -> str:
@@ -1496,9 +1391,8 @@ def _wait_for(scheduler: Scheduler, job_ids: Sequence[int], *, timeout: Optional
 
 
 def cmd_wait(args) -> int:
-    scheduler = _open(args)
-    try:
-        ids = _resolve_ids(scheduler, args.ids)
+    with closing(_open(args)) as scheduler:
+        ids = _resolve_ids(args.ids)
         missing = [job_id for job_id in ids if dbm.get_job(scheduler.conn, job_id) is None]
         if missing:
             return _error(f"unknown job ids: {missing}", as_json=args.json)
@@ -1535,16 +1429,13 @@ def cmd_wait(args) -> int:
         if payload["timed_out"]:
             return 2
         return 0 if payload["all_succeeded"] else 1
-    finally:
-        scheduler.close()
 
 
 def cmd_cancel(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         results = []
         try:
-            for job_id in _resolve_ids(scheduler, args.ids):
+            for job_id in _resolve_ids(args.ids):
                 # Read the dependents first: once the job is cancelled its
                 # dependents are held, and the point of saying so is to name
                 # what this command is about to stop.
@@ -1576,29 +1467,24 @@ def cmd_cancel(args) -> int:
                         f"`nvidb job edit {item['holds'][0]} --add-after ID`."
                     )
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_release(args) -> int:
     """Let held jobs run by forgetting the prerequisites that died."""
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         results = []
         try:
-            for job_id in _resolve_ids(scheduler, args.ids):
+            for job_id in _resolve_ids(args.ids):
                 results.append({"id": job_id, **scheduler.release(job_id)})
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
-        summary = _maybe_tick(scheduler, args, force=True)
+        summary = _maybe_tick(scheduler, args)
         if args.json:
             _print_json({"results": results, "tick": summary})
         else:
             for item in results:
                 print(f"job {item['id']}: {item['reason']}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_edit(args) -> int:
@@ -1609,13 +1495,12 @@ def cmd_edit(args) -> int:
             command = _read_script(args.script)
         except ValueError as error:
             return _error(str(error), as_json=args.json)
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         changes = {
-            "add": _resolve_ids(scheduler, args.add_after or []),
-            "drop": _resolve_ids(scheduler, args.drop_after or []),
-            "add_any": _resolve_ids(scheduler, args.add_after_any or []),
-            "drop_any": _resolve_ids(scheduler, args.drop_after_any or []),
+            "add": _resolve_ids(args.add_after),
+            "drop": _resolve_ids(args.drop_after),
+            "add_any": _resolve_ids(args.add_after_any),
+            "drop_any": _resolve_ids(args.drop_after_any),
         }
         if command is None and args.vram is None and not any(changes.values()):
             return _error(
@@ -1627,13 +1512,13 @@ def cmd_edit(args) -> int:
             job = scheduler.edit_job(args.id, vram=args.vram, command=command, **changes)
         except (ValueError, RuntimeError) as error:
             return _error(str(error), as_json=args.json)
-        summary = _maybe_tick(scheduler, args, force=True)
+        summary = _maybe_tick(scheduler, args)
         job = dbm.get_job(scheduler.conn, args.id) or job
         if args.json:
             _print_json({"ok": True, "job": job.to_dict(), "tick": summary})
         else:
-            after = ",".join(str(i) for i in job.depends_on) or "-"
-            after_any = ",".join(str(i) for i in job.depends_any) or "-"
+            after = _csv(job.depends_on) or "-"
+            after_any = _csv(job.depends_any) or "-"
             print(
                 f"job {job.id} ({job.display_state}): "
                 f"vram={format_mb(job.vram_mb)} after={after} after-any={after_any}"
@@ -1643,20 +1528,17 @@ def cmd_edit(args) -> int:
             if job.held_reason:
                 print(f"  still held: {job.held_reason}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_requeue(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         results = []
         try:
-            for job_id in _resolve_ids(scheduler, args.ids):
+            for job_id in _resolve_ids(args.ids):
                 results.append({"id": job_id, "requeued": scheduler.requeue(job_id)})
         except RuntimeError as error:
             return _error(str(error), as_json=args.json)
-        summary = _maybe_tick(scheduler, args, force=True)
+        summary = _maybe_tick(scheduler, args)
         if args.json:
             _print_json({"results": results, "tick": summary})
         else:
@@ -1666,13 +1548,10 @@ def cmd_requeue(args) -> int:
                     + ("requeued" if item["requeued"] else "not requeueable")
                 )
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_result(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         job = dbm.get_job(scheduler.conn, args.id)
         if job is None:
             return _error(f"job {args.id} not found", as_json=args.json)
@@ -1688,20 +1567,17 @@ def cmd_result(args) -> int:
         else:
             print(json.dumps(job.result, ensure_ascii=False, indent=2) if job.result is not None else "(no result)")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_note(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         replacement = " ".join(args.text) if args.text else None
         given = [
             name
             for name, value in (
                 ("text", replacement),
                 ("--append", args.append),
-                ("--clear", args.clear or None),
+                ("--clear", args.clear),
             )
             if value
         ]
@@ -1731,13 +1607,10 @@ def cmd_note(args) -> int:
         else:
             print(f"job {args.id} note: {value or '(cleared)'}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_priority(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         if args.up or args.down:
             slots = args.up or args.down
             moved = scheduler.move_pending(args.id, -slots if args.up else slots)
@@ -1768,14 +1641,14 @@ def cmd_priority(args) -> int:
                 print(f"job {job.id} priority: {job.priority}")
             return 0
 
-        text = str(args.value)
+        text = args.value
         try:
-            relative = text.startswith(("+", "-")) and text not in ("+", "-")
             amount = int(text)
         except ValueError:
             return _error(
                 f"invalid priority {text!r} (use 5, +1, or -2)", as_json=args.json
             )
+        relative = text.startswith(("+", "-"))
         try:
             if relative:
                 value = scheduler.adjust_priority(args.id, amount)
@@ -1793,27 +1666,22 @@ def cmd_priority(args) -> int:
         else:
             print(f"job {args.id} priority: {value}")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_purge(args) -> int:
-    scheduler = _open(args)
-    try:
+    with closing(_open(args)) as scheduler:
         removed = dbm.purge_jobs(scheduler.conn, states=args.state or None)
         if args.json:
             _print_json({"removed": removed})
         else:
             print(f"removed {removed} finished job record(s)")
         return 0
-    finally:
-        scheduler.close()
 
 
 def cmd_tui(args) -> int:
     from .tui import run_tui
 
-    return run_tui(db_path=getattr(args, "db_path", None), refresh=args.refresh)
+    return run_tui(db_path=args.db_path, refresh=args.refresh)
 
 
 # --- parser wiring ---------------------------------------------------------
@@ -1846,16 +1714,25 @@ def _add_common(parser: argparse.ArgumentParser, *, json_flag: bool = True) -> N
     )
 
 
+def _add_command(sub, name: str, func, *, json_flag: bool = True, **kwargs) -> argparse.ArgumentParser:
+    """Add a subcommand that takes the shared flags and runs `func`."""
+    parser = sub.add_parser(name, **kwargs)
+    _add_common(parser, json_flag=json_flag)
+    parser.set_defaults(func=func)
+    return parser
+
+
+def _add_no_tick(parser: argparse.ArgumentParser, **kwargs) -> None:
+    parser.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS, **kwargs)
+
+
 def _add_refresh_flags(parser: argparse.ArgumentParser) -> None:
     """Reads refresh on their own; these flags force or suppress that."""
     parser.add_argument(
         "--tick", action="store_true", default=argparse.SUPPRESS,
         help="Force a refresh even if one just ran",
     )
-    parser.add_argument(
-        "--no-tick", action="store_true", default=argparse.SUPPRESS,
-        help="Read the database without contacting nodes",
-    )
+    _add_no_tick(parser, help="Read the database without contacting nodes")
 
 
 def _add_procs_flag(parser: argparse.ArgumentParser) -> None:
@@ -1881,56 +1758,53 @@ def register_parsers(subparsers) -> None:
 
 def _register_queue_parsers(subparsers) -> None:
     """Queue monitoring, lifecycle, and node administration commands."""
-    queue = subparsers.add_parser(
+    queue = _add_command(
+        subparsers,
         "queue",
+        cmd_tui,
         aliases=["q"],
         help="Cluster job queue: status, TUI, scheduler tick",
     )
-    _add_common(queue)
     queue.add_argument(
         "--refresh", type=float, default=3.0, help="TUI refresh interval in seconds"
     )
     # `queue_cli` is how the main entry point recognises these commands, rather
     # than matching on a subcommand name that a positional could shadow.
-    queue.set_defaults(func=cmd_tui, queue_cli=True, **SHARED_DEFAULTS)
+    queue.set_defaults(queue_cli=True, **SHARED_DEFAULTS)
     queue_sub = queue.add_subparsers(dest="queue_command")
 
-    status = queue_sub.add_parser("status", help="Show nodes, capacity and jobs")
-    _add_common(status)
+    status = _add_command(queue_sub, "status", cmd_status, help="Show nodes, capacity and jobs")
     _add_refresh_flags(status)
     _add_procs_flag(status)
     _add_ignored_flag(status)
-    status.set_defaults(func=cmd_status)
 
-    tick = queue_sub.add_parser("tick", help="Run one scheduler pass")
-    _add_common(tick)
+    tick = _add_command(queue_sub, "tick", cmd_tick, help="Run one scheduler pass")
     tick.add_argument("--watch", type=int, default=0, metavar="SECONDS",
                       help="Keep ticking every N seconds until interrupted")
-    tick.set_defaults(func=cmd_tick)
 
-    alerts = queue_sub.add_parser(
+    alerts = _add_command(
+        queue_sub,
         "alerts",
+        cmd_alerts,
         help="Show failures that still need attention",
         description=(
             "Lists what went wrong on the nodes. Exits non-zero while any alert "
             "is unacknowledged, so a shell or an agent can branch on it."
         ),
     )
-    _add_common(alerts)
     _add_refresh_flags(alerts)
     alerts.add_argument("--all", action="store_true", help="Include acknowledged alerts")
     alerts.add_argument("--detail", action="store_true", help="Show the captured output")
     alerts.add_argument("-n", "--number", type=int, default=50)
-    alerts.set_defaults(func=cmd_alerts)
 
-    ack = queue_sub.add_parser("ack", help="Acknowledge alerts")
-    _add_common(ack)
+    ack = _add_command(queue_sub, "ack", cmd_ack, help="Acknowledge alerts")
     ack.add_argument("ids", nargs="*", help="Alert ids to acknowledge")
     ack.add_argument("--all", action="store_true", help="Acknowledge every open alert")
-    ack.set_defaults(func=cmd_ack)
 
-    daemon = queue_sub.add_parser(
+    daemon = _add_command(
+        queue_sub,
         "daemon",
+        cmd_daemon,
         help="Run the scheduler continuously and deliver alerts",
         description=(
             "Optional: the queue works without it, because every command runs a "
@@ -1938,20 +1812,19 @@ def _register_queue_parsers(subparsers) -> None:
             "instead of waiting to be asked."
         ),
     )
-    _add_common(daemon)
     daemon.add_argument("--interval", type=int, default=15, metavar="SECONDS")
     daemon.add_argument("--no-notify", action="store_true", help="Tick but stay quiet")
     daemon.add_argument(
         "--no-backup", action="store_true", help="Skip configured periodic backups"
     )
     daemon.add_argument("--once", action="store_true", help="Run a single pass and exit")
-    daemon.set_defaults(func=cmd_daemon)
 
-    backup = queue_sub.add_parser(
+    backup = _add_command(
+        queue_sub,
         "backup",
+        cmd_backup,
         help="Create and verify a consistent snapshot of the queue database",
     )
-    _add_common(backup)
     backup.add_argument(
         "path",
         nargs="?",
@@ -1965,10 +1838,11 @@ def _register_queue_parsers(subparsers) -> None:
         metavar="N",
         help="Keep the newest N generated backups (default: 0, keep all)",
     )
-    backup.set_defaults(func=cmd_backup)
 
-    keeper = queue_sub.add_parser(
+    keeper = _add_command(
+        queue_sub,
         "keeper",
+        cmd_keeper,
         help="Install and control the supervisor that keeps this queue moving",
         description=(
             "Uses a portable detached shell supervisor by default. Pass "
@@ -1976,12 +1850,11 @@ def _register_queue_parsers(subparsers) -> None:
             "--start enables it so the daemon can return after a host reboot."
         ),
     )
-    _add_common(keeper)
     keeper.add_argument(
         "keeper_action",
         nargs="?",
         default="status",
-        choices=["install", "start", "ensure", "stop", "restart", "status", "logs"],
+        choices=["install", *keeper_mod.ACTIONS],
     )
     keeper.add_argument(
         "--nvidb",
@@ -2008,54 +1881,53 @@ def _register_queue_parsers(subparsers) -> None:
     keeper_managers.add_argument("--launchd", action="store_true", help="Install a macOS LaunchAgent")
     keeper_managers.add_argument("--shell", action="store_true", help="Install the portable shell supervisor")
     keeper.add_argument("-n", "--number", type=int, default=50, help="Log lines to show")
-    keeper.set_defaults(func=cmd_keeper)
 
-    events = queue_sub.add_parser("events", help="Replay the queue event log")
-    _add_common(events)
+    events = _add_command(queue_sub, "events", cmd_events, help="Replay the queue event log")
     events.add_argument("--since", type=int, default=None, help="Only events after this id")
     events.add_argument("--job", type=int, default=None, help="Only events for this job")
     events.add_argument("-n", "--number", type=int, default=50, help="Maximum events")
-    events.set_defaults(func=cmd_events)
 
-    nodes = queue_sub.add_parser(
+    nodes = _add_command(
+        queue_sub,
         "nodes",
+        cmd_nodes,
         help="Show node capacity, including GPU work the queue does not manage",
     )
-    _add_common(nodes)
     _add_procs_flag(nodes)
     _add_refresh_flags(nodes)
     _add_ignored_flag(nodes)
-    nodes.set_defaults(func=cmd_nodes)
 
-    lanes = queue_sub.add_parser(
+    lanes = _add_command(
+        queue_sub,
         "lanes",
+        cmd_lanes,
         help="Show every GPU's serial queue: what it runs now and what is next",
     )
-    _add_common(lanes)
     _add_refresh_flags(lanes)
     lanes.add_argument("--node", default=None, help="Only lanes on this node")
-    lanes.set_defaults(func=cmd_lanes)
 
-    pools = queue_sub.add_parser(
+    pools = _add_command(
+        queue_sub,
         "pools",
+        cmd_pools,
         help="Show the named GPU pools: their member cards and their jobs",
     )
-    _add_common(pools)
     _add_refresh_flags(pools)
-    pools.set_defaults(func=cmd_pools)
 
     _register_lane_parser(queue_sub)
     _register_node_actions(queue_sub)
 
-    tui = queue_sub.add_parser("tui", help="Open the interactive queue TUI")
-    _add_common(tui, json_flag=False)
+    tui = _add_command(
+        queue_sub, "tui", cmd_tui, json_flag=False, help="Open the interactive queue TUI"
+    )
     tui.add_argument("--refresh", type=float, default=argparse.SUPPRESS)
-    tui.set_defaults(func=cmd_tui)
 
 def _register_lane_parser(queue_sub) -> None:
     """Lane ordering and resident runner controls."""
-    lane = queue_sub.add_parser(
+    lane = _add_command(
+        queue_sub,
         "lane",
+        cmd_lane_show,
         help="Inspect and reorder one GPU's serial queue",
         description=(
             "A lane is one GPU and the order it runs its jobs in. With no "
@@ -2063,37 +1935,32 @@ def _register_lane_parser(queue_sub) -> None:
             "subcommands edit that order."
         ),
     )
-    _add_common(lane)
     _add_refresh_flags(lane)
     lane.add_argument("lane", help="Lane name or an unambiguous part of one")
-    lane.set_defaults(func=cmd_lane_show)
     lane_sub = lane.add_subparsers(dest="lane_command")
 
-    lane_move = lane_sub.add_parser(
+    lane_move = _add_command(
+        lane_sub,
         "move",
+        cmd_lane_move,
         help="Move a queued job within its lane",
         description=(
             "Positions are 1-based over the queued jobs, so `--to 1` means "
             "next to run. A running job cannot be moved."
         ),
     )
-    _add_common(lane_move)
     lane_move.add_argument("id", type=int)
     lane_move.add_argument("--to", default=None, metavar="head|tail|N")
     lane_move.add_argument("--before", type=int, default=None, metavar="ID")
     lane_move.add_argument("--after", type=int, default=None, metavar="ID")
-    lane_move.set_defaults(func=cmd_lane_move)
 
-    lane_swap = lane_sub.add_parser("swap", help="Exchange two queued jobs' places")
-    _add_common(lane_swap)
+    lane_swap = _add_command(lane_sub, "swap", cmd_lane_swap, help="Exchange two queued jobs' places")
     lane_swap.add_argument("first", type=int)
     lane_swap.add_argument("second", type=int)
-    lane_swap.set_defaults(func=cmd_lane_swap)
 
-    lane_assign = lane_sub.add_parser(
-        "assign", help="Put a queued job into this lane, or take it out"
+    lane_assign = _add_command(
+        lane_sub, "assign", cmd_lane_assign, help="Put a queued job into this lane, or take it out"
     )
-    _add_common(lane_assign)
     lane_assign.add_argument("id", type=int)
     lane_assign.add_argument("--at", default="tail", metavar="head|tail|N")
     lane_assign.add_argument(
@@ -2101,30 +1968,30 @@ def _register_lane_parser(queue_sub) -> None:
         action="store_true",
         help="Remove the job from its lane and let the scheduler place it",
     )
-    lane_assign.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
-    lane_assign.set_defaults(func=cmd_lane_assign)
+    _add_no_tick(lane_assign)
 
-    lane_pause = lane_sub.add_parser(
+    _add_command(
+        lane_sub,
         "pause",
+        cmd_lane_pause,
         help="Stop starting new jobs here; what is running is left alone",
+    ).set_defaults(action="pause")
+
+    lane_resume = _add_command(
+        lane_sub, "resume", cmd_lane_pause, help="Start running this lane again"
     )
-    _add_common(lane_pause)
-    lane_pause.set_defaults(func=cmd_lane_pause, action="pause")
+    _add_no_tick(lane_resume)
+    lane_resume.set_defaults(action="resume")
 
-    lane_resume = lane_sub.add_parser("resume", help="Start running this lane again")
-    _add_common(lane_resume)
-    lane_resume.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
-    lane_resume.set_defaults(func=cmd_lane_pause, action="resume")
-
-    lane_skip = lane_sub.add_parser(
-        "skip", help="Send the next job to the back of the lane"
+    lane_skip = _add_command(
+        lane_sub, "skip", cmd_lane_skip, help="Send the next job to the back of the lane"
     )
-    _add_common(lane_skip)
-    lane_skip.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
-    lane_skip.set_defaults(func=cmd_lane_skip)
+    _add_no_tick(lane_skip)
 
-    lane_runner = lane_sub.add_parser(
+    lane_runner = _add_command(
+        lane_sub,
         "runner",
+        cmd_lane_runner,
         help="The resident process on the node that starts this lane's jobs",
         description=(
             "With a runner, the lane starts its next job the moment the "
@@ -2132,7 +1999,6 @@ def _register_lane_parser(queue_sub) -> None:
             "restarting the runner never touches the job it started."
         ),
     )
-    _add_common(lane_runner)
     _add_refresh_flags(lane_runner)
     lane_runner.add_argument(
         "runner_action",
@@ -2145,42 +2011,25 @@ def _register_lane_parser(queue_sub) -> None:
         action="store_true",
         help="Stop the runner now instead of after its current job",
     )
-    lane_runner.set_defaults(func=cmd_lane_runner)
 
-    lane_concurrency = lane_sub.add_parser(
+    lane_concurrency = _add_command(
+        lane_sub,
         "concurrency",
+        cmd_lane_concurrency,
         help="How many of this lane's jobs may run at once (default 1)",
     )
-    _add_common(lane_concurrency)
     lane_concurrency.add_argument("value", type=int)
-    lane_concurrency.set_defaults(func=cmd_lane_concurrency)
 
 def _register_node_actions(queue_sub) -> None:
-    drain = queue_sub.add_parser("drain", help="Stop scheduling new jobs onto a node")
-    _add_common(drain)
-    drain.add_argument("name")
-    drain.set_defaults(func=cmd_node_set, action="drain")
-
-    resume = queue_sub.add_parser("resume", help="Allow scheduling onto a node again")
-    _add_common(resume)
-    resume.add_argument("name")
-    resume.set_defaults(func=cmd_node_set, action="resume")
-
-    ignore = queue_sub.add_parser(
-        "ignore",
-        help="Stop probing, scheduling, and normally displaying a node",
-    )
-    _add_common(ignore)
-    ignore.add_argument("name")
-    ignore.set_defaults(func=cmd_node_ignore, action="ignore")
-
-    unignore = queue_sub.add_parser(
-        "unignore",
-        help="Restore a previously ignored node",
-    )
-    _add_common(unignore)
-    unignore.add_argument("name")
-    unignore.set_defaults(func=cmd_node_ignore, action="unignore")
+    for action, help_text in (
+        ("drain", "Stop scheduling new jobs onto a node"),
+        ("resume", "Allow scheduling onto a node again"),
+        ("ignore", "Stop probing, scheduling, and normally displaying a node"),
+        ("unignore", "Restore a previously ignored node"),
+    ):
+        parser = _add_command(queue_sub, action, cmd_node_set, help=help_text)
+        parser.add_argument("name")
+        parser.set_defaults(action=action)
 
 def _register_job_parsers(subparsers) -> None:
     job = subparsers.add_parser("job", help="Submit and manage queue jobs")
@@ -2197,15 +2046,16 @@ def _register_job_parsers(subparsers) -> None:
     _register_job_metadata_parsers(job_sub)
 
 def _register_submit_parser(job_sub) -> None:
-    submit = job_sub.add_parser(
+    submit = _add_command(
+        job_sub,
         "submit",
+        cmd_submit,
         help="Queue a command",
         description=(
             "Queue a command. Put the command last, after `--`, or pass it as a "
             "single quoted string."
         ),
     )
-    _add_common(submit)
     submit.add_argument("-n", "--name", default="", help="Human-readable job name")
     submit.add_argument("--vram", default=None, help="Estimated peak VRAM per GPU, e.g. 20G; required and positive in shared mode")
     submit.add_argument("--gpus", type=int, default=1, help="GPUs required (0 for CPU-only)")
@@ -2245,17 +2095,15 @@ def _register_submit_parser(job_sub) -> None:
                         help="Use a local file's contents as the command body")
     submit.add_argument("--wait", action="store_true", help="Block until the job finishes")
     submit.add_argument("--wait-timeout", type=int, default=None, metavar="SECONDS")
-    submit.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS, help="Do not schedule right away")
+    _add_no_tick(submit, help="Do not schedule right away")
     # `dest` must not be "command": the top-level parser already stores the
     # chosen subcommand there, and a positional of the same name would clobber it.
     submit.add_argument(
         "command_parts", nargs="*", metavar="COMMAND", help="Command to run"
     )
-    submit.set_defaults(func=cmd_submit)
 
 def _register_job_read_parsers(job_sub) -> None:
-    listing = job_sub.add_parser("ls", help="List jobs")
-    _add_common(listing)
+    listing = _add_command(job_sub, "ls", cmd_list, help="List jobs")
     listing.add_argument("--state", action="append", choices=list(JOB_STATES), default=[])
     listing.add_argument("--active", action="store_true", help="Only pending and running")
     listing.add_argument(
@@ -2266,41 +2114,34 @@ def _register_job_read_parsers(job_sub) -> None:
     listing.add_argument("--node", default=None)
     listing.add_argument("-n", "--number", type=int, default=None, help="Show the newest N")
     _add_refresh_flags(listing)
-    listing.set_defaults(func=cmd_list)
 
-    show = job_sub.add_parser("show", help="Show one job in detail")
-    _add_common(show)
+    show = _add_command(job_sub, "show", cmd_show, help="Show one job in detail")
     show.add_argument("id", type=int)
     show.add_argument("--logs", type=int, nargs="?", const=40, default=0,
                       metavar="LINES", help="Include the tail of stdout")
     _add_refresh_flags(show)
-    show.set_defaults(func=cmd_show)
 
-    logs = job_sub.add_parser("logs", help="Read a job's output")
-    _add_common(logs)
+    logs = _add_command(job_sub, "logs", cmd_logs, help="Read a job's output")
     logs.add_argument("id", type=int)
     logs.add_argument("-n", "--number", type=int, default=200, help="Lines to show")
     logs.add_argument("--stderr", action="store_true", help="Read stderr instead")
     logs.add_argument("-f", "--follow", action="store_true", help="Keep streaming")
     _add_refresh_flags(logs)
-    logs.set_defaults(func=cmd_logs)
 
-    wait = job_sub.add_parser("wait", help="Block until jobs finish")
-    _add_common(wait)
+    wait = _add_command(job_sub, "wait", cmd_wait, help="Block until jobs finish")
     wait.add_argument("ids", nargs="+")
     wait.add_argument("--timeout", type=int, default=None, metavar="SECONDS")
     wait.add_argument("--logs", type=int, nargs="?", const=40, default=0, metavar="LINES")
-    wait.set_defaults(func=cmd_wait)
 
 def _register_job_control_parsers(job_sub) -> None:
-    cancel = job_sub.add_parser("cancel", help="Cancel pending or running jobs")
-    _add_common(cancel)
+    cancel = _add_command(job_sub, "cancel", cmd_cancel, help="Cancel pending or running jobs")
     cancel.add_argument("ids", nargs="+")
-    cancel.set_defaults(func=cmd_cancel)
-    cancel.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS, help="Skip keeper ensure and scheduling; still cancel the requested jobs")
+    _add_no_tick(cancel, help="Skip keeper ensure and scheduling; still cancel the requested jobs")
 
-    release = job_sub.add_parser(
+    release = _add_command(
+        job_sub,
         "release",
+        cmd_release,
         help="Run a held job without the dependency that died",
         description=(
             "A job whose prerequisite was cancelled or failed is held, not "
@@ -2308,13 +2149,13 @@ def _register_job_control_parsers(job_sub) -> None:
             "dead prerequisites so it can be scheduled."
         ),
     )
-    _add_common(release)
     release.add_argument("ids", nargs="+")
-    release.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
-    release.set_defaults(func=cmd_release)
+    _add_no_tick(release)
 
-    edit = job_sub.add_parser(
+    edit = _add_command(
+        job_sub,
         "edit",
+        cmd_edit,
         help="Change a queued job's request",
         description=(
             "Change a queued job's command, VRAM reservation or prerequisites "
@@ -2322,7 +2163,6 @@ def _register_job_control_parsers(job_sub) -> None:
             "change before the job has been staged on its node."
         ),
     )
-    _add_common(edit)
     edit.add_argument("id", type=int)
     command_source = edit.add_mutually_exclusive_group()
     command_source.add_argument("--command", dest="new_command", default=None,
@@ -2337,33 +2177,32 @@ def _register_job_control_parsers(job_sub) -> None:
     edit.add_argument("--add-after-any", action="append", default=[], metavar="ID",
                       help="Also wait for this job to finish, whatever the outcome")
     edit.add_argument("--drop-after-any", action="append", default=[], metavar="ID")
-    edit.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
-    edit.set_defaults(func=cmd_edit)
+    _add_no_tick(edit)
 
-    requeue = job_sub.add_parser("requeue", help="Re-queue finished jobs")
-    _add_common(requeue)
+    requeue = _add_command(job_sub, "requeue", cmd_requeue, help="Re-queue finished jobs")
     requeue.add_argument("ids", nargs="+")
-    requeue.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
-    requeue.set_defaults(func=cmd_requeue)
+    _add_no_tick(requeue)
 
 def _register_job_metadata_parsers(job_sub) -> None:
-    result = job_sub.add_parser(
-        "result", help="Read or write a job's result payload (a channel between clients)"
+    result = _add_command(
+        job_sub,
+        "result",
+        cmd_result,
+        help="Read or write a job's result payload (a channel between clients)",
     )
-    _add_common(result)
     result.add_argument("id", type=int)
     result.add_argument("--set", default=None, metavar="JSON", help="Store this payload")
-    result.set_defaults(func=cmd_result)
 
-    note = job_sub.add_parser(
+    note = _add_command(
+        job_sub,
         "note",
+        cmd_note,
         help="Read or write a job's annotation",
         description=(
             "With no text the current note is printed. Notes stay editable "
             "after a job finishes, so a client can record what it concluded."
         ),
     )
-    _add_common(note)
     note.add_argument("id", type=int)
     note.add_argument("text", nargs="*", help="Replace the note with this text")
     # `--append` carries its own value: argparse cannot reliably split a bare
@@ -2371,10 +2210,11 @@ def _register_job_metadata_parsers(job_sub) -> None:
     note.add_argument("--append", default=None, metavar="TEXT",
                       help="Add this to the existing note")
     note.add_argument("--clear", action="store_true", help="Remove the note")
-    note.set_defaults(func=cmd_note)
 
-    priority = job_sub.add_parser(
+    priority = _add_command(
+        job_sub,
         "priority",
+        cmd_priority,
         help="Read or change a job's priority / queue position",
         description=(
             "With no value the current priority is printed. A bare number "
@@ -2383,7 +2223,6 @@ def _register_job_metadata_parsers(job_sub) -> None:
             "priorities of the jobs it passes)."
         ),
     )
-    _add_common(priority)
     priority.add_argument("id", type=int)
     priority.add_argument("value", nargs="?", default=None,
                           help="New priority: 5 sets, +1/-2 adjust")
@@ -2391,12 +2230,9 @@ def _register_job_metadata_parsers(job_sub) -> None:
                           help="Move a pending job N slots earlier")
     priority.add_argument("--down", type=int, default=0, metavar="N",
                           help="Move a pending job N slots later")
-    priority.set_defaults(func=cmd_priority)
 
-    purge = job_sub.add_parser("purge", help="Delete finished job records")
-    _add_common(purge)
+    purge = _add_command(job_sub, "purge", cmd_purge, help="Delete finished job records")
     purge.add_argument("--state", action="append", choices=sorted(TERMINAL_JOB_STATES), default=[])
-    purge.set_defaults(func=cmd_purge)
 
 def quiet_transport_logging() -> None:
     """Keep Paramiko's internal connection tracebacks out of queue output.
@@ -2416,19 +2252,19 @@ def quiet_transport_logging() -> None:
 def _forward_to_queue_host(target: Dict[str, Any], args) -> int:
     """Hand this invocation to the machine that owns the queue."""
     script_text = None
-    if getattr(args, "func", None) in (cmd_submit, cmd_edit) and getattr(args, "script", None):
+    if args.func in (cmd_submit, cmd_edit) and args.script:
         # `--script` names a file on *this* machine, so it is read here and the
         # contents travel with the command.
         try:
             script_text = _read_script(args.script)
         except ValueError as error:
-            return _error(str(error), as_json=getattr(args, "json", False))
+            return _error(str(error), as_json=args.json)
     return remote_mod.forward(
         target,
         sys.argv[1:],
         # The TUI needs a terminal on the far side; everything else is a pipe
         # and must not be given one, or its output would grow carriage returns.
-        tty=getattr(args, "func", None) is cmd_tui and sys.stdin.isatty(),
+        tty=args.func is cmd_tui and sys.stdin.isatty(),
         script_text=script_text,
     )
 
@@ -2436,10 +2272,7 @@ def _forward_to_queue_host(target: Dict[str, Any], args) -> int:
 def dispatch(args) -> int:
     """Run the handler argparse selected, or report a usable error."""
     quiet_transport_logging()
-    handler = getattr(args, "func", None)
-    if handler is None:
-        return _error("no queue subcommand selected")
-    if not getattr(args, "local", False):
+    if not args.local:
         target = remote_mod.load_target()
         if target is not None:
             try:
@@ -2447,8 +2280,8 @@ def dispatch(args) -> int:
             except KeyboardInterrupt:
                 return 130
     try:
-        return handler(args)
+        return args.func(args)
     except KeyboardInterrupt:
         return 130
     except Exception as error:  # keep JSON consumers from seeing a traceback
-        return _error(f"{type(error).__name__}: {error}", as_json=getattr(args, "json", False))
+        return _error(f"{type(error).__name__}: {error}", as_json=args.json)
