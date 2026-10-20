@@ -12,6 +12,7 @@ from blessed import Terminal
 from nvidb.connection import NVClientPool
 from nvidb import config
 from nvidb.mouse import MouseEvent
+from nvidb.tui_controls import HoverState
 from nvidb.tui_theme import display_width
 
 
@@ -101,6 +102,17 @@ def _pool():
     pool._default_expansion_applied = False
     pool._expansion_touched = False
     pool._persist_view_enabled = False
+    pool._tui_menu = None
+    pool._tui_hover = HoverState()
+    pool._tui_hover_dirty = False
+    pool._tui_base_rows = None
+    pool._tui_diff_screen = None
+    pool._toolbar_overflow = []
+    pool._nodes_view_start = 0
+    pool._node_listed_indices = []
+    pool._node_workers = []
+    pool._signal_worker = None
+    pool._blocks_formatted_width = None
     pool.quit_flag = threading.Event()
     pool.refresh_needed = threading.Event()
     return pool
@@ -394,11 +406,7 @@ def test_unified_filter_modes_and_error_view():
     assert "Error filter: GPU rows hidden" in rendered
     assert "Connection timed out" in rendered
     assert "Local" not in "\n".join(
-        pool._get_unified_node_status_lines(
-            raw_stats,
-            last_update_time=1,
-            errors_only=True,
-        )
+        pool._get_unified_node_status_lines(raw_stats, errors_only=True)
     )
 
 
@@ -1005,14 +1013,9 @@ def test_detailed_cards_stay_aligned_with_progress_bars_on_wide_terminals(monkey
     table["Hostname"] = "100.64.0.42"
     monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((140, 40)))
 
-    rendered = pool._format_unified_detailed_table(
-        table,
-        selected_row=0,
-        section_headers={0: ("training-node (100.64.0.42)", "2 GPUs | free 1")},
-    )
+    rendered = pool._format_unified_detailed_table(table, selected_row=0)
     plain = _without_ansi(rendered)
 
-    assert "training-node (100.64.0.42) · 2 GPUs | free 1" in plain
     assert "━" in plain and "─" in plain
     assert all(len(line) == 140 for line in plain.splitlines())
 
@@ -1185,7 +1188,7 @@ def _server_block(pool, gpu_count):
         _gpu_row(index, "RTX 4090", "10 %", "1024/24576")
         for index in range(gpu_count)
     ]
-    table = pool._format_fixed_width_table(pd.DataFrame(rows), border=True)
+    table = pool._format_fixed_width_table(pd.DataFrame(rows))
     return f"Driver: 550.0 | CUDA: 12.4\n{table}"
 
 

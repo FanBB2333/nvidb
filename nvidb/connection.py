@@ -54,7 +54,6 @@ from .tui_theme import (
     wrap_display,
 )
 from .utils import (
-    units_from_str,
     extract_numbers,
     extract_value_and_unit,
     format_bandwidth,
@@ -100,6 +99,11 @@ def _terminal_size(columns=80, lines=24):
         return os.get_terminal_size()
     except OSError:
         return os.terminal_size((columns, lines))
+
+
+def _clip(text, width, ellipsis=".."):
+    """Fit text to `width` columns, marking a cut only where the mark fits."""
+    return fit_display(text, width, ellipsis=ellipsis if width > display_width(ellipsis) else "")
 
 
 def _xml_text(element, path, default="N/A"):
@@ -1379,6 +1383,8 @@ class NVClientPool:
     # separator ("├───┤") when the panel border is drawn, instead of being
     # padded and sided like ordinary text.
     _PANEL_SEPARATOR = "\x00__nvidb_panel_separator__\x00"
+    # Click-target kinds whose whole row lights up under the pointer.
+    _HOVER_ROW_KINDS = {"gpu", "server", "process", "command", "close_help"}
     UNIFIED_TABLE_COLUMNS = (
         "Node",
         "Hostname",
@@ -1410,9 +1416,9 @@ class NVClientPool:
     }
     UNIFIED_SORT_MODES = ("node", "available", "utilization")
     UNIFIED_SORT_LABELS = {
-        "node": "Node",
-        "available": "Available",
-        "utilization": "Util high",
+        "node": "Node order",
+        "available": "Available GPUs first",
+        "utilization": "Highest utilization first",
     }
     UNIFIED_FILTER_MODES = ("all", "available", "busy", "errors")
     UNIFIED_FILTER_LABELS = {
@@ -1530,6 +1536,9 @@ class NVClientPool:
         self._tui_hover = HoverState()
         self._tui_hover_dirty = False
         self._tui_base_rows = None
+        # Created on the first paint and dropped whenever the screen must be
+        # repainted from scratch (see _answer_secret_request).
+        self._tui_diff_screen = None
         self._toolbar_overflow = []
         self._unified_page_start = 0
         self._unified_gpu_count = 0
@@ -1544,6 +1553,8 @@ class NVClientPool:
         # Rendered node blocks reused while their sample and layout hold
         # (see _format_client_blocks).
         self._formatted_node_blocks = {}
+        # Terminal width the cached blocks were laid out for.
+        self._blocks_formatted_width = None
         self._last_update_time = None
         self._last_fetch_duration = None
         self._last_fetch_error = None
@@ -1553,6 +1564,7 @@ class NVClientPool:
         self._node_listed_indices = list(range(len(self.pool)))
         self._node_samples = {}
         self._node_workers = []
+        self._signal_worker = None
         self._secret_requests = Queue()
     
     def connect_all(self):
@@ -1883,7 +1895,7 @@ class NVClientPool:
                 continue
 
             formatted_table = self._format_fixed_width_table(
-                stats, border=True, outer_margin=panel_margin
+                stats, outer_margin=panel_margin
             )
 
             system_info_header = ""
@@ -1929,7 +1941,7 @@ class NVClientPool:
                             continue
                         sub_df = advanced_df[cols_present].copy()
                         sub_table = self._format_fixed_width_table(
-                            sub_df, border=True, outer_margin=panel_margin
+                            sub_df, outer_margin=panel_margin
                         )
                         sub_blocks.append(f"{title}\n{sub_table}")
 
@@ -3780,7 +3792,6 @@ class NVClientPool:
         table,
         *,
         selected_row=None,
-        section_headers=None,
         row_line_map=None,
     ):
         """Format each GPU as a readable, color-aware four-line card.
@@ -3815,18 +3826,7 @@ class NVClientPool:
                 return value
             return f"{value} {unit}"
 
-        def truncate(text, width):
-            text = str(text)
-            if width <= 0:
-                return ""
-            if display_width(text) <= width:
-                return text
-            if width <= 2:
-                return fit_display(text, width, ellipsis="")
-            return fit_display(text, width, ellipsis="..")
-
-        def utilization_status(value):
-            percent = parse_leading_float(value)
+        def utilization_status(percent):
             if percent is None:
                 return "UNKNOWN", None
             if percent >= 80:
@@ -3836,21 +3836,6 @@ class NVClientPool:
             if percent >= 5:
                 return "ACTIVE", "cyan"
             return "IDLE", "dark_grey"
-
-        def memory_color(value):
-            value = clean(value)
-            if "/" not in value:
-                return None
-            used, total = value.split("/", 1)
-            used_value = parse_leading_float(used)
-            total_value = parse_leading_float(total)
-            if (
-                used_value is None
-                or total_value is None
-                or total_value <= 0
-            ):
-                return None
-            return self._threshold_color(used_value / total_value * 100, 75, 90)
 
         def link_load_percent(row, direction):
             value = row.get(f"{HIDDEN_COLUMN_PREFIX}{direction}_percent")
@@ -3891,8 +3876,6 @@ class NVClientPool:
             separator = "  "
 
             def minimum_total():
-                if not active:
-                    return 0
                 return (
                     sum(
                         min(display_width(field["text"]), field["minimum"])
@@ -3905,9 +3888,6 @@ class NVClientPool:
                 if minimum_total() <= content_width:
                     break
                 active = [field for field in active if field["key"] != key]
-
-            if not active:
-                return " " * content_width
 
             widths = [display_width(field["text"]) for field in active]
             excess = (
@@ -3938,7 +3918,7 @@ class NVClientPool:
                     excess -= reduction
 
             plain_parts = [
-                truncate(field["text"], width)
+                _clip(field["text"], width)
                 for field, width in zip(active, widths)
             ]
             plain_length = (
@@ -3968,10 +3948,7 @@ class NVClientPool:
             """Render a smooth line bar; empty when the metric is unknown."""
             if percent is None or table_width < 100:
                 return ""
-            try:
-                value = max(0.0, min(100.0, float(percent)))
-            except (TypeError, ValueError):
-                return ""
+            value = max(0.0, min(100.0, percent))
             filled = int(round(value / 100.0 * width))
             if value > 0 and filled == 0:
                 filled = 1
@@ -3995,24 +3972,11 @@ class NVClientPool:
                 + content
                 + colored(f" {border_vertical}", "dark_grey")
             )
-        section_headers = section_headers or {}
         lines = [top_border]
         for row_index, (_, row) in enumerate(table.iterrows()):
-            band = section_headers.get(row_index)
-            if band:
-                lines.extend(
-                    [
-                        card_line(
-                            self._format_section_band(
-                                *band,
-                                table_width - 4,
-                            )
-                        ),
-                        middle_border,
-                    ]
-                )
+            capacity = self._unified_gpu_capacity(row)
             utilization = clean(row.get("util")).replace(" ", "")
-            status, utilization_color = utilization_status(utilization)
+            status, utilization_color = utilization_status(capacity["utilization"])
             marker = (
                 "› "
                 if pane_focused and row_index == selected_row
@@ -4046,13 +4010,12 @@ class NVClientPool:
                 ),
             ]
 
-            utilization_percent = parse_leading_float(row.get("util"))
-            memory_percent = self._unified_gpu_capacity(row)["memory_percent"]
+            memory_percent = capacity["memory_percent"]
             load_fields = [
                 make_field("section", "LOAD", 4, color="green", bold=True),
                 make_field(
                     "util",
-                    f"Util {utilization}{progress_bar(utilization_percent)}",
+                    f"Util {utilization}{progress_bar(capacity['utilization'])}",
                     8,
                     color=utilization_color,
                     bold=True,
@@ -4071,7 +4034,7 @@ class NVClientPool:
                     f"VRAM {add_unit(row.get('memory[used/total]'), 'MiB')}"
                     f"{progress_bar(memory_percent, 8)}",
                     18,
-                    color=memory_color(row.get("memory[used/total]")),
+                    color=self._threshold_color(memory_percent, 75, 90),
                     bold=True,
                 ),
                 make_field(
@@ -4171,38 +4134,27 @@ class NVClientPool:
             )
         return "\n".join(lines)
 
-    def _get_unified_node_status_lines(
-        self,
-        raw_stats_by_client,
-        last_update_time,
-        *,
-        errors_only=False,
-    ):
+    def _get_unified_node_status_lines(self, raw_stats_by_client, *, errors_only=False):
         """Describe nodes that cannot contribute rows to the unified table."""
-        hide_unsupported = bool(self.hide_unsupported)
         lines = []
         hidden_count = 0
-        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
         # The promoted local machine reports through the top strip, so it
         # is neither listed nor counted among the hidden nodes here.
         for idx in self._compute_node_indices(raw_stats_by_client):
             node, hostname = self._client_table_identity(idx)
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-            if isinstance(system_info, dict) and system_info.get("error"):
+            if system_info.get("error"):
                 message = system_info.get("error", "Error")
                 # A node that dropped off must not read like a node that simply
                 # has no NVIDIA GPU, so it keeps the red marker of a real error.
                 lines.append(colored(f"! {node} ({hostname}): {message}", "red"))
             elif idx not in raw_stats_by_client or system_info.get("loading"):
-                if not errors_only and getattr(self, "debug", False):
+                if not errors_only and self.debug:
                     lines.append(f"- {node} ({hostname}): {self._node_monitor_text(system_info)}")
-            elif (
-                not errors_only
-                and (not isinstance(stats, pd.DataFrame) or stats.empty)
-            ):
+            elif not errors_only and stats.empty:
                 # Machines without NVIDIA GPUs (e.g. a macOS laptop) would
                 # otherwise repeat the same "no data" line on every refresh.
-                if hide_unsupported:
+                if self.hide_unsupported:
                     hidden_count += 1
                     continue
                 lines.append(f"- {node} ({hostname}): No GPU data available")
@@ -4223,23 +4175,18 @@ class NVClientPool:
         """
         if last_update_time is None or self._default_expansion_applied:
             return
-        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
+        raw = raw_stats_by_client
         self._default_expansion_applied = all(
-            idx in raw_stats_by_client and not raw_stats_by_client[idx][1].get("loading")
+            idx in raw and not raw[idx][1].get("loading")
             for idx in range(len(self.pool))
         )
-        if self._expansion_touched:
+        if self._expansion_touched or not self.hide_unsupported:
             return
-        if not bool(self.hide_unsupported):
-            return
-
-        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
-        expanded = set()
-        for idx in range(len(self.pool)):
-            stats, _system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-            if (isinstance(stats, pd.DataFrame) and not stats.empty) or idx not in raw_stats_by_client or _system_info.get("loading"):
-                expanded.add(idx)
-        self.expanded_servers = expanded
+        self.expanded_servers = {
+            idx
+            for idx in range(len(self.pool))
+            if idx not in raw or not raw[idx][0].empty or raw[idx][1].get("loading")
+        }
 
     @staticmethod
     def _screen_line_count(elements):
@@ -4271,7 +4218,7 @@ class NVClientPool:
                 users = {}
             if users:
                 user_line = (
-                    f"Users: {self._format_user_memory_totals(users, max_users=12)}"
+                    f"Users: {self._format_user_memory_totals(users)}"
                 )
                 width = _terminal_size().columns
                 if self.term.length(user_line) > width:
@@ -4281,22 +4228,16 @@ class NVClientPool:
             blocks[idx] = block
         return blocks
 
-    @staticmethod
-    def _marker_width():
-        """Columns a full-width helper line may use inside a block."""
-        return max(10, _terminal_size().columns)
-
-    def _trim_server_block(self, lines, keep):
+    def _trim_server_block(self, lines, keep, width):
         """Shorten one expanded block to `keep` lines by dropping GPU rows.
 
         The table keeps its frame: everything up to the header separator
         stays, as many data rows as fit follow, and the original bottom
-        border closes it. Returns None when there is no table to shrink
-        or `keep` cannot hold the frame, meaning the caller should
-        collapse the server instead.
+        border closes it. The marker naming the dropped lines is fitted to
+        `width`. Returns None when there is no table to shrink or `keep`
+        cannot hold the frame, meaning the caller should collapse the
+        server instead.
         """
-        if keep >= len(lines):
-            return lines
         plain = [self._ANSI_ESCAPE_RE.sub("", line) for line in lines]
         top_index = next(
             (index for index, text in enumerate(plain) if text.startswith("╭")),
@@ -4312,25 +4253,24 @@ class NVClientPool:
             ),
             None,
         )
+        if separator_index is None:
+            return None
         bottom_index = next(
             (
                 index
-                for index in range(
-                    separator_index + 1 if separator_index is not None else 0,
-                    len(plain),
-                )
+                for index in range(separator_index + 1, len(plain))
                 if plain[index].startswith("╰")
             ),
             None,
         )
-        if separator_index is None or bottom_index is None:
+        if bottom_index is None:
             return None
 
         head = lines[: separator_index + 1]
         bottom = lines[bottom_index]
         marker_text = fit(
             f"  … {len(lines) - keep} line(s) hidden — enlarge the terminal or press [c]",
-            self._marker_width(),
+            width,
         )
         marker = colored(marker_text, "dark_grey")
         # A frame with no data rows left says nothing a collapsed header
@@ -4340,8 +4280,7 @@ class NVClientPool:
             return None
         rows = lines[separator_index + 1 : bottom_index]
         kept_rows = keep - overhead + 1
-        trimmed = head + rows[:kept_rows] + [bottom, marker]
-        return trimmed
+        return head + rows[:kept_rows] + [bottom, marker]
 
     def _selected_unified_row(self, raw_stats_by_client):
         """Return the currently selected GPU row across filtering and sorting."""
@@ -4361,12 +4300,7 @@ class NVClientPool:
         width = max(20, int(width))
         height = max(4, int(height))
         inner_width = max(1, width - 4)
-        display_mode = getattr(
-            self,
-            "display_mode",
-            self.DISPLAY_MODE_NODES,
-        )
-        unified = display_mode == self.DISPLAY_MODE_UNIFIED
+        unified = self.display_mode == self.DISPLAY_MODE_UNIFIED
         pane = self.unified_active_pane
 
         if not unified:
@@ -4385,26 +4319,11 @@ class NVClientPool:
         elif pane == "process" and self._process_panel_visible():
             context = "UNIFIED · PROCESS"
             mode = self._get_unified_process_sort_mode()
-            arrow = (
-                "▼"
-                if bool(
-                    getattr(
-                        self,
-                        "unified_process_sort_descending",
-                        mode != "command",
-                    )
-                )
-                else "▲"
-            )
-            query = str(
-                self.unified_process_filter or ""
-            )
-            rows = int(
-                self._unified_process_visible_rows or 1
-            )
+            arrow = "▼" if self.unified_process_sort_descending else "▲"
             state = (
                 f"sort {self.UNIFIED_PROCESS_SORT_LABELS[mode]}{arrow}"
-                f" · filter /{query or '-'} · rows {rows}"
+                f" · filter /{self.unified_process_filter or '-'}"
+                f" · rows {self._unified_process_visible_rows or 1}"
             )
             entries = [
                 ("state", "Current", state),
@@ -4451,18 +4370,7 @@ class NVClientPool:
 
         entries.insert(0, ("key", "Mouse / m", "Click controls; More opens all hidden actions"))
 
-        def trim(text, limit):
-            text = str(text)
-            if display_width(text) <= limit:
-                return text
-            if limit <= 1:
-                return fit_display(text, limit, ellipsis="")
-            return fit(text, limit)
-
-        title = trim(
-            f"─ Help · {context} · ?/Esc/q close ",
-            width - 2,
-        )
+        title = _clip(f"─ Help · {context} · ?/Esc/q close ", width - 2, "…")
         lines = [
             colored("╭", "dark_grey")
             + colored(title, "cyan", attrs=["bold"])
@@ -4482,13 +4390,13 @@ class NVClientPool:
         description_width = max(0, inner_width - key_width - 1)
         for kind, key, description in entries:
             if kind == "section":
-                plain = trim(f"── {key} ", inner_width)
+                plain = _clip(f"── {key} ", inner_width, "…")
                 plain += "─" * max(0, inner_width - display_width(plain))
                 styled = colored(plain, "dark_grey")
             else:
-                key_text = pad_display(trim(key, key_width), key_width)
+                key_text = pad_display(_clip(key, key_width, "…"), key_width)
                 description_text = pad_display(
-                    trim(description, description_width),
+                    _clip(description, description_width, "…"),
                     description_width,
                 )
                 plain = f"{key_text} {description_text}"
@@ -4513,7 +4421,7 @@ class NVClientPool:
         self._body_click_targets = {}
         self._body_click_regions = []
         if last_update_time is None and not raw_stats_by_client:
-            return ["Unified GPU table"] + (["Loading GPU data..."] if getattr(self, "debug", False) else [])
+            return ["Unified GPU table"] + (["Loading GPU data..."] if self.debug else [])
 
         source_table = self._build_unified_gpu_table(raw_stats_by_client)
         if source_table.empty:
@@ -4528,9 +4436,7 @@ class NVClientPool:
         terminal_width = terminal_size.columns
         terminal_height = terminal_size.lines
         filter_mode = self._get_unified_filter_mode()
-        errors = self._get_unified_node_status_lines(
-            raw_stats_by_client, last_update_time, errors_only=True,
-        )
+        errors = self._get_unified_node_status_lines(raw_stats_by_client, errors_only=True)
         if filter_mode == "errors":
             # Errors have their own scrollable page; a long process panel
             # must never hide the machines that stopped responding.
@@ -4565,7 +4471,7 @@ class NVClientPool:
         compact_history = (
             show_process_panel
             and terminal_height < 36
-            and bool(self.unified_show_trends)
+            and self.unified_show_trends
         )
         filtered_table = self._filter_unified_gpu_table(source_table)
         sorted_table = self._sort_unified_gpu_table(filtered_table)
@@ -4574,28 +4480,21 @@ class NVClientPool:
             detailed=detailed,
         )
         title = "Unified GPU table (Detailed)" if detailed else "Unified GPU table"
-        # Detailed cards already repeat node identity, so node bands only spend
-        # scarce vertical space there. Keep the bands for the compact table.
-        section_headers = (
-            {}
-            if detailed
-            else self._unified_section_headers(table, sorted_table)
-        )
         row_line_map = {}
         header_regions = []
-        if filter_mode == "errors":
-            rendered_table = "Error filter: GPU rows hidden"
-        elif table.empty and not source_table.empty:
+        if table.empty and not source_table.empty:
             filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
             rendered_table = f"No GPUs match the {filter_label} filter"
         elif detailed:
             rendered_table = self._format_unified_detailed_table(
                 table,
                 selected_row=selected_row,
-                section_headers=section_headers,
                 row_line_map=row_line_map,
             )
         else:
+            # Detailed cards already repeat node identity, so node bands only
+            # spend scarce vertical space there; only this table gets them.
+            section_headers = self._unified_section_headers(table, sorted_table)
             display_table = table.copy()
             if not display_table.empty:
                 display_table.insert(
@@ -4614,7 +4513,6 @@ class NVClientPool:
                     )
             rendered_table = self._format_fixed_width_table(
                 display_table,
-                border=True,
                 column_labels=self.UNIFIED_TABLE_LABELS,
                 fixed_width_columns=("sel",),
                 section_headers=section_headers,
@@ -4697,9 +4595,8 @@ class NVClientPool:
             )
         # Remember where each GPU row landed so a click can select it.
         table_offset = self._screen_line_count(lines)
-        page_start = int(self._unified_page_start or 0)
         self._body_click_targets = {
-            table_offset + line_index: ("gpu", page_start + row_index)
+            table_offset + line_index: ("gpu", self._unified_page_start + row_index)
             for line_index, row_index in row_line_map.items()
         }
         self._body_click_regions.extend(
@@ -4713,14 +4610,7 @@ class NVClientPool:
             command_line_map = {}
             action_regions = []
             process_offset = self._screen_line_count(lines)
-            compact_frame = detailed and (
-                terminal_height < 28
-                or (
-                    terminal_height < 36
-                    and bool(self.unified_show_trends)
-                )
-            )
-            frame_reserve = 3 if compact_frame else 4
+            frame_reserve = 3 if self._compact_detailed_layout(terminal_height) else 4
             selected_processes = self._get_sorted_unified_processes(
                 raw_stats_by_client,
                 selected_gpu_row,
@@ -4776,32 +4666,34 @@ class NVClientPool:
             if self.unified_active_pane == "process":
                 self.unified_active_pane = "gpu"
 
-        if (
-            self.unified_show_trends
-            and filter_mode != "errors"
-            and (
-                not compact_history
-                or int(self._unified_process_count or 0) == 0
-            )
+        if self.unified_show_trends and (
+            not compact_history or self._unified_process_count == 0
         ):
             lines.append(
                 self._format_unified_gpu_trends(selected_gpu_row)
             )
 
-        status_lines = self._get_unified_node_status_lines(
-            raw_stats_by_client,
-            last_update_time,
-            # Detailed mode reserves the lower half for process interaction.
-            # Still show real node errors, but omit the routine "unsupported
-            # node hidden" reminder that is already reflected in the title.
-            errors_only=(filter_mode == "errors" or detailed),
-        )
-        # Real errors are always visible in the top banner and its error page.
-        status_lines = [line for line in status_lines if line not in errors]
-        if status_lines:
-            lines.append("Node status:")
-            lines.extend(status_lines)
+        # Detailed mode reserves the lower half for process interaction, so
+        # it omits the routine "unsupported node hidden" reminder that is
+        # already reflected in the title. Real errors are always visible in
+        # the top banner and its error page instead of here.
+        if not detailed:
+            status_lines = [
+                line
+                for line in self._get_unified_node_status_lines(raw_stats_by_client)
+                if line not in errors
+            ]
+            if status_lines:
+                lines.append("Node status:")
+                lines.extend(status_lines)
         return lines
+
+    def _compact_detailed_layout(self, terminal_height):
+        """Whether detailed mode must save rows: a short window, or history on."""
+        return self.unified_detailed and (
+            terminal_height < 28
+            or (terminal_height < 36 and self.unified_show_trends)
+        )
 
     @staticmethod
     def _control_style(text, style):
@@ -4869,9 +4761,7 @@ class NVClientPool:
         return controls
 
     def _open_tui_menu(self, name):
-        hover = getattr(self, "_tui_hover", None)
-        if hover is not None:
-            hover.clear()
+        self._tui_hover.clear()
         selected = 0
         if name == "filter":
             title = "Filter GPUs"
@@ -4880,8 +4770,7 @@ class NVClientPool:
             selected = self.UNIFIED_FILTER_MODES.index(self._get_unified_filter_mode())
         elif name == "sort":
             title = "Sort GPUs"
-            labels = {"node": "Node order", "available": "Available GPUs first", "utilization": "Highest utilization first"}
-            entries = [(labels[mode], ("gpu_sort", mode)) for mode in self.UNIFIED_SORT_MODES]
+            entries = [(self.UNIFIED_SORT_LABELS[mode], ("gpu_sort", mode)) for mode in self.UNIFIED_SORT_MODES]
             selected = self.UNIFIED_SORT_MODES.index(self._get_unified_sort_mode())
         elif name == "process_sort":
             title = "Sort processes · choose current field to reverse"
@@ -4890,7 +4779,7 @@ class NVClientPool:
             selected = self.UNIFIED_PROCESS_SORT_MODES.index(self._get_unified_process_sort_mode())
         else:
             title = "More actions"
-            controls = getattr(self, "_toolbar_overflow", []) or self._monitor_controls()
+            controls = self._toolbar_overflow or self._monitor_controls()
             entries = [(label, (action, value)) for label, action, value, _ in controls]
         self._tui_menu = ActionMenu(title, entries, selected=selected)
         self.unified_process_filter_editing = False
@@ -4947,10 +4836,11 @@ class NVClientPool:
         rows = []
         for line in output_lines:
             rows.extend(str(line).split("\n"))
-        menu = getattr(self, "_tui_menu", None)
+        width, height = self.term.width or 80, self.term.height or 24
+        menu = self._tui_menu
         if menu is not None:
             rows = menu.render(
-                self.term.width or 80, max(1, (self.term.height or 24) - 1),
+                width, max(1, height - 1),
                 self._control_style,
                 hover_enabled=False,
             )
@@ -4958,38 +4848,34 @@ class NVClientPool:
             self._click_regions = []
             self._click_targets = {}
         else:
-            height = max(0, (self.term.height or 24) - 1)
-            self._click_regions = [region for region in self._click_regions if region[0] < height]
-            self._click_targets = {row: target for row, target in self._click_targets.items() if row < height}
+            self._click_regions = [region for region in self._click_regions if region[0] < height - 1]
+            self._click_targets = {row: target for row, target in self._click_targets.items() if row < height - 1}
         # Pointer feedback reuses this layout. Rebuilding it on every motion
         # used to reformat every node's dataframes before changing two rows.
-        self._tui_base_rows = rows[:max(0, (self.term.height or 24) - 1)]
-        self._tui_frame_size = (self.term.width or 80, self.term.height or 24)
+        self._tui_base_rows = rows[:max(0, height - 1)]
+        self._tui_frame_size = (width, height)
         self._tui_frame_menu = menu
         self._paint_tui_hover()
 
     def _paint_tui_hover(self):
         """Repaint pointer feedback without collecting or formatting data."""
-        rows = getattr(self, "_tui_base_rows", None)
-        menu = getattr(self, "_tui_menu", None)
+        rows = self._tui_base_rows
+        menu = self._tui_menu
         size = (self.term.width or 80, self.term.height or 24)
         if (rows is None or size != self._tui_frame_size
                 or menu is not self._tui_frame_menu):
             return False
-        hover = menu.hover if menu is not None else getattr(self, "_tui_hover", None)
-        if hover is not None:
-            rows = hover.paint(
-                rows,
-                menu.regions if menu is not None else self._click_regions,
-                {} if menu is not None else self._click_targets,
-                size[0], enabled=self.mouse_enabled and bool(self.term.does_styling),
-                row_kinds={"gpu", "server", "process", "command", "close_help"},
-            )
-        screen = getattr(self, "_tui_diff_screen", None)
-        if screen is None:
-            screen = DiffScreen(self.term)
-            self._tui_diff_screen = screen
-        screen.paint(rows)
+        hover = menu.hover if menu is not None else self._tui_hover
+        rows = hover.paint(
+            rows,
+            menu.regions if menu is not None else self._click_regions,
+            {} if menu is not None else self._click_targets,
+            size[0], enabled=self.mouse_enabled and bool(self.term.does_styling),
+            row_kinds=self._HOVER_ROW_KINDS,
+        )
+        if self._tui_diff_screen is None:
+            self._tui_diff_screen = DiffScreen(self.term)
+        self._tui_diff_screen.paint(rows)
         self._tui_hover_dirty = False
         return True
 
@@ -5040,15 +4926,9 @@ class NVClientPool:
             left = remaining // 2
             return " " * left + text + " " * (remaining - left)
 
-        line1 = centered(title)
-        line2 = centered(message)
-        line3 = " " * width
         return "\n".join(
-            [
-                colored(line1, "white", "on_red", attrs=["bold"]),
-                colored(line2, "white", "on_red", attrs=["bold"]),
-                colored(line3, "white", "on_red", attrs=["bold"]),
-            ]
+            colored(line, "white", "on_red", attrs=["bold"])
+            for line in (centered(title), centered(message), " " * width)
         )
     
     @staticmethod
@@ -5065,7 +4945,7 @@ class NVClientPool:
         separator = " · "
 
         if display_width(label) >= width:
-            label = fit_display(label, width, ellipsis=".." if width > 2 else "")
+            label = _clip(label, width)
             separator = ""
             detail = ""
         elif (
@@ -5099,37 +4979,30 @@ class NVClientPool:
     def _format_fixed_width_table(
         self,
         df,
-        border: bool = False,
         column_labels=None,
         *,
-        min_width_overrides=None,
-        importance_overrides=None,
-        must_keep_columns=None,
-        left_align_columns=None,
-        fill_columns=None,
         fixed_width_columns=(),
         section_headers=None,
         row_line_map=None,
         header_regions=None,
         outer_margin: int = 0,
     ):
-        """Format fixed-width table display.
+        """Format a GPU table inside a rounded frame, fitted to the terminal.
 
-        Optional keyword arguments let callers reuse the layout engine for
-        non-GPU tables: column minimum widths, drop priority, columns that must
-        survive on narrow terminals, left-aligned and space-absorbing columns,
-        plus `section_headers` (row index -> banner text) for grouped views.
-        `row_line_map` is filled in with line offset -> data row index so callers
-        can turn a mouse click into a row. `outer_margin` shrinks the table to
-        leave room for a caller-drawn frame around it (e.g. the per-node view's
-        panel border) instead of using the terminal's full width.
+        `fixed_width_columns` never absorb spare width, and
+        `section_headers` (row index -> banner text) adds node bands for
+        grouped views. `row_line_map` is filled in with line offset -> data
+        row index so callers can turn a mouse click into a row. `outer_margin`
+        shrinks the table to leave room for a caller-drawn frame around it
+        (e.g. the per-node view's panel border) instead of using the
+        terminal's full width.
         """
         if df.empty:
             return "No GPU data available"
 
         column_labels = column_labels or {}
         section_headers = section_headers or {}
-        left_align_columns = set(left_align_columns or ()) | {"Node", "Hostname"}
+        left_align_columns = {"Node", "Hostname"}
         fixed_width_columns = set(fixed_width_columns or ())
 
         # Get terminal width
@@ -5177,11 +5050,10 @@ class NVClientPool:
                     "processes": 14,
                 }
             )
-        min_widths.update(min_width_overrides or {})
 
         # Calculate widths based on terminal space
         separator_width = 3
-        outer_width = 4 if border else 0  # "| " + " |"
+        outer_width = 4  # "│ " + " │"
         max_content_width = max(0, terminal_width - outer_width)
 
         # Column importance: larger => dropped earlier when narrow
@@ -5204,10 +5076,7 @@ class NVClientPool:
             "link": 12,
             "fan": 13,
         }
-        importance.update(importance_overrides or {})
-        if must_keep_columns is not None:
-            must_keep_names = tuple(must_keep_columns)
-        elif is_unified_table:
+        if is_unified_table:
             must_keep_names = (
                 "sel",
                 "Node",
@@ -5289,21 +5158,14 @@ class NVClientPool:
             "mem_util",
             "GPU",
         ]
-        if fill_columns:
-            fill_priority = list(fill_columns) + [
-                col for col in fill_priority if col not in fill_columns
-            ]
 
         if available_width >= desired_total:
             column_widths = dict(desired_widths)
             extra = available_width - desired_total
             if extra > 0 and not self.compact:
-                if fill_columns:
-                    spread_columns = [c for c in fill_columns if c in selected_columns]
-                else:
-                    spread_columns = [
-                        c for c in selected_columns if c not in fixed_width_columns
-                    ]
+                spread_columns = [
+                    c for c in selected_columns if c not in fixed_width_columns
+                ]
                 if not spread_columns:
                     spread_columns = list(selected_columns)
                 share, remainder = divmod(extra, len(spread_columns))
@@ -5346,16 +5208,8 @@ class NVClientPool:
                     excess -= reduce_by
 
         def truncate_text(text: str, width: int, tail_preserve: bool = False) -> str:
-            if width <= 0:
-                return ""
-            if text is None:
-                text = ""
-            text = str(text)
-            if display_width(text) <= width:
-                return text
-            if width <= 2:
-                return fit_display(text, width, ellipsis="")
-            if tail_preserve:
+            text = "" if text is None else str(text)
+            if tail_preserve and width > 2 and display_width(text) > width:
                 budget = width - 2
                 kept = []
                 used = 0
@@ -5366,7 +5220,7 @@ class NVClientPool:
                     kept.append(char)
                     used += char_width
                 return ".." + "".join(reversed(kept))
-            return fit_display(text, width, ellipsis="..")
+            return _clip(text, width)
 
         def align_text(text: str, width: int, alignment: str = "center") -> str:
             remaining = max(0, width - display_width(text))
@@ -5378,24 +5232,14 @@ class NVClientPool:
             return " " * left + text + " " * (remaining - left)
 
         def parse_ratio_percent(value: str) -> Optional[float]:
-            if value is None:
+            if "/" not in str(value):
                 return None
-            value_str = str(value).strip()
-            if not value_str or value_str in {"N/A", "-"} or "/" not in value_str:
+            used_str, total_str = str(value).split("/", 1)
+            used_val = parse_leading_float(used_str)
+            total_val = parse_leading_float(total_str)
+            if used_val is None or total_val is None or total_val <= 0:
                 return None
-            used_str, total_str = value_str.split("/", 1)
-            try:
-                used_numbers = extract_numbers(used_str)
-                total_numbers = extract_numbers(total_str)
-                if not used_numbers or not total_numbers:
-                    return None
-                used_val = float(used_numbers[0])
-                total_val = float(total_numbers[0])
-                if total_val <= 0:
-                    return None
-                return (used_val / total_val) * 100
-            except Exception:
-                return None
+            return used_val / total_val * 100
 
         def mem_bar_bg(percent: Optional[float]) -> Optional[str]:
             if percent is None:
@@ -5438,15 +5282,10 @@ class NVClientPool:
             if percent is None:
                 return "".join(chars)
 
-            try:
-                p = max(0.0, min(100.0, float(percent)))
-            except Exception:
-                return "".join(chars)
-
+            p = max(0.0, min(100.0, percent))
             fill_len = int(round((p / 100.0) * width))
             if p > 0 and fill_len == 0:
                 fill_len = 1
-            fill_len = max(0, min(width, fill_len))
 
             # Keep the unfilled portion on the terminal default background.
             # `termcolor`'s "on_grey" maps to ANSI 40 (black), which looks wrong
@@ -5471,7 +5310,7 @@ class NVClientPool:
         cell_separator = colored(" │ ", "dark_grey")
         header_parts = []
         header_styled_parts = []
-        header_column = 2 if border else 0
+        header_column = 2
         for col in selected_columns:
             width = column_widths.get(col, 12)
             col_name = truncate_text(str(column_labels.get(col, col)), width)
@@ -5480,17 +5319,10 @@ class NVClientPool:
             header_styled_parts.append(colored(cell, "cyan", attrs=["bold"]))
             mode = {"Node": "node", "Hostname": "node", "GPU": "node", "util": "utilization"}.get(col)
             if header_regions is not None and mode:
-                header_regions.append((1 if border else 0, header_column, header_column + width - 1, mode))
+                header_regions.append((1, header_column, header_column + width - 1, mode))
             header_column += width + 3
         header_plain = " │ ".join(header_parts)
         header = cell_separator.join(header_styled_parts)
-
-        # Format separator line
-        separator_parts = []
-        for col in selected_columns:
-            width = column_widths.get(col, 12)
-            separator_parts.append("─" * width)
-        separator = colored("─┼─", "dark_grey").join(separator_parts)
 
         # Format data rows
         inner_width = display_width(header_plain)
@@ -5524,15 +5356,7 @@ class NVClientPool:
                     row_parts.append(cell)
                     continue
 
-                if col == "util" and value != "N/A":
-                    percent = parse_leading_float(raw_value)
-                    display_text = str(raw_value).replace(" ", "")
-                    if percent is not None:
-                        display_text = f"{int(round(percent))}%"
-                    row_parts.append(format_bar_cell(display_text, percent, width))
-                    continue
-
-                if col == "mem_util" and value != "N/A":
+                if col in {"util", "mem_util"} and value != "N/A":
                     percent = parse_leading_float(raw_value)
                     display_text = str(raw_value).replace(" ", "")
                     if percent is not None:
@@ -5579,46 +5403,44 @@ class NVClientPool:
 
             data_lines.append(cell_separator.join(row_parts))
 
-        result_lines = [header, separator] + data_lines
-        data_offset = 2
-        if border:
-            # A rounded hairline frame instead of ASCII `+--+` art: the
-            # corners flow into the rules and the whole border stays one
-            # dim grey, so the frame reads as a hairline, not a cage.
-            frame_width = inner_width + 4
-            side_l = colored("│ ", "dark_grey")
-            side_r = colored(" │", "dark_grey")
-            result_lines = (
-                [
-                    colored(frame_top(frame_width), "dark_grey"),
-                    side_l + header + side_r,
-                    colored(frame_separator(frame_width), "dark_grey"),
-                ]
-                + [side_l + line + side_r for line in data_lines]
-                + [colored(frame_bottom(frame_width), "dark_grey")]
-            )
-            data_offset = 3
+        # A rounded hairline frame instead of ASCII `+--+` art: the corners
+        # flow into the rules and the whole border stays one dim grey, so
+        # the frame reads as a hairline, not a cage.
+        frame_width = inner_width + 4
+        side_l = colored("│ ", "dark_grey")
+        side_r = colored(" │", "dark_grey")
+        result_lines = (
+            [
+                colored(frame_top(frame_width), "dark_grey"),
+                side_l + header + side_r,
+                colored(frame_separator(frame_width), "dark_grey"),
+            ]
+            + [side_l + line + side_r for line in data_lines]
+            + [colored(frame_bottom(frame_width), "dark_grey")]
+        )
 
         if row_line_map is not None:
             for line_index, row_index in row_lines.items():
-                row_line_map[data_offset + line_index] = row_index
+                row_line_map[3 + line_index] = row_index
 
         return "\n".join(result_lines)
     
-    def _get_server_summary(self, stats, system_info):
-        """Generate compact summary for collapsed server view."""
-        summary_data = self._get_server_summary_data(stats, system_info)
-        return self._format_server_summary(summary_data)
+    def _get_server_summary_data(self, stats, system_info):
+        """Compute summary data for formatting/alignment.
 
-    def _get_server_summary_data(self, stats, system_info=None):
-        """Compute summary data for formatting/alignment."""
-        # Extract system stats from system_info if available
-        sys_stats = {}
-        data_source = None
-        if system_info and isinstance(system_info, dict):
-            data_source = system_info.get("data_source")
-        if system_info and isinstance(system_info, dict):
-            sys_stats = system_info.get("system_stats", {})
+        `stats` is a processed node frame (see _collect_client_gpu_info), so
+        VRAM comes from its `memory[used/total]` MiB column.
+        """
+        sys_stats = system_info.get("system_stats", {})
+        system = {
+            "cpu_cores": sys_stats.get("cpu_cores", 0),
+            "cpu_percent": sys_stats.get("cpu_percent", 0.0),
+            "mem_used_gb": sys_stats.get("mem_used_gb", 0.0),
+            "mem_total_gb": sys_stats.get("mem_total_gb", 0.0),
+            "swap_used_gb": sys_stats.get("swap_used_gb", 0.0),
+            "swap_total_gb": sys_stats.get("swap_total_gb", 0.0),
+            "data_source": system_info.get("data_source"),
+        }
 
         if stats.empty:
             # Return system stats even when no GPU data
@@ -5630,36 +5452,8 @@ class NVClientPool:
                 "mem_display": "N/A",
                 "mem_percent": None,
                 "no_gpu": True,
-                # System stats
-                "cpu_cores": sys_stats.get("cpu_cores", 0),
-                "cpu_percent": sys_stats.get("cpu_percent", 0.0),
-                "mem_used_gb": sys_stats.get("mem_used_gb", 0.0),
-                "mem_total_gb": sys_stats.get("mem_total_gb", 0.0),
-                "swap_used_gb": sys_stats.get("swap_used_gb", 0.0),
-                "swap_total_gb": sys_stats.get("swap_total_gb", 0.0),
-                "data_source": data_source,
+                **system,
             }
-
-        def mem_to_mib(value_str) -> int:
-            if not value_str or str(value_str).strip() in {"N/A", ""}:
-                return 0
-            try:
-                numbers = extract_numbers(str(value_str))
-                if not numbers:
-                    return 0
-                value = float(numbers[0])
-                unit = units_from_str(str(value_str)).lower()
-                if unit in {"mib", "mb"}:
-                    return int(value)
-                if unit in {"gib", "gb"}:
-                    return int(value * 1024)
-                if unit in {"kib", "kb"}:
-                    return int(value / 1024)
-                if unit in {"b"}:
-                    return int(value / (1024 * 1024))
-                return int(value)
-            except Exception:
-                return 0
 
         gpu_count = len(stats)
         idle_count = 0
@@ -5668,7 +5462,7 @@ class NVClientPool:
         total_mem_total_mib = 0
 
         for _, row in stats.iterrows():
-            util_str = str(row.get("util", row.get("gpu_util", "0")))
+            util_str = str(row.get("util", "0"))
             try:
                 util_val = int(util_str.replace("%", "").strip())
                 total_util += util_val
@@ -5677,23 +5471,11 @@ class NVClientPool:
             except (ValueError, AttributeError):
                 pass
 
-            # Prefer explicit used/total fields (from nvidia-smi -q -x); fallback to pre-formatted column
-            used_mib = mem_to_mib(row.get("used", ""))
-            total_mib = mem_to_mib(row.get("total", ""))
-
-            if used_mib == 0 and total_mib == 0:
-                mem_col = row.get("memory[used/total]", "")
-                if mem_col and "/" in str(mem_col):
-                    try:
-                        used_str, total_str = str(mem_col).split("/", 1)
-                        used_mib = int("".join(filter(str.isdigit, used_str)) or 0)
-                        total_mib = int("".join(filter(str.isdigit, total_str)) or 0)
-                    except Exception:
-                        used_mib = 0
-                        total_mib = 0
-
-            total_mem_used_mib += used_mib
-            total_mem_total_mib += total_mib
+            mem_col = row.get("memory[used/total]", "")
+            if mem_col and "/" in str(mem_col):
+                used_str, total_str = str(mem_col).split("/", 1)
+                total_mem_used_mib += int("".join(filter(str.isdigit, used_str)) or 0)
+                total_mem_total_mib += int("".join(filter(str.isdigit, total_str)) or 0)
 
         avg_util = total_util // gpu_count if gpu_count > 0 else 0
 
@@ -5718,14 +5500,7 @@ class NVClientPool:
                 if total_mem_total_mib > 0
                 else None
             ),
-            # System stats
-            "cpu_cores": sys_stats.get("cpu_cores", 0),
-            "cpu_percent": sys_stats.get("cpu_percent", 0.0),
-            "mem_used_gb": sys_stats.get("mem_used_gb", 0.0),
-            "mem_total_gb": sys_stats.get("mem_total_gb", 0.0),
-            "swap_used_gb": sys_stats.get("swap_used_gb", 0.0),
-            "swap_total_gb": sys_stats.get("swap_total_gb", 0.0),
-            "data_source": data_source,
+            **system,
         }
 
     @staticmethod
@@ -5744,14 +5519,12 @@ class NVClientPool:
         Green = at least one idle GPU, yellow = all GPUs busy, red = the
         node errored, hollow/dim = still loading or nothing to report.
         """
-        if not isinstance(summary_data, dict):
-            return ("●", "dark_grey")
         status = summary_data.get("status")
         if status == "error":
             return ("●", "red")
         if status == "loading":
             return ("◌", "dark_grey")
-        if status == "empty" or summary_data.get("no_gpu"):
+        if summary_data.get("no_gpu"):
             return ("●", "dark_grey")
         if summary_data.get("idle_count", 0) > 0:
             return ("●", "green")
@@ -5786,21 +5559,13 @@ class NVClientPool:
         `compact` renders the plain short form for narrow terminals, where
         the aligned form would push a server header past the terminal edge.
         """
+        status = summary_data.get("status")
         if compact:
-            if not summary_data:
-                return colored("no data", "dark_grey")
-            status = (
-                summary_data.get("status")
-                if isinstance(summary_data, dict)
-                else None
-            )
             if status == "loading":
                 return colored(summary_data.get("message", "loading…"), "dark_grey")
             if status == "error":
                 message = " ".join(str(summary_data.get("message", "Error")).split())
                 return colored(f"err: {message or 'error'}", "red")
-            if status == "empty":
-                return colored("no data", "dark_grey")
             if summary_data.get("no_gpu"):
                 source = summary_data.get("data_source")
                 return colored(
@@ -5811,18 +5576,10 @@ class NVClientPool:
                 f"{summary_data['gpu_count']}G · {summary_data['avg_util']}% · "
                 f"{summary_data['mem_display']}"
             )
-        if not summary_data:
-            return colored("No GPU data available", "dark_grey")
-        if isinstance(summary_data, dict) and summary_data.get("status") == "loading":
+        if status == "loading":
             return colored(summary_data.get("message", "Loading..."), "dark_grey")
-        if isinstance(summary_data, dict) and summary_data.get("status") == "error":
-            message = summary_data.get("message", "Error")
-            error_type = summary_data.get("error_type")
-            if error_type == "auth" and str(message).strip() == "Password incorrect":
-                return colored("Password incorrect", "red", attrs=["bold"])
-            return colored(message, "red", attrs=["bold"])
-        if isinstance(summary_data, dict) and summary_data.get("status") == "empty":
-            return colored("No GPU data available", "dark_grey")
+        if status == "error":
+            return colored(summary_data.get("message", "Error"), "red", attrs=["bold"])
 
         gpu_count = summary_data["gpu_count"]
         idle_count = summary_data["idle_count"]
@@ -5875,16 +5632,11 @@ class NVClientPool:
             pieces = [colored(label, "dark_grey"), colored(f"src:{source}", "dark_grey")]
             return sep.join(pieces + sys_parts)
 
-        if widths:
-            gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
-            idle_digits = widths.get("idle_digits", len(str(idle_count)))
-            util_digits = widths.get("util_digits", len(str(avg_util)))
-            mem_width = widths.get("mem_width", len(str(mem_display)))
-        else:
-            gpu_digits = len(str(gpu_count))
-            idle_digits = len(str(idle_count))
-            util_digits = len(str(avg_util))
-            mem_width = len(str(mem_display))
+        widths = widths or {}
+        gpu_digits = widths.get("gpu_digits", len(str(gpu_count)))
+        idle_digits = widths.get("idle_digits", len(str(idle_count)))
+        util_digits = widths.get("util_digits", len(str(avg_util)))
+        mem_width = widths.get("mem_width", len(str(mem_display)))
 
         gpu_part = f"{gpu_count:>{gpu_digits}} GPUs"
         # The idle count is what someone scanning for a free card reads
@@ -5918,21 +5670,10 @@ class NVClientPool:
 
         return sep.join(parts)
 
-    def _format_user_memory_totals(self, user_summary: dict, *, max_users: int = 10) -> str:
+    def _format_user_memory_totals(self, user_summary: dict, *, max_users: int = 12) -> str:
         """Format per-user total VRAM usage (MiB) as a compact single-line string."""
-        if not user_summary:
-            return ""
-
-        items = []
-        for user, mib in user_summary.items():
-            try:
-                mib_int = int(mib)
-            except Exception:
-                continue
-            if mib_int <= 0:
-                continue
-            items.append((str(user), mib_int))
-
+        # The MiB values are int sums (see get_process_summary / _sample_metadata).
+        items = [(str(user), mib) for user, mib in user_summary.items() if mib > 0]
         if not items:
             return ""
 
@@ -5951,7 +5692,7 @@ class NVClientPool:
     
     def print_stats(self, use_cache=False):
         """Print GPU stats with collapsible server view."""
-        _set_monitor_theme(getattr(self, "theme", "classic"))
+        _set_monitor_theme(self.theme)
         # Fetch new data or use cache
         if use_cache:
             with self._cache_lock:
@@ -5990,15 +5731,15 @@ class NVClientPool:
             # The header summary already says "Loading..."; a block under it
             # would only repeat the same word twice per server.
             stats_list = [""] * len(self.pool)
-        if not isinstance(raw_stats_by_client, dict):
-            raw_stats_by_client = {}
-        elif stats_list and raw_stats_by_client:
+        terminal_size = _terminal_size()
+        terminal_width = terminal_size.columns
+        terminal_height = terminal_size.lines
+        if stats_list and raw_stats_by_client:
             # Responsive relayout: the cached blocks were formatted for the
             # width the terminal had at fetch time. If the window has been
             # resized since, re-render them from the raw stats now instead
             # of painting tables that no longer fit (or waste) the width.
-            current_width = _terminal_size().columns
-            if getattr(self, "_node_workers", None) or getattr(self, "_blocks_formatted_width", None) != current_width:
+            if self._node_workers or self._blocks_formatted_width != terminal_width:
                 try:
                     stats_list = self._format_client_blocks(
                         [
@@ -6017,29 +5758,22 @@ class NVClientPool:
         self._node_listed_indices = node_indices
 
         # Disable expand/collapse for servers with auth errors (e.g., password incorrect)
-        try:
-            disabled = set()
-            for idx in range(len(self.pool)):
-                _stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
-                if isinstance(system_info, dict) and system_info.get("error_type") == "auth":
-                    disabled.add(idx)
-            self._toggle_disabled_servers = disabled
-        except Exception:
-            self._toggle_disabled_servers = set()
-        
+        self._toggle_disabled_servers = {
+            idx
+            for idx in range(len(self.pool))
+            if raw_stats_by_client.get(idx, (None, {}))[1].get("error_type") == "auth"
+        }
+
         current_time = time.strftime("%H:%M:%S")
-        
+
         # Ensure selected_server is within bounds
-        if self.selected_server >= len(self.pool):
-            self.selected_server = len(self.pool) - 1
-        if self.selected_server < 0:
-            self.selected_server = 0
+        self.selected_server = max(0, min(self.selected_server, len(self.pool) - 1))
 
         update_display = "--:--:--"
         if last_update_time:
             update_display = time.strftime("%H:%M:%S", time.localtime(last_update_time))
         fetch_display = ""
-        debug = bool(getattr(self, "debug", False))
+        debug = self.debug
         if debug and isinstance(last_fetch_duration, (int, float)):
             fetch_display = f" ({last_fetch_duration:.1f}s)"
         warn_display = " · WARN: refresh failed" if last_fetch_error else ""
@@ -6047,9 +5781,6 @@ class NVClientPool:
         output_lines = []
         server_count = len(node_indices)
         server_label = "Server" if server_count == 1 else "Servers"
-        terminal_size = _terminal_size()
-        terminal_width = terminal_size.columns
-        terminal_height = terminal_size.lines
 
         display_mode = self.display_mode
         # Narrow windows get their own chrome. Every line the frame builds
@@ -6068,7 +5799,7 @@ class NVClientPool:
             # A very short window cannot spare two rows for decoration:
             # data completeness beats the frame.
             and terminal_height >= 14
-            and not bool(self.tui_help_visible)
+            and not self.tui_help_visible
         )
         # The local machine's own strip opens the page in both views. It
         # sits above the per-node panel frame, so it is laid out for the
@@ -6131,21 +5862,22 @@ class NVClientPool:
             for row, start, end, target in toolbar_regions
         ]
 
-        pending_nodes = []
-        slow_nodes = []
-        for idx in node_indices:
-            _stats, info = raw_stats_by_client.get(idx, (None, {"loading": True}))
-            monitor = info.get("_monitor", {})
-            if info.get("loading"):
-                pending_nodes.append(self._client_table_identity(idx)[0])
-            elif monitor.get("updated") and not info.get("error") and time.time() - monitor["updated"] > 5:
-                slow_nodes.append(self._client_table_identity(idx)[0])
-        if debug and (pending_nodes or slow_nodes):
-            notices = []
-            for label, nodes in (("Loading", pending_nodes), ("Stale >5s", slow_nodes)):
-                if nodes:
-                    notices.append(f"{label} {len(nodes)}: {', '.join(nodes[:3])}" + (" …" if len(nodes) > 3 else ""))
-            output_lines.append(colored(fit_display(" · ".join(notices), terminal_width), "yellow"))
+        if debug:
+            pending_nodes = []
+            slow_nodes = []
+            for idx in node_indices:
+                _stats, info = raw_stats_by_client.get(idx, (None, {"loading": True}))
+                monitor = info.get("_monitor", {})
+                if info.get("loading"):
+                    pending_nodes.append(self._client_table_identity(idx)[0])
+                elif monitor.get("updated") and not info.get("error") and time.time() - monitor["updated"] > 5:
+                    slow_nodes.append(self._client_table_identity(idx)[0])
+            if pending_nodes or slow_nodes:
+                notices = []
+                for label, nodes in (("Loading", pending_nodes), ("Stale >5s", slow_nodes)):
+                    if nodes:
+                        notices.append(f"{label} {len(nodes)}: {', '.join(nodes[:3])}" + (" …" if len(nodes) > 3 else ""))
+                output_lines.append(colored(fit_display(" · ".join(notices), terminal_width), "yellow"))
 
         # The rule under the chrome is decoration; a very short window
         # spends the row on data instead.
@@ -6156,7 +5888,7 @@ class NVClientPool:
                 separator_width = max(20, terminal_width)
             output_lines.append(colored("─" * separator_width, "dark_grey"))
 
-        if bool(self.tui_help_visible):
+        if self.tui_help_visible:
             help_offset = self._screen_line_count(output_lines)
             help_lines = self._format_tui_help_lines(
                 terminal_width,
@@ -6173,25 +5905,16 @@ class NVClientPool:
             self._write_tui_lines(output_lines)
             return
 
-        meta = {}
-        if isinstance(raw_stats_by_client, dict):
-            meta = raw_stats_by_client.get("_nvidb", {}) or {}
+        meta = raw_stats_by_client.get("_nvidb") or {}
         user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
         global_user_memory = meta.get("user_memory_global", {}) or {}
 
         compact_detailed_screen = (
             display_mode == self.DISPLAY_MODE_UNIFIED
-            and bool(self.unified_detailed)
-            and (
-                terminal_height < 28
-                or (
-                    terminal_height < 36
-                    and bool(self.unified_show_trends)
-                )
-            )
+            and self._compact_detailed_layout(terminal_height)
         )
         if global_user_memory and not compact_detailed_screen:
-            user_totals = self._format_user_memory_totals(global_user_memory, max_users=12)
+            user_totals = self._format_user_memory_totals(global_user_memory)
             plain_line = f"Users (all nodes): {user_totals}"
             if self.term.length(plain_line) > terminal_width:
                 output_lines.append(fit(plain_line, terminal_width))
@@ -6213,13 +5936,11 @@ class NVClientPool:
             # Translate the body-relative hit boxes into absolute screen rows.
             self._click_targets = {
                 body_offset + line: target
-                for line, target in (self._body_click_targets or {}).items()
+                for line, target in self._body_click_targets.items()
             }
             self._click_regions = toolbar_regions + [
                 (body_offset + line, start, end, target)
-                for line, start, end, target in (
-                    self._body_click_regions or []
-                )
+                for line, start, end, target in self._body_click_regions
             ]
             self._write_tui_lines(output_lines)
             return
@@ -6239,7 +5960,6 @@ class NVClientPool:
         server_rows = []
         max_header_width = 0
 
-        summary_rows = []
         for position, idx in enumerate(node_indices):
             client = self.pool[idx]
             stats_info = stats_list[idx] if idx < len(stats_list) else ""
@@ -6251,7 +5971,7 @@ class NVClientPool:
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
 
             # Build summary
-            if isinstance(system_info, dict) and system_info.get("error"):
+            if system_info.get("error"):
                 summary_data = {
                     "status": "error",
                     "message": system_info.get("error", "Error"),
@@ -6260,7 +5980,7 @@ class NVClientPool:
             elif idx not in raw_stats_by_client or system_info.get("loading") or (last_update_time is None and stats.empty):
                 summary_data = {"status": "loading", "message": self._node_monitor_text(system_info)}
             else:
-                summary_data = self._get_server_summary_data(stats, system_info) or {"status": "empty"}
+                summary_data = self._get_server_summary_data(stats, system_info)
 
             # Format the header line (index padded for consistent width)
             if toggle_disabled:
@@ -6274,13 +5994,10 @@ class NVClientPool:
                 f"{dot} {client.description}"
             )
 
-            header_width = display_width(header_plain)
-            max_header_width = max(max_header_width, header_width)
-
-            summary_rows.append(summary_data)
+            max_header_width = max(max_header_width, display_width(header_plain))
             server_rows.append((idx, is_selected, is_expanded, header_plain, summary_data, stats_info))
 
-        non_empty_summaries = [s for s in summary_rows if isinstance(s, dict) and "gpu_count" in s]
+        non_empty_summaries = [row[4] for row in server_rows if "gpu_count" in row[4]]
         if non_empty_summaries:
             widths = {
                 "gpu_digits": max(len(str(s["gpu_count"])) for s in non_empty_summaries),
@@ -6317,8 +6034,8 @@ class NVClientPool:
         for position, (
             idx,
             is_selected,
-            _is_expanded,
-            _header_plain,
+            is_expanded,
+            header_plain,
             summary_data,
             _stats_info,
         ) in enumerate(server_rows):
@@ -6328,7 +6045,7 @@ class NVClientPool:
             expand_icon = (
                 "!"
                 if toggle_disabled
-                else ("▾" if idx in visible_blocks else "▸")
+                else ("▾" if is_expanded else "▸")
             )
             selector = "❯" if is_selected else " "
             dot, dot_color = self._server_health_dot(summary_data)
@@ -6369,12 +6086,8 @@ class NVClientPool:
                         + colored(description, attrs=["bold"])
                     )
             else:
-                header_plain = (
-                    f"{selector} {expand_icon} "
-                    f"[{position + 1:{index_width}d}] {dot} {self.pool[idx].description}"
-                )
                 pad = max_header_width - display_width(header_plain)
-                header_padded = header_plain + (" " * pad if pad > 0 else "")
+                header_padded = header_plain + " " * pad
                 header_padded = fit(header_padded, max(1, summary_room))
                 if is_selected:
                     header_display = (
@@ -6421,12 +6134,7 @@ class NVClientPool:
         # servers, a short terminal), show a window of servers that
         # follows the selection. An indicator line at each edge counts what
         # is scrolled out, so nothing can fall off the screen unnoticed.
-        region_height = max(
-            1,
-            (terminal_height - 1)
-            - self._screen_line_count(output_lines)
-            - border_rows,
-        )
+        region_height = max(1, rows_for_body)
         # One server taller than the entire region is the only case where
         # rows still have to go: there is nowhere to scroll them to. Only
         # that server's own table is shortened, and it always says by how
@@ -6434,6 +6142,8 @@ class NVClientPool:
         # it vanished. Trimming always starts from the untouched section
         # so the dropped-line count stays honest across both passes.
         natural_sections = [(idx, list(lines)) for idx, lines in sections]
+        # Markers sit inside the panel frame, so they fit its content width.
+        marker_width = max(10, terminal_width)
 
         def fit_section(position, budget):
             idx, lines = natural_sections[position]
@@ -6446,7 +6156,7 @@ class NVClientPool:
                 # how many GPUs are down there.
                 sections[position] = (idx, [lines[0]])
                 return
-            trimmed = self._trim_server_block(lines[1:], budget - 1)
+            trimmed = self._trim_server_block(lines[1:], budget - 1, marker_width)
             if trimmed is None:
                 # Not even one data row survives under the header; saying
                 # so beats painting a headless slice of the table.
@@ -6454,7 +6164,7 @@ class NVClientPool:
                     colored(
                         fit(
                             "  … table hidden — enlarge the terminal or press [c]",
-                            self._marker_width(),
+                            marker_width,
                         ),
                         "dark_grey",
                     )
@@ -6568,7 +6278,7 @@ class NVClientPool:
 
         start = max(
             0,
-            min(getattr(self, "_nodes_view_start", 0), count - 1, selected_pos),
+            min(self._nodes_view_start, count - 1, selected_pos),
         )
         end = end_for(start)
         while selected_pos >= end and start < selected_pos:
@@ -6596,7 +6306,7 @@ class NVClientPool:
             "group_by_node": bool(self.unified_group_by_node),
             "hide_unsupported": bool(self.hide_unsupported),
             "mouse": bool(self.mouse_enabled),
-            "theme": getattr(self, "theme", "classic"),
+            "theme": self.theme,
         }
 
     def _persist_view_settings(self):
@@ -6617,7 +6327,7 @@ class NVClientPool:
         self._persist_view_settings()
 
     def _toggle_theme(self):
-        self.theme = "muted" if getattr(self, "theme", "classic") == "classic" else "classic"
+        self.theme = "muted" if self.theme == "classic" else "classic"
         _set_monitor_theme(self.theme)
         self._apply_view_change()
         return True
@@ -6646,10 +6356,7 @@ class NVClientPool:
         self.unified_sort_mode = mode
         self.unified_selected_gpu = 0
         self.unified_selected_gpu_key = None
-        self.unified_selected_process = 0
-        self.unified_selected_process_pid = None
-        self.unified_command_scroll = 0
-        self._pending_process_signal = None
+        self._reset_process_selection()
         self._apply_view_change()
 
     def _cycle_unified_filter_mode(self):
@@ -6663,35 +6370,29 @@ class NVClientPool:
         self.unified_filter_mode = mode
         self.unified_selected_gpu = 0
         self.unified_selected_gpu_key = None
-        self.unified_selected_process = 0
-        self.unified_selected_process_pid = None
-        self.unified_command_scroll = 0
         self.unified_active_pane = "gpu"
-        self._pending_process_signal = None
+        self._reset_process_selection()
         self._apply_view_change()
 
     def _move_unified_selection(self, delta):
-        gpu_count = max(0, int(self._unified_gpu_count or 0))
+        gpu_count = self._unified_gpu_count
         if gpu_count == 0:
             return False
-        current = int(self.unified_selected_gpu or 0)
+        current = self.unified_selected_gpu
         selected = max(0, min(current + delta, gpu_count - 1))
         if selected == current:
             return False
         self.unified_selected_gpu = selected
         self.unified_selected_gpu_key = None
-        self.unified_selected_process = 0
-        self.unified_selected_process_pid = None
-        self.unified_command_scroll = 0
-        self._pending_process_signal = None
+        self._reset_process_selection()
         self._request_ui_refresh()
         return True
 
     def _move_unified_process_selection(self, delta):
-        count = max(0, int(self._unified_process_count or 0))
+        count = self._unified_process_count
         if count == 0:
             return False
-        current = int(self.unified_selected_process or 0)
+        current = self.unified_selected_process
         selected = max(0, min(current + delta, count - 1))
         if selected == current:
             return False
@@ -6706,15 +6407,8 @@ class NVClientPool:
         if mode not in self.UNIFIED_PROCESS_SORT_MODES:
             return False
         current = self._get_unified_process_sort_mode()
-        current_descending = bool(
-            getattr(
-                self,
-                "unified_process_sort_descending",
-                current != "command",
-            )
-        )
         if mode == current and toggle:
-            descending = not current_descending
+            descending = not self.unified_process_sort_descending
         elif mode == current:
             return False
         else:
@@ -6738,39 +6432,25 @@ class NVClientPool:
     def _adjust_unified_process_rows(self, delta):
         if not self._process_panel_visible():
             return False
-        current = int(self.unified_process_rows or 0)
-        if current <= 0:
-            current = max(
-                1,
-                int(
-                    getattr(
-                        self,
-                        "_unified_process_visible_rows",
-                        1,
-                    )
-                    or 1
-                ),
-            )
-        selected = max(1, min(12, current + int(delta)))
+        current = self.unified_process_rows or max(1, self._unified_process_visible_rows)
+        selected = max(1, min(12, current + delta))
         if selected == current:
             return False
         self.unified_process_rows = selected
         self._request_ui_refresh()
         return True
 
-    def _reset_unified_process_filter_selection(self):
+    def _reset_process_selection(self):
         self.unified_selected_process = 0
         self.unified_selected_process_pid = None
         self.unified_command_scroll = 0
         self._pending_process_signal = None
 
     def _start_unified_process_filter(self):
-        if max(0, int(self._unified_gpu_count or 0)) == 0:
+        if self._unified_gpu_count == 0:
             return False
         entered = self._enter_unified_process_pane()
-        changed = not bool(
-            self.unified_process_filter_editing
-        )
+        changed = not self.unified_process_filter_editing
         self.unified_process_filter_editing = True
         self._pending_process_signal = None
         if changed and not entered:
@@ -6779,9 +6459,7 @@ class NVClientPool:
 
     def _handle_unified_process_filter_key(self, key_text, key_name):
         """Edit the live process filter while keeping global shortcuts inactive."""
-        if not bool(
-            self.unified_process_filter_editing
-        ):
+        if not self.unified_process_filter_editing:
             return False
 
         enter_pressed = (
@@ -6796,7 +6474,7 @@ class NVClientPool:
         if key_name == "KEY_ESCAPE" or key_text == "\x1b":
             self.unified_process_filter = ""
             self.unified_process_filter_editing = False
-            self._reset_unified_process_filter_selection()
+            self._reset_process_selection()
             self._request_ui_refresh()
             return True
 
@@ -6804,18 +6482,16 @@ class NVClientPool:
             key_name in {"KEY_BACKSPACE", "KEY_DELETE"}
             or key_text in {"\b", "\x7f"}
         ):
-            query = str(
-                self.unified_process_filter or ""
-            )
+            query = self.unified_process_filter
             if query:
                 self.unified_process_filter = query[:-1]
-                self._reset_unified_process_filter_selection()
+                self._reset_process_selection()
                 self._request_ui_refresh()
             return True
 
         if key_text == "\x15":  # Ctrl+U
             self.unified_process_filter = ""
-            self._reset_unified_process_filter_selection()
+            self._reset_process_selection()
             self._request_ui_refresh()
             return True
 
@@ -6824,59 +6500,35 @@ class NVClientPool:
             and not str(key_name).startswith("KEY_")
             and all(character.isprintable() for character in key_text)
         ):
-            query = str(
-                self.unified_process_filter or ""
-            )
-            self.unified_process_filter = (query + key_text)[:80]
-            self._reset_unified_process_filter_selection()
+            self.unified_process_filter = (self.unified_process_filter + key_text)[:80]
+            self._reset_process_selection()
             self._request_ui_refresh()
             return True
         return False
 
     def _clear_unified_process_filter(self):
-        query = str(self.unified_process_filter or "")
-        editing = bool(
-            self.unified_process_filter_editing
-        )
-        if not query and not editing:
+        if not self.unified_process_filter and not self.unified_process_filter_editing:
             return False
         self.unified_process_filter = ""
         self.unified_process_filter_editing = False
-        self._reset_unified_process_filter_selection()
+        self._reset_process_selection()
         self._request_ui_refresh()
         return True
 
     def _toggle_tui_help(self):
-        self.tui_help_visible = not bool(
-            self.tui_help_visible
-        )
+        self.tui_help_visible = not self.tui_help_visible
         self.unified_process_filter_editing = False
         self._pending_process_signal = None
         self._request_ui_refresh()
         return True
 
     def _scroll_unified_command(self, page_delta):
-        line_count = max(
-            0,
-            int(self._unified_command_line_count or 0),
-        )
-        page_size = max(
-            0,
-            int(self._unified_command_page_size or 0),
-        )
+        line_count = self._unified_command_line_count
+        page_size = self._unified_command_page_size
         if page_size <= 0 or line_count <= page_size:
             return False
-        current = max(
-            0,
-            int(self.unified_command_scroll or 0),
-        )
-        selected = max(
-            0,
-            min(
-                current + int(page_delta) * page_size,
-                line_count - page_size,
-            ),
-        )
+        current = self.unified_command_scroll
+        selected = max(0, min(current + page_delta * page_size, line_count - page_size))
         if selected == current:
             return False
         self.unified_command_scroll = selected
@@ -6884,46 +6536,37 @@ class NVClientPool:
         return True
 
     def _process_panel_visible(self):
-        if bool(self.unified_process_panel_hidden):
+        if self.unified_process_panel_hidden:
             return False
         return (
-            self.display_mode
-            == self.DISPLAY_MODE_UNIFIED
-            and (
-                bool(self.unified_detailed)
-                or bool(self.unified_show_processes)
-            )
+            self.display_mode == self.DISPLAY_MODE_UNIFIED
+            and (self.unified_detailed or self.unified_show_processes)
             and self._get_unified_filter_mode() != "errors"
         )
 
     def _enter_unified_process_pane(self):
         """Show the selected GPU's processes and move focus into that pane."""
         if (
-            self.display_mode
-            != self.DISPLAY_MODE_UNIFIED
+            self.display_mode != self.DISPLAY_MODE_UNIFIED
             or self._get_unified_filter_mode() == "errors"
-            or max(0, int(self._unified_gpu_count or 0)) == 0
+            or self._unified_gpu_count == 0
         ):
             return False
 
         visibility_changed = False
         persist_visibility = False
-        if bool(self.unified_detailed):
-            if bool(
-                self.unified_process_panel_hidden
-            ):
+        if self.unified_detailed:
+            if self.unified_process_panel_hidden:
                 self.unified_process_panel_hidden = False
                 visibility_changed = True
-        elif not bool(self.unified_show_processes):
+        elif not self.unified_show_processes:
             self.unified_show_processes = True
             visibility_changed = True
             persist_visibility = True
 
         if not self._process_panel_visible():
             return False
-        focus_changed = (
-            self.unified_active_pane != "process"
-        )
+        focus_changed = self.unified_active_pane != "process"
         if not visibility_changed and not focus_changed:
             return False
 
@@ -6938,24 +6581,19 @@ class NVClientPool:
     def _toggle_unified_process_panel(self):
         """Show or hide the process pane without treating Enter as a toggle."""
         if (
-            self.display_mode
-            != self.DISPLAY_MODE_UNIFIED
+            self.display_mode != self.DISPLAY_MODE_UNIFIED
             or self._get_unified_filter_mode() == "errors"
-            or max(0, int(self._unified_gpu_count or 0)) == 0
+            or self._unified_gpu_count == 0
         ):
             return False
 
-        detailed = bool(self.unified_detailed)
+        detailed = self.unified_detailed
         if detailed:
-            self.unified_process_panel_hidden = not bool(
-                self.unified_process_panel_hidden
-            )
+            self.unified_process_panel_hidden = not self.unified_process_panel_hidden
             panel_visible = not self.unified_process_panel_hidden
         else:
             self.unified_process_panel_hidden = False
-            panel_visible = not bool(
-                self.unified_show_processes
-            )
+            panel_visible = not self.unified_show_processes
             self.unified_show_processes = panel_visible
 
         if not panel_visible:
@@ -7004,6 +6642,11 @@ class NVClientPool:
             "process": process,
             "client_index": client_index,
         }
+
+    @staticmethod
+    def _process_command_identity(process):
+        """The command text a confirmation must still find on the armed PID."""
+        return str(process.get("command") or process.get("process_name") or "")
 
     def _set_process_action_notice(self, message, color):
         self._process_action_notice = {
@@ -7066,11 +6709,7 @@ class NVClientPool:
             "pid": int(pid_text),
             "client_index": context["client_index"],
             "node": str(context["row"].get("Node", "N/A")),
-            "command": str(
-                process.get("command")
-                or process.get("process_name")
-                or ""
-            ),
+            "command": self._process_command_identity(process),
             "expires_at": time.monotonic() + 5,
         }
         self._request_ui_refresh()
@@ -7104,12 +6743,7 @@ class NVClientPool:
             not pid_text.isdigit()
             or int(pid_text) != pending.get("pid")
             or context["client_index"] != pending.get("client_index")
-            or str(
-                context["process"].get("command")
-                or context["process"].get("process_name")
-                or ""
-            )
-            != pending.get("command")
+            or self._process_command_identity(context["process"]) != pending.get("command")
         ):
             self._pending_process_signal = None
             self._set_process_action_notice(
@@ -7128,8 +6762,8 @@ class NVClientPool:
             f"status=$?; printf '\\n{marker}%s\\n' \"$status\""
         )
         self._pending_process_signal = None
-        if getattr(self, "_node_workers", None):
-            worker = getattr(self, "_signal_worker", None)
+        if self._node_workers:
+            worker = self._signal_worker
             if worker is not None and worker.is_alive():
                 self._set_process_action_notice("A signal request is still in progress", "yellow")
             else:
@@ -7181,10 +6815,7 @@ class NVClientPool:
         The promoted local machine is not in the list, so the cursor
         steps over it instead of landing on a row that is not on screen.
         """
-        indices = list(
-            getattr(self, "_node_listed_indices", None)
-            or range(len(self.pool))
-        )
+        indices = list(self._node_listed_indices or range(len(self.pool)))
         if not indices:
             return False
         try:
@@ -7214,7 +6845,7 @@ class NVClientPool:
         """Apply one mouse event and report whether the frame changed."""
         if not self.mouse_enabled:
             return False
-        menu = getattr(self, "_tui_menu", None)
+        menu = self._tui_menu
         if menu is not None:
             previous_region = menu.hover.region
             result = menu.handle_mouse(event)
@@ -7225,12 +6856,9 @@ class NVClientPool:
                 return changed
             return self._finish_tui_menu_input(result)
         if event.is_motion:
-            hover = getattr(self, "_tui_hover", None)
-            if hover is None:
-                hover = self._tui_hover = HoverState()
-            changed = hover.move(
+            changed = self._tui_hover.move(
                 event, self._click_regions, self._click_targets, self.term.width or 80,
-                row_kinds={"gpu", "server", "process", "command", "close_help"},
+                row_kinds=self._HOVER_ROW_KINDS,
             )
             if changed:
                 self._tui_hover_dirty = True
@@ -7248,7 +6876,7 @@ class NVClientPool:
         if target is None:
             target = (self._click_targets or {}).get(row)
 
-        if bool(self.tui_help_visible):
+        if self.tui_help_visible:
             if (
                 event.is_left_press
                 and target is not None
@@ -7335,32 +6963,12 @@ class NVClientPool:
             return self._request_process_signal(value)
         if kind == "toggle_trends":
             self.unified_active_pane = "process"
-            self.unified_show_trends = not getattr(
-                self,
-                "unified_show_trends",
-                False,
-            )
+            self.unified_show_trends = not self.unified_show_trends
             self._apply_view_change()
             return True
-        if kind == "process":
+        if kind in {"process", "command"}:
             changed = (
-                value
-                != int(self.unified_selected_process or 0)
-                or self.unified_active_pane != "process"
-            )
-            if not changed:
-                return False
-            self.unified_selected_process = value
-            self.unified_selected_process_pid = None
-            self.unified_command_scroll = 0
-            self.unified_active_pane = "process"
-            self._pending_process_signal = None
-            self._request_ui_refresh()
-            return True
-        if kind == "command":
-            changed = (
-                value
-                != int(self.unified_selected_process or 0)
+                value != self.unified_selected_process
                 or self.unified_active_pane != "process"
             )
             if not changed:
@@ -7374,18 +6982,15 @@ class NVClientPool:
             return True
         if kind == "gpu":
             changed = (
-                value != int(self.unified_selected_gpu or 0)
+                value != self.unified_selected_gpu
                 or self.unified_active_pane != "gpu"
             )
             if not changed:
                 return self._enter_unified_process_pane()
             self.unified_selected_gpu = value
             self.unified_selected_gpu_key = None
-            self.unified_selected_process = 0
-            self.unified_selected_process_pid = None
-            self.unified_command_scroll = 0
             self.unified_active_pane = "gpu"
-            self._pending_process_signal = None
+            self._reset_process_selection()
             if not self._process_panel_visible():
                 self._enter_unified_process_pane()
                 self.unified_active_pane = "gpu"
@@ -7396,18 +7001,17 @@ class NVClientPool:
     def _handle_keypress(self, key):
         """Apply one TUI keypress and return whether it changed visible state."""
         key_text = str(key)
-        key_name = key.name if hasattr(key, "name") and key.name else key_text
+        key_name = getattr(key, "name", None) or key_text
         key_lower = key_text.lower()
 
-        hover = getattr(self, "_tui_hover", None)
-        if key_text and hover is not None and hover.clear():
+        if key_text and self._tui_hover.clear():
             self._request_ui_refresh()
 
-        menu = getattr(self, "_tui_menu", None)
+        menu = self._tui_menu
         if menu is not None:
             return self._finish_tui_menu_input(menu.handle_key(key_text, key_name))
 
-        if bool(self.tui_help_visible):
+        if self.tui_help_visible:
             if (
                 key_text in {"?", "q", "Q", "\n", "\r", " "}
                 or key_name in {"KEY_ESCAPE", "KEY_ENTER"}
@@ -7416,9 +7020,7 @@ class NVClientPool:
                 return self._toggle_tui_help()
             return False
 
-        if bool(
-            self.unified_process_filter_editing
-        ):
+        if self.unified_process_filter_editing:
             return self._handle_unified_process_filter_key(
                 key_text,
                 key_name,
@@ -7442,9 +7044,7 @@ class NVClientPool:
                 self._set_process_action_notice("Signal cancelled", "yellow")
                 self._request_ui_refresh()
                 return True
-            if self._clear_unified_process_filter():
-                return True
-            return False
+            return self._clear_unified_process_filter()
 
         enter_pressed = (
             key_name == "KEY_ENTER"
@@ -7456,45 +7056,28 @@ class NVClientPool:
         if key_lower == "v":
             self._toggle_display_mode()
             return True
-        if key_lower == "d":
-            if self.display_mode != self.DISPLAY_MODE_UNIFIED:
-                return False
-            self.unified_detailed = not self.unified_detailed
-            self.unified_active_pane = "gpu"
-            self.unified_process_panel_hidden = False
-            self.unified_selected_process = 0
-            self.unified_selected_process_pid = None
-            self.unified_command_scroll = 0
-            self._pending_process_signal = None
-            self._apply_view_change()
-            return True
-        if key_lower == "g":
-            if self.display_mode != self.DISPLAY_MODE_UNIFIED:
-                return False
-            self.unified_group_by_node = not getattr(
-                self,
-                "unified_group_by_node",
-                True,
-            )
-            self._apply_view_change()
-            return True
-        if key_lower == "u":
-            if self.display_mode != self.DISPLAY_MODE_UNIFIED:
-                return False
-            self.hide_unsupported = not self.hide_unsupported
-            self._apply_view_change()
-            return True
-        if key_lower == "s":
-            if self.display_mode != self.DISPLAY_MODE_UNIFIED:
-                return False
-            self._cycle_unified_sort_mode()
-            return True
-        if key_lower == "f":
-            if self.display_mode != self.DISPLAY_MODE_UNIFIED:
-                return False
-            self._cycle_unified_filter_mode()
-            return True
         if self.display_mode == self.DISPLAY_MODE_UNIFIED:
+            if key_lower == "d":
+                self.unified_detailed = not self.unified_detailed
+                self.unified_active_pane = "gpu"
+                self.unified_process_panel_hidden = False
+                self._reset_process_selection()
+                self._apply_view_change()
+                return True
+            if key_lower == "g":
+                self.unified_group_by_node = not self.unified_group_by_node
+                self._apply_view_change()
+                return True
+            if key_lower == "u":
+                self.hide_unsupported = not self.hide_unsupported
+                self._apply_view_change()
+                return True
+            if key_lower == "s":
+                self._cycle_unified_sort_mode()
+                return True
+            if key_lower == "f":
+                self._cycle_unified_filter_mode()
+                return True
             if key_text == "/":
                 return self._start_unified_process_filter()
             if key_text == "O":
@@ -7522,13 +7105,9 @@ class NVClientPool:
             if key_text == "K" or key_name == "KEY_F9":
                 return self._request_process_signal("KILL")
             if key_lower == "t":
-                if max(0, int(self._unified_gpu_count or 0)) == 0:
+                if self._unified_gpu_count == 0:
                     return False
-                self.unified_show_trends = not getattr(
-                    self,
-                    "unified_show_trends",
-                    False,
-                )
+                self.unified_show_trends = not self.unified_show_trends
                 self._apply_view_change()
                 return True
             if key_name in {"KEY_TAB", "KEY_BTAB"} or key_text == "\t":
@@ -7559,15 +7138,11 @@ class NVClientPool:
             if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN", "KEY_PGDOWN"}:
                 if process_pane:
                     return self._move_unified_process_selection(5)
-                return self._move_unified_selection(
-                    max(1, int(self._unified_page_size or 1))
-                )
+                return self._move_unified_selection(max(1, self._unified_page_size))
             if key_name in {"KEY_PPAGE", "KEY_PAGEUP", "KEY_PGUP"}:
                 if process_pane:
                     return self._move_unified_process_selection(-5)
-                return self._move_unified_selection(
-                    -max(1, int(self._unified_page_size or 1))
-                )
+                return self._move_unified_selection(-max(1, self._unified_page_size))
             if enter_pressed or key_text == " ":
                 return self._enter_unified_process_pane()
             return False
@@ -7592,30 +7167,6 @@ class NVClientPool:
             self._request_ui_refresh()
             return True
         return False
-
-    def _keyboard_listener(self, cbreak_context):
-        """Real-time keyboard listener thread, monitors keys for navigation and control."""
-        parser = MouseSequenceParser()
-        try:
-            while not self.quit_flag.is_set():
-                try:
-                    key = self.term.inkey(timeout=0.1)
-                    if not key:
-                        # An escape that never became a mouse report is just Esc.
-                        for pending in parser.flush():
-                            self._handle_keypress(pending)
-                        continue
-                    events, keys = parser.feed(key)
-                    for event in events:
-                        self._handle_mouse_event(event)
-                    for pending in keys:
-                        self._handle_keypress(pending)
-                except KeyboardInterrupt:
-                    break
-        except Exception as error:
-            # Swallowing this silently would hide every input bug behind a
-            # dead keyboard, so at least log it before the listener dies.
-            logging.error(msg=f"Keyboard listener crashed: {error}")
 
     def _start_mouse_reporting(self):
         """Ask the terminal for SGR mouse reports, when the user wants them."""
@@ -7725,7 +7276,7 @@ class NVClientPool:
             self.cached_raw_stats = raw
         # Phase-only transitions do not change the normal frame. Actual data
         # publications still wake the UI immediately.
-        if getattr(self, "debug", False):
+        if self.debug:
             self.refresh_needed.set()
 
     def _refresh_node(self, idx, interval_seconds):
@@ -7876,7 +7427,7 @@ class NVClientPool:
                         self.refresh_needed.clear()
                         self.print_stats(use_cache=True)
                         next_draw = time.monotonic() + 1.0
-                    elif getattr(self, "_tui_hover_dirty", False):
+                    elif self._tui_hover_dirty:
                         if not self._paint_tui_hover():
                             self.print_stats(use_cache=True)
                     self._answer_secret_request()
@@ -7918,9 +7469,7 @@ class NVClientPool:
         print(f"Time: {current_time} | {server_label}: {server_count}")
         print("-" * separator_width)
 
-        meta = {}
-        if isinstance(raw_stats_by_client, dict):
-            meta = raw_stats_by_client.get("_nvidb", {}) or {}
+        meta = raw_stats_by_client.get("_nvidb") or {}
         user_memory_by_client = meta.get("user_memory_by_client", {}) or {}
         global_user_memory = meta.get("user_memory_global", {}) or {}
 
@@ -7930,20 +7479,17 @@ class NVClientPool:
             stats, system_info = raw_stats_by_client.get(idx, (pd.DataFrame(), {}))
 
             # Build summary
-            summary = self._get_server_summary(stats, system_info)
+            summary = self._format_server_summary(self._get_server_summary_data(stats, system_info))
 
             # Print header with summary
             print(f"[{position + 1}] {client.description}  {summary}")
 
             # Print the full stats table
             print(stats_info)
-            if isinstance(user_memory_by_client, dict):
-                user_summary = user_memory_by_client.get(idx, {}) or {}
-            else:
-                user_summary = {}
+            user_summary = user_memory_by_client.get(idx) or {}
             if user_summary:
-                print(f"Users: {self._format_user_memory_totals(user_summary, max_users=12)}")
+                print(f"Users: {self._format_user_memory_totals(user_summary)}")
             print()  # Add spacing after each server
 
         if global_user_memory:
-            print(f"Users (all nodes): {self._format_user_memory_totals(global_user_memory, max_users=12)}")
+            print(f"Users (all nodes): {self._format_user_memory_totals(global_user_memory)}")

@@ -313,7 +313,7 @@ def test_a_dropped_node_keeps_its_error_line_in_the_unified_view():
 
     lines = [
         _without_ansi(line)
-        for line in pool._get_unified_node_status_lines(raw_stats, last_update_time=1)
+        for line in pool._get_unified_node_status_lines(raw_stats)
     ]
 
     assert any("! training-node (100.64.0.42): Connection lost" in line for line in lines)

@@ -173,7 +173,7 @@ def test_pending_nodes_remain_visible_and_expand_when_they_arrive(make_pool, mon
         assert "Test GPU" in frame
         assert pool.expanded_servers == {0, 1}
         assert not pool._default_expansion_applied
-        status = "\n".join(pool._get_unified_node_status_lines(pool.cached_raw_stats, time.time()))
+        status = "\n".join(pool._get_unified_node_status_lines(pool.cached_raw_stats))
         assert "slow" in status and "Connecting SSH" in status
         assert "without GPU support" not in status
         pool._publish_node_sample(1, sample, phase="ready", started=time.time(), timings={})
