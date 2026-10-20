@@ -2,9 +2,6 @@ import math
 import re
 
 
-def units_from_str(s: str) -> str:
-    return ''.join(filter(str.isalpha, s))
-
 def extract_numbers(s):
     # 捕获整数和小数部分，包括前导零和小数点
     return re.findall(r'\d+\.?\d*', s)

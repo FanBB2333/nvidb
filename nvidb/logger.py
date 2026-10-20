@@ -246,7 +246,7 @@ def run_sqlite_logger(server_list=None, interval=5, db_path=None):
     print(f"Starting GPU logging to: {logger.db_path}")
     print(f"Interval: {logger.interval} seconds")
     print(f"Remote servers: {'Yes' if server_list else 'No (local only)'}")
-    print("Press Ctrl+C to stop and save data\n")
+    print("Rows are written every interval; press Ctrl+C to stop\n")
     
     if not logger.start_logging():
         print("Failed to start logging")
