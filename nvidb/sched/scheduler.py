@@ -3422,8 +3422,8 @@ class Scheduler:
         ]
         return view
 
-    def snapshot(self, *, include_ignored: bool = False) -> Dict[str, Any]:
-        """A single JSON-friendly view of the whole queue, for other tools."""
+    def node_views(self, *, include_ignored: bool = False) -> List[Dict[str, Any]]:
+        """The nodes the UIs show, each masked by its GPU allowlist."""
         headroom = int(self.settings["headroom_mb"])
         nodes = dbm.get_nodes(self.conn, include_ignored=include_ignored)
         if not include_ignored:
@@ -3437,6 +3437,12 @@ class Scheduler:
             nodes = [
                 node for node in nodes if node.name in self._configured_nodes
             ]
+        return [self._node_view(node, headroom) for node in nodes]
+
+    def snapshot(self, *, include_ignored: bool = False) -> Dict[str, Any]:
+        """A single JSON-friendly view of the whole queue, for other tools."""
+        headroom = int(self.settings["headroom_mb"])
+        nodes = self.node_views(include_ignored=include_ignored)
         jobs = dbm.list_jobs(self.conn, states=["pending", "running"])
         recent = dbm.list_jobs(self.conn, limit=20, newest_first=True)
         recent_terminal = [job for job in recent if job.is_terminal][:10]
@@ -3474,7 +3480,7 @@ class Scheduler:
             # should have waited for. They are counted as pending above, so
             # they need saying separately or they read as ordinary queueing.
             "held": [job.to_dict() for job in dbm.held_jobs(self.conn)],
-            "nodes": [self._node_view(node, headroom) for node in nodes],
+            "nodes": nodes,
             "lanes": self.lanes(),
             "pools": self.pools(),
             "jobs": [job.to_dict() for job in jobs],

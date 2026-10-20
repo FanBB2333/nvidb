@@ -848,14 +848,9 @@ def cmd_nodes(args) -> int:
     scheduler = _open(args)
     try:
         _refresh(scheduler, args)
-        headroom = int(scheduler.settings["headroom_mb"])
-        nodes = [
-            node.to_dict(headroom)
-            for node in dbm.get_nodes(
-                scheduler.conn,
-                include_ignored=bool(getattr(args, "include_ignored", False)),
-            )
-        ]
+        nodes = scheduler.node_views(
+            include_ignored=bool(getattr(args, "include_ignored", False))
+        )
         if args.json:
             _print_json({"nodes": nodes})
         else:
@@ -1004,7 +999,9 @@ def cmd_lanes(args) -> int:
     scheduler = _open(args)
     try:
         _refresh(scheduler, args)
-        node = dbm.resolve_node_name(scheduler.conn, args.node) if args.node else None
+        # An unknown or ambiguous name filters on itself and matches nothing,
+        # rather than resolving to None and listing every node's lanes.
+        node = (dbm.resolve_node_name(scheduler.conn, args.node) or args.node) if args.node else None
         lanes = scheduler.lanes(node=node)
         if args.json:
             _print_json({"lanes": lanes})
@@ -1384,7 +1381,7 @@ def cmd_list(args) -> int:
             jobs = dbm.list_jobs(
                 scheduler.conn,
                 states=states,
-                node=dbm.resolve_node_name(scheduler.conn, args.node) if args.node else None,
+                node=(dbm.resolve_node_name(scheduler.conn, args.node) or args.node) if args.node else None,
                 limit=args.number,
                 newest_first=bool(args.number),
             )
@@ -1446,15 +1443,17 @@ def cmd_logs(args) -> int:
         seen = ""
         try:
             while True:
+                job = dbm.get_job(scheduler.conn, job.id)
+                if job is None:
+                    break
+                # Decided before the read, so the lines a job writes as it
+                # finishes are in the last read rather than after it.
+                done = job.is_terminal
                 text = scheduler.job_logs(job.id, stream=stream, lines=args.number)
-                if text.startswith(seen):
-                    sys.stdout.write(text[len(seen):])
-                else:
-                    sys.stdout.write(text)
+                sys.stdout.write(_unseen(seen, text))
                 sys.stdout.flush()
                 seen = text
-                job = dbm.get_job(scheduler.conn, job.id)
-                if job is None or job.is_terminal:
+                if done:
                     break
                 time.sleep(2)
                 scheduler.tick()
@@ -1463,6 +1462,21 @@ def cmd_logs(args) -> int:
         return 0
     finally:
         scheduler.close()
+
+
+def _unseen(seen: str, text: str) -> str:
+    """What a fresh `tail -n` window adds to the one printed before it.
+
+    Once the log outgrows the window the window slides, so the new tail no
+    longer starts with the old one but with some later line of it. The
+    longest such overlap is what was already printed.
+    """
+    start = 0
+    while not text.startswith(seen[start:]):
+        start = seen.find("\n", start) + 1
+        if not start:
+            return text
+    return text[len(seen) - start:]
 
 
 def _wait_for(scheduler: Scheduler, job_ids: Sequence[int], *, timeout: Optional[int]) -> List[Job]:
@@ -1804,13 +1818,30 @@ def cmd_tui(args) -> int:
 
 # --- parser wiring ---------------------------------------------------------
 
+# Every subcommand repeats the shared flags so they also work after it, but
+# its copies default to SUPPRESS: argparse copies a subcommand's defaults over
+# what its parent parsed, which would silently undo `nvidb queue --local
+# status`. The real defaults are set once, on the `queue` and `job` roots.
+SHARED_DEFAULTS = {
+    "json": False,
+    "db_path": None,
+    "local": False,
+    "tick": False,
+    "no_tick": False,
+}
+
+
 def _add_common(parser: argparse.ArgumentParser, *, json_flag: bool = True) -> None:
     if json_flag:
-        parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    parser.add_argument("--db-path", default=None, help="Queue database path")
+        parser.add_argument(
+            "--json", action="store_true", default=argparse.SUPPRESS,
+            help="Emit machine-readable JSON",
+        )
+    parser.add_argument("--db-path", default=argparse.SUPPRESS, help="Queue database path")
     parser.add_argument(
         "--local",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Use this machine's own queue even when a remote queue host is configured",
     )
 
@@ -1818,10 +1849,12 @@ def _add_common(parser: argparse.ArgumentParser, *, json_flag: bool = True) -> N
 def _add_refresh_flags(parser: argparse.ArgumentParser) -> None:
     """Reads refresh on their own; these flags force or suppress that."""
     parser.add_argument(
-        "--tick", action="store_true", help="Force a refresh even if one just ran"
+        "--tick", action="store_true", default=argparse.SUPPRESS,
+        help="Force a refresh even if one just ran",
     )
     parser.add_argument(
-        "--no-tick", action="store_true", help="Read the database without contacting nodes"
+        "--no-tick", action="store_true", default=argparse.SUPPRESS,
+        help="Read the database without contacting nodes",
     )
 
 
@@ -1859,7 +1892,7 @@ def _register_queue_parsers(subparsers) -> None:
     )
     # `queue_cli` is how the main entry point recognises these commands, rather
     # than matching on a subcommand name that a positional could shadow.
-    queue.set_defaults(func=cmd_tui, queue_cli=True)
+    queue.set_defaults(func=cmd_tui, queue_cli=True, **SHARED_DEFAULTS)
     queue_sub = queue.add_subparsers(dest="queue_command")
 
     status = queue_sub.add_parser("status", help="Show nodes, capacity and jobs")
@@ -2016,7 +2049,7 @@ def _register_queue_parsers(subparsers) -> None:
 
     tui = queue_sub.add_parser("tui", help="Open the interactive queue TUI")
     _add_common(tui, json_flag=False)
-    tui.add_argument("--refresh", type=float, default=3.0)
+    tui.add_argument("--refresh", type=float, default=argparse.SUPPRESS)
     tui.set_defaults(func=cmd_tui)
 
 def _register_lane_parser(queue_sub) -> None:
@@ -2068,7 +2101,7 @@ def _register_lane_parser(queue_sub) -> None:
         action="store_true",
         help="Remove the job from its lane and let the scheduler place it",
     )
-    lane_assign.add_argument("--no-tick", action="store_true")
+    lane_assign.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
     lane_assign.set_defaults(func=cmd_lane_assign)
 
     lane_pause = lane_sub.add_parser(
@@ -2080,14 +2113,14 @@ def _register_lane_parser(queue_sub) -> None:
 
     lane_resume = lane_sub.add_parser("resume", help="Start running this lane again")
     _add_common(lane_resume)
-    lane_resume.add_argument("--no-tick", action="store_true")
+    lane_resume.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
     lane_resume.set_defaults(func=cmd_lane_pause, action="resume")
 
     lane_skip = lane_sub.add_parser(
         "skip", help="Send the next job to the back of the lane"
     )
     _add_common(lane_skip)
-    lane_skip.add_argument("--no-tick", action="store_true")
+    lane_skip.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
     lane_skip.set_defaults(func=cmd_lane_skip)
 
     lane_runner = lane_sub.add_parser(
@@ -2155,6 +2188,7 @@ def _register_job_parsers(subparsers) -> None:
     job.set_defaults(
         queue_cli=True,
         func=lambda args: _error("pick a job subcommand (submit, ls, show, wait, ...)"),
+        **SHARED_DEFAULTS,
     )
 
     _register_submit_parser(job_sub)
@@ -2211,7 +2245,7 @@ def _register_submit_parser(job_sub) -> None:
                         help="Use a local file's contents as the command body")
     submit.add_argument("--wait", action="store_true", help="Block until the job finishes")
     submit.add_argument("--wait-timeout", type=int, default=None, metavar="SECONDS")
-    submit.add_argument("--no-tick", action="store_true", help="Do not schedule right away")
+    submit.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS, help="Do not schedule right away")
     # `dest` must not be "command": the top-level parser already stores the
     # chosen subcommand there, and a positional of the same name would clobber it.
     submit.add_argument(
@@ -2263,7 +2297,7 @@ def _register_job_control_parsers(job_sub) -> None:
     _add_common(cancel)
     cancel.add_argument("ids", nargs="+")
     cancel.set_defaults(func=cmd_cancel)
-    cancel.add_argument("--no-tick", action="store_true", help="Skip keeper ensure and scheduling; still cancel the requested jobs")
+    cancel.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS, help="Skip keeper ensure and scheduling; still cancel the requested jobs")
 
     release = job_sub.add_parser(
         "release",
@@ -2276,7 +2310,7 @@ def _register_job_control_parsers(job_sub) -> None:
     )
     _add_common(release)
     release.add_argument("ids", nargs="+")
-    release.add_argument("--no-tick", action="store_true")
+    release.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
     release.set_defaults(func=cmd_release)
 
     edit = job_sub.add_parser(
@@ -2303,13 +2337,13 @@ def _register_job_control_parsers(job_sub) -> None:
     edit.add_argument("--add-after-any", action="append", default=[], metavar="ID",
                       help="Also wait for this job to finish, whatever the outcome")
     edit.add_argument("--drop-after-any", action="append", default=[], metavar="ID")
-    edit.add_argument("--no-tick", action="store_true")
+    edit.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
     edit.set_defaults(func=cmd_edit)
 
     requeue = job_sub.add_parser("requeue", help="Re-queue finished jobs")
     _add_common(requeue)
     requeue.add_argument("ids", nargs="+")
-    requeue.add_argument("--no-tick", action="store_true")
+    requeue.add_argument("--no-tick", action="store_true", default=argparse.SUPPRESS)
     requeue.set_defaults(func=cmd_requeue)
 
 def _register_job_metadata_parsers(job_sub) -> None:

@@ -796,3 +796,81 @@ def test_daemon_survives_a_lost_scheduler_lease(parser, monkeypatch, capsys):
     assert scheduler.calls == 2
     assert scheduler.closed
     assert json.loads(capsys.readouterr().out)["tick"]["skipped"] == "lease_lost"
+
+
+def test_flags_given_before_a_subcommand_are_kept(parser):
+    """argparse copies a subcommand's defaults over what its parent parsed."""
+    args = parser.parse_args(["queue", "--local", "--json", "--db-path", "/x", "status"])
+    assert (args.local, args.json, args.db_path) == (True, True, "/x")
+    args = parser.parse_args(["queue", "lane", "box:0", "--no-tick", "--json", "skip"])
+    assert (args.no_tick, args.json) == (True, True)
+    assert parser.parse_args(["queue", "--refresh", "1", "tui"]).refresh == 1.0
+    # Every command still gets every shared key, with the usual defaults.
+    for argv in (["job"], ["job", "ls"], ["queue", "tick"], ["queue", "tui"]):
+        args = parser.parse_args(argv)
+        assert (args.json, args.local, args.db_path, args.tick, args.no_tick) == (
+            False, False, None, False, False,
+        )
+
+
+def test_an_unknown_node_filter_matches_nothing(parser, queue_db, capsys):
+    conn = dbm.open_db(queue_db)
+    try:
+        for name in ("box406", "box407"):
+            dbm.upsert_node(conn, name)
+            dbm.ensure_lane(conn, f"{name}:0", node=name, gpu_ids=[0])
+            job_id = dbm.insert_job(conn, command="sleep 1")
+            dbm.update_job(conn, job_id, state="running", node=name)
+    finally:
+        conn.close()
+
+    # "box" is ambiguous and "typo" unknown: neither may widen to every node.
+    for query, expected in (("box406", ["box406"]), ("typo", []), ("box", [])):
+        assert _run(parser, ["job", "ls", "--node", query, "--json", "--no-tick"], queue_db) == 0
+        assert [job["node"] for job in json.loads(capsys.readouterr().out)["jobs"]] == expected
+        assert _run(parser, ["queue", "lanes", "--node", query, "--json", "--no-tick"], queue_db) == 0
+        assert [lane["node"] for lane in json.loads(capsys.readouterr().out)["lanes"]] == expected
+
+
+def test_unseen_skips_what_a_sliding_log_window_already_showed():
+    assert sched_cli._unseen("", "a\nb\n") == "a\nb\n"
+    assert sched_cli._unseen("a\nb", "a\nbc\n") == "c\n"
+    assert sched_cli._unseen("a\nb\nc\n", "b\nc\nd\n") == "d\n"
+    assert sched_cli._unseen("a\nb\n", "x\ny\n") == "x\ny\n"
+
+
+def test_follow_prints_each_log_line_once(parser, monkeypatch, capsys):
+    """Past `-n` lines the tail slides; the lines written as the job ends still show."""
+    from types import SimpleNamespace
+
+    log = [f"line {i}\n" for i in range(1, 6)]
+    state = {"done": False}
+
+    class FakeScheduler:
+        conn = None
+
+        def job_logs(self, job_id, *, stream, lines):
+            return "".join(log[-lines:])
+
+        def tick(self, **kwargs):
+            if len(log) == 5:
+                log.extend(["line 6\n", "line 7\n"])
+            else:
+                # The job writes its last line and is marked finished by
+                # another client before this follower reads again.
+                log.append("line 8\n")
+                state["done"] = True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sched_cli, "_open", lambda args: FakeScheduler())
+    monkeypatch.setattr(sched_cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        sched_cli.dbm,
+        "get_job",
+        lambda conn, job_id: SimpleNamespace(id=job_id, is_terminal=state["done"]),
+    )
+    args = parser.parse_args(["job", "logs", "1", "-f", "-n", "3", "--no-tick"])
+    assert sched_cli.cmd_logs(args) == 0
+    assert capsys.readouterr().out == "".join(f"line {i}\n" for i in range(3, 9))

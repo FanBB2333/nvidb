@@ -1,4 +1,5 @@
 """A server entry's `gpu_ids:` key picks which of its cards nvidb uses."""
+import json
 import os
 import sys
 from pathlib import Path
@@ -284,3 +285,20 @@ def test_empty_allowlist_still_permits_cpu_only_jobs(tmp_path):
     finally:
         scheduler.close()
         conn.close()
+
+
+def test_queue_nodes_shows_only_the_gpus_the_queue_was_given(masked_scheduler, monkeypatch, capsys):
+    """`queue nodes` must mask the same cards the NODES block of `queue status` does."""
+    from nvidb.sched import cli as sched_cli
+
+    scheduler, _cluster = masked_scheduler
+    scheduler.tick(force=True)
+    root = sched_cli.ArgumentParser(prog="nvidb")
+    sched_cli.register_parsers(root.add_subparsers(dest="command"))
+    monkeypatch.setattr(sched_cli, "_open", lambda args: scheduler)
+
+    args = root.parse_args(["queue", "nodes", "--json", "--no-tick", "--local"])
+    assert sched_cli.dispatch(args) == 0
+    nodes = json.loads(capsys.readouterr().out)["nodes"]
+    node = next(item for item in nodes if item["name"] == "shared-box")
+    assert [gpu["index"] for gpu in node["gpus"]] == [0, 1]
