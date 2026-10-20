@@ -910,7 +910,7 @@ def test_editing_dependencies_reattaches_a_held_job(scheduler, cluster):
     assert dbm.get_job(scheduler.conn, second).is_held
 
     replacement = scheduler.submit("stage1-again", vram="1G", node="small-node")
-    scheduler.edit_dependencies(second, add=[replacement], drop=[first])
+    scheduler.edit_job(second, add=[replacement], drop=[first])
     job = dbm.get_job(scheduler.conn, second)
     assert job.depends_on == [replacement]
     assert job.held_reason is None
@@ -983,13 +983,13 @@ def test_a_dependency_edit_refuses_to_build_a_cycle(scheduler):
     first = scheduler.submit("a")
     second = scheduler.submit("b", depends_on=[first])
     with pytest.raises(ValueError, match="deadlock"):
-        scheduler.edit_dependencies(first, add=[second])
+        scheduler.edit_job(first, add=[second])
 
 
 def test_a_job_cannot_be_made_to_depend_on_itself(scheduler):
     job_id = scheduler.submit("a")
     with pytest.raises(ValueError, match="itself"):
-        scheduler.edit_dependencies(job_id, add=[job_id])
+        scheduler.edit_job(job_id, add=[job_id])
 
 
 def test_releasing_a_job_that_is_not_held_changes_nothing(scheduler):
