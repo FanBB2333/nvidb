@@ -205,7 +205,7 @@ def format_servers_yaml(servers) -> str:
         port = server.get("port", 22)
         try:
             port_int = int(port)
-        except Exception:
+        except (TypeError, ValueError):
             port_int = 22
         lines.append(f"    port: {port_int}")
 
@@ -246,20 +246,8 @@ def format_config_yaml(cfg: dict) -> str:
     """Render the whole config file: `basic`, other sections, then `servers`."""
     import yaml
 
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    servers = cfg.get("servers", []) or []
-
-    header_cfg = {}
-    if "basic" in cfg:
-        header_cfg["basic"] = cfg.get("basic")
-    else:
-        header_cfg["basic"] = {"compact": False}
-    for key, value in cfg.items():
-        if key in {"basic", "servers"}:
-            continue
-        header_cfg[key] = value
+    header_cfg = {"basic": cfg.get("basic", {"compact": False})}
+    header_cfg.update((key, value) for key, value in cfg.items() if key not in {"basic", "servers"})
 
     header_text = yaml.safe_dump(
         header_cfg,
@@ -267,7 +255,7 @@ def format_config_yaml(cfg: dict) -> str:
         allow_unicode=True,
         default_flow_style=False,
     ).rstrip("\n")
-    servers_text = format_servers_yaml(servers).rstrip("\n")
+    servers_text = format_servers_yaml(cfg.get("servers") or []).rstrip("\n")
     return f"{header_text}\n\n{servers_text}\n"
 
 
@@ -291,24 +279,20 @@ def write_config(cfg: dict, config_path=None):
     _write_text_atomic(path, format_config_yaml(cfg))
 
 
+def _choice(options):
+    def convert(value):
+        if isinstance(value, str) and value in options:
+            return value
+        raise ValueError(f"not one of {options}: {value!r}")
+    return convert
+
+
+_VIEW_CONVERTERS = {key: _choice(options) for key, options in VIEW_SETTING_CHOICES.items()}
+
+
 def normalize_view_settings(raw) -> dict:
     """Merge stored view settings over the defaults, dropping invalid values."""
-    settings = dict(DEFAULT_VIEW_SETTINGS)
-    if not isinstance(raw, dict):
-        return settings
-
-    for key, default in DEFAULT_VIEW_SETTINGS.items():
-        if key not in raw:
-            continue
-        value = raw[key]
-        choices = VIEW_SETTING_CHOICES.get(key)
-        if choices is not None:
-            if isinstance(value, str) and value in choices:
-                settings[key] = value
-            continue
-        if isinstance(default, bool):
-            settings[key] = bool(value)
-    return settings
+    return merge_settings(DEFAULT_VIEW_SETTINGS, raw, converters=_VIEW_CONVERTERS)
 
 
 def load_view_settings(config_path=None, cfg=None) -> dict:
@@ -375,18 +359,14 @@ def _replace_top_level_block(text: str, key: str, block: str) -> str:
     return "".join(lines[:start]) + block + "".join(lines[end:])
 
 
-def save_view_settings(settings, config_path=None) -> bool:
+def save_view_settings(settings, config_path=None):
     """Persist TUI view settings, keeping the rest of config.yml untouched."""
     path = Path(config_path or get_config_path()).expanduser()
     settings = normalize_view_settings(settings)
-    try:
-        if not path.exists():
-            write_config({"view": settings}, path)
-            return True
-        text = path.read_text(encoding="utf-8")
-        updated = _replace_top_level_block(text, "view", _render_view_block(settings))
-        if updated != text:
-            _write_text_atomic(path, updated)
-        return True
-    except Exception:
-        return False
+    if not path.exists():
+        write_config({"view": settings}, path)
+        return
+    text = path.read_text(encoding="utf-8")
+    updated = _replace_top_level_block(text, "view", _render_view_block(settings))
+    if updated != text:
+        _write_text_atomic(path, updated)

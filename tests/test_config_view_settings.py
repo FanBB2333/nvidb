@@ -31,7 +31,7 @@ def test_view_settings_round_trip_keeps_servers_and_basic(monkeypatch, tmp_path)
         }
     )
 
-    assert config.save_view_settings(
+    config.save_view_settings(
         {
             "mode": "unified",
             "detailed": True,
@@ -77,9 +77,9 @@ def test_saving_view_settings_preserves_comments_and_layout(monkeypatch, tmp_pat
     )
     config_path.write_text(original)
 
-    assert config.save_view_settings(config.DEFAULT_VIEW_SETTINGS)
+    config.save_view_settings(config.DEFAULT_VIEW_SETTINGS)
     once = config_path.read_text()
-    assert config.save_view_settings({**config.DEFAULT_VIEW_SETTINGS, "mode": "unified"})
+    config.save_view_settings({**config.DEFAULT_VIEW_SETTINGS, "mode": "unified"})
     twice = config_path.read_text()
 
     for text in (once, twice):
@@ -116,3 +116,4 @@ def test_invalid_view_settings_fall_back_to_defaults(monkeypatch, tmp_path):
     assert settings["filter"] == "all"
     assert settings["detailed"] is True
     assert "unknown" not in settings
+

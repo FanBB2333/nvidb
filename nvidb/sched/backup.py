@@ -35,12 +35,8 @@ def default_directory() -> Path:
 def load_settings(queue_settings: Optional[dict] = None) -> Dict[str, Any]:
     """Normalize ``queue.backup`` without making malformed values fatal."""
     raw = queue_settings.get("backup") if isinstance(queue_settings, dict) else None
-    if raw is False:
-        return dict(DEFAULT_SETTINGS)
     if raw is True:
-        settings = dict(DEFAULT_SETTINGS)
-        settings["enabled"] = True
-        return settings
+        raw = {"enabled": True}
     if not isinstance(raw, dict):
         return dict(DEFAULT_SETTINGS)
 
@@ -161,7 +157,7 @@ def create(
         target = Path(destination).expanduser()
         if _same_path(source, target):
             raise ValueError("backup destination is the queue database itself")
-        if target.exists() and target.is_dir():
+        if target.is_dir():
             backup_dir = target
             target = _generated_path(backup_dir, created)
             generated = True
@@ -171,9 +167,6 @@ def create(
             backup_dir = target.parent
     else:
         target = _generated_path(backup_dir, created)
-
-    if _same_path(source, target):
-        raise ValueError("backup destination is the queue database itself")
 
     backup_dir.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -225,7 +218,7 @@ def create(
             pass
 
     dbm.set_meta(conn, LAST_BACKUP_META, created_at)
-    removed = _prune(backup_dir, int(keep))
+    removed = _prune(backup_dir, keep)
     return {
         "path": str(target),
         "source": str(source),
@@ -256,7 +249,7 @@ def maybe_create(
         # the due backup while this process was waiting for the scheduler.
         current = now or _utc_now()
         previous = _parse_iso(dbm.get_meta(conn, LAST_BACKUP_META))
-        interval_seconds = float(settings["interval_hours"]) * 3600
+        interval_seconds = settings["interval_hours"] * 3600
         if (
             previous is not None
             and (current - previous).total_seconds() < interval_seconds
@@ -265,7 +258,7 @@ def maybe_create(
 
         return create(
             conn,
-            keep=int(settings["keep"]),
+            keep=settings["keep"],
             directory=settings["directory"],
             now=current,
         )

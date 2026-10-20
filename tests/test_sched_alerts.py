@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
 
 from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.notify import Notifier, format_alert, load_notify_settings  # noqa: E402
+from nvidb.sched.notify import Notifier, load_notify_settings  # noqa: E402
 from nvidb.sched.scheduler import Scheduler  # noqa: E402
 
 
@@ -462,16 +462,6 @@ def test_the_log_channel_appends_one_json_line_per_alert(tmp_path, monkeypatch):
     )
     lines = log_path.read_text().strip().splitlines()
     assert [json.loads(line)["title"] for line in lines] == ["a", "b"]
-
-
-def test_the_alert_summary_names_the_job_and_the_node():
-    assert format_alert(
-        {"title": "train failed", "job_id": 12, "node": "big-node"}
-    ) == "train failed [job 12 on big-node]"
-    assert format_alert({"title": "node down", "node": "big-node"}) == (
-        "node down [big-node]"
-    )
-    assert format_alert({"title": "something"}) == "something"
 
 
 def test_desktop_failure_is_logged_without_blocking_other_alert_channels(monkeypatch, tmp_path, caplog):

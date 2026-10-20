@@ -29,7 +29,6 @@ from .. import config as nvidb_config
 SCRIPT_NAME = "queue-keeper.sh"
 PID_NAME = "queue-keeper.pid"
 LOG_NAME = "queue-keeper.log"
-SESSION_NAME = "queue-keeper.session"
 LOCK_NAME = "queue-keeper.lock"
 TOKEN_NAME = "queue-keeper.token"
 MANAGER_NAME = "queue-keeper.manager"
@@ -149,23 +148,15 @@ def resolve_nvidb_binary(explicit: Optional[str] = None) -> str:
     )
 
 
-def render(
-    *,
-    nvidb_bin: str,
-    interval: int = DEFAULT_INTERVAL,
-    manager_name: str = "shell",
-    token: Optional[str] = None,
-) -> str:
+def render(*, nvidb_bin: str, interval: int, manager_name: str, token: str) -> str:
     """Fill the shipped template in for this machine."""
-    if manager_name not in MANAGERS:
-        raise ValueError(f"unknown keeper manager: {manager_name}")
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     return (
         template.replace("__NVIDB_HOME__", shlex.quote(str(home())))
         .replace("__NVIDB_BIN__", shlex.quote(str(nvidb_bin)))
         .replace("__INTERVAL__", str(int(interval)))
         .replace("__MANAGER__", shlex.quote(manager_name))
-        .replace("__KEEPER_TOKEN__", shlex.quote(token or secrets.token_hex(16)))
+        .replace("__KEEPER_TOKEN__", shlex.quote(token))
         .replace("__SYSTEMD_UNIT__", shlex.quote(SYSTEMD_UNIT_NAME))
         .replace("__LAUNCHD_LABEL__", shlex.quote(LAUNCHD_LABEL))
         .replace("__LAUNCHD_PLIST__", shlex.quote(str(launchd_unit_path())))
@@ -232,6 +223,28 @@ def _command_error(result: subprocess.CompletedProcess) -> str:
     return (result.stderr or result.stdout or f"exit {result.returncode}").strip()
 
 
+def _daemon_reload() -> None:
+    reloaded = _systemctl("daemon-reload")
+    if reloaded.returncode != 0:
+        raise RuntimeError(
+            f"systemctl --user daemon-reload failed: {_command_error(reloaded)}"
+        )
+
+
+def _log_location(manager_name: str) -> str:
+    if manager_name == "systemd":
+        return f"journalctl --user -u {SYSTEMD_UNIT_NAME}"
+    return str(log_file())
+
+
+def _unit_location(manager_name: str) -> Optional[str]:
+    if manager_name == "systemd":
+        return str(systemd_unit_path())
+    if manager_name == "launchd":
+        return str(launchd_unit_path())
+    return None
+
+
 def install(
     *,
     nvidb_bin: Optional[str] = None,
@@ -278,7 +291,11 @@ def install(
 
     unit = systemd_unit_path()
     if manager_name == "launchd":
-        _write_atomic(launchd_unit_path(), render_launchd_unit(nvidb_bin=resolved, interval=interval), mode=0o644)
+        _write_atomic(
+            launchd_unit_path(),
+            render_launchd_unit(nvidb_bin=resolved, interval=interval),
+            mode=0o644,
+        )
     elif previous_manager == "launchd" and launchd_unit_path().exists():
         launchd_unit_path().unlink()
     if manager_name == "systemd":
@@ -287,25 +304,12 @@ def install(
             render_systemd_unit(nvidb_bin=resolved, interval=interval),
             mode=0o644,
         )
-        reloaded = _systemctl("daemon-reload")
-        if reloaded.returncode != 0:
-            raise RuntimeError(
-                f"systemctl --user daemon-reload failed: {_command_error(reloaded)}"
-            )
+        _daemon_reload()
     elif previous_manager == "systemd" and unit.exists():
         unit.unlink()
         if shutil.which("systemctl"):
-            reloaded = _systemctl("daemon-reload")
-            if reloaded.returncode != 0:
-                raise RuntimeError(
-                    f"systemctl --user daemon-reload failed: {_command_error(reloaded)}"
-                )
+            _daemon_reload()
 
-    log = (
-        f"journalctl --user -u {SYSTEMD_UNIT_NAME}"
-        if manager_name == "systemd"
-        else str(log_file())
-    )
     _reset_status_cache()
     return {
         "script": str(target),
@@ -313,9 +317,8 @@ def install(
         "interval": int(interval),
         "replaced": existed,
         "manager": manager_name,
-        "unit": (str(unit) if manager_name == "systemd" else
-                 str(launchd_unit_path()) if manager_name == "launchd" else None),
-        "log": log,
+        "unit": _unit_location(manager_name),
+        "log": _log_location(manager_name),
     }
 
 
@@ -342,11 +345,11 @@ def _token() -> Optional[str]:
 def _shell_process_matches(pid: int, token: Optional[str]) -> bool:
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError, OverflowError):
+    except (OSError, OverflowError):
         return False
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -424,11 +427,6 @@ def status() -> Dict[str, Any]:
     else:
         pid = _pid()
         running = bool(pid and _shell_process_matches(pid, _token()))
-    log = (
-        f"journalctl --user -u {SYSTEMD_UNIT_NAME}"
-        if manager_name == "systemd"
-        else str(log_file())
-    )
     value = {
         "installed": script_path().exists(),
         "running": running,
@@ -436,9 +434,8 @@ def status() -> Dict[str, Any]:
         "manager": manager_name,
         "stopped": stopped_file().exists(),
         "script": str(script_path()),
-        "unit": (str(systemd_unit_path()) if manager_name == "systemd" else
-                 str(launchd_unit_path()) if manager_name == "launchd" else None),
-        "log": log,
+        "unit": _unit_location(manager_name),
+        "log": _log_location(manager_name),
     }
     _status_cache["at"] = now
     _status_cache["value"] = dict(value)

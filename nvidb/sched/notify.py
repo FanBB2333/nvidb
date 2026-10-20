@@ -51,32 +51,23 @@ def alert_log_path() -> Path:
     return Path(nvidb_config.WORKING_DIR).expanduser() / "alerts.log"
 
 
-def format_alert(alert: Dict[str, Any]) -> str:
-    """One human-readable line: what broke, and where."""
-    where = []
-    if alert.get("job_id"):
-        where.append(f"job {alert['job_id']}")
-    if alert.get("node"):
-        where.append(alert["node"])
-    location = f" [{' on '.join(where)}]" if where else ""
-    return f"{alert['title']}{location}"
+_ALERT_LABELS = {
+    "node_down": "Node unreachable",
+    "node_disk_low": "Disk space low",
+    "job_lost": "Job process lost",
+    "job_retried": "Retrying job",
+    "job_unschedulable": "Job cannot be scheduled",
+    "job_held": "Job needs attention",
+    "job_overdue": "Job overdue",
+    "job_timeout": "Job timed out",
+    "launch_failed": "Job could not start",
+}
 
 
 def desktop_content(alert: Dict[str, Any]) -> Tuple[str, str, str]:
     """Keep the event, its location, and the explanation on separate lines."""
     kind = str(alert["kind"])
-    labels = {
-        "node_down": "Node unreachable",
-        "node_disk_low": "Disk space low",
-        "job_lost": "Job process lost",
-        "job_retried": "Retrying job",
-        "job_unschedulable": "Job cannot be scheduled",
-        "job_held": "Job needs attention",
-        "job_overdue": "Job overdue",
-        "job_timeout": "Job timed out",
-        "launch_failed": "Job could not start",
-    }
-    title = f"nvidb · {labels.get(kind, kind.replace('_', ' ').capitalize())}"
+    title = f"nvidb · {_ALERT_LABELS.get(kind, kind.replace('_', ' ').capitalize())}"
     body = str(alert["title"])
     node = str(alert.get("node") or "")
     location = []
@@ -109,10 +100,10 @@ class Notifier:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.settings.get("enabled"))
+        return self.settings["enabled"]
 
     def wants(self, alert: Dict[str, Any]) -> bool:
-        minimum = SEVERITY_ORDER.get(str(self.settings.get("min_severity", "warning")), 0)
+        minimum = SEVERITY_ORDER.get(str(self.settings["min_severity"]), 0)
         return SEVERITY_ORDER.get(str(alert.get("severity", "error")), 1) >= minimum
 
     def deliver(self, alerts: Sequence[Dict[str, Any]]) -> List[int]:
@@ -145,7 +136,7 @@ class Notifier:
     # --- channels ---------------------------------------------------------
 
     def _to_log(self, alert: Dict[str, Any]) -> None:
-        if not self.settings.get("log"):
+        if not self.settings["log"]:
             return
         path = alert_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +155,7 @@ class Notifier:
         )
 
     def _to_command(self, alert: Dict[str, Any]) -> None:
-        command = self.settings.get("command")
+        command = self.settings["command"]
         if not command:
             return
         subprocess.run(
