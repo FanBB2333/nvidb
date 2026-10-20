@@ -1,4 +1,3 @@
-import shlex
 from pathlib import Path
 
 import pytest
@@ -12,14 +11,14 @@ from nvidb.sched.scheduler import Scheduler
 from nvidb.sched.transport import SSHTransport, TransportError
 from nvidb.ssh_proxy import (
     ProxyJumpError,
-    build_proxy_command,
+    _proxy_command_args,
     normalize_proxyjump,
 )
 from nvidb.test import run as cli_run
 
 
 def test_proxyjump_command_uses_openssh_stdio_forward():
-    command = build_proxy_command(
+    command = _proxy_command_args(
         "login-a,alice@login-b:2222",
         "10.0.0.42",
         2200,
@@ -28,7 +27,7 @@ def test_proxyjump_command_uses_openssh_stdio_forward():
         batch_mode=True,
     )
 
-    assert shlex.split(command) == [
+    assert command == [
         "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
@@ -50,13 +49,13 @@ def test_proxyjump_command_uses_openssh_stdio_forward():
 
 
 def test_proxyjump_command_brackets_an_ipv6_target():
-    command = build_proxy_command(
+    command = _proxy_command_args(
         "jump",
         "2001:db8::42",
         ssh_executable="ssh",
     )
 
-    assert shlex.split(command)[-3:] == ["[2001:db8::42]:22", "--", "jump"]
+    assert command[-3:] == ["[2001:db8::42]:22", "--", "jump"]
 
 
 @pytest.mark.parametrize("value", [None, "", "  ", "none", "NONE"])
@@ -68,7 +67,7 @@ def test_empty_or_disabled_proxyjump_is_normalized_to_none(value):
 def test_invalid_proxyjump_is_rejected(value):
     if value == "jump:bad":
         with pytest.raises(ProxyJumpError):
-            build_proxy_command(value, "gpu", ssh_executable="ssh")
+            _proxy_command_args(value, "gpu", ssh_executable="ssh")
     else:
         with pytest.raises(ProxyJumpError):
             normalize_proxyjump(value)
@@ -120,6 +119,9 @@ class _FakeProxy:
 class _FakeTransportState:
     def is_active(self):
         return True
+
+    def set_keepalive(self, interval):
+        pass
 
 
 class _FakeSSHClient:

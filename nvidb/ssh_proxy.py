@@ -11,7 +11,6 @@ subprocess exiting is an ordinary connection close.
 from __future__ import annotations
 
 import math
-import shlex
 import shutil
 import socket
 import subprocess
@@ -90,7 +89,7 @@ def _final_jump_destination(spec: str):
 
 
 def _proxy_command_args(
-    proxyjump,
+    chain: str,
     hostname: str,
     port: int = 22,
     *,
@@ -98,12 +97,8 @@ def _proxy_command_args(
     connect_timeout: Optional[float] = None,
     batch_mode: bool = False,
 ) -> List[str]:
-    """The OpenSSH argv for the stdio forward."""
-    normalized = normalize_proxyjump(proxyjump)
-    if normalized is None:
-        raise ProxyJumpError("ProxyJump is empty")
-
-    jumps = normalized.split(",")
+    """The OpenSSH argv for the stdio forward over an already normalized chain."""
+    jumps = chain.split(",")
     destination, jump_port = _final_jump_destination(jumps[-1])
 
     args = [str(ssh_executable)]
@@ -119,28 +114,6 @@ def _proxy_command_args(
         args.extend(["-p", str(jump_port)])
     args.extend(["--", destination])
     return args
-
-
-def build_proxy_command(
-    proxyjump,
-    hostname: str,
-    port: int = 22,
-    *,
-    ssh_executable: str = "ssh",
-    connect_timeout: Optional[float] = None,
-    batch_mode: bool = False,
-) -> str:
-    """The stdio-forward command as one shell-quoted string (for display)."""
-    return shlex.join(
-        _proxy_command_args(
-            proxyjump,
-            hostname,
-            port,
-            ssh_executable=ssh_executable,
-            connect_timeout=connect_timeout,
-            batch_mode=batch_mode,
-        )
-    )
 
 
 class _ProxyJumpSocket(socket.socket):
@@ -159,8 +132,7 @@ class _ProxyJumpSocket(socket.socket):
         try:
             super().close()
         finally:
-            process = getattr(self, "_process", None)
-            self._process = None
+            process, self._process = self._process, None
             if process is None:
                 return
             if process.poll() is None:
@@ -176,8 +148,6 @@ class _ProxyJumpSocket(socket.socket):
                     except OSError:
                         pass
                     process.wait()
-            else:
-                process.wait()
 
 
 def open_proxyjump_socket(

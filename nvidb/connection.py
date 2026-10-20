@@ -19,7 +19,7 @@ import threading
 
 import paramiko
 from paramiko import AuthenticationException
-from paramiko.ssh_exception import NoValidConnectionsError, PasswordRequiredException
+from paramiko.ssh_exception import PasswordRequiredException
 import pandas as pd
 from termcolor import colored as _term_colored
 from . import config as nvidb_config
@@ -65,18 +65,17 @@ from .utils import (
 )
 
 
-MONITOR_THEMES = ANSI_THEMES
 _monitor_theme = "classic"
 
 
 def _set_monitor_theme(theme):
     global _monitor_theme
-    _monitor_theme = theme if theme in MONITOR_THEMES else "classic"
+    _monitor_theme = theme if theme in ANSI_THEMES else "classic"
 
 
 def colored(text, color=None, on_color=None, attrs=None):
     """Apply the active monitor palette through termcolor."""
-    mapped = MONITOR_THEMES[_monitor_theme].get(color, color)
+    mapped = ANSI_THEMES[_monitor_theme].get(color, color)
     return _term_colored(text, mapped, on_color, attrs)
 
 
@@ -90,15 +89,145 @@ def _as_gpu_index(value):
 
 def parse_leading_float(value):
     """Return the first numeric component of a text field, or None."""
-    if value is None:
-        return None
     numbers = extract_numbers(str(value))
-    if not numbers:
-        return None
+    return float(numbers[0]) if numbers else None
+
+
+def _xml_text(element, path, default="N/A"):
+    """Text of `path` under an `nvidia-smi -q -x` element, or `default`."""
+    if element is None:
+        return default
+    found = element.find(path)
+    return found.text if found is not None else default
+
+
+def _format_rounded(value, unit, divisor=1):
+    """An NVML reading as a rounded integer with its unit, or "N/A"."""
     try:
-        return float(numbers[0])
+        return f"{int(round(float(value) / divisor))} {unit}"
     except (TypeError, ValueError):
+        return "N/A"
+
+
+def _format_milliwatts(value):
+    try:
+        watts = float(value) / 1000.0
+    except (TypeError, ValueError):
+        return "N/A"
+    return f"{watts:.2f} W"
+
+
+def _dcgm_percent(value):
+    """A DCGM profiling reading as 0-100, or None when it is not a number."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    # Profiling fields may be 0-1 ratios; normalize to 0-100%.
+    if 0.0 <= number <= 1.0:
+        number *= 100.0
+    return min(max(number, 0.0), 100.0)
+
+
+def _format_dcgm_percent(value) -> str:
+    if value is None:
+        return "N/A"
+    text = str(value).strip()
+    if not text or text in {"N/A", "-"}:
+        return "N/A"
+    number = _dcgm_percent(text)
+    # Text that is not a number is shown as it came.
+    return text if number is None else f"{number:.0f}%"
+
+
+def _dcgm_metric_row(gpu):
+    """One GPU's DCGM row, plus the two columns derived from its readings."""
+    pipes = [
+        _dcgm_percent(gpu.get(field))
+        for field in ("tensor_active", "fp64_active", "fp32_active", "fp16_active", "int_active")
+    ]
+    pipes = [value for value in pipes if value is not None]
+    dram = _dcgm_percent(gpu.get("dram_active"))
+    # Speed of light: the busiest of the pipes and DRAM.
+    bounds = pipes + ([dram] if dram is not None else [])
+    instruction_throughput = max(pipes) if pipes else None
+    sol = max(bounds) if bounds else None
+    return {
+        "GPU": gpu["gpu_index"],
+        "sm_active": _format_dcgm_percent(gpu.get("sm_active")),
+        "sm_occupancy": _format_dcgm_percent(gpu.get("sm_occupancy")),
+        "instruction_throughput": _format_dcgm_percent(instruction_throughput),
+        "sol": _format_dcgm_percent(sol),
+        "tensor_active": _format_dcgm_percent(gpu.get("tensor_active")),
+        "fp64_active": _format_dcgm_percent(gpu.get("fp64_active")),
+        "fp32_active": _format_dcgm_percent(gpu.get("fp32_active")),
+        "fp16_active": _format_dcgm_percent(gpu.get("fp16_active")),
+    }
+
+
+def _last_json_object(text):
+    """The last line of `text` that parses as a JSON object, or None.
+
+    Scanning from the end skips whatever the remote shell printed first.
+    """
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_meminfo_kb(text):
+    """`/proc/meminfo` lines as {field: kB}."""
+    mem_info = {}
+    for line in text.strip().split("\n"):
+        if ":" in line:
+            key, value = line.split(":", 1)
+            # Extract numeric value (in kB)
+            value = value.strip().split()[0]
+            try:
+                mem_info[key.strip()] = int(value)
+            except ValueError:
+                pass
+    return mem_info
+
+
+def _vm_stat_available_bytes(text):
+    """Free + inactive + speculative memory from macOS `vm_stat`, in bytes."""
+    page_size = 4096  # Default page size
+    pages = {"Pages free:": 0, "Pages inactive:": 0, "Pages speculative:": 0}
+    for line in text.split("\n"):
+        if "page size of" in line:
+            try:
+                page_size = int(line.split()[-2])
+            except ValueError:
+                pass
+            continue
+        for label in pages:
+            if label in line:
+                try:
+                    pages[label] = int(line.split()[-1].rstrip("."))
+                except ValueError:
+                    pass
+                break
+    return sum(pages.values()) * page_size
+
+
+def _parse_swapusage_gb(text):
+    """`sysctl -n vm.swapusage` ("total = 2048.00M  used = ...") in GB."""
+    keys = {"total": "swap_total_gb", "used": "swap_used_gb"}
+    swap = {}
+    parts = text.split()
+    for i, part in enumerate(parts):
+        if part in keys and i + 2 < len(parts):
+            try:
+                swap[keys[part]] = float(parts[i + 2].rstrip("M")) / 1024
+            except ValueError:
+                pass
+    return swap
 
 
 class _ConnectProgress:
@@ -217,6 +346,11 @@ class BaseClient(ABC):
         self.last_connect_error = message
         self.last_error_type = error_type
 
+    def _set_connected(self):
+        self.connected = True
+        self.last_connect_error = None
+        self.last_error_type = None
+
     def ensure_connected(self) -> bool:
         """Return whether this client can serve a query right now.
 
@@ -244,45 +378,10 @@ class BaseClient(ABC):
         for i in range(0, len(items), chunk_size):
             yield items[i : i + chunk_size]
 
-    @staticmethod
-    def _unique_pids(pids):
-        """Clean and de-duplicate PIDs (preserve order)."""
-        seen = set()
-        unique_pids = []
-        for pid in pids or ():
-            pid_str = str(pid).strip()
-            if not pid_str or pid_str == "N/A":
-                continue
-            if pid_str in seen:
-                continue
-            seen.add(pid_str)
-            unique_pids.append(pid_str)
-        return unique_pids
-
     def get_pid_user_map(self, pids, chunk_size: int = 128):
         """Batch query pid -> username mapping via a single ps call (or a few chunked calls)."""
-        unique_pids = self._unique_pids(pids)
-        if not unique_pids:
-            return {}
-
-        pid_to_user = {}
-        for pid_chunk in self._chunked(unique_pids, chunk_size):
-            pid_list = ",".join(pid_chunk)
-            output = self.execute_command(f"ps -o pid=,user= -p {pid_list}")
-            if not isinstance(output, str) or not output.strip():
-                continue
-            for line in output.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) != 2:
-                    continue
-                pid_str, username = parts[0].strip(), parts[1].strip()
-                if pid_str and username:
-                    pid_to_user[pid_str] = username
-
-        return pid_to_user
+        details = self._query_pid_details(list(dict.fromkeys(pids)), ("pid", "user"), chunk_size)
+        return {pid: info["username"] for pid, info in details.items()}
 
     # `ps` keyword sets tried in order: Linux (with thread count), BSD/macOS,
     # then the minimal set every ps implementation supports. `args` stays last
@@ -299,42 +398,38 @@ class BaseClient(ABC):
         for pid_chunk in self._chunked(pids, chunk_size):
             pid_list = ",".join(pid_chunk)
             output = self.execute_command(f"ps -o {selector} -p {pid_list}")
-            if not isinstance(output, str) or not output.strip():
-                continue
             for line in output.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, len(fields) - 1)
+                # strip() first: the maxsplit tail keeps trailing whitespace.
+                parts = line.strip().split(None, len(fields) - 1)
                 if len(parts) < len(fields):
                     continue
                 values = dict(zip(fields, parts))
-                pid_str = values.get("pid", "").strip()
-                if not pid_str:
-                    continue
-                details[pid_str] = {
-                    "username": values.get("user") or None,
+                details[values["pid"]] = {
+                    "username": values.get("user"),
                     "cpu_percent": parse_leading_float(values.get("pcpu")),
                     "mem_percent": parse_leading_float(values.get("pmem")),
                     "rss_kb": parse_leading_float(values.get("rss")),
-                    "elapsed": (values.get("etime") or "").strip() or None,
-                    "state": (values.get("stat") or "").strip() or None,
+                    "elapsed": values.get("etime"),
+                    "state": values.get("stat"),
                     "threads": parse_leading_float(values.get("nlwp")),
-                    "command": (values.get("args") or "").strip() or None,
+                    "command": values.get("args"),
                 }
         return details
 
     def get_pid_process_info(self, pids, chunk_size: int = 128):
         """Batch query htop-style details (CPU, RSS, state, full command) per pid."""
-        unique_pids = self._unique_pids(pids)
-        if not unique_pids:
-            return {}
-
+        unique_pids = list(dict.fromkeys(pids))
         for fields in self.PROCESS_DETAIL_FIELD_SETS:
             details = self._query_pid_details(unique_pids, fields, chunk_size)
             if details:
                 return details
         return {}
+
+    def _connection_error_info(self):
+        return {
+            "error": self.last_connect_error or "Not connected",
+            "error_type": self.last_error_type or "error",
+        }
 
     def get_full_gpu_info(self, *, include_advanced=True):
         """Get GPU information (base + optional advanced profiling).
@@ -345,429 +440,204 @@ class BaseClient(ABC):
         # A dropped link is revived here rather than reported as "no GPUs":
         # every refresh tick gets one (rate-limited) chance to reconnect.
         if not self.ensure_connected():
-            error_message = self.last_connect_error or "Not connected"
-            error_type = self.last_error_type or "error"
-            return pd.DataFrame(), {"error": error_message, "error_type": error_type}
+            return pd.DataFrame(), self._connection_error_info()
 
-        def safe_get_text(element, path, default="N/A"):
-            """Safely get text from XML element, return default if not found."""
-            if element is None:
-                return default
-            found = element.find(path)
-            return found.text if found is not None else default
-
-        def _format_percent(value):
-            try:
-                return f"{int(round(float(value)))} %"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        def _format_mib(value):
-            try:
-                return f"{int(round(float(value) / (1024 * 1024)))} MiB"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        def _format_kib_per_second(value):
-            try:
-                return f"{int(round(float(value)))} KB/s"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        def _format_watts(value):
-            try:
-                watts = float(value) / 1000.0
-            except (TypeError, ValueError):
-                return "N/A"
-            return f"{watts:.2f} W"
-
-        def _format_temperature(value):
-            try:
-                return f"{int(round(float(value)))} C"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        def _fetch_nvml_base():
-            try:
-                payload = self.query_nvml_snapshot()
-            except Exception as error:
-                logging.debug(msg=f"Failed to query NVML snapshot: {error}")
-                return (
-                    pd.DataFrame(),
-                    {
-                        "data_source": "nvml",
-                        "nvml_error": f"{type(error).__name__}: {error}",
-                    },
-                    False,
-                )
-
-            if not isinstance(payload, dict) or payload.get("ok") is not True:
-                error = (
-                    payload.get("error", "NVML snapshot failed")
-                    if isinstance(payload, dict)
-                    else "NVML helper returned an invalid payload"
-                )
-                return (
-                    pd.DataFrame(),
-                    {"data_source": "nvml", "nvml_error": str(error)},
-                    False,
-                )
-
-            gpus = payload.get("gpus")
-            if not isinstance(gpus, list):
-                return (
-                    pd.DataFrame(),
-                    {
-                        "data_source": "nvml",
-                        "nvml_error": "NVML snapshot did not contain a GPU list",
-                    },
-                    False,
-                )
-
-            rows = []
-            for fallback_index, gpu in enumerate(gpus):
-                if not isinstance(gpu, dict):
-                    continue
-                try:
-                    gpu_index = int(gpu.get("gpu_index", fallback_index))
-                except (TypeError, ValueError):
-                    gpu_index = fallback_index
-
-                processes = []
-                for process in gpu.get("processes") or []:
-                    if not isinstance(process, dict):
-                        continue
-                    used_memory = _format_mib(process.get("used_gpu_memory_bytes"))
-                    processes.append(
-                        {
-                            "gpu_instance_id": process.get("gpu_instance_id"),
-                            "compute_instance_id": process.get("compute_instance_id"),
-                            "pid": process.get("pid"),
-                            "type": process.get("type") or "N/A",
-                            "process_name": process.get("process_name") or "N/A",
-                            "used_memory": used_memory,
-                            "username": process.get("username"),
-                        }
-                    )
-
-                performance_state = gpu.get("performance_state")
-                try:
-                    power_state = f"P{int(performance_state)}"
-                except (TypeError, ValueError):
-                    power_state = "N/A"
-
-                rows.append(
-                    {
-                        "gpu_index": gpu_index,
-                        "product_name": gpu.get("name") or "Unknown GPU",
-                        "product_architecture": gpu.get("architecture") or "N/A",
-                        "tx_util": _format_kib_per_second(gpu.get("pcie_tx_kib_per_s")),
-                        "rx_util": _format_kib_per_second(gpu.get("pcie_rx_kib_per_s")),
-                        "fan_speed": _format_percent(gpu.get("fan_percent")),
-                        "total": _format_mib(gpu.get("memory_total_bytes")),
-                        "used": _format_mib(gpu.get("memory_used_bytes")),
-                        "free": _format_mib(gpu.get("memory_free_bytes")),
-                        "gpu_util": _format_percent(gpu.get("gpu_util_percent")),
-                        "memory_util": _format_percent(gpu.get("memory_util_percent")),
-                        "gpu_temp": _format_temperature(gpu.get("temperature_c")),
-                        "power_state": power_state,
-                        "power_draw": _format_watts(gpu.get("power_usage_mw")),
-                        "current_power_limit": _format_watts(gpu.get("power_limit_mw")),
-                        "pcie_link_gen_current": gpu.get("pcie_link_gen_current"),
-                        "pcie_link_width_current": gpu.get("pcie_link_width_current"),
-                        "pcie_link_gen_max": gpu.get("pcie_link_gen_max"),
-                        "pcie_link_width_max": gpu.get("pcie_link_width_max"),
-                        "processes": processes,
-                    }
-                )
-
-            backend = payload.get("backend") or "unknown"
-            detail = "nvidia-ml-py" if backend == "pynvml" else "libnvidia-ml.so.1"
-            system_info = {
-                "driver_version": payload.get("driver_version") or "N/A",
-                "cuda_version": payload.get("cuda_version") or "N/A",
-                "attached_gpus": str(len(rows)),
-                "data_source": "nvml",
-                "data_source_detail": detail,
-                "nvml_backend": backend,
-            }
-            return pd.DataFrame(rows), system_info, True
-
-        def _fetch_nvidia_smi_base():
-            try:
-                result = self.execute_command("nvidia-smi -q -x")
-                if not result or not result.strip() or not result.strip().startswith("<?xml"):
-                    return pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}
-
-                root = ET.fromstring(result)
-                driver_version = safe_get_text(root, "driver_version", "N/A")
-                cuda_version = safe_get_text(root, "cuda_version", "N/A")
-                attached_gpus = safe_get_text(root, "attached_gpus", "0")
-                gpus = root.findall("gpu")
-                rows = []
-
-                for gpu_index, gpu in enumerate(gpus):
-                    product_name = safe_get_text(gpu, "product_name", "Unknown GPU")
-                    product_architecture = safe_get_text(gpu, "product_architecture", "N/A")
-
-                    pci = gpu.find("pci")
-                    tx_util = safe_get_text(pci, "tx_util", "N/A")
-                    rx_util = safe_get_text(pci, "rx_util", "N/A")
-                    # nvidia-smi spells widths as "16x"; parse_link_number copes.
-                    link_info = pci.find("pci_gpu_link_info") if pci is not None else None
-                    link_gen_current = safe_get_text(
-                        link_info, "pcie_gen/current_link_gen", None
-                    )
-                    link_gen_max = safe_get_text(link_info, "pcie_gen/max_link_gen", None)
-                    link_width_current = safe_get_text(
-                        link_info, "link_widths/current_link_width", None
-                    )
-                    link_width_max = safe_get_text(
-                        link_info, "link_widths/max_link_width", None
-                    )
-                    fan_speed = safe_get_text(gpu, "fan_speed", "N/A")
-
-                    fb_memory_usage = gpu.find("fb_memory_usage")
-                    total = safe_get_text(fb_memory_usage, "total", "N/A")
-                    used = safe_get_text(fb_memory_usage, "used", "N/A")
-                    free = safe_get_text(fb_memory_usage, "free", "N/A")
-
-                    utilization = gpu.find("utilization")
-                    gpu_util = safe_get_text(utilization, "gpu_util", "N/A")
-                    memory_util = safe_get_text(utilization, "memory_util", "N/A")
-
-                    temperature = gpu.find("temperature")
-                    gpu_temp = safe_get_text(temperature, "gpu_temp", "N/A")
-
-                    gpu_power_readings = gpu.find("gpu_power_readings")
-                    # On newer drivers (e.g. WSL/591.x) the P-state under
-                    # <gpu_power_readings><power_state> is deprecated and returns
-                    # "Requested functionality has been deprecated"; the real perf
-                    # state now lives in <gpu><performance_state>.
-                    power_state = safe_get_text(gpu_power_readings, "power_state", "N/A")
-                    if not power_state or power_state == "N/A" or "deprecated" in power_state.lower():
-                        power_state = safe_get_text(gpu, "performance_state", "N/A")
-
-                    power_draw = safe_get_text(gpu_power_readings, "power_draw", None)
-                    if power_draw is None or power_draw == "N/A":
-                        power_draw = safe_get_text(gpu_power_readings, "instant_power_draw", "N/A")
-
-                    current_power_limit = safe_get_text(gpu_power_readings, "current_power_limit", "N/A")
-
-                    processes = gpu.find("processes")
-
-                    rows.append(
-                        {
-                            "gpu_index": gpu_index,
-                            "product_name": product_name,
-                            "product_architecture": product_architecture,
-                            "tx_util": tx_util,
-                            "rx_util": rx_util,
-                            "fan_speed": fan_speed,
-                            "total": total,
-                            "used": used,
-                            "free": free,
-                            "gpu_util": gpu_util,
-                            "memory_util": memory_util,
-                            "gpu_temp": gpu_temp,
-                            "power_state": power_state,
-                            "power_draw": power_draw,
-                            "current_power_limit": current_power_limit,
-                            "pcie_link_gen_current": link_gen_current,
-                            "pcie_link_width_current": link_width_current,
-                            "pcie_link_gen_max": link_gen_max,
-                            "pcie_link_width_max": link_width_max,
-                            "processes": processes,
-                        }
-                    )
-
-                stats = pd.DataFrame(rows)
-                system_info = {
-                    "driver_version": driver_version,
-                    "cuda_version": cuda_version,
-                    "attached_gpus": attached_gpus,
-                    "data_source": "nvidia-smi",
-                    "data_source_detail": "nvidia-smi -q -x",
-                }
-                return stats, system_info
-
-            except Exception as e:
-                logging.debug(msg=f"Failed to get base GPU info via nvidia-smi: {e}")
-                return pd.DataFrame(), {"data_source": "unsupported", "unsupported": True}
-
-        stats, system_info, nvml_ok = _fetch_nvml_base()
-        if not nvml_ok:
-            nvml_error = system_info.get("nvml_error", "NVML unavailable")
-            stats, system_info = _fetch_nvidia_smi_base()
+        stats, system_info, nvml_error = self._nvml_base_info()
+        if nvml_error is not None:
+            stats, system_info = self._nvidia_smi_base_info()
             system_info["fallback_reason"] = nvml_error
-            if system_info.get("data_source") == "unsupported":
-                system_info["nvml_error"] = nvml_error
         if stats.empty:
             # The link can die mid-fetch. Say so, instead of letting one tick
             # look like a machine that never had an NVIDIA GPU.
             if self.connected is False:
-                return pd.DataFrame(), {
-                    "error": self.last_connect_error or "Not connected",
-                    "error_type": self.last_error_type or "error",
-                }
+                return pd.DataFrame(), self._connection_error_info()
             return stats, system_info
 
         if not include_advanced:
             return stats, system_info
         return self._add_advanced_gpu_info(stats, system_info)
 
+    def _nvml_base_info(self):
+        """The base table from NVML, or (None, None, why NVML failed)."""
+        try:
+            payload = self.query_nvml_snapshot()
+        except Exception as error:
+            logging.debug(msg=f"Failed to query NVML snapshot: {error}")
+            return None, None, f"{type(error).__name__}: {error}"
+        if payload.get("ok") is not True:
+            return None, None, str(payload.get("error", "NVML snapshot failed"))
+
+        rows = []
+        for gpu in payload["gpus"]:
+            processes = [
+                {
+                    "gpu_instance_id": process.get("gpu_instance_id"),
+                    "compute_instance_id": process.get("compute_instance_id"),
+                    "pid": process.get("pid"),
+                    "type": process.get("type") or "N/A",
+                    "process_name": process.get("process_name") or "N/A",
+                    "used_memory": _format_rounded(
+                        process.get("used_gpu_memory_bytes"), "MiB", 1024 * 1024
+                    ),
+                    "username": process.get("username"),
+                }
+                for process in gpu.get("processes") or []
+            ]
+            try:
+                power_state = f"P{int(gpu.get('performance_state'))}"
+            except (TypeError, ValueError):
+                power_state = "N/A"
+
+            rows.append(
+                {
+                    "gpu_index": gpu["gpu_index"],
+                    "product_name": gpu.get("name") or "Unknown GPU",
+                    "product_architecture": gpu.get("architecture") or "N/A",
+                    "tx_util": _format_rounded(gpu.get("pcie_tx_kib_per_s"), "KB/s"),
+                    "rx_util": _format_rounded(gpu.get("pcie_rx_kib_per_s"), "KB/s"),
+                    "fan_speed": _format_rounded(gpu.get("fan_percent"), "%"),
+                    "total": _format_rounded(gpu.get("memory_total_bytes"), "MiB", 1024 * 1024),
+                    "used": _format_rounded(gpu.get("memory_used_bytes"), "MiB", 1024 * 1024),
+                    "free": _format_rounded(gpu.get("memory_free_bytes"), "MiB", 1024 * 1024),
+                    "gpu_util": _format_rounded(gpu.get("gpu_util_percent"), "%"),
+                    "memory_util": _format_rounded(gpu.get("memory_util_percent"), "%"),
+                    "gpu_temp": _format_rounded(gpu.get("temperature_c"), "C"),
+                    "power_state": power_state,
+                    "power_draw": _format_milliwatts(gpu.get("power_usage_mw")),
+                    "current_power_limit": _format_milliwatts(gpu.get("power_limit_mw")),
+                    "pcie_link_gen_current": gpu.get("pcie_link_gen_current"),
+                    "pcie_link_width_current": gpu.get("pcie_link_width_current"),
+                    "pcie_link_gen_max": gpu.get("pcie_link_gen_max"),
+                    "pcie_link_width_max": gpu.get("pcie_link_width_max"),
+                    "processes": processes,
+                }
+            )
+
+        backend = payload.get("backend") or "unknown"
+        system_info = {
+            "driver_version": payload.get("driver_version") or "N/A",
+            "cuda_version": payload.get("cuda_version") or "N/A",
+            "attached_gpus": str(len(rows)),
+            "data_source": "nvml",
+            "data_source_detail": "nvidia-ml-py" if backend == "pynvml" else "libnvidia-ml.so.1",
+        }
+        return pd.DataFrame(rows), system_info, None
+
+    def _nvidia_smi_base_info(self):
+        """The base table from `nvidia-smi -q -x`, the fallback when NVML fails."""
+        try:
+            result = self.execute_command("nvidia-smi -q -x")
+            if not result.lstrip().startswith("<?xml"):
+                return pd.DataFrame(), {"data_source": "unsupported"}
+
+            root = ET.fromstring(result)
+            rows = []
+            for gpu_index, gpu in enumerate(root.findall("gpu")):
+                pci = gpu.find("pci")
+                # nvidia-smi spells widths as "16x"; parse_link_number copes.
+                link_info = pci.find("pci_gpu_link_info") if pci is not None else None
+                fb_memory_usage = gpu.find("fb_memory_usage")
+                utilization = gpu.find("utilization")
+                gpu_power_readings = gpu.find("gpu_power_readings")
+                # On newer drivers (e.g. WSL/591.x) the P-state under
+                # <gpu_power_readings><power_state> is deprecated and returns
+                # "Requested functionality has been deprecated"; the real perf
+                # state now lives in <gpu><performance_state>.
+                power_state = _xml_text(gpu_power_readings, "power_state")
+                if not power_state or power_state == "N/A" or "deprecated" in power_state.lower():
+                    power_state = _xml_text(gpu, "performance_state")
+
+                power_draw = _xml_text(gpu_power_readings, "power_draw", None)
+                if power_draw is None or power_draw == "N/A":
+                    power_draw = _xml_text(gpu_power_readings, "instant_power_draw")
+
+                # Same shape as the NVML process entries.
+                processes_element = gpu.find("processes")
+                processes = [
+                    {
+                        "pid": _xml_text(process_info, "pid"),
+                        "process_name": _xml_text(process_info, "process_name"),
+                        "used_memory": _xml_text(process_info, "used_memory", "0 MiB"),
+                        "gpu_instance_id": _xml_text(process_info, "gpu_instance_id"),
+                        "compute_instance_id": _xml_text(process_info, "compute_instance_id"),
+                        "type": _xml_text(process_info, "type"),
+                        "username": _xml_text(process_info, "username", None),
+                    }
+                    for process_info in (
+                        processes_element.findall("process_info")
+                        if processes_element is not None
+                        else ()
+                    )
+                ]
+
+                rows.append(
+                    {
+                        "gpu_index": gpu_index,
+                        "product_name": _xml_text(gpu, "product_name", "Unknown GPU"),
+                        "product_architecture": _xml_text(gpu, "product_architecture"),
+                        "tx_util": _xml_text(pci, "tx_util"),
+                        "rx_util": _xml_text(pci, "rx_util"),
+                        "fan_speed": _xml_text(gpu, "fan_speed"),
+                        "total": _xml_text(fb_memory_usage, "total"),
+                        "used": _xml_text(fb_memory_usage, "used"),
+                        "free": _xml_text(fb_memory_usage, "free"),
+                        "gpu_util": _xml_text(utilization, "gpu_util"),
+                        "memory_util": _xml_text(utilization, "memory_util"),
+                        "gpu_temp": _xml_text(gpu.find("temperature"), "gpu_temp"),
+                        "power_state": power_state,
+                        "power_draw": power_draw,
+                        "current_power_limit": _xml_text(gpu_power_readings, "current_power_limit"),
+                        "pcie_link_gen_current": _xml_text(link_info, "pcie_gen/current_link_gen", None),
+                        "pcie_link_width_current": _xml_text(
+                            link_info, "link_widths/current_link_width", None
+                        ),
+                        "pcie_link_gen_max": _xml_text(link_info, "pcie_gen/max_link_gen", None),
+                        "pcie_link_width_max": _xml_text(link_info, "link_widths/max_link_width", None),
+                        "processes": processes,
+                    }
+                )
+
+            system_info = {
+                "driver_version": _xml_text(root, "driver_version"),
+                "cuda_version": _xml_text(root, "cuda_version"),
+                "attached_gpus": _xml_text(root, "attached_gpus", "0"),
+                "data_source": "nvidia-smi",
+                "data_source_detail": "nvidia-smi -q -x",
+            }
+            return pd.DataFrame(rows), system_info
+
+        except Exception as e:
+            logging.debug(msg=f"Failed to get base GPU info via nvidia-smi: {e}")
+            return pd.DataFrame(), {"data_source": "unsupported"}
+
     def _add_advanced_gpu_info(self, stats, system_info):
         """Enrich a base snapshot after its GPU rows can already be displayed."""
-        if stats.empty:
-            return stats, system_info
-
-        def fmt_percent(value) -> str:
-            if value is None:
-                return "N/A"
-            text = str(value).strip()
-            if not text or text in {"N/A", "-"}:
-                return "N/A"
-            try:
-                num = float(text)
-            except Exception:
-                # Already formatted?
-                return text
-            # Profiling fields may be 0-1 ratios; normalize to 0-100%.
-            if 0.0 <= num <= 1.0:
-                num *= 100.0
-            if num < 0:
-                num = 0.0
-            if num > 100:
-                num = 100.0
-            return f"{num:.0f}%"
-
-        def fmt_temp_c(value) -> str:
-            if value is None:
-                return "N/A"
-            try:
-                num = float(value)
-            except Exception:
-                return "N/A"
-            return f"{num:.0f} C"
-
-        def fmt_watts(value) -> str:
-            if value is None:
-                return "N/A"
-            try:
-                num = float(value)
-            except Exception:
-                return "N/A"
-            return f"{num:.1f} W" if abs(num - int(num)) > 0.01 else f"{int(num)} W"
-
         # Fetch advanced profiling metrics via DCGM (optional). A host without
         # DCGM answers the same way on every refresh, so the failure is cached
         # instead of paying the remote python startup per tick forever.
-        if self._dcgm_probe_failed:
+        if stats.empty or self._dcgm_probe_failed:
             return stats, system_info
         try:
-            dcgm_cmd = make_dcgm_snapshot_command()
-            dcgm_out = self.execute_command(dcgm_cmd)
-            payload = None
-            if isinstance(dcgm_out, str) and dcgm_out.strip():
-                for line in reversed(dcgm_out.splitlines()):
-                    line = line.strip()
-                    if not line or not line.startswith("{"):
-                        continue
-                    try:
-                        payload = json.loads(line)
-                        break
-                    except Exception:
-                        continue
-
-            if isinstance(payload, dict) and payload.get("ok") is True:
-                gpus = payload.get("gpus") or []
-                if isinstance(gpus, list) and gpus:
-                    adv_rows = []
-
-                    for gpu in gpus:
-                        try:
-                            gpu_index = int(gpu.get("gpu_index"))
-                        except Exception:
-                            gpu_index = len(adv_rows)
-
-                        sm_active = gpu.get("sm_active")
-                        sm_occupancy = gpu.get("sm_occupancy")
-                        tensor_active = gpu.get("tensor_active")
-                        fp64_active = gpu.get("fp64_active")
-                        fp32_active = gpu.get("fp32_active")
-                        fp16_active = gpu.get("fp16_active")
-                        int_active = gpu.get("int_active")
-                        dram_active = gpu.get("dram_active")
-
-                        def pct_num(v):
-                            if v is None:
-                                return None
-                            try:
-                                x = float(v)
-                            except Exception:
-                                return None
-                            if 0.0 <= x <= 1.0:
-                                x *= 100.0
-                            if x < 0:
-                                x = 0.0
-                            if x > 100:
-                                x = 100.0
-                            return x
-
-                        pipe_vals = [
-                            pct_num(tensor_active),
-                            pct_num(fp64_active),
-                            pct_num(fp32_active),
-                            pct_num(fp16_active),
-                            pct_num(int_active),
-                        ]
-                        pipe_vals = [v for v in pipe_vals if v is not None]
-                        instr_throughput = max(pipe_vals) if pipe_vals else None
-                        sol = None
-                        dram_pct = pct_num(dram_active)
-                        if instr_throughput is not None and dram_pct is not None:
-                            sol = max(instr_throughput, dram_pct)
-                        elif instr_throughput is not None:
-                            sol = instr_throughput
-                        elif dram_pct is not None:
-                            sol = dram_pct
-
-                        adv_rows.append(
-                            {
-                                "GPU": gpu_index,
-                                "sm_active": fmt_percent(sm_active),
-                                "sm_occupancy": fmt_percent(sm_occupancy),
-                                "instruction_throughput": fmt_percent(instr_throughput),
-                                "sol": fmt_percent(sol),
-                                "tensor_active": fmt_percent(tensor_active),
-                                "fp64_active": fmt_percent(fp64_active),
-                                "fp32_active": fmt_percent(fp32_active),
-                                "fp16_active": fmt_percent(fp16_active),
-                            }
-                        )
-
-                    adv_df = pd.DataFrame(adv_rows)
-                    advanced_supported = False
-                    try:
-                        if not adv_df.empty:
-                            metric_cols = [c for c in adv_df.columns if c != "GPU"]
-                            for col in metric_cols:
-                                values = adv_df[col].astype(str).tolist()
-                                if any(v not in {"N/A", "-", ""} for v in values):
-                                    advanced_supported = True
-                                    break
-                    except Exception:
-                        advanced_supported = False
-
-                    system_info["advanced_source"] = "dcgm"
-                    system_info["advanced_source_detail"] = payload.get("connection") or "N/A"
-                    system_info["advanced_metrics"] = adv_df
-                    system_info["advanced_supported"] = advanced_supported
-            else:
+            payload = _last_json_object(self.execute_command(make_dcgm_snapshot_command()))
+            if payload is None or payload.get("ok") is not True:
                 self._dcgm_probe_failed = True
+                return stats, system_info
+            rows = [_dcgm_metric_row(gpu) for gpu in payload.get("gpus") or []]
         except Exception:
-            # DCGM is optional; ignore failures.
-            pass
+            # DCGM is optional, and a dropped link is only temporary, so this
+            # does not mark the host as lacking DCGM.
+            return stats, system_info
+
+        if rows:
+            system_info["advanced_source"] = "dcgm"
+            system_info["advanced_source_detail"] = payload.get("connection") or "N/A"
+            system_info["advanced_metrics"] = pd.DataFrame(rows)
+            system_info["advanced_supported"] = any(
+                value not in {"N/A", "-", ""}
+                for row in rows
+                for column, value in row.items()
+                if column != "GPU"
+            )
         return stats, system_info
 
     def get_system_stats(self) -> dict:
@@ -794,57 +664,25 @@ class BaseClient(ABC):
         try:
             # Core count never changes, so ask the host once and remember.
             if self._cpu_cores is None:
-                cpu_output = self.execute_command("nproc")
-                if cpu_output and cpu_output.strip().isdigit():
-                    self._cpu_cores = int(cpu_output.strip())
-                else:
-                    # Try macOS sysctl
-                    cpu_output = self.execute_command("sysctl -n hw.ncpu")
-                    if cpu_output and cpu_output.strip().isdigit():
-                        self._cpu_cores = int(cpu_output.strip())
+                # Linux first, then macOS.
+                for command in ("nproc", "sysctl -n hw.ncpu"):
+                    cores = self.execute_command(command).strip()
+                    if cores.isdigit():
+                        self._cpu_cores = int(cores)
+                        break
             if self._cpu_cores is not None:
                 result["cpu_cores"] = self._cpu_cores
 
-            # Get CPU utilization - try Linux first
-            cpu_usage_output = self.execute_command(
-                "grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'"
-            )
-            if cpu_usage_output and cpu_usage_output.strip():
-                try:
-                    result["cpu_percent"] = float(cpu_usage_output.strip())
-                except ValueError:
-                    pass
-            else:
-                # Try macOS - use top for CPU usage (user + sys)
-                cpu_usage_output = self.execute_command(
-                    "top -l 1 -n 0 | grep 'CPU usage' | awk '{print $3, $5}' | tr -d '%,'"
-                )
-                if cpu_usage_output and cpu_usage_output.strip():
-                    try:
-                        parts = cpu_usage_output.strip().split()
-                        if len(parts) >= 2:
-                            user_cpu = float(parts[0])
-                            sys_cpu = float(parts[1])
-                            result["cpu_percent"] = user_cpu + sys_cpu
-                    except ValueError:
-                        pass
+            cpu_percent = self._cpu_percent()
+            if cpu_percent is not None:
+                result["cpu_percent"] = cpu_percent
 
             # Get memory info - try Linux first
             mem_output = self.execute_command(
                 "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo"
             )
-            if mem_output and mem_output.strip():
-                mem_info = {}
-                for line in mem_output.strip().split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        # Extract numeric value (in kB)
-                        value = value.strip().split()[0]
-                        try:
-                            mem_info[key.strip()] = int(value)
-                        except ValueError:
-                            pass
-
+            if mem_output.strip():
+                mem_info = _parse_meminfo_kb(mem_output)
                 mem_total_kb = mem_info.get("MemTotal", 0)
                 mem_available_kb = mem_info.get("MemAvailable", 0)
                 swap_total_kb = mem_info.get("SwapTotal", 0)
@@ -857,68 +695,46 @@ class BaseClient(ABC):
             else:
                 # Try macOS - use sysctl for memory
                 mem_total_output = self.execute_command("sysctl -n hw.memsize")
-                if mem_total_output and mem_total_output.strip().isdigit():
+                if mem_total_output.strip().isdigit():
                     mem_total_bytes = int(mem_total_output.strip())
                     result["mem_total_gb"] = mem_total_bytes / (1024 * 1024 * 1024)
 
-                    # Get memory usage from vm_stat on macOS
                     vm_stat_output = self.execute_command("vm_stat")
                     if vm_stat_output:
-                        page_size = 4096  # Default page size
-                        pages_free = 0
-                        pages_inactive = 0
-                        pages_speculative = 0
-
-                        for line in vm_stat_output.split("\n"):
-                            if "page size of" in line:
-                                try:
-                                    page_size = int(line.split()[-2])
-                                except (ValueError, IndexError):
-                                    pass
-                            elif "Pages free:" in line:
-                                try:
-                                    pages_free = int(line.split()[-1].rstrip('.'))
-                                except (ValueError, IndexError):
-                                    pass
-                            elif "Pages inactive:" in line:
-                                try:
-                                    pages_inactive = int(line.split()[-1].rstrip('.'))
-                                except (ValueError, IndexError):
-                                    pass
-                            elif "Pages speculative:" in line:
-                                try:
-                                    pages_speculative = int(line.split()[-1].rstrip('.'))
-                                except (ValueError, IndexError):
-                                    pass
-
-                        available_bytes = (pages_free + pages_inactive + pages_speculative) * page_size
+                        available_bytes = _vm_stat_available_bytes(vm_stat_output)
                         result["mem_used_gb"] = (mem_total_bytes - available_bytes) / (1024 * 1024 * 1024)
 
-                # Get swap info on macOS
-                swap_output = self.execute_command("sysctl -n vm.swapusage")
-                if swap_output:
-                    # Parse more carefully
-                    parts = swap_output.split()
-                    for i, part in enumerate(parts):
-                        if part == "total" and i + 2 < len(parts):
-                            try:
-                                val = parts[i + 2].rstrip("M")
-                                result["swap_total_gb"] = float(val) / 1024
-                            except (ValueError, IndexError):
-                                pass
-                        elif part == "used" and i + 2 < len(parts):
-                            try:
-                                val = parts[i + 2].rstrip("M")
-                                result["swap_used_gb"] = float(val) / 1024
-                            except (ValueError, IndexError):
-                                pass
+                result.update(_parse_swapusage_gb(self.execute_command("sysctl -n vm.swapusage")))
 
         except Exception as e:
             logging.debug(msg=f"Failed to get system stats: {e}")
 
         return result
 
-    def get_process_summary(self, gpu_stats=None, detailed: bool = False, *, resolve_users=True):
+    def _cpu_percent(self):
+        """Total CPU utilization in percent, or None when it cannot be read."""
+        # Try Linux first
+        output = self.execute_command(
+            "grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'"
+        )
+        if output.strip():
+            try:
+                return float(output.strip())
+            except ValueError:
+                return None
+
+        # Try macOS - use top for CPU usage (user + sys)
+        parts = self.execute_command(
+            "top -l 1 -n 0 | grep 'CPU usage' | awk '{print $3, $5}' | tr -d '%,'"
+        ).split()
+        if len(parts) >= 2:
+            try:
+                return float(parts[0]) + float(parts[1])
+            except ValueError:
+                pass
+        return None
+
+    def get_process_summary(self, gpu_stats, detailed: bool = False, *, resolve_users=True):
         """Get detailed GPU processes information with user summary.
 
         With `detailed`, one extra batched `ps` call per host enriches every GPU
@@ -927,174 +743,97 @@ class BaseClient(ABC):
         With `resolve_users=False`, only the supplied GPU snapshot is used;
         PIDs remain visible before any additional SSH round trips complete.
         """
-        def safe_get_text(element, path, default="N/A"):
-            """Safely get text from XML element, return default if not found"""
-            if element is None:
-                return default
-            found = element.find(path)
-            return found.text if found is not None else default
-        
-        try:
-            # Use provided gpu_stats if available, otherwise get fresh data
-            if gpu_stats is None:
-                stats, _ = self.get_full_gpu_info()
-            else:
-                stats = gpu_stats
-            
-            process_entries = []
-            pids = []
-            all_pids = []
+        # (entry, pid as text, used MiB) per GPU process.
+        process_entries = []
+        pids = []
+        all_pids = []
 
-            # First pass: extract processes and collect all pids
-            for idx, row in stats.iterrows():
-                processes_element = row.get("processes")
-                try:
-                    gpu_index = int(row.get("gpu_index", idx))
-                except (TypeError, ValueError):
-                    gpu_index = idx
+        # First pass: extract processes and collect all pids
+        for idx, row in gpu_stats.iterrows():
+            try:
+                gpu_index = int(row.get("gpu_index", idx))
+            except (TypeError, ValueError):
+                gpu_index = idx
 
-                native_processes = (
-                    processes_element if isinstance(processes_element, list) else None
-                )
-                if native_processes is not None:
-                    extracted_processes = [
-                        process for process in native_processes if isinstance(process, dict)
-                    ]
-                elif hasattr(processes_element, "findall"):
-                    extracted_processes = []
-                    for process_info in processes_element.findall("process_info"):
-                        extracted_processes.append(
-                            {
-                                "pid": safe_get_text(process_info, "pid", "N/A"),
-                                "process_name": safe_get_text(
-                                    process_info, "process_name", "N/A"
-                                ),
-                                "used_memory": safe_get_text(
-                                    process_info, "used_memory", "0 MiB"
-                                ),
-                                "gpu_instance_id": safe_get_text(
-                                    process_info, "gpu_instance_id", "N/A"
-                                ),
-                                "compute_instance_id": safe_get_text(
-                                    process_info, "compute_instance_id", "N/A"
-                                ),
-                                "type": safe_get_text(process_info, "type", "N/A"),
-                                "username": safe_get_text(
-                                    process_info, "username", None
-                                ),
-                            }
+            for process in row.get("processes") or []:
+                pid = process.get("pid", "N/A")
+                used_memory = process.get("used_memory", "0 MiB")
+                username = process.get("username")
+                gpu_instance_id = process.get("gpu_instance_id")
+                compute_instance_id = process.get("compute_instance_id")
+
+                memory_value = 0
+                if used_memory != "N/A":
+                    try:
+                        memory_value = int(
+                            float(str(used_memory).replace("MiB", "").strip())
                         )
-                else:
-                    extracted_processes = []
+                    except (TypeError, ValueError):
+                        memory_value = 0
 
-                for process in extracted_processes:
-                    pid = process.get("pid", "N/A")
-                    used_memory = process.get("used_memory", "0 MiB")
-                    username = process.get("username")
-                    gpu_instance_id = process.get("gpu_instance_id")
-                    compute_instance_id = process.get("compute_instance_id")
+                pid_str = str(pid).strip()
+                if pid_str and pid_str != "N/A":
+                    all_pids.append(pid_str)
+                    if not username or username == "N/A":
+                        pids.append(pid_str)
 
-                    memory_value = 0
-                    if used_memory != "N/A":
-                        try:
-                            memory_value = int(
-                                float(str(used_memory).replace("MiB", "").strip())
-                            )
-                        except (TypeError, ValueError):
-                            memory_value = 0
+                entry = {
+                    "gpu_instance_id": (
+                        gpu_instance_id if gpu_instance_id is not None else "N/A"
+                    ),
+                    "compute_instance_id": (
+                        compute_instance_id if compute_instance_id is not None else "N/A"
+                    ),
+                    "pid": pid,
+                    "type": process.get("type") or "N/A",
+                    "process_name": process.get("process_name") or "N/A",
+                    "used_memory": used_memory,
+                    "username": username,
+                    "gpu_index": gpu_index,
+                }
+                process_entries.append((entry, pid_str, memory_value))
 
-                    pid_str = str(pid).strip()
-                    if pid_str and pid_str != "N/A":
-                        all_pids.append(pid_str)
-                        if not username or username == "N/A":
-                            pids.append(pid_str)
+        pid_details = self.get_pid_process_info(all_pids) if detailed and resolve_users else {}
+        missing_user_pids = [
+            pid_str for pid_str in pids if not pid_details.get(pid_str, {}).get("username")
+        ]
+        pid_to_user = self.get_pid_user_map(missing_user_pids) if resolve_users else {}
 
-                    process_entries.append(
-                        {
-                            "gpu_instance_id": (
-                                gpu_instance_id
-                                if gpu_instance_id is not None
-                                else "N/A"
-                            ),
-                            "compute_instance_id": (
-                                compute_instance_id
-                                if compute_instance_id is not None
-                                else "N/A"
-                            ),
-                            "pid": pid,
-                            "type": process.get("type") or "N/A",
-                            "process_name": process.get("process_name") or "N/A",
-                            "used_memory": used_memory,
-                            "username": username,
-                            "gpu_index": gpu_index,
-                            "_memory_value": memory_value,
-                        }
-                    )
+        all_processes = []
+        user_memory_summary = {}
+        for entry, pid_str, memory_value in process_entries:
+            details = pid_details.get(pid_str, {})
+            username = entry["username"]
+            if not username or username == "N/A":
+                username = details.get("username")
+            if not username or username == "N/A":
+                username = pid_to_user.get(pid_str, "N/A")
 
-            pid_details = self.get_pid_process_info(all_pids) if detailed and resolve_users else {}
-            missing_user_pids = [
-                pid_str
-                for pid_str in pids
-                if not (pid_details.get(pid_str) or {}).get("username")
-            ]
-            pid_to_user = self.get_pid_user_map(missing_user_pids) if resolve_users else {}
+            all_processes.append(
+                {
+                    **entry,
+                    "username": username,
+                    "command": details.get("command") or entry["process_name"],
+                    "cpu_percent": details.get("cpu_percent"),
+                    "mem_percent": details.get("mem_percent"),
+                    "rss_kb": details.get("rss_kb"),
+                    "elapsed": details.get("elapsed"),
+                    "state": details.get("state"),
+                    "threads": details.get("threads"),
+                }
+            )
 
-            all_processes = []
-            user_memory_summary = {}
-            for entry in process_entries:
-                pid_str = str(entry.get("pid", "")).strip()
-                details = pid_details.get(pid_str) or {}
-                username = entry.get("username")
-                if not username or username == "N/A":
-                    username = details.get("username")
-                if not username or username == "N/A":
-                    username = (
-                        pid_to_user.get(pid_str, "N/A")
-                        if pid_str and pid_str != "N/A"
-                        else "N/A"
-                    )
+            if username != "N/A" and memory_value > 0:
+                user_memory_summary[username] = user_memory_summary.get(username, 0) + memory_value
 
-                all_processes.append(
-                    {
-                        "gpu_instance_id": entry.get("gpu_instance_id", "N/A"),
-                        "compute_instance_id": entry.get("compute_instance_id", "N/A"),
-                        "pid": entry.get("pid", "N/A"),
-                        "type": entry.get("type", "N/A"),
-                        "process_name": entry.get("process_name", "N/A"),
-                        "used_memory": entry.get("used_memory", "0 MiB"),
-                        "username": username,
-                        "gpu_index": entry.get("gpu_index"),
-                        "command": details.get("command") or entry.get("process_name", "N/A"),
-                        "cpu_percent": details.get("cpu_percent"),
-                        "mem_percent": details.get("mem_percent"),
-                        "rss_kb": details.get("rss_kb"),
-                        "elapsed": details.get("elapsed"),
-                        "state": details.get("state"),
-                        "threads": details.get("threads"),
-                    }
-                )
+        return all_processes, user_memory_summary
 
-                memory_value = entry.get("_memory_value", 0) or 0
-                if username != "N/A" and memory_value > 0:
-                    user_memory_summary[username] = user_memory_summary.get(username, 0) + memory_value
-            
-            return all_processes, user_memory_summary
-            
-        except Exception as e:
-            logging.error(msg=f"Failed to get process summary: {e}")
-            return [], {}
-    
     def format_user_memory_compact(self, user_summary):
         """Format user memory summary in compact format like 'qbs(23082M) gdm(4M)' sorted by memory usage desc"""
-        if not user_summary:
-            return ""
-        
-        formatted_users = []
-        # Sort by memory usage in descending order
-        for username, total_memory in sorted(user_summary.items(), key=lambda x: x[1], reverse=True):
-            formatted_users.append(f"{username}({total_memory}M)")
-        
-        return " ".join(formatted_users)
+        return " ".join(
+            f"{username}({total_memory}M)"
+            for username, total_memory in sorted(user_summary.items(), key=lambda x: x[1], reverse=True)
+        )
 
 
 class RemoteClient(BaseClient):
@@ -1116,9 +855,9 @@ class RemoteClient(BaseClient):
         self.auth = server.auth
         self.description = server.description
         self.password = server.password
-        self.identityfile = getattr(server, "identityfile", None)
-        self.proxyjump = getattr(server, "proxyjump", None)
-        self.gpu_ids = getattr(server, "gpu_ids", None)
+        self.identityfile = server.identityfile
+        self.proxyjump = server.proxyjump
+        self.gpu_ids = server.gpu_ids
         self._proxy = None
         self.client = self._make_ssh_client()
         # Lock order is always _connect_lock -> _nvml_agent_lock; never take the
@@ -1148,17 +887,20 @@ class RemoteClient(BaseClient):
                 pass
         self._proxy = None
 
+    def _close_ssh(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self._close_proxy()
+
     def _connect_client(self, *, batch_mode: bool = False, **kwargs):
         """Connect a fresh Paramiko client, optionally through ProxyJump.
 
         `batch_mode` forbids the ProxyJump helper from prompting, which matters
         on the background reconnect path where nothing can answer a prompt.
         """
-        try:
-            self.client.close()
-        except Exception:
-            pass
-        self._close_proxy()
+        self._close_ssh()
         self.client = self._make_ssh_client()
 
         kwargs.setdefault("timeout", self.CONNECT_TIMEOUT_SECONDS)
@@ -1168,53 +910,33 @@ class RemoteClient(BaseClient):
         # A native ssh jump helper cannot use our UI-owned secret prompt.
         # Never let it read /dev/tty concurrently with the live monitor.
         batch_mode = batch_mode or self.secret_prompt is not _prompt_secret
-        proxy = None
         try:
-            proxy = open_proxyjump_socket(
+            self._proxy = open_proxyjump_socket(
                 self.proxyjump,
                 self.host,
                 self.port,
                 connect_timeout=self.CONNECT_TIMEOUT_SECONDS,
                 batch_mode=batch_mode,
             )
-            if proxy is not None:
-                kwargs["sock"] = proxy
+            if self._proxy is not None:
+                kwargs["sock"] = self._proxy
             self.client.connect(**kwargs)
         except Exception:
-            try:
-                self.client.close()
-            except Exception:
-                pass
-            if proxy is not None:
-                try:
-                    proxy.close()
-                except Exception:
-                    pass
+            self._close_ssh()
             raise
-        self._proxy = proxy
-        try:
-            transport = self.client.get_transport()
-            if transport is not None:
-                transport.set_keepalive(self.KEEPALIVE_SECONDS)
-        except Exception:
-            pass
+        transport = self.client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(self.KEEPALIVE_SECONDS)
 
     def _transport_alive(self) -> bool:
-        try:
-            transport = self.client.get_transport()
-        except Exception:
-            return False
+        transport = self.client.get_transport()
         return bool(transport is not None and transport.is_active())
 
     def _close_link_locked(self):
         """Drop the SSH session (and the NVML agent riding on it)."""
         with self._nvml_agent_lock:
             self._close_nvml_agent_locked()
-        try:
-            self.client.close()
-        except Exception:
-            pass
-        self._close_proxy()
+        self._close_ssh()
 
     def _mark_link_lost(self, error=None):
         """Note that the SSH session died so the next tick reconnects.
@@ -1242,9 +964,7 @@ class RemoteClient(BaseClient):
         with self._connect_lock:
             if self._transport_alive():
                 if not self.connected:
-                    self.connected = True
-                    self.last_connect_error = None
-                    self.last_error_type = None
+                    self._set_connected()
                 return True
 
             if self.connected:
@@ -1287,41 +1007,29 @@ class RemoteClient(BaseClient):
 
     def __del__(self):
         try:
-            with self._nvml_agent_lock:
-                self._close_nvml_agent_locked()
-        except Exception:
-            pass
-        try:
-            self.client.close()
+            self._close_link_locked()
             # Debug, not info: `__del__` runs at interpreter shutdown, so at
             # info level every node dropped a line onto the user's shell
             # prompt after the UI had already gone.
             logging.debug(msg=f"Connection to {self.host}:{self.port} closed.")
         except Exception:
             pass
-        self._close_proxy()
 
     def _close_nvml_agent_locked(self):
         channel = self._nvml_agent_channel
-        if channel is not None:
+        if channel is not None and not channel.closed:
             try:
-                if not channel.closed:
-                    channel.sendall(b"quit\n")
+                channel.sendall(b"quit\n")
             except Exception:
                 pass
 
-        for stream_name in (
-            "_nvml_agent_stdin",
-            "_nvml_agent_stdout",
-            "_nvml_agent_stderr",
-        ):
-            stream = getattr(self, stream_name, None)
+        for stream in (self._nvml_agent_stdin, self._nvml_agent_stdout, self._nvml_agent_stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except Exception:
                     pass
-            setattr(self, stream_name, None)
+        self._nvml_agent_stdin = self._nvml_agent_stdout = self._nvml_agent_stderr = None
 
         if channel is not None:
             try:
@@ -1331,15 +1039,14 @@ class RemoteClient(BaseClient):
         self._nvml_agent_channel = None
 
     def _start_nvml_agent_locked(self):
+        # exec_command's timeout is also set on the channel.
         stdin, stdout, stderr = self.client.exec_command(
             command=make_nvml_agent_command(), timeout=10.0,
         )
-        channel = stdout.channel
-        channel.settimeout(10.0)
         self._nvml_agent_stdin = stdin
         self._nvml_agent_stdout = stdout
         self._nvml_agent_stderr = stderr
-        self._nvml_agent_channel = channel
+        self._nvml_agent_channel = stdout.channel
 
     def query_nvml_snapshot(self) -> dict:
         """Query the persistent remote NVML agent, restarting it once on failure."""
@@ -1362,8 +1069,6 @@ class RemoteClient(BaseClient):
 
                     channel.sendall(b"snapshot\n")
                     line = self._nvml_agent_stdout.readline()
-                    if isinstance(line, bytes):
-                        line = line.decode("utf-8", errors="replace")
                     if not line:
                         raise RuntimeError("Remote NVML agent closed its output")
                     payload = json.loads(line)
@@ -1380,25 +1085,14 @@ class RemoteClient(BaseClient):
         return {
             "ok": False,
             "backend": "ctypes",
-            "error": (
-                f"{type(last_error).__name__}: {last_error}"
-                if last_error is not None
-                else "Remote NVML agent failed"
-            ),
+            "error": f"{type(last_error).__name__}: {last_error}",
         }
 
-    def _authenticate_with_password(
-        self,
-        max_attempts=3,
-        *,
-        prompt_only: bool = False,
-        allow_prompt: bool = True,
-    ) -> bool:
+    def _authenticate_with_password(self, max_attempts=3, *, allow_prompt: bool = True) -> bool:
         """Attempt password authentication with retry limit.
 
         Args:
             max_attempts: Maximum number of password attempts (default: 3)
-            prompt_only: Do not try any configured password; always prompt (default: False)
             allow_prompt: Allow asking the user; background reconnects cannot
                 (nothing is reading the terminal) and fail instead.
 
@@ -1408,8 +1102,7 @@ class RemoteClient(BaseClient):
         """
         for attempt in range(max_attempts):
             try:
-                password = None
-                if not prompt_only and self.password is not None and attempt == 0:
+                if self.password is not None and attempt == 0:
                     password = self.password
                 elif not allow_prompt:
                     self._set_connect_error(
@@ -1434,27 +1127,73 @@ class RemoteClient(BaseClient):
                     allow_agent=False,
                     look_for_keys=False,
                 )
-                self.connected = True
-                self.last_connect_error = None
-                self.last_error_type = None
+                self._set_connected()
                 logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
                 return True
-                    
+
             except AuthenticationException:
-                if attempt == max_attempts - 1:
-                    logging.error(
-                        msg=f"Password authentication failed after {max_attempts} attempts on {self.description}"
-                    )
-                    self._set_connect_error("Password incorrect", error_type="auth")
-                    return False
                 continue
             except Exception as e:
                 logging.error(msg=f"Password authentication error on {self.description}: {e}")
                 self._set_connect_error(str(e), error_type="connect")
                 return False
 
+        logging.error(
+            msg=f"Password authentication failed after {max_attempts} attempts on {self.description}"
+        )
         self._set_connect_error("Password incorrect", error_type="auth")
         return False
+
+    def _connect_with_key(self, *, allow_prompt: bool) -> bool:
+        """Key (or agent) authentication; `auth: auto` falls back to a password."""
+        password_fallback = self.auth == "auto"
+        identityfile = os.path.expanduser(str(self.identityfile)) if self.identityfile else None
+        target = dict(
+            batch_mode=not allow_prompt,
+            hostname=self.host,
+            port=self.port,
+            username=self.username,
+            key_filename=identityfile,
+        )
+        try:
+            self._connect_client(
+                allow_agent=not identityfile,
+                look_for_keys=not identityfile,
+                **target,
+            )
+        except PasswordRequiredException:
+            if not identityfile:
+                if password_fallback:
+                    logging.error(msg=f"Key requires passphrase on {self.description}, trying password...")
+                    return self._authenticate_with_password(allow_prompt=allow_prompt)
+                self._set_connect_error("Key requires passphrase; set `identityfile` or use `auth: password`", error_type="auth")
+                return False
+            if not allow_prompt:
+                self._set_connect_error(
+                    "Key passphrase required; restart nvidb to enter it",
+                    error_type="auth",
+                )
+                return False
+            passphrase = self.secret_prompt(f"Enter passphrase for key {identityfile} -> ")
+            # Raised from inside this handler, a wrong passphrase skips the
+            # sibling handler below and fails as a connection error.
+            self._connect_client(
+                allow_agent=False,
+                look_for_keys=False,
+                passphrase=passphrase,
+                **target,
+            )
+        except AuthenticationException as e:
+            if password_fallback:
+                logging.error(msg=f"Key-based authentication failed on {self.description}, trying password...")
+                return self._authenticate_with_password(allow_prompt=allow_prompt)
+            logging.error(msg=f"Key-based authentication failed on {self.description}: {e}")
+            self._set_connect_error("Key authentication failed", error_type="auth")
+            return False
+        self._set_connected()
+        suffix = "" if password_fallback else " (key auth)"
+        logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}{suffix}")
+        return True
 
     def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
         with self._connect_lock:
@@ -1482,132 +1221,21 @@ class RemoteClient(BaseClient):
             logging.info(
                 msg=f"Connecting to {self.host}:{self.port} as {self.username}"
             )
-        batch_mode = not allow_prompt
         # catch the OSError exception when the host is not reachable
         try:
-            identityfile = None
-            if self.auth in ("auto", "key") and self.identityfile:
-                identityfile = os.path.expanduser(str(self.identityfile))
-            if self.auth == "auto":
-                # Auto mode: try key-based auth first, then password
-                try:
-                    self._connect_client(
-                        batch_mode=batch_mode,
-                        hostname=self.host,
-                        port=self.port,
-                        username=self.username,
-                        allow_agent=False if identityfile else True,
-                        look_for_keys=False if identityfile else True,
-                        key_filename=identityfile,
-                    )
-                    self.connected = True
-                    self.last_connect_error = None
-                    self.last_error_type = None
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
-                    return True
-                except PasswordRequiredException:
-                    if not identityfile:
-                        logging.error(msg=f"Key requires passphrase on {self.description}, trying password...")
-                        return self._authenticate_with_password(allow_prompt=allow_prompt)
-                    if not allow_prompt:
-                        self._set_connect_error(
-                            "Key passphrase required; restart nvidb to enter it",
-                            error_type="auth",
-                        )
-                        return False
-                    passphrase = self.secret_prompt(f"Enter passphrase for key {identityfile} -> ")
-                    self._connect_client(
-                        batch_mode=batch_mode,
-                        hostname=self.host,
-                        port=self.port,
-                        username=self.username,
-                        allow_agent=False,
-                        look_for_keys=False,
-                        key_filename=identityfile,
-                        passphrase=passphrase,
-                    )
-                    self.connected = True
-                    self.last_connect_error = None
-                    self.last_error_type = None
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username}")
-                    return True
-                except AuthenticationException:
-                    logging.error(msg=f"Key-based authentication failed on {self.description}, trying password...")
-                    # Use the new password authentication method with retry limit
-                    return self._authenticate_with_password(allow_prompt=allow_prompt)
-                except NoValidConnectionsError as e:
-                    logging.error(msg=f"Connection failed: {e}")
-                    self._set_connect_error(str(e), error_type="connect")
-                    return False
-            elif self.auth == "key":
-                # Key-based authentication only (no password fallback)
-                try:
-                    self._connect_client(
-                        batch_mode=batch_mode,
-                        hostname=self.host,
-                        port=self.port,
-                        username=self.username,
-                        allow_agent=False if identityfile else True,
-                        look_for_keys=False if identityfile else True,
-                        key_filename=identityfile,
-                    )
-                    self.connected = True
-                    self.last_connect_error = None
-                    self.last_error_type = None
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (key auth)")
-                    return True
-                except PasswordRequiredException:
-                    if not identityfile:
-                        self._set_connect_error("Key requires passphrase; set `identityfile` or use `auth: password`", error_type="auth")
-                        return False
-                    if not allow_prompt:
-                        self._set_connect_error(
-                            "Key passphrase required; restart nvidb to enter it",
-                            error_type="auth",
-                        )
-                        return False
-                    passphrase = self.secret_prompt(f"Enter passphrase for key {identityfile} -> ")
-                    self._connect_client(
-                        batch_mode=batch_mode,
-                        hostname=self.host,
-                        port=self.port,
-                        username=self.username,
-                        allow_agent=False,
-                        look_for_keys=False,
-                        key_filename=identityfile,
-                        passphrase=passphrase,
-                    )
-                    self.connected = True
-                    self.last_connect_error = None
-                    self.last_error_type = None
-                    logging.info(msg=f"Connected to {self.host}:{self.port} as {self.username} (key auth)")
-                    return True
-                except AuthenticationException as e:
-                    logging.error(msg=f"Key-based authentication failed on {self.description}: {e}")
-                    self._set_connect_error("Key authentication failed", error_type="auth")
-                    return False
-                except NoValidConnectionsError as e:
-                    logging.error(msg=f"Connection failed: {e}")
-                    self._set_connect_error(str(e), error_type="connect")
-                    return False
-            elif self.auth == "password":
-                # Password authentication with retry limit
-                try:
-                    # Password mode: try configured password first, then prompt if needed.
-                    return self._authenticate_with_password(allow_prompt=allow_prompt)
-                except NoValidConnectionsError as e:
-                    logging.error(msg=f"Connection failed: {e}")
-                    self._set_connect_error(str(e), error_type="connect")
-                    return False
-            else:
-                logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto', 'key', or 'password'.")
-                self._set_connect_error(f"Unsupported auth method: {self.auth}", error_type="error")
-                return False
+            if self.auth in ("auto", "key"):
+                return self._connect_with_key(allow_prompt=allow_prompt)
+            if self.auth == "password":
+                # Password mode: try configured password first, then prompt if needed.
+                return self._authenticate_with_password(allow_prompt=allow_prompt)
+            logging.error(msg=f"Unsupported authentication method: {self.auth}, please use 'auto', 'key', or 'password'.")
+            self._set_connect_error(f"Unsupported auth method: {self.auth}", error_type="error")
+            return False
         except Exception as e:
             logging.error(msg=f"Connection failed: {e}")
             self._set_connect_error(str(e), error_type="connect")
             return False
-    
+
     def execute_command(self, command: str) -> str:
         """Execute command on remote server.
 
@@ -1662,9 +1290,7 @@ class LocalClient(BaseClient):
     def connect(self, *, allow_prompt: bool = True, announce: bool = True) -> bool:
         """Local connection is always successful"""
         logging.info(msg=f"Connected to local machine as {self.username}")
-        self.connected = True
-        self.last_connect_error = None
-        self.last_error_type = None
+        self._set_connected()
         return True
     
     def execute_command(self, command: str) -> str:
