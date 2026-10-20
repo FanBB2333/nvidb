@@ -5,50 +5,25 @@ something goes wrong on a node, and the notifier pushing those alerts out
 exactly once.
 """
 import json
-import os
 import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import make_scheduler, two_node_cluster
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.notify import Notifier, load_notify_settings  # noqa: E402
-from nvidb.sched.scheduler import Scheduler  # noqa: E402
+from nvidb.sched import db as dbm
+from nvidb.sched.notify import Notifier, load_notify_settings
 
 
 @pytest.fixture
 def cluster():
-    big = FakeNode("big-node", [FakeGpu(0, "RTX PRO 5000 72GB", 73415)])
-    small = FakeNode("small-node", [FakeGpu(0, "RTX 3090 Ti", 24564)])
-    return FakeCluster(big, small)
+    return two_node_cluster()
 
 
 @pytest.fixture
 def scheduler(tmp_path, cluster):
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cluster.config(),
-        settings={
-            "headroom_mb": 512,
-            "max_jobs_per_gpu": 4,
-            "probe_timeout": 5,
-            "launch_timeout": 5,
-            "tick_min_interval": 0,
-            "lock_ttl": 60,
-            "job_root": ".nvidb/jobs",
-            "default_vram": "0",
-            "placement": "spread",
-            "include_local": False,
-            "min_disk_free_mb": 512,
-        },
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
+    sched = make_scheduler(conn, cluster, min_disk_free_mb=512)
     yield sched
     sched.close()
     conn.close()

@@ -1,32 +1,15 @@
 """Named GPU pools: a job may run on any member card, across nodes."""
 import json
-import os
-import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import FakeCluster, FakeGpu, FakeNode, make_scheduler
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb.sched import cli as sched_cli  # noqa: E402
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.scheduler import Scheduler, gpu_pools  # noqa: E402
-
-SETTINGS = {
-    "headroom_mb": 512,
-    "max_jobs_per_gpu": 4,
-    "probe_timeout": 5,
-    "launch_timeout": 5,
-    "tick_min_interval": 0,
-    "lock_ttl": 60,
-    "job_root": ".nvidb/jobs",
-    "default_vram": "0",
-    "placement": "spread",
-    "include_local": False,
-}
+from nvidb.sched import cli as sched_cli
+from nvidb.sched import db as dbm
+from nvidb.sched.scheduler import gpu_pools
 
 POOLS = {
     # One card on alpha, both on beta; gamma is outside the pool.
@@ -53,15 +36,7 @@ def _scheduler(tmp_path, cluster, pools=None, **settings):
     cfg = cluster.config()
     cfg["queue"] = {"pools": POOLS if pools is None else pools}
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cfg,
-        settings={**SETTINGS, **settings},
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
-    return sched
+    return make_scheduler(conn, cluster, cfg=cfg, **settings)
 
 
 @pytest.fixture

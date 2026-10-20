@@ -1,10 +1,8 @@
 """GPU admission across ordinary jobs, staged jobs, and mode changes."""
 import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
 from fake_cluster import FakeCluster, FakeGpu, FakeNode
 from nvidb.sched import db, runner_agent
 from nvidb.sched.scheduler import DEFAULT_SETTINGS, Scheduler, load_settings

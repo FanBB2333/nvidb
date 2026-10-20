@@ -5,49 +5,31 @@ in the database rather than something implied by priorities and dependency
 chains. These tests are mostly about that promise: the printed order is the
 order, editing it is cheap, and nothing silently runs out of turn.
 """
-import os
-import sys
-
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import (
+    SCHEDULER_SETTINGS,
+    FakeCluster,
+    FakeGpu,
+    FakeNode,
+    make_scheduler,
+    two_node_cluster,
+)
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.model import make_lane_name, parse_lane_name  # noqa: E402
-from nvidb.sched.scheduler import Scheduler  # noqa: E402
+from nvidb.sched import db as dbm
+from nvidb.sched.model import make_lane_name, parse_lane_name
+from nvidb.sched.scheduler import Scheduler
 
 
 @pytest.fixture
 def cluster():
-    big = FakeNode("big-node", [FakeGpu(0, "RTX PRO 5000 72GB", 73415)])
-    small = FakeNode("small-node", [FakeGpu(0, "RTX 3090 Ti", 24564)])
-    return FakeCluster(big, small)
+    return two_node_cluster()
 
 
 @pytest.fixture
 def scheduler(tmp_path, cluster):
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cluster.config(),
-        settings={
-            "headroom_mb": 512,
-            "max_jobs_per_gpu": 4,
-            "probe_timeout": 5,
-            "launch_timeout": 5,
-            "tick_min_interval": 0,
-            "lock_ttl": 60,
-            "job_root": ".nvidb/jobs",
-            "default_vram": "0",
-            "placement": "spread",
-            "include_local": False,
-        },
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
+    sched = make_scheduler(conn, cluster)
     yield sched
     sched.close()
     conn.close()
@@ -127,18 +109,7 @@ def test_lanes_list_in_config_order_then_by_gpu(tmp_path):
     sched = Scheduler(
         conn,
         cfg=cluster.config(),
-        settings={
-            "headroom_mb": 512,
-            "max_jobs_per_gpu": 4,
-            "probe_timeout": 5,
-            "launch_timeout": 5,
-            "tick_min_interval": 0,
-            "lock_ttl": 60,
-            "job_root": ".nvidb/jobs",
-            "default_vram": "0",
-            "placement": "spread",
-            "include_local": False,
-        },
+        settings=dict(SCHEDULER_SETTINGS),
         backend_factory=cluster.backend_factory,
         owner="test",
     )

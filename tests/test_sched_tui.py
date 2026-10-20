@@ -32,17 +32,10 @@ def _content_line(line):
 
 
 @pytest.fixture(autouse=True)
-def wide_terminal():
+def wide_terminal(monkeypatch):
     """blessed reads COLUMNS/LINES when it has no tty, which is the case here."""
-    previous = {key: os.environ.get(key) for key in ("COLUMNS", "LINES")}
-    os.environ["COLUMNS"] = "150"
-    os.environ["LINES"] = "42"
-    yield
-    for key, value in previous.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
+    monkeypatch.setenv("COLUMNS", "150")
+    monkeypatch.setenv("LINES", "42")
 
 
 def _gpu(index=0, name="RTX 3090 Ti", total=24564, used=0, external=0, reserved=0,

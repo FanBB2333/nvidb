@@ -5,52 +5,34 @@ happy path does not cover: a drained node, a cursor that falls behind, a job
 nothing can host. They share a failure mode - the queue stays quietly wrong,
 and whoever called `nvidb job wait` waits forever.
 """
-import os
-import sys
 import time
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import (
+    SCHEDULER_SETTINGS,
+    FakeCluster,
+    FakeGpu,
+    FakeNode,
+    make_scheduler,
+    two_node_cluster,
+)
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
+from nvidb.sched import db as dbm
+from nvidb.sched.scheduler import Scheduler
 
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.scheduler import Scheduler  # noqa: E402
-
-SETTINGS = {
-    "headroom_mb": 512,
-    "max_jobs_per_gpu": 4,
-    "max_cpu_jobs_per_node": 4,
-    "probe_timeout": 5,
-    "launch_timeout": 5,
-    "tick_min_interval": 0,
-    "lock_ttl": 60,
-    "job_root": ".nvidb/jobs",
-    "default_vram": "0",
-    "placement": "spread",
-    "include_local": False,
-}
+SETTINGS = {**SCHEDULER_SETTINGS, "max_cpu_jobs_per_node": 4}
 
 
 @pytest.fixture
 def cluster():
-    big = FakeNode("big-node", [FakeGpu(0, "RTX PRO 5000 72GB", 73415)])
-    small = FakeNode("small-node", [FakeGpu(0, "RTX 3090 Ti", 24564)])
-    return FakeCluster(big, small)
+    return two_node_cluster()
 
 
 @pytest.fixture
 def scheduler(tmp_path, cluster):
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cluster.config(),
-        settings=dict(SETTINGS),
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
+    sched = make_scheduler(conn, cluster, **SETTINGS)
     yield sched
     sched.close()
     conn.close()

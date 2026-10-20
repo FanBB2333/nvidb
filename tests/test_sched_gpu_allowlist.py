@@ -1,33 +1,16 @@
 """A server entry's `gpu_ids:` key picks which of its cards nvidb uses."""
 import json
-import os
-import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import SCHEDULER_SETTINGS, FakeCluster, FakeGpu, FakeNode
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb import config  # noqa: E402
-from nvidb.data_modules import ServerListInfo  # noqa: E402
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.scheduler import Scheduler, gpu_allowlists  # noqa: E402
-
-SETTINGS = {
-    "headroom_mb": 512,
-    "max_jobs_per_gpu": 4,
-    "probe_timeout": 5,
-    "launch_timeout": 5,
-    "tick_min_interval": 0,
-    "lock_ttl": 60,
-    "job_root": ".nvidb/jobs",
-    "default_vram": "0",
-    "placement": "spread",
-    "include_local": False,
-}
+from nvidb import config
+from nvidb.data_modules import ServerListInfo
+from nvidb.sched import db as dbm
+from nvidb.sched.scheduler import Scheduler, gpu_allowlists
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 
@@ -65,7 +48,7 @@ def _scheduler(conn, cluster, gpu_indices=None):
     return Scheduler(
         conn,
         cfg=cfg,
-        settings=dict(SETTINGS),
+        settings=dict(SCHEDULER_SETTINGS),
         backend_factory=cluster.backend_factory,
         owner="test",
     )
@@ -247,7 +230,7 @@ def test_daemon_style_scheduler_reloads_gpu_allowlists(tmp_path, monkeypatch):
     conn = dbm.open_db(tmp_path / "queue.db")
     scheduler = Scheduler(
         conn,
-        settings=dict(SETTINGS),
+        settings=dict(SCHEDULER_SETTINGS),
         backend_factory=cluster.backend_factory,
         owner="test",
     )

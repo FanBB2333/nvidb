@@ -8,53 +8,28 @@ tables and the TUI panes.
 import argparse
 import io
 import json
-import os
 import re
-import sys
 from contextlib import redirect_stdout
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import SCHEDULER_SETTINGS, make_scheduler, two_node_cluster
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb.sched import cli as sched_cli  # noqa: E402
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.model import GpuProcess  # noqa: E402
-from nvidb.sched.scheduler import MAX_RECORDED_GPU_PROCESSES, Scheduler  # noqa: E402
+from nvidb.sched import cli as sched_cli
+from nvidb.sched import db as dbm
+from nvidb.sched.model import GpuProcess
+from nvidb.sched.scheduler import MAX_RECORDED_GPU_PROCESSES, Scheduler
 
 
 @pytest.fixture
 def cluster():
-    big = FakeNode("big-node", [FakeGpu(0, "RTX PRO 5000 72GB", 73415)])
-    small = FakeNode("small-node", [FakeGpu(0, "RTX 3090 Ti", 24564)])
-    return FakeCluster(big, small)
+    return two_node_cluster()
 
 
 @pytest.fixture
 def scheduler(tmp_path, cluster):
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cluster.config(),
-        settings={
-            "headroom_mb": 512,
-            "gpu_mode": "shared",
-            "max_jobs_per_gpu": 4,
-            "probe_timeout": 5,
-            "launch_timeout": 5,
-            "tick_min_interval": 0,
-            "lock_ttl": 60,
-            "job_root": ".nvidb/jobs",
-            "default_vram": "0",
-            "placement": "spread",
-            "include_local": False,
-        },
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
+    sched = make_scheduler(conn, cluster, gpu_mode="shared")
     yield sched
     sched.close()
     conn.close()
@@ -226,22 +201,7 @@ def cli(tmp_path, monkeypatch, cluster):
 
     def _patched(conn, **kwargs):
         kwargs.setdefault("backend_factory", cluster.backend_factory)
-        kwargs.setdefault(
-            "settings",
-            {
-                "headroom_mb": 512,
-                "gpu_mode": "shared",
-                "max_jobs_per_gpu": 4,
-                "probe_timeout": 5,
-                "launch_timeout": 5,
-                "tick_min_interval": 0,
-                "lock_ttl": 60,
-                "job_root": ".nvidb/jobs",
-                "default_vram": "0",
-                "placement": "spread",
-                "include_local": False,
-            },
-        )
+        kwargs.setdefault("settings", {**SCHEDULER_SETTINGS, "gpu_mode": "shared"})
         return real_scheduler(conn, **kwargs)
 
     monkeypatch.setattr(sched_cli, "Scheduler", _patched)
@@ -337,16 +297,9 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
 @pytest.fixture(autouse=True)
-def wide_terminal():
-    previous = {key: os.environ.get(key) for key in ("COLUMNS", "LINES")}
-    os.environ["COLUMNS"] = "150"
-    os.environ["LINES"] = "42"
-    yield
-    for key, value in previous.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
+def wide_terminal(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "150")
+    monkeypatch.setenv("LINES", "42")
 
 
 def _tui_state(processes, attribution="processes", external=6000, queue_mem=4000):

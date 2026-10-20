@@ -1,18 +1,21 @@
 """Tests for the nvidb job queue: storage, scheduling policy and job lifecycle."""
-import os
-import sys
 import threading
 import time
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import (
+    SCHEDULER_SETTINGS,
+    FakeCluster,
+    FakeGpu,
+    FakeNode,
+    make_scheduler,
+    two_node_cluster,
+)
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched.executor import build_run_script, parse_probe_output  # noqa: E402
-from nvidb.sched.model import (  # noqa: E402
+from nvidb.sched import db as dbm
+from nvidb.sched.executor import build_run_script, parse_probe_output
+from nvidb.sched.model import (
     display_width,
     fit_display,
     format_duration,
@@ -20,44 +23,20 @@ from nvidb.sched.model import (  # noqa: E402
     pad_display,
     parse_size_mb,
 )
-from nvidb.sched.scheduler import Scheduler  # noqa: E402
+from nvidb.sched.scheduler import Scheduler
 
 
 # --- fixtures --------------------------------------------------------------
 
-SETTINGS = {
-    "headroom_mb": 512,
-    "max_jobs_per_gpu": 4,
-    "probe_timeout": 5,
-    "launch_timeout": 5,
-    "tick_min_interval": 0,
-    "lock_ttl": 60,
-    "job_root": ".nvidb/jobs",
-    "default_vram": "0",
-    "placement": "spread",
-    "include_local": False,
-}
-
-
 @pytest.fixture
 def cluster():
-    """Two single-GPU machines shaped like the real ones: 72G busy, 24G free."""
-    big = FakeNode("big-node", [FakeGpu(0, "RTX PRO 5000 72GB", 73415)])
-    small = FakeNode("small-node", [FakeGpu(0, "RTX 3090 Ti", 24564)])
-    return FakeCluster(big, small)
+    return two_node_cluster()
 
 
 @pytest.fixture
 def scheduler(tmp_path, cluster):
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cluster.config(),
-        settings=dict(SETTINGS),
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
+    sched = make_scheduler(conn, cluster)
     yield sched
     sched.close()
     conn.close()
@@ -328,7 +307,7 @@ def test_nodes_list_in_config_order_not_alphabetically(tmp_path):
     sched = Scheduler(
         conn,
         cfg=cluster.config(),
-        settings=dict(SETTINGS),
+        settings=dict(SCHEDULER_SETTINGS),
         backend_factory=cluster.backend_factory,
         owner="test",
     )

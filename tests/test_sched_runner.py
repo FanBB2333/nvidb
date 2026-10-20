@@ -16,13 +16,11 @@ import time
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+from fake_cluster import FakeCluster, FakeGpu, FakeNode, make_scheduler
 
-from fake_cluster import FakeCluster, FakeGpu, FakeNode  # noqa: E402
-
-from nvidb.sched import db as dbm  # noqa: E402
-from nvidb.sched import runner_agent  # noqa: E402
-from nvidb.sched.scheduler import Scheduler, TICK_LOCK, UNSTAGED_CANCEL_OWNER  # noqa: E402
+from nvidb.sched import db as dbm
+from nvidb.sched import runner_agent
+from nvidb.sched.scheduler import Scheduler, TICK_LOCK, UNSTAGED_CANCEL_OWNER
 
 
 # --- the shipped program ---------------------------------------------------
@@ -375,26 +373,7 @@ def cluster():
 @pytest.fixture
 def scheduler(tmp_path, cluster):
     conn = dbm.open_db(tmp_path / "queue.db")
-    sched = Scheduler(
-        conn,
-        cfg=cluster.config(),
-        settings={
-            "headroom_mb": 512,
-            "max_jobs_per_gpu": 4,
-            "probe_timeout": 5,
-            "launch_timeout": 5,
-            "tick_min_interval": 0,
-            "lock_ttl": 60,
-            "job_root": ".nvidb/jobs",
-            "default_vram": "0",
-            "placement": "spread",
-            "include_local": False,
-            "lane_lookahead": 1,
-        },
-        backend_factory=cluster.backend_factory,
-        owner="test",
-    )
-    sched.sync_nodes_from_config()
+    sched = make_scheduler(conn, cluster, lane_lookahead=1)
     yield sched
     sched.close()
     conn.close()

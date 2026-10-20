@@ -10,9 +10,24 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from nvidb.sched.executor import JobProbe, LaunchRejected, LaunchResult, NodeProbe
+from nvidb.sched.scheduler import Scheduler
 from nvidb.sched.transport import CommandResult, TransportError
 
 MB = 1024 * 1024
+
+# The scheduler settings most queue tests run with; a test adds its own keys.
+SCHEDULER_SETTINGS = {
+    "headroom_mb": 512,
+    "max_jobs_per_gpu": 4,
+    "probe_timeout": 5,
+    "launch_timeout": 5,
+    "tick_min_interval": 0,
+    "lock_ttl": 60,
+    "job_root": ".nvidb/jobs",
+    "default_vram": "0",
+    "placement": "spread",
+    "include_local": False,
+}
 
 
 class FakeGpu:
@@ -484,3 +499,24 @@ class FakeCluster:
 
     def __getitem__(self, name: str) -> FakeNode:
         return self.nodes[name]
+
+
+def two_node_cluster() -> FakeCluster:
+    """Two single-GPU machines shaped like the real ones: 72G and 24G."""
+    return FakeCluster(
+        FakeNode("big-node", [FakeGpu(0, "RTX PRO 5000 72GB", 73415)]),
+        FakeNode("small-node", [FakeGpu(0, "RTX 3090 Ti", 24564)]),
+    )
+
+
+def make_scheduler(conn, cluster: FakeCluster, cfg: Optional[dict] = None, **settings) -> Scheduler:
+    """A scheduler on `cluster` with SCHEDULER_SETTINGS plus `settings`, nodes synced."""
+    sched = Scheduler(
+        conn,
+        cfg=cluster.config() if cfg is None else cfg,
+        settings={**SCHEDULER_SETTINGS, **settings},
+        backend_factory=cluster.backend_factory,
+        owner="test",
+    )
+    sched.sync_nodes_from_config()
+    return sched
