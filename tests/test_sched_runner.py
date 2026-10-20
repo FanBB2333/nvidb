@@ -609,6 +609,24 @@ def test_a_job_that_starts_and_ends_between_two_passes_is_not_run_again(
     assert dbm.get_job(scheduler.conn, job_id).state == "completed"
 
 
+def test_a_job_finished_unobserved_keeps_its_lane_card(scheduler, cluster):
+    """Staged, started and retired by the runner between two passes."""
+    scheduler.tick(force=True)
+    first = scheduler.submit("first", lane="box:0", vram="1G")
+    scheduler.tick(force=True)
+    second = scheduler.submit("second", lane="box:0", vram="1G")
+    scheduler.tick(force=True)
+    cluster["box"].finish_job(first, exit_code=0)
+    _runner(cluster).poll("box:0")
+    cluster["box"].finish_job(second, exit_code=0)
+    _runner(cluster).poll("box:0")
+    scheduler.tick(force=True)
+
+    job = dbm.get_job(scheduler.conn, second)
+    assert job.state == "completed"
+    assert job.gpu_ids == [0]
+
+
 def test_a_lane_moves_on_after_a_job_nobody_saw_running(scheduler, cluster):
     """The lane must not wedge on a job that finished unobserved."""
     scheduler.tick(force=True)
@@ -680,6 +698,26 @@ def test_cancelling_a_staged_job_takes_it_back_before_it_starts(scheduler, clust
     staged = [spec["job_id"] for spec in _runner(cluster).lanes["box:0"]["queued"]]
     assert queued not in staged
     assert dbm.get_job(scheduler.conn, first).state == "running"
+
+
+def test_cancelling_in_a_paused_lane_stages_nothing_new(scheduler, cluster):
+    """A cancel only takes work back; it must not stage the job behind it,
+    or a paused lane could no longer be rearranged."""
+    scheduler.tick(force=True)
+    scheduler.submit("first", lane="box:0", vram="1G")
+    scheduler.tick(force=True)
+    queued = scheduler.submit("queued", lane="box:0", vram="1G")
+    scheduler.tick(force=True)
+    later = scheduler.submit("later", lane="box:0", vram="1G")
+    scheduler.set_lane_paused("box:0", True)
+    scheduler.tick(force=True)
+    scheduler.lane_move(later, to="head")
+
+    scheduler.cancel(queued)
+
+    assert dbm.get_job(scheduler.conn, later).run_dir is None
+    assert _runner(cluster).lanes["box:0"]["queued"] == []
+    scheduler.lane_assign(later, None)  # still a local record, so it can move
 
 
 def test_a_job_started_after_it_was_cancelled_is_stopped(scheduler, cluster):

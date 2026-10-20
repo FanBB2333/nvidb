@@ -1402,6 +1402,7 @@ class Scheduler:
                 if orphan_reason:
                     self._remember_orphan(job, reason=orphan_reason)
                 self._mark_cancelled(job_id, reason)
+                dbm.resolve_job_alerts(self.conn, job_id, "job_overdue")
             return True
 
     def _mark_cancelled(self, job_id: int, reason: str) -> None:
@@ -1829,6 +1830,8 @@ class Scheduler:
         summary: Dict[str, Any],
     ) -> None:
         """Retry a vanished attempt only when none of its processes remain."""
+        # Either way the node has answered what an overdue warning was waiting for.
+        dbm.resolve_job_alerts(self.conn, job.id, "job_overdue")
         # Neither alive nor holding an exit code: the process vanished.
         # Why is usually sitting in the job's own stderr - a full disk, an
         # OOM kill - so it is read once here and carried onto the record
@@ -1976,6 +1979,7 @@ class Scheduler:
                         job.id,
                         state=state,
                         node=node.name,
+                        gpu_ids=self._lane_gpu_ids(job),
                         exit_code=exit_code,
                         started_at=started_at,
                         finished_at=finished_at,
@@ -2630,8 +2634,10 @@ class Scheduler:
                     # job that cannot start yet may be staged past it.
                     break
             else:
+                # Outside a tick nothing new is reserved: only work the runner
+                # was already handed is sent again.
                 ready, hold_reason = self._dependencies_ready(job)
-                if hold_reason or not ready:
+                if hold_reason or not ready or not job.run_dir:
                     break
             attempt = job.attempt + 1
             run_dir = self._lane_run_dir(lane, job, attempt)
@@ -2922,10 +2928,10 @@ class Scheduler:
         node = dbm.get_node(self.conn, lane.node)
         if node is None:
             return
-        lookahead = max(1, int(self.settings.get("lane_lookahead") or 1))
-        specs = [
+        # A paused lane's runner was already handed nothing by the last tick.
+        specs = [] if lane.paused else [
             spec
-            for spec in self._lane_specs(lane, lookahead)
+            for spec in self._lane_specs(lane, self._lane_window(lane))
             if spec["job_id"] != job.id
         ]
         try:

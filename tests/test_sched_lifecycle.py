@@ -567,6 +567,25 @@ def test_offline_completion_never_becomes_timeout_or_holds_dependents(scheduler,
     assert not cluster["small-node"].killed
 
 
+def test_an_overdue_job_found_vanished_closes_its_overdue_alert(scheduler, cluster):
+    scheduler.tick(force=True)
+    job_id = scheduler.submit("work", node="small-node", max_runtime_s=60)
+    scheduler.tick(force=True)
+    _overrun(scheduler, job_id)
+    cluster["small-node"].online = False
+    scheduler.tick(force=True)
+    open_kinds = [a["kind"] for a in dbm.list_alerts(scheduler.conn, open_only=True)]
+    assert "job_overdue" in open_kinds
+
+    cluster["small-node"].vanish_job(job_id)
+    cluster["small-node"].online = True
+    scheduler.tick(force=True)
+
+    assert dbm.get_job(scheduler.conn, job_id).state == "lost"
+    open_kinds = [a["kind"] for a in dbm.list_alerts(scheduler.conn, open_only=True)]
+    assert "job_overdue" not in open_kinds
+
+
 @pytest.mark.parametrize("signal_delivered", [False, True])
 def test_timeout_transport_failure_preserves_running_until_reconciled(scheduler, cluster, monkeypatch, signal_delivered):
     from nvidb.sched.transport import TransportError
