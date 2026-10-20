@@ -94,6 +94,14 @@ def parse_leading_float(value):
     return float(numbers[0]) if numbers else None
 
 
+def _terminal_size(columns=80, lines=24):
+    """The terminal's size, or the given fallback when stdout is no TTY."""
+    try:
+        return os.get_terminal_size()
+    except OSError:
+        return os.terminal_size((columns, lines))
+
+
 def _xml_text(element, path, default="N/A"):
     """Text of `path` under an `nvidia-smi -q -x` element, or `default`."""
     if element is None:
@@ -1431,15 +1439,6 @@ class NVClientPool:
         "pid": "PID",
         "command": "COMMAND",
     }
-    UNIFIED_PROCESS_SORT_COLUMNS = {
-        "vram": "vram",
-        "cpu": "cpu",
-        "mem": "mem",
-        "rss": "rss",
-        "time": "time",
-        "pid": "pid",
-        "command": "command",
-    }
 
     def __init__(
         self,
@@ -1488,11 +1487,7 @@ class NVClientPool:
         self._default_expansion_applied = False
         self._expansion_touched = False
         settings = nvidb_config.normalize_view_settings(view_settings)
-        self.display_mode = (
-            self.DISPLAY_MODE_UNIFIED
-            if settings["mode"] == "unified"
-            else self.DISPLAY_MODE_NODES
-        )
+        self.display_mode = settings["mode"]
         self.unified_detailed = settings["detailed"]
         self.unified_sort_mode = settings["sort"]
         self.unified_filter_mode = settings["filter"]
@@ -1520,7 +1515,6 @@ class NVClientPool:
         self.unified_process_sort_descending = True
         self.unified_process_rows = 0
         self._unified_process_visible_rows = 1
-        self._unified_process_total_count = 0
         self._unified_process_count = 0
         self.unified_command_scroll = 0
         self._unified_command_line_count = 0
@@ -1544,10 +1538,12 @@ class NVClientPool:
         self._unified_process_history = {}
         self._unified_history_lock = threading.Lock()
         self.refresh_needed = threading.Event()  # Flag to trigger immediate refresh after key press
-        self.ui_only_refresh = False  # Flag to indicate UI-only refresh (no data fetch)
         self.cached_stats = None  # Cached GPU stats data
         self.cached_raw_stats = {}  # Cached raw stats per client index
         self._cache_lock = threading.Lock()
+        # Rendered node blocks reused while their sample and layout hold
+        # (see _format_client_blocks).
+        self._formatted_node_blocks = {}
         self._last_update_time = None
         self._last_fetch_duration = None
         self._last_fetch_error = None
@@ -1580,14 +1576,13 @@ class NVClientPool:
             _active_connect_progress = progress
         try:
             for client in self.pool:
-                label = str(getattr(client, "description", "") or "node")
+                label = str(client.description or "node")
                 progress.show(label)
                 try:
                     connected = client.connect(announce=False)
                 except Exception as e:
                     logging.error(msg=f"Failed to connect to {label}: {e}")
-                    if hasattr(client, "_set_connect_error"):
-                        client._set_connect_error(str(e), error_type="connect")
+                    client._set_connect_error(str(e), error_type="connect")
                     connected = False
                 progress.mark(bool(connected))
         finally:
@@ -1680,7 +1675,7 @@ class NVClientPool:
         allowed = set(allowed)
 
         def keep(frame):
-            if not isinstance(frame, pd.DataFrame) or frame.empty:
+            if frame.empty:
                 return frame
             for column in ("gpu_index", "GPU"):
                 if column in frame.columns:
@@ -1692,15 +1687,13 @@ class NVClientPool:
             return frame
 
         stats = keep(stats)
-        if isinstance(system_info, dict):
-            system_info = dict(system_info)
-            advanced = system_info.get("advanced_metrics")
-            if isinstance(advanced, pd.DataFrame):
-                system_info["advanced_metrics"] = keep(advanced)
-            # The header count must describe what is on screen, not what
-            # the driver reported.
-            if isinstance(stats, pd.DataFrame):
-                system_info["attached_gpus"] = str(len(stats))
+        system_info = dict(system_info)
+        advanced = system_info.get("advanced_metrics")
+        if isinstance(advanced, pd.DataFrame):
+            system_info["advanced_metrics"] = keep(advanced)
+        # The header count must describe what is on screen, not what
+        # the driver reported.
+        system_info["attached_gpus"] = str(len(stats))
         return stats, system_info
 
     def _collect_client_gpu_info(
@@ -1719,35 +1712,19 @@ class NVClientPool:
             except Exception as e:
                 logging.warning(f"Failed to get system stats for {client.description}: {e}")
 
-        user_summary_for_client = {}
-
         # Empty/error samples still retain their node identity.
         if stats.empty:
             return stats, system_info, {}, {}
 
-        # Optimize rx/tx display - split into two columns
-        rx_list = []
-        tx_list = []
-        for _, row in stats.iterrows():
-            rx_val, rx_unit = extract_value_and_unit(row['rx_util'])
-            tx_val, tx_unit = extract_value_and_unit(row['tx_util'])
-
-            rx_formatted = format_bandwidth(rx_val, rx_unit)
-            tx_formatted = format_bandwidth(tx_val, tx_unit)
-
-            # Ensure formatted strings don't exceed column width limit
-            rx_list.append(rx_formatted[:11])
-            tx_list.append(tx_formatted[:11])
-
-        stats['rx'] = rx_list
-        stats['tx'] = tx_list
+        # Compact rx/tx display, cut to the column width limit.
+        stats['rx'] = [format_bandwidth(*extract_value_and_unit(value))[:11] for value in stats['rx_util']]
+        stats['tx'] = [format_bandwidth(*extract_value_and_unit(value))[:11] for value in stats['tx_util']]
         self._add_pcie_link_columns(stats)
         stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
         stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
         # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)
         process_list = []
-        per_gpu_process_details = {}
         try:
             all_processes, user_summary_for_client = client.get_process_summary(
                 stats,
@@ -1818,22 +1795,17 @@ class NVClientPool:
             'pcie_link_gen_current', 'pcie_link_width_current',
             'pcie_link_gen_max', 'pcie_link_width_max',
         ]
-        # Only drop columns that exist in the DataFrame
-        columns_to_drop = [col for col in columns_to_drop if col in stats.columns]
-        stats = stats.drop(columns=columns_to_drop)
+        stats = stats.drop(columns=columns_to_drop, errors="ignore")
 
         # Reorder columns: move mem_util before memory[used/total] and processes at the end
-        if 'processes' in stats.columns:
-            # Define desired column order
-            desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'link', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
-            # Only keep columns that exist in stats
-            ordered_columns = [col for col in desired_order if col in stats.columns]
-            # Add any remaining columns that weren't in desired_order
-            remaining_columns = [col for col in stats.columns if col not in ordered_columns]
-            stats = stats[ordered_columns + remaining_columns]
+        desired_order = ['GPU', 'name', 'fan', 'util', 'temp', 'link', 'rx', 'tx', 'power', 'mem_util', 'memory[used/total]', 'processes']
+        # Only keep columns that exist in stats
+        ordered_columns = [col for col in desired_order if col in stats.columns]
+        # Add any remaining columns that weren't in desired_order
+        remaining_columns = [col for col in stats.columns if col not in ordered_columns]
+        stats = stats[ordered_columns + remaining_columns]
 
-
-        return stats, system_info, dict(user_summary_for_client or {}), per_gpu_process_details
+        return stats, system_info, user_summary_for_client, per_gpu_process_details
 
     @staticmethod
     def _sample_metadata(samples):
@@ -1842,12 +1814,7 @@ class NVClientPool:
         totals = {}
         for summary in users.values():
             for username, mib in summary.items():
-                try:
-                    mib = int(mib)
-                except (TypeError, ValueError):
-                    continue
-                if mib > 0:
-                    totals[username] = totals.get(username, 0) + mib
+                totals[username] = totals.get(username, 0) + mib
         return {
             "user_memory_by_client": users,
             "user_memory_global": totals,
@@ -1856,9 +1823,6 @@ class NVClientPool:
 
     def get_client_gpus_info(self, return_raw: bool = False):
         # Synchronous consumers (--once, logger, web) keep a complete snapshot.
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)
-        pd.set_option('display.colheader_justify', 'center')
         want_details = self._process_panel_visible()
         samples = {
             idx: self._collect_client_gpu_info(client, want_process_details=want_details)
@@ -1869,7 +1833,7 @@ class NVClientPool:
         formatted = self._format_client_blocks([raw[idx] for idx in range(len(self.pool))])
         return (formatted, raw) if return_raw else formatted
 
-    def _format_client_blocks(self, stats_str):
+    def _format_client_blocks(self, blocks):
         """Render each client's (stats, system_info) pair into its TUI block.
 
         Kept separate from the fetch so print_stats can re-run it from the
@@ -1879,17 +1843,19 @@ class NVClientPool:
         # These blocks only ever appear inside the per-node view's panel
         # border, so they reserve its margin up front - narrow terminals
         # drop the border (see `compact_layout`) and so reserve nothing.
-        try:
-            _fetch_width = os.get_terminal_size().columns
-        except OSError:
-            _fetch_width = 80
-        self._blocks_formatted_width = _fetch_width
-        panel_margin = 0 if _fetch_width < 72 else self._PANEL_BORDER_MARGIN
+        width = _terminal_size().columns
+        self._blocks_formatted_width = width
+        panel_margin = 0 if width < 72 else self._PANEL_BORDER_MARGIN
         formatted_stats = []
-        cache = getattr(self, "_formatted_node_blocks", {})
-        self._formatted_node_blocks = cache
-        render_key = (_fetch_width, _monitor_theme, bool(getattr(self, "compact", False)))
-        for idx, (client, (stats, system_info)) in enumerate(zip(self.pool, stats_str)):
+        cache = self._formatted_node_blocks
+        render_key = (width, _monitor_theme, self.compact)
+
+        def with_detail(name, detail):
+            if detail and detail not in {"N/A", "-", ""}:
+                return f"{name} ({detail})"
+            return str(name)
+
+        for idx, (client, (stats, system_info)) in enumerate(zip(self.pool, blocks)):
             monitor_text = self._node_monitor_text(system_info) if system_info.get("_monitor") else ""
             monitor_line = "\n" + monitor_text if monitor_text else ""
             cached = cache.get(idx)
@@ -1900,9 +1866,9 @@ class NVClientPool:
                 formatted_stats.append("")
                 continue
             # Create formatted table display (or error panel)
-            if isinstance(system_info, dict) and system_info.get("error"):
+            if system_info.get("error"):
                 error_panel = self._format_error_panel(
-                    system_info.get("error", "Error"),
+                    system_info["error"],
                     error_type=system_info.get("error_type"),
                     outer_margin=panel_margin,
                 )
@@ -1915,12 +1881,10 @@ class NVClientPool:
 
             system_info_header = ""
             if system_info:
-                source = system_info.get("data_source", "N/A")
-                source_detail = system_info.get("data_source_detail")
-                if source_detail and source_detail not in {"N/A", "-", ""}:
-                    source_display = f"{source} ({source_detail})"
-                else:
-                    source_display = str(source)
+                source_display = with_detail(
+                    system_info.get("data_source", "N/A"),
+                    system_info.get("data_source_detail"),
+                )
                 # Surface DCGM status: it is easy to mistake a hidden advanced table
                 # for "DCGM not connected" when profiling fields are just unsupported
                 # (DCP metrics are datacenter-GPU only).
@@ -1928,11 +1892,9 @@ class NVClientPool:
                 adv_source = system_info.get("advanced_source")
                 if adv_source:
                     if system_info.get("advanced_supported") is True:
-                        adv_detail = system_info.get("advanced_source_detail")
-                        if adv_detail and adv_detail not in {"N/A", "-", ""}:
-                            advanced_display = f" · Advanced {adv_source} ({adv_detail})"
-                        else:
-                            advanced_display = f" · Advanced {adv_source}"
+                        advanced_display = " · Advanced " + with_detail(
+                            adv_source, system_info.get("advanced_source_detail")
+                        )
                     else:
                         advanced_display = f" · Advanced {adv_source} (profiling unavailable)"
                 # Static facts, dimmed whole: the eye should land on the
@@ -1949,10 +1911,8 @@ class NVClientPool:
                 )
 
             advanced_block = ""
-            advanced_supported = (
-                isinstance(system_info, dict) and system_info.get("advanced_supported") is True
-            )
-            advanced_df = system_info.get("advanced_metrics") if isinstance(system_info, dict) else None
+            advanced_supported = system_info.get("advanced_supported") is True
+            advanced_df = system_info.get("advanced_metrics")
             if advanced_supported and isinstance(advanced_df, pd.DataFrame) and not advanced_df.empty:
                 try:
                     sub_blocks = ["Advanced (DCGM)"]
@@ -1991,7 +1951,7 @@ class NVClientPool:
         return left + " " * (remaining - visible_width + 1) + colored(version, "dark_grey")
 
     def _node_monitor_text(self, system_info):
-        if not getattr(self, "debug", False):
+        if not self.debug:
             return ""
         monitor = system_info.get("_monitor", {})
         if not monitor:
@@ -2014,7 +1974,7 @@ class NVClientPool:
     def _local_client_index(self):
         """Pool index of the local machine, or None when it is absent."""
         for idx, client in enumerate(self.pool):
-            if getattr(client, "port", None) == "local" or isinstance(client, LocalClient):
+            if client.port == "local":
                 return idx
         return None
 
@@ -2030,9 +1990,8 @@ class NVClientPool:
         local_idx = self._local_client_index()
         if local_idx is None or len(indices) <= 1:
             return indices
-        raw = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
-        stats, _system_info = raw.get(local_idx, (pd.DataFrame(), {}))
-        if isinstance(stats, pd.DataFrame) and not stats.empty:
+        entry = raw_stats_by_client.get(local_idx)
+        if entry is not None and not entry[0].empty:
             return indices
         indices.remove(local_idx)
         return indices
@@ -2057,20 +2016,13 @@ class NVClientPool:
         sep_plain = " · "
         sep = colored(sep_plain, "dark_grey")
         head_plain = f"⌂ {identity_plain}{sep_plain}{os_plain}"
-        head = (
-            colored("⌂ ", "cyan", attrs=["bold"])
-            + colored(identity_plain, attrs=["bold"])
-            + sep
-            + colored(os_plain, "dark_grey")
-        )
+        identity_styled = colored("⌂ ", "cyan", attrs=["bold"]) + colored(identity_plain, attrs=["bold"])
+        head = identity_styled + sep + colored(os_plain, "dark_grey")
 
-        raw = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
-        _stats, system_info = raw.get(local_idx, (pd.DataFrame(), {}))
-        sys_stats = (
-            system_info.get("system_stats") if isinstance(system_info, dict) else None
-        ) or {}
+        _stats, system_info = raw_stats_by_client.get(local_idx, (None, {}))
+        sys_stats = system_info.get("system_stats") or {}
         if not sys_stats:
-            if not getattr(self, "debug", False):
+            if not self.debug:
                 return [head if display_width(head_plain) <= terminal_width else fit_display(head_plain, terminal_width)]
             tail_plain = "collecting system stats…"
             plain = f"{head_plain}{sep_plain}{tail_plain}"
@@ -2080,43 +2032,20 @@ class NVClientPool:
 
         cores = int(sys_stats.get("cpu_cores") or 0)
         cpu_percent = int(round(float(sys_stats.get("cpu_percent") or 0.0)))
-        if cpu_percent >= 80:
-            cpu_color = "red"
-        elif cpu_percent >= 50:
-            cpu_color = "yellow"
-        else:
-            cpu_color = "green"
+        cpu_color = self._threshold_color(cpu_percent, 50, 80, "green")
 
-        load_values = None
         load_avg = sys_stats.get("load_avg")
-        if isinstance(load_avg, (list, tuple)) and len(load_avg) == 3:
-            try:
-                load_values = tuple(float(value) for value in load_avg)
-            except (TypeError, ValueError):
-                load_values = None
+        load_values = tuple(float(value) for value in load_avg) if load_avg else None
         load_color = None
         if load_values is not None and cores > 0:
-            load_ratio = load_values[0] / cores
-            if load_ratio >= 1.0:
-                load_color = "red"
-            elif load_ratio >= 0.7:
-                load_color = "yellow"
-            else:
-                load_color = "green"
+            load_color = self._threshold_color(load_values[0] / cores, 0.7, 1.0, "green")
 
         mem_used = float(sys_stats.get("mem_used_gb") or 0.0)
         mem_total = float(sys_stats.get("mem_total_gb") or 0.0)
         mem_percent = (
             int(round(mem_used / mem_total * 100)) if mem_total > 0 else None
         )
-        if mem_percent is None:
-            mem_color = None
-        elif mem_percent >= 90:
-            mem_color = "red"
-        elif mem_percent >= 75:
-            mem_color = "yellow"
-        else:
-            mem_color = "green"
+        mem_color = self._threshold_color(mem_percent, 75, 90, "green")
 
         swap_used = float(sys_stats.get("swap_used_gb") or 0.0)
         swap_total = float(sys_stats.get("swap_total_gb") or 0.0)
@@ -2177,12 +2106,7 @@ class NVClientPool:
         for variant_index, parts in enumerate(variants):
             drop_os = variant_index == len(variants) - 1
             plain_pieces = [head_plain if not drop_os else f"⌂ {identity_plain}"]
-            styled_pieces = [
-                head
-                if not drop_os
-                else colored("⌂ ", "cyan", attrs=["bold"])
-                + colored(identity_plain, attrs=["bold"])
-            ]
+            styled_pieces = [identity_styled if drop_os else head]
             plain_pieces.extend(plain for plain, _styled in parts)
             styled_pieces.extend(styled for _plain, styled in parts)
             plain = sep_plain.join(plain_pieces)
@@ -2193,11 +2117,10 @@ class NVClientPool:
     def _client_table_identity(self, client_index):
         """Return compact node and hostname labels for the unified TUI table."""
         client = self.pool[client_index]
-        description = str(getattr(client, "description", "") or "").strip()
-        configured_host = str(getattr(client, "host", "") or "").strip()
-        is_local = getattr(client, "port", None) == "local" or isinstance(client, LocalClient)
+        description = str(client.description or "").strip()
+        configured_host = str(client.host or "").strip()
 
-        if is_local:
+        if client.port == "local":
             try:
                 hostname = socket.gethostname().strip()
             except Exception:
@@ -2210,15 +2133,11 @@ class NVClientPool:
     def _build_unified_gpu_table(self, raw_stats_by_client):
         """Combine all available per-node GPU rows into one display table."""
         frames = []
-        raw_stats_by_client = raw_stats_by_client if isinstance(raw_stats_by_client, dict) else {}
-
         for idx in range(len(self.pool)):
             entry = raw_stats_by_client.get(idx)
-            if not isinstance(entry, tuple) or len(entry) != 2:
+            if entry is None or entry[0].empty:
                 continue
-            stats, _system_info = entry
-            if not isinstance(stats, pd.DataFrame) or stats.empty:
-                continue
+            stats = entry[0]
 
             node, hostname = self._client_table_identity(idx)
             table = stats.copy()
@@ -2236,26 +2155,15 @@ class NVClientPool:
             return pd.DataFrame(columns=list(self.UNIFIED_TABLE_COLUMNS))
         return pd.concat(frames, ignore_index=True, sort=False).fillna("N/A")
 
-    @staticmethod
-    def _extract_metric_number(value):
-        """Return the first numeric component of a displayed metric."""
-        if value is None:
-            return None
-        try:
-            numbers = extract_numbers(str(value))
-            return float(numbers[0]) if numbers else None
-        except (TypeError, ValueError, IndexError):
-            return None
-
     def _unified_gpu_capacity(self, row):
         """Return utilization and VRAM values used by summaries and sorting."""
-        utilization = self._extract_metric_number(row.get("util"))
+        utilization = parse_leading_float(row.get("util"))
         memory_value = str(row.get("memory[used/total]", "") or "")
         used_mib = total_mib = None
         if "/" in memory_value:
             used_value, total_value = memory_value.split("/", 1)
-            used_mib = self._extract_metric_number(used_value)
-            total_mib = self._extract_metric_number(total_value)
+            used_mib = parse_leading_float(used_value)
+            total_mib = parse_leading_float(total_value)
 
         memory_percent = None
         free_mib = None
@@ -2391,10 +2299,7 @@ class NVClientPool:
         total_mib = sum(values["total_mib"] for values in known_memory)
         free_mib = max(0.0, total_mib - used_mib)
 
-        try:
-            terminal_width = os.get_terminal_size().columns
-        except OSError:
-            terminal_width = 80
+        terminal_width = _terminal_size().columns
 
         average_display = (
             f"{average_utilization:.0f}%"
@@ -2402,94 +2307,48 @@ class NVClientPool:
             else "N/A"
         )
 
-        def _util_color(avg):
-            if avg is None:
-                return None
-            if avg >= 80:
-                return "red"
-            if avg >= 50:
-                return "yellow"
-            return "green"
+        wide = total_mib > 0 and terminal_width >= 100
+        # (label, value, value colour) per segment; the plain and styled
+        # lines below are built from the same list.
+        segments = [
+            ("available " if wide else "avail ", f"{available_count}/{len(table)}", "green"),
+            ("busy ", str(busy_count), "yellow"),
+            (
+                "avg util " if wide else "avg ",
+                average_display,
+                self._threshold_color(average_utilization, 50, 80, "green"),
+            ),
+        ]
+        if total_mib > 0:
+            memory_percent = used_mib / total_mib * 100
+            if wide:
+                vram_text = (
+                    f"{used_mib / 1024:.1f}/{total_mib / 1024:.1f} GiB "
+                    f"({memory_percent:.0f}%)"
+                )
+                free_text = f"{free_mib / 1024:.1f} GiB"
+            else:
+                vram_text = f"{used_mib / 1024:.0f}/{total_mib / 1024:.0f}G"
+                free_text = f"{free_mib / 1024:.0f}G"
+            segments += [
+                ("VRAM ", vram_text, self._threshold_color(memory_percent, 75, 90, "green")),
+                ("free ", free_text, "green"),
+            ]
 
-        def _mem_pct_color(pct):
-            if pct >= 90:
-                return "red"
-            if pct >= 75:
-                return "yellow"
-            return "green"
-
+        plain_summary = (
+            "Capacity: "
+            + " | ".join(label + value for label, value, _color in segments)
+            + ("" if total_mib > 0 else " | VRAM N/A")
+        )
+        if len(plain_summary) > terminal_width:
+            return plain_summary[: max(0, terminal_width - 3)] + "..."
         sep = colored(" · ", "dark_grey")
-        if total_mib > 0 and terminal_width >= 100:
-            memory_percent = used_mib / total_mib * 100
-            plain_summary = (
-                f"Capacity: available {available_count}/{len(table)} | "
-                f"busy {busy_count} | avg util {average_display} | "
-                f"VRAM {used_mib / 1024:.1f}/{total_mib / 1024:.1f} GiB "
-                f"({memory_percent:.0f}%) | free {free_mib / 1024:.1f} GiB"
-            )
-            if len(plain_summary) > terminal_width:
-                return plain_summary[: max(0, terminal_width - 3)] + "..."
-            summary = (
-                colored("Capacity:", "cyan", attrs=["bold"])
-                + " available "
-                + colored(f"{available_count}/{len(table)}", "green")
-                + sep + "busy "
-                + colored(str(busy_count), "yellow")
-                + sep + "avg util "
-                + colored(average_display, _util_color(average_utilization))
-                + sep + "VRAM "
-                + colored(
-                    f"{used_mib / 1024:.1f}/{total_mib / 1024:.1f} GiB ({memory_percent:.0f}%)",
-                    _mem_pct_color(memory_percent),
-                )
-                + sep + "free "
-                + colored(f"{free_mib / 1024:.1f} GiB", "green")
-            )
-        elif total_mib > 0:
-            plain_summary = (
-                f"Capacity: avail {available_count}/{len(table)} | "
-                f"busy {busy_count} | avg {average_display} | "
-                f"VRAM {used_mib / 1024:.0f}/{total_mib / 1024:.0f}G | "
-                f"free {free_mib / 1024:.0f}G"
-            )
-            if len(plain_summary) > terminal_width:
-                return plain_summary[: max(0, terminal_width - 3)] + "..."
-            memory_percent = used_mib / total_mib * 100
-            summary = (
-                colored("Capacity:", "cyan", attrs=["bold"])
-                + " avail "
-                + colored(f"{available_count}/{len(table)}", "green")
-                + sep + "busy "
-                + colored(str(busy_count), "yellow")
-                + sep + "avg "
-                + colored(average_display, _util_color(average_utilization))
-                + sep + "VRAM "
-                + colored(
-                    f"{used_mib / 1024:.0f}/{total_mib / 1024:.0f}G",
-                    _mem_pct_color(memory_percent),
-                )
-                + sep + "free "
-                + colored(f"{free_mib / 1024:.0f}G", "green")
-            )
-        else:
-            plain_summary = (
-                f"Capacity: avail {available_count}/{len(table)} | "
-                f"busy {busy_count} | avg {average_display} | VRAM N/A"
-            )
-            if len(plain_summary) > terminal_width:
-                return plain_summary[: max(0, terminal_width - 3)] + "..."
-            summary = (
-                colored("Capacity:", "cyan", attrs=["bold"])
-                + " avail "
-                + colored(f"{available_count}/{len(table)}", "green")
-                + sep + "busy "
-                + colored(str(busy_count), "yellow")
-                + sep + "avg "
-                + colored(average_display, _util_color(average_utilization))
-                + sep + "VRAM N/A"
-            )
-
-        return summary
+        return (
+            colored("Capacity:", "cyan", attrs=["bold"])
+            + " "
+            + sep.join(label + colored(value, color) for label, value, color in segments)
+            + ("" if total_mib > 0 else sep + "VRAM N/A")
+        )
 
     def _unified_grouping_active(self):
         """Group rows into node blocks only while the table follows node order."""
@@ -2531,15 +2390,17 @@ class NVClientPool:
     def _unified_section_headers(self, visible_table, scope_table):
         """Map visible row index -> node band text for the grouped views."""
         headers = {}
-        if (
-            not self._unified_grouping_active()
-            or visible_table.empty
-            or "Node" not in visible_table.columns
-        ):
+        if not self._unified_grouping_active() or visible_table.empty:
             return headers
 
         def identity(row):
             return str(row.get("Node", "")), str(row.get("Hostname", ""))
+
+        # One pass over the whole scope: a band summarises every row of its
+        # node, including the ones on other pages.
+        rows_by_node = {}
+        for _, node_row in scope_table.iterrows():
+            rows_by_node.setdefault(identity(node_row), []).append(node_row)
 
         previous_key = None
         for position, (_, row) in enumerate(visible_table.iterrows()):
@@ -2547,24 +2408,14 @@ class NVClientPool:
             if key == previous_key:
                 continue
             previous_key = key
-            node_rows = [
-                node_row
-                for _, node_row in scope_table.iterrows()
-                if identity(node_row) == key
-            ]
             headers[position] = self._format_unified_node_band(
-                key[0],
-                key[1],
-                node_rows or [row],
+                key[0], key[1], rows_by_node[key]
             )
         return headers
 
     def _paginate_unified_gpu_table(self, table, *, detailed):
         """Return the visible GPU page and selected row within that page."""
-        try:
-            terminal_height = os.get_terminal_size().lines
-        except OSError:
-            terminal_height = 24
+        terminal_height = _terminal_size().lines
 
         show_processes = self._process_panel_visible()
         show_trends = bool(self.unified_show_trends)
@@ -2576,42 +2427,25 @@ class NVClientPool:
             # The local machine's strip at the top of the page.
             + (1 if self._local_client_index() is not None else 0)
         )
-        # Node bands take screen space too: two extra lines per block in the
-        # detailed view (the block reuses one card border), one otherwise.
-        group_count = 0
-        if (
-            not detailed
-            and self._unified_grouping_active()
-            and not table.empty
-            and "Node" in table.columns
-        ):
-            group_count = len(table[["Node", "Hostname"]].drop_duplicates())
         if detailed:
-            reserved_lines = 10 + extra_lines + group_count * 2
+            reserved_lines = 10 + extra_lines
             page_size = max(1, (terminal_height - reserved_lines) // 5)
         else:
+            # Node bands exist only in the compact table, one line each.
+            group_count = (
+                len(table[["Node", "Hostname"]].drop_duplicates())
+                if self._unified_grouping_active() and not table.empty
+                else 0
+            )
             reserved_lines = 12 + extra_lines + group_count
             page_size = max(1, terminal_height - reserved_lines)
 
         total = len(table)
-        selected = int(self.unified_selected_gpu or 0)
         selected_key = self.unified_selected_gpu_key
-        if selected_key is not None:
-            for position, (_, row) in enumerate(table.iterrows()):
-                if self._unified_gpu_history_key(row) == selected_key:
-                    selected = position
-                    break
-        selected = max(0, min(selected, max(0, total - 1)))
-        self.unified_selected_gpu = selected
-        new_selected_key = (
-            self._unified_gpu_history_key(table.iloc[selected])
-            if total
-            else None
-        )
-        self.unified_selected_gpu_key = new_selected_key
+        selected = self._sync_selected_gpu(table)
         if (
             selected_key is not None
-            and new_selected_key != selected_key
+            and self.unified_selected_gpu_key != selected_key
         ):
             self.unified_selected_process = 0
             self.unified_selected_process_pid = None
@@ -2637,6 +2471,46 @@ class NVClientPool:
         page_status = f"Rows {page_start + 1}-{page_end}/{total}"
         return visible_table, selected_on_page, page_status
 
+    def _sync_selected_gpu(self, table):
+        """Re-find the selected GPU in `table` by its key, clamp, and store it.
+
+        Returns the selected position; an empty table selects 0 and no key.
+        """
+        selected = int(self.unified_selected_gpu or 0)
+        selected_key = self.unified_selected_gpu_key
+        if selected_key is not None:
+            for position, (_, row) in enumerate(table.iterrows()):
+                if self._unified_gpu_history_key(row) == selected_key:
+                    selected = position
+                    break
+        selected = max(0, min(selected, max(0, len(table) - 1)))
+        self.unified_selected_gpu = selected
+        self.unified_selected_gpu_key = (
+            self._unified_gpu_history_key(table.iloc[selected])
+            if len(table)
+            else None
+        )
+        return selected
+
+    def _sync_selected_process(self, processes):
+        """Re-find the selected process by PID, clamp, and store it.
+
+        Returns the selected index; an empty list selects 0 and no PID.
+        """
+        index = int(self.unified_selected_process or 0)
+        selected_pid = self.unified_selected_process_pid
+        if selected_pid is not None:
+            for process_index, process in enumerate(processes):
+                if str(process.get("pid", "")) == str(selected_pid):
+                    index = process_index
+                    break
+        index = max(0, min(index, len(processes) - 1))
+        self.unified_selected_process = index
+        self.unified_selected_process_pid = (
+            str(processes[index].get("pid", "")) if processes else None
+        )
+        return index
+
     def _unified_client_index_for_row(self, selected_row):
         """Resolve a unified-table row back to its local/remote client."""
         if selected_row is None:
@@ -2655,26 +2529,11 @@ class NVClientPool:
         if client_index is None:
             return []
 
-        meta = (
-            raw_stats_by_client.get("_nvidb", {})
-            if isinstance(raw_stats_by_client, dict)
-            else {}
-        )
-        process_details_by_client = (
-            meta.get("process_details_by_client", {})
-            if isinstance(meta, dict)
-            else {}
-        )
-        client_details = process_details_by_client.get(client_index, {})
-        if not isinstance(client_details, dict):
-            return []
-        gpu_key = str(selected_row.get("GPU", ""))
-        processes = client_details.get(gpu_key, [])
-        return [
-            process
-            for process in processes
-            if isinstance(process, dict)
-        ]
+        # No "_nvidb" block before the first publish, and no entry for a
+        # node that has not been sampled yet.
+        meta = raw_stats_by_client.get("_nvidb", {})
+        client_details = meta.get("process_details_by_client", {}).get(client_index, {})
+        return list(client_details.get(str(selected_row.get("GPU", "")), []))
 
     def _get_sorted_unified_processes(
         self,
@@ -2711,13 +2570,7 @@ class NVClientPool:
             ]
 
         mode = self._get_unified_process_sort_mode()
-        descending = bool(
-            getattr(
-                self,
-                "unified_process_sort_descending",
-                mode != "command",
-            )
-        )
+        descending = self.unified_process_sort_descending
         present = []
         missing = []
         for process in processes:
@@ -2759,19 +2612,18 @@ class NVClientPool:
             seconds = seconds * 60 + part
         return days * 86400 + seconds
 
+    # Process field read as a number for each numeric process sort mode.
+    _PROCESS_SORT_FIELDS = {
+        "vram": "used_memory",
+        "cpu": "cpu_percent",
+        "mem": "mem_percent",
+        "rss": "rss_kb",
+        "pid": "pid",
+    }
+
     def _unified_process_sort_value(self, process, mode):
-        if mode == "vram":
-            return self._extract_metric_number(process.get("used_memory"))
-        if mode == "cpu":
-            return self._extract_metric_number(process.get("cpu_percent"))
-        if mode == "mem":
-            return self._extract_metric_number(process.get("mem_percent"))
-        if mode == "rss":
-            return self._extract_metric_number(process.get("rss_kb"))
         if mode == "time":
             return self._process_elapsed_seconds(process.get("elapsed"))
-        if mode == "pid":
-            return self._extract_metric_number(process.get("pid"))
         if mode == "command":
             command = (
                 process.get("command")
@@ -2779,7 +2631,8 @@ class NVClientPool:
                 or ""
             )
             return str(command).casefold() or None
-        return None
+        field = self._PROCESS_SORT_FIELDS.get(mode)
+        return parse_leading_float(process.get(field)) if field else None
 
     @staticmethod
     def _format_memory_kb(value):
@@ -2797,7 +2650,7 @@ class NVClientPool:
         return f"{kib:.0f}K"
 
     @staticmethod
-    def _process_metric_color(value, warning, critical, default="cyan"):
+    def _threshold_color(value, warning, critical, default="cyan"):
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -2807,6 +2660,106 @@ class NVClientPool:
         if number >= warning:
             return "yellow"
         return default
+
+    @staticmethod
+    def _process_state_color(state):
+        """Running is green, uninterruptible/zombie/dead red, the rest dim."""
+        if state.startswith("R"):
+            return "green"
+        if state.startswith(("D", "Z", "X")):
+            return "red"
+        return "dark_grey"
+
+    @staticmethod
+    def _process_vram_share(process, total_mib):
+        """(VRAM MiB, % of `total_mib`) for one process; either may be None."""
+        vram_mib = parse_leading_float(process.get("used_memory"))
+        percent = vram_mib / total_mib * 100 if vram_mib is not None and total_mib else None
+        return vram_mib, percent
+
+    # (key, label, minimum width, alignment) of the process list columns.
+    _PROCESS_TABLE_COLUMNS = (
+        ("sel", "", 1, "left"),
+        ("pid", "PID", 7, "right"),
+        ("user", "USER", 9, "left"),
+        ("vram", "VRAM", 10, "right"),
+        ("gpu", "VRAM%", 6, "right"),
+        ("cpu", "CPU%", 6, "right"),
+        ("mem", "MEM%", 6, "right"),
+        ("rss", "RSS", 7, "right"),
+        ("time", "TIME", 9, "right"),
+        ("state", "S", 3, "left"),
+        ("command", "COMMAND", 12, "left"),
+    )
+
+    @classmethod
+    def _process_table_columns(cls, inner_width, sort_column, arrow):
+        """The process list columns that fit `inner_width`, with their widths.
+
+        The sorted column's label carries `arrow`. Optional columns drop in a
+        fixed order until the rest fit; COMMAND takes any width left over.
+        """
+        columns = [
+            {
+                "key": key,
+                "label": f"{label}{arrow}" if key == sort_column else label,
+                "minimum": minimum,
+                "align": align,
+            }
+            for key, label, minimum, align in cls._PROCESS_TABLE_COLUMNS
+        ]
+
+        def columns_width(columns):
+            return sum(column["minimum"] for column in columns) + max(
+                0, len(columns) - 1
+            )
+
+        for optional_key in (
+            "state",
+            "time",
+            "rss",
+            "mem",
+            "user",
+            "gpu",
+            "cpu",
+            "vram",
+        ):
+            if columns_width(columns) <= inner_width:
+                break
+            columns = [
+                column for column in columns if column["key"] != optional_key
+            ]
+        if columns_width(columns) > inner_width:
+            for column in columns:
+                if column["key"] == "pid":
+                    column["minimum"] = 5
+                elif column["key"] == "command":
+                    column["minimum"] = max(4, inner_width - 8)
+
+        extra_width = max(0, inner_width - columns_width(columns))
+        for column in columns:
+            column["width"] = column["minimum"]
+            if column["key"] == "command":
+                column["width"] += extra_width
+        return columns
+
+    def _process_notice_lines(self, panel):
+        """The process-action notice as panel lines while it is live.
+
+        An expired notice is cleared and yields no line.
+        """
+        notice = self._process_action_notice
+        if notice and notice.get("expires_at", 0) > time.monotonic():
+            message = str(notice.get("message", ""))
+            return [
+                panel.line(
+                    message,
+                    colored(message, notice.get("color") or "white", attrs=["bold"]),
+                )
+            ]
+        if notice:
+            self._process_action_notice = None
+        return []
 
     def _format_unified_process_history(
         self,
@@ -2824,9 +2777,10 @@ class NVClientPool:
             else []
         )
         title = (
-            f"History  GPU {len(gpu_history)}/60 | process {len(history)}/60"
+            f"History  GPU {len(gpu_history)}/{self._HISTORY_SAMPLES}"
+            f" | process {len(history)}/{self._HISTORY_SAMPLES}"
             if include_gpu
-            else f"History  {len(history)}/60 samples"
+            else f"History  {len(history)}/{self._HISTORY_SAMPLES} samples"
         )
         if not history and not gpu_history:
             plain = fit(f"{title} | waiting for samples", width)
@@ -2906,11 +2860,6 @@ class NVClientPool:
                 ]
             )
 
-        rss_values = [
-            float(sample["rss_kb"])
-            for sample in history
-            if sample.get("rss_kb") is not None
-        ]
         rows.extend(
             [
                 metric_row(
@@ -2941,7 +2890,7 @@ class NVClientPool:
                     "RSS",
                     "rss_kb",
                     self._format_memory_kb,
-                    max([1] + rss_values),
+                    1,
                     "light_grey",
                     history,
                 ),
@@ -2961,18 +2910,14 @@ class NVClientPool:
     ):
         """Format the selectable htop-style process pane below GPU cards."""
         if selected_row is None:
-            self._unified_process_total_count = 0
             self._unified_process_count = 0
             self._unified_process_visible_rows = 0
             self._unified_command_line_count = 0
             self._unified_command_page_size = 0
             return "Process details: no GPU selected"
 
-        try:
-            terminal_size = os.get_terminal_size()
-            terminal_width, terminal_height = terminal_size.columns, terminal_size.lines
-        except OSError:
-            terminal_width, terminal_height = 80, 24
+        terminal_size = _terminal_size()
+        terminal_width, terminal_height = terminal_size.columns, terminal_size.lines
         width = max(20, terminal_width)
         inner_width = max(1, width - 4)
         height_budget = max(
@@ -3009,27 +2954,9 @@ class NVClientPool:
             selected_row,
         )
         processes = self._filter_and_sort_processes(all_processes)
-        self._unified_process_total_count = len(all_processes)
         self._unified_process_count = len(processes)
-        selected_index = int(
-            self.unified_selected_process or 0
-        )
         selected_pid = self.unified_selected_process_pid
-        if selected_pid is not None:
-            for index, process in enumerate(processes):
-                if str(process.get("pid", "")) == str(selected_pid):
-                    selected_index = index
-                    break
-        selected_index = max(
-            0,
-            min(selected_index, max(0, len(processes) - 1)),
-        )
-        self.unified_selected_process = selected_index
-        self.unified_selected_process_pid = (
-            str(processes[selected_index].get("pid", ""))
-            if processes
-            else None
-        )
+        selected_index = self._sync_selected_process(processes)
         if (
             selected_pid is not None
             and self.unified_selected_process_pid != str(selected_pid)
@@ -3065,17 +2992,7 @@ class NVClientPool:
         process_sort_label = self.UNIFIED_PROCESS_SORT_LABELS[
             process_sort_mode
         ]
-        process_sort_arrow = (
-            "▼"
-            if bool(
-                getattr(
-                    self,
-                    "unified_process_sort_descending",
-                    process_sort_mode != "command",
-                )
-            )
-            else "▲"
-        )
+        process_sort_arrow = "▼" if self.unified_process_sort_descending else "▲"
         focus_label = "ACTIVE" if pane_focused else "inactive · Enter/→"
         filter_title = f" | {filter_label}" if filter_label else ""
         title = (
@@ -3085,23 +3002,22 @@ class NVClientPool:
         )
         lines = [panel.heading(title)]
         # Keep search and close available even when no process matches.
-        process_controls = [
-            ("/ Find" if inner_width >= 28 else "/", "key", "/", "cyan"),
-            ("Clear" if inner_width >= 28 else "x", "clear_search", None, "cyan"),
-            ("Hide" if inner_width >= 28 else "p", "key", "p", "cyan"),
-        ]
+        # Short screens reuse the heading for these (see below), so they get
+        # the short labels too.
+        short = compact_layout or inner_width < 28
         if filter_editing:
-            process_controls[0] = ("Apply" if inner_width >= 28 else "OK", "key", "\n", "cyan")
+            find_control = ("OK" if short else "Apply", "key", "\n", "cyan")
+        else:
+            find_control = ("/" if short else "/ Find", "key", "/", "cyan")
+        process_controls = [
+            find_control,
+            ("x" if short else "Clear", "clear_search", None, "cyan"),
+            ("p" if short else "Hide", "key", "p", "cyan"),
+        ]
+        button_lines, button_regions, _ = action_bar(process_controls, inner_width, self._control_style)
         if compact_layout:
             # Reuse the heading on short screens so controls cannot push the
             # signal buttons or command pager below the terminal edge.
-            process_controls = [
-                ("OK" if filter_editing else "/", "key", "\n" if filter_editing else "/", "cyan"),
-                ("x", "clear_search", None, "cyan"),
-                ("p", "key", "p", "cyan"),
-            ]
-        button_lines, button_regions, _ = action_bar(process_controls, inner_width, self._control_style)
-        if compact_layout:
             buttons_width = display_width(self._ANSI_ESCAPE_RE.sub("", button_lines[0]))
             button_start = width - 2 - buttons_width
             prefix = pad_display(fit_display(title, max(0, button_start - 3)), button_start - 2)
@@ -3114,7 +3030,7 @@ class NVClientPool:
             lines.append(panel.line(self._ANSI_ESCAPE_RE.sub("", button_lines[0]), button_lines[0]))
 
         total_process_vram = sum(
-            self._extract_metric_number(process.get("used_memory")) or 0
+            parse_leading_float(process.get("used_memory")) or 0
             for process in processes
         )
         total_gpu_mib = capacity.get("total_mib")
@@ -3124,11 +3040,7 @@ class NVClientPool:
                 f" ({total_process_vram / total_gpu_mib * 100:.1f}% of GPU VRAM)"
             )
         visible_summary = (
-            (
-                f"{len(processes)}/{len(all_processes)} match"
-                if filter_query or filter_editing
-                else f"{len(processes)} active"
-            )
+            count_label
             + f" | {'matched' if filter_query else 'process'} VRAM "
             f"{vram_summary}"
             + (
@@ -3185,115 +3097,13 @@ class NVClientPool:
                     ),
                 )
             )
-            notice = self._process_action_notice
-            if notice and notice.get("expires_at", 0) > time.monotonic():
-                message = str(notice.get("message", ""))
-                lines.append(
-                    panel.line(
-                        message,
-                        colored(
-                            message,
-                            notice.get("color") or "white",
-                            attrs=["bold"],
-                        ),
-                    )
-                )
-            elif notice:
-                self._process_action_notice = None
+            lines.extend(self._process_notice_lines(panel))
             lines.append(panel.rule("", bottom=True))
             return "\n".join(lines)
 
-        active_sort_column = self.UNIFIED_PROCESS_SORT_COLUMNS[
-            process_sort_mode
-        ]
-
-        def sortable_label(key, label):
-            if key == active_sort_column:
-                return f"{label}{process_sort_arrow}"
-            return label
-
-        column_specs = [
-            {"key": "sel", "label": "", "minimum": 1, "align": "left"},
-            {
-                "key": "pid",
-                "label": sortable_label("pid", "PID"),
-                "minimum": 7,
-                "align": "right",
-            },
-            {"key": "user", "label": "USER", "minimum": 9, "align": "left"},
-            {
-                "key": "vram",
-                "label": sortable_label("vram", "VRAM"),
-                "minimum": 10,
-                "align": "right",
-            },
-            {"key": "gpu", "label": "VRAM%", "minimum": 6, "align": "right"},
-            {
-                "key": "cpu",
-                "label": sortable_label("cpu", "CPU%"),
-                "minimum": 6,
-                "align": "right",
-            },
-            {
-                "key": "mem",
-                "label": sortable_label("mem", "MEM%"),
-                "minimum": 6,
-                "align": "right",
-            },
-            {
-                "key": "rss",
-                "label": sortable_label("rss", "RSS"),
-                "minimum": 7,
-                "align": "right",
-            },
-            {
-                "key": "time",
-                "label": sortable_label("time", "TIME"),
-                "minimum": 9,
-                "align": "right",
-            },
-            {"key": "state", "label": "S", "minimum": 3, "align": "left"},
-            {
-                "key": "command",
-                "label": sortable_label("command", "COMMAND"),
-                "minimum": 12,
-                "align": "left",
-            },
-        ]
-
-        def columns_width(columns):
-            return sum(column["minimum"] for column in columns) + max(
-                0, len(columns) - 1
-            )
-
-        columns = list(column_specs)
-        for optional_key in (
-            "state",
-            "time",
-            "rss",
-            "mem",
-            "user",
-            "gpu",
-            "cpu",
-            "vram",
-        ):
-            if columns_width(columns) <= inner_width:
-                break
-            columns = [
-                column for column in columns if column["key"] != optional_key
-            ]
-        if columns_width(columns) > inner_width:
-            for column in columns:
-                if column["key"] == "pid":
-                    column["minimum"] = 5
-                elif column["key"] == "command":
-                    column["minimum"] = max(4, inner_width - 8)
-
-        extra_width = max(0, inner_width - columns_width(columns))
-        for column in columns:
-            column["width"] = column["minimum"]
-            if column["key"] == "command":
-                column["width"] += extra_width
+        columns = self._process_table_columns(
+            inner_width, process_sort_mode, process_sort_arrow
+        )
 
         def padded_cell(value, column):
             value = panel.trim(value, column["width"])
@@ -3302,15 +3112,10 @@ class NVClientPool:
             return pad_display(value, column["width"])
 
         def process_cells(process, index):
-            vram_mib = self._extract_metric_number(process.get("used_memory"))
-            gpu_percent = (
-                vram_mib / total_gpu_mib * 100
-                if vram_mib is not None and total_gpu_mib
-                else None
-            )
-            cpu_percent = self._extract_metric_number(process.get("cpu_percent"))
-            mem_percent = self._extract_metric_number(process.get("mem_percent"))
-            rss_kb = self._extract_metric_number(process.get("rss_kb"))
+            vram_mib, gpu_percent = self._process_vram_share(process, total_gpu_mib)
+            cpu_percent = parse_leading_float(process.get("cpu_percent"))
+            mem_percent = parse_leading_float(process.get("mem_percent"))
+            rss_kb = parse_leading_float(process.get("rss_kb"))
             state = str(process.get("state") or "-")
             command = str(
                 process.get("command")
@@ -3346,27 +3151,21 @@ class NVClientPool:
                 "sel": "cyan",
                 "pid": "light_grey",
                 "user": "light_grey",
-                "vram": self._process_metric_color(
+                "vram": self._threshold_color(
                     gpu_percent, 50, 80
                 ),
-                "gpu": self._process_metric_color(
+                "gpu": self._threshold_color(
                     gpu_percent, 50, 80
                 ),
-                "cpu": self._process_metric_color(
+                "cpu": self._threshold_color(
                     cpu_percent, 70, 100
                 ),
-                "mem": self._process_metric_color(
+                "mem": self._threshold_color(
                     mem_percent, 20, 40
                 ),
                 "rss": "dark_grey",
                 "time": "dark_grey",
-                "state": (
-                    "green"
-                    if state.startswith("R")
-                    else "red"
-                    if state.startswith(("D", "Z", "X"))
-                    else "dark_grey"
-                ),
+                "state": self._process_state_color(state),
                 "command": "light_grey",
             }
             return values, colors
@@ -3378,40 +3177,25 @@ class NVClientPool:
         header_styled = " ".join(
             colored(
                 cell,
-                "cyan" if column["key"] == active_sort_column else "dark_grey",
+                "cyan" if column["key"] == process_sort_mode else "dark_grey",
                 attrs=(
                     ["bold"]
-                    if column["key"] == active_sort_column
+                    if column["key"] == process_sort_mode
                     else None
                 ),
             )
             for cell, column in zip(header_cells, columns)
         )
-        header_line_index = None
         if not ultra_compact:
-            if compact_layout:
-                header_line_index = len(lines)
-                lines.append(panel.line(header_plain, header_styled))
-            else:
+            if not compact_layout:
                 lines.append(panel.rule("PROCESS LIST"))
-                header_line_index = len(lines)
-                lines.append(panel.line(header_plain, header_styled))
-
-        if header_line_index is not None:
-            sort_targets = {
-                "pid": "pid",
-                "vram": "vram",
-                "gpu": "vram",
-                "cpu": "cpu",
-                "mem": "mem",
-                "rss": "rss",
-                "time": "time",
-                "command": "command",
-            }
+            header_line_index = len(lines)
+            lines.append(panel.line(header_plain, header_styled))
             column_start = 0
             for column in columns:
-                sort_target = sort_targets.get(column["key"])
-                if sort_target:
+                # Clicking VRAM% sorts by VRAM, like the VRAM column itself.
+                sort_target = "vram" if column["key"] == "gpu" else column["key"]
+                if sort_target in self.UNIFIED_PROCESS_SORT_MODES:
                     action_regions.append(
                         (
                             header_line_index,
@@ -3497,11 +3281,10 @@ class NVClientPool:
             )
 
         process = processes[selected_index]
-        selected_pid = process.get("pid", "N/A")
         if not compact_history:
             selected_label = (
                 f"{'SELECTED PROCESS' if pane_focused else 'PROCESS DETAILS'}"
-                f" | PID {selected_pid}"
+                f" | PID {process.get('pid', 'N/A')}"
             )
             if compact_layout:
                 selected_label += (
@@ -3510,117 +3293,54 @@ class NVClientPool:
                     f" | {process.get('state') or '-'}"
                 )
             lines.append(panel.rule(selected_label))
-        vram_mib = self._extract_metric_number(process.get("used_memory"))
-        gpu_percent = (
-            vram_mib / total_gpu_mib * 100
-            if vram_mib is not None and total_gpu_mib
-            else None
-        )
+        vram_mib, gpu_percent = self._process_vram_share(process, total_gpu_mib)
         gpu_used_mib = capacity.get("used_mib")
         used_share = (
             vram_mib / gpu_used_mib * 100
             if vram_mib is not None and gpu_used_mib
             else None
         )
-        cpu_percent = self._extract_metric_number(process.get("cpu_percent"))
-        mem_percent = self._extract_metric_number(process.get("mem_percent"))
-        usage_fields = [
-            (
-                (
-                    f"VRAM {vram_mib:,.0f} MiB"
-                    if vram_mib is not None
-                    else "VRAM N/A"
-                ),
-                self._process_metric_color(gpu_percent, 50, 80),
-            ),
-            (
-                (
-                    f"{gpu_percent:.1f}% of GPU VRAM"
-                    if gpu_percent is not None
-                    else "% of GPU VRAM N/A"
-                ),
-                "cyan",
-            ),
-            (
-                (
-                    f"{used_share:.1f}% of used VRAM"
-                    if used_share is not None
-                    else "% of used VRAM N/A"
-                ),
-                "cyan",
-            ),
-            (
-                (
-                    f"CPU {cpu_percent:.1f}%"
-                    if cpu_percent is not None
-                    else "CPU N/A"
-                ),
-                self._process_metric_color(cpu_percent, 70, 100),
-            ),
-            (
-                (
-                    f"Host MEM {mem_percent:.1f}%"
-                    if mem_percent is not None
-                    else "Host MEM N/A"
-                ),
-                self._process_metric_color(mem_percent, 20, 40),
-            ),
-            (
-                f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
-                "dark_grey",
-            ),
-        ]
+        cpu_percent = parse_leading_float(process.get("cpu_percent"))
+        mem_percent = parse_leading_float(process.get("mem_percent"))
+        vram_color = self._threshold_color(gpu_percent, 50, 80)
         if compact_layout:
-            if vram_mib is not None:
-                compact_vram = f"VRAM {vram_mib:,.0f}M"
-            else:
-                compact_vram = "VRAM N/A"
             usage_fields = [
-                (
-                    compact_vram,
-                    self._process_metric_color(
-                        gpu_percent,
-                        50,
-                        80,
-                    ),
-                ),
+                (f"VRAM {vram_mib:,.0f}M" if vram_mib is not None else "VRAM N/A", vram_color),
             ]
             if gpu_percent is not None:
                 usage_fields.append((f"{gpu_percent:.1f}% total", "cyan"))
             if used_share is not None:
                 usage_fields.append((f"{used_share:.1f}% used", "cyan"))
-            usage_fields.extend(
-                [
-                    (
-                        (
-                            f"CPU {cpu_percent:.1f}%"
-                            if cpu_percent is not None
-                            else "CPU N/A"
-                        ),
-                        self._process_metric_color(
-                            cpu_percent,
-                            70,
-                            100,
-                        ),
-                    ),
-                    (
-                        (
-                            f"MEM {mem_percent:.1f}%"
-                            if mem_percent is not None
-                            else "MEM N/A"
-                        ),
-                        self._process_metric_color(
-                            mem_percent,
-                            20,
-                            40,
-                        ),
-                    ),
-                    (
-                        f"RSS {self._format_memory_kb(process.get('rss_kb'))}",
-                        "dark_grey",
-                    ),
-                ]
-            )
+        else:
+            usage_fields = [
+                (f"VRAM {vram_mib:,.0f} MiB" if vram_mib is not None else "VRAM N/A", vram_color),
+                (
+                    f"{gpu_percent:.1f}% of GPU VRAM"
+                    if gpu_percent is not None
+                    else "% of GPU VRAM N/A",
+                    "cyan",
+                ),
+                (
+                    f"{used_share:.1f}% of used VRAM"
+                    if used_share is not None
+                    else "% of used VRAM N/A",
+                    "cyan",
+                ),
+            ]
+        mem_label = "MEM" if compact_layout else "Host MEM"
+        usage_fields += [
+            (
+                f"CPU {cpu_percent:.1f}%" if cpu_percent is not None else "CPU N/A",
+                self._threshold_color(cpu_percent, 70, 100),
+            ),
+            (
+                f"{mem_label} {mem_percent:.1f}%"
+                if mem_percent is not None
+                else f"{mem_label} N/A",
+                self._threshold_color(mem_percent, 20, 40),
+            ),
+            (f"RSS {self._format_memory_kb(process.get('rss_kb'))}", "dark_grey"),
+        ]
         threads = process.get("threads")
         try:
             threads_display = (
@@ -3631,17 +3351,10 @@ class NVClientPool:
         except (TypeError, ValueError):
             threads_display = str(threads or "-")
         state = str(process.get("state") or "-")
-        state_color = (
-            "green"
-            if state.startswith("R")
-            else "red"
-            if state.startswith(("D", "Z", "X"))
-            else "dark_grey"
-        )
         detail_fields = [
             (f"User {process.get('username', 'N/A')}", "light_grey"),
             (f"Type {process.get('type', 'N/A')}", "dark_grey"),
-            (f"State {state}", state_color),
+            (f"State {state}", self._process_state_color(state)),
             (f"Threads {threads_display}", "dark_grey"),
             (f"Elapsed {process.get('elapsed') or '-'}", "dark_grey"),
         ]
@@ -3869,24 +3582,13 @@ class NVClientPool:
             plain = buttons_plain + message
             lines.append(panel.line(plain, confirm_lines[0] + colored(message, "yellow")))
         else:
-            notice = self._process_action_notice
-            if notice and notice.get("expires_at", 0) > time.monotonic():
-                message = str(notice.get("message", ""))
-                lines.append(
-                    panel.line(
-                        message,
-                        colored(
-                            message,
-                            notice.get("color") or "white",
-                            attrs=["bold"],
-                        ),
-                    )
-                )
-            elif notice:
-                self._process_action_notice = None
+            lines.extend(self._process_notice_lines(panel))
 
         lines.append(panel.rule("", bottom=True))
         return "\n".join(lines)
+
+    # Telemetry samples kept per GPU and per process for the trend views.
+    _HISTORY_SAMPLES = 60
 
     @staticmethod
     def _unified_gpu_history_key(row):
@@ -3922,7 +3624,7 @@ class NVClientPool:
                         "timestamp": timestamp,
                         "utilization": capacity["utilization"],
                         "memory": capacity["memory_percent"],
-                        "temperature": self._extract_metric_number(
+                        "temperature": parse_leading_float(
                             row.get("temp")
                         ),
                     },
@@ -3934,30 +3636,21 @@ class NVClientPool:
                 row,
             ):
                 pid = str(process.get("pid", "")).strip()
-                if not pid or not pid.isdigit():
+                if not pid.isdigit():
                     continue
-                vram_mib = self._extract_metric_number(
-                    process.get("used_memory")
-                )
-                gpu_vram_percent = None
-                if (
-                    vram_mib is not None
-                    and total_mib is not None
-                    and total_mib > 0
-                ):
-                    gpu_vram_percent = vram_mib / total_mib * 100
+                vram_mib, gpu_vram_percent = self._process_vram_share(process, total_mib)
                 process_samples.append(
                     (
                         self._unified_process_history_key(row, process),
                         {
                             "timestamp": timestamp,
-                            "cpu_percent": self._extract_metric_number(
+                            "cpu_percent": parse_leading_float(
                                 process.get("cpu_percent")
                             ),
-                            "mem_percent": self._extract_metric_number(
+                            "mem_percent": parse_leading_float(
                                 process.get("mem_percent")
                             ),
-                            "rss_kb": self._extract_metric_number(
+                            "rss_kb": parse_leading_float(
                                 process.get("rss_kb")
                             ),
                             "vram_mib": vram_mib,
@@ -3970,13 +3663,13 @@ class NVClientPool:
             for key, sample in gpu_samples:
                 history = self._unified_gpu_history.setdefault(
                     key,
-                    deque(maxlen=60),
+                    deque(maxlen=self._HISTORY_SAMPLES),
                 )
                 history.append(sample)
             for key, sample in process_samples:
                 history = self._unified_process_history.setdefault(
                     key,
-                    deque(maxlen=60),
+                    deque(maxlen=self._HISTORY_SAMPLES),
                 )
                 history.append(sample)
 
@@ -3987,22 +3680,17 @@ class NVClientPool:
             stale_keys = [
                 key
                 for key, history in self._unified_process_history.items()
-                if history
-                and history[-1].get("timestamp", timestamp) < stale_before
+                if history[-1]["timestamp"] < stale_before
             ]
             for key in stale_keys:
-                self._unified_process_history.pop(key, None)
+                del self._unified_process_history[key]
 
     def _get_unified_gpu_history(self, selected_row):
-        if selected_row is None:
-            return []
         key = self._unified_gpu_history_key(selected_row)
         with self._unified_history_lock:
             return list(self._unified_gpu_history.get(key, ()))
 
     def _get_unified_process_history(self, selected_row, process):
-        if selected_row is None or process is None:
-            return []
         key = self._unified_process_history_key(selected_row, process)
         with self._unified_history_lock:
             return list(
@@ -4034,14 +3722,11 @@ class NVClientPool:
         history = self._get_unified_gpu_history(selected_row)
         node = selected_row.get("Node", "N/A")
         gpu_index = selected_row.get("GPU", "N/A")
-        title = f"Trends: {node} GPU {gpu_index} | {len(history)}/60 samples"
+        title = f"Trends: {node} GPU {gpu_index} | {len(history)}/{self._HISTORY_SAMPLES} samples"
         if not history:
             return f"{title}\nWaiting for telemetry samples"
 
-        try:
-            terminal_width = os.get_terminal_size().columns
-        except OSError:
-            terminal_width = 80
+        terminal_width = _terminal_size().columns
 
         def metric_line(label, key, minimum, maximum, unit, color):
             values = [sample.get(key) for sample in history]
@@ -4099,10 +3784,7 @@ class NVClientPool:
         if table.empty:
             return "No GPU data available"
 
-        try:
-            terminal_width = os.get_terminal_size().columns
-        except OSError:
-            terminal_width = 80
+        terminal_width = _terminal_size().columns
         table_width = max(20, terminal_width)
         content_width = max(1, table_width - 4)
         pane_focused = self.unified_active_pane == "gpu"
@@ -4137,7 +3819,7 @@ class NVClientPool:
             return fit_display(text, width, ellipsis="..")
 
         def utilization_status(value):
-            percent = self._extract_metric_number(value)
+            percent = parse_leading_float(value)
             if percent is None:
                 return "UNKNOWN", None
             if percent >= 80:
@@ -4153,30 +3835,15 @@ class NVClientPool:
             if "/" not in value:
                 return None
             used, total = value.split("/", 1)
-            used_value = self._extract_metric_number(used)
-            total_value = self._extract_metric_number(total)
+            used_value = parse_leading_float(used)
+            total_value = parse_leading_float(total)
             if (
                 used_value is None
                 or total_value is None
                 or total_value <= 0
             ):
                 return None
-            percent = used_value / total_value * 100
-            if percent >= 90:
-                return "red"
-            if percent >= 75:
-                return "yellow"
-            return "cyan"
-
-        def threshold_color(value, warning, critical, default="cyan"):
-            number = self._extract_metric_number(value)
-            if number is None:
-                return None
-            if number >= critical:
-                return "red"
-            if number >= warning:
-                return "yellow"
-            return default
+            return self._threshold_color(used_value / total_value * 100, 75, 90)
 
         def link_load_percent(row, direction):
             value = row.get(f"{HIDDEN_COLUMN_PREFIX}{direction}_percent")
@@ -4372,7 +4039,7 @@ class NVClientPool:
                 ),
             ]
 
-            utilization_percent = self._extract_metric_number(row.get("util"))
+            utilization_percent = parse_leading_float(row.get("util"))
             memory_percent = self._unified_gpu_capacity(row)["memory_percent"]
             load_fields = [
                 make_field("section", "LOAD", 4, color="green", bold=True),
@@ -4404,7 +4071,7 @@ class NVClientPool:
                     "temp",
                     f"Temp {clean(row.get('temp'))}",
                     9,
-                    color=threshold_color(row.get("temp"), 70, 85),
+                    color=self._threshold_color(parse_leading_float(row.get("temp")), 70, 85),
                 ),
                 make_field(
                     "fan",
@@ -4599,10 +4266,7 @@ class NVClientPool:
                 user_line = (
                     f"Users: {self._format_user_memory_totals(users, max_users=12)}"
                 )
-                try:
-                    width = os.get_terminal_size().columns
-                except OSError:
-                    width = 80
+                width = _terminal_size().columns
                 if self.term.length(user_line) > width:
                     user_line = user_line[: max(0, width - 3)] + "..."
                 block.append(colored(user_line, "dark_grey"))
@@ -4613,10 +4277,7 @@ class NVClientPool:
     @staticmethod
     def _marker_width():
         """Columns a full-width helper line may use inside a block."""
-        try:
-            return max(10, os.get_terminal_size().columns)
-        except OSError:
-            return 80
+        return max(10, _terminal_size().columns)
 
     def _trim_server_block(self, lines, keep):
         """Shorten one expanded block to `keep` lines by dropping GPU rows.
@@ -4684,18 +4345,7 @@ class NVClientPool:
         )
         if table.empty:
             return None
-        selected = int(self.unified_selected_gpu or 0)
-        selected_key = self.unified_selected_gpu_key
-        if selected_key is not None:
-            for position, (_, row) in enumerate(table.iterrows()):
-                if self._unified_gpu_history_key(row) == selected_key:
-                    selected = position
-                    break
-        selected = max(0, min(selected, len(table) - 1))
-        self.unified_selected_gpu = selected
-        self.unified_selected_gpu_key = self._unified_gpu_history_key(
-            table.iloc[selected]
-        )
+        selected = self._sync_selected_gpu(table)
         self._unified_gpu_count = len(table)
         return table.iloc[selected]
 
@@ -4867,13 +4517,9 @@ class NVClientPool:
             )
         node_total = len(self._compute_node_indices(raw_stats_by_client))
         detailed = self.unified_detailed
-        try:
-            terminal_size = os.get_terminal_size()
-            terminal_width = terminal_size.columns
-            terminal_height = terminal_size.lines
-        except OSError:
-            terminal_width = 80
-            terminal_height = 24
+        terminal_size = _terminal_size()
+        terminal_width = terminal_size.columns
+        terminal_height = terminal_size.lines
         filter_mode = self._get_unified_filter_mode()
         errors = self._get_unified_node_status_lines(
             raw_stats_by_client, last_update_time, errors_only=True,
@@ -5115,7 +4761,6 @@ class NVClientPool:
             )
             lines.append(process_panel)
         else:
-            self._unified_process_total_count = 0
             self._unified_process_count = 0
             self._unified_process_visible_rows = 0
             self._unified_command_line_count = 0
@@ -5372,10 +5017,7 @@ class NVClientPool:
         *,
         outer_margin: int = 0,
     ) -> str:
-        try:
-            width = os.get_terminal_size().columns
-        except OSError:
-            width = 80
+        width = _terminal_size().columns
         if outer_margin:
             width = max(20, width - outer_margin)
 
@@ -5484,10 +5126,7 @@ class NVClientPool:
         fixed_width_columns = set(fixed_width_columns or ())
 
         # Get terminal width
-        try:
-            terminal_width = os.get_terminal_size().columns
-        except OSError:
-            terminal_width = 120  # Default width
+        terminal_width = _terminal_size(columns=120).columns
         if outer_margin:
             terminal_width = max(20, terminal_width - outer_margin)
         
@@ -5731,20 +5370,6 @@ class NVClientPool:
             left = remaining // 2
             return " " * left + text + " " * (remaining - left)
 
-        def parse_percent(value: str) -> Optional[float]:
-            if value is None:
-                return None
-            value_str = str(value).strip()
-            if not value_str or value_str in {"N/A", "-"}:
-                return None
-            numbers = extract_numbers(value_str)
-            if not numbers:
-                return None
-            try:
-                return float(numbers[0])
-            except Exception:
-                return None
-
         def parse_ratio_percent(value: str) -> Optional[float]:
             if value is None:
                 return None
@@ -5893,7 +5518,7 @@ class NVClientPool:
                     continue
 
                 if col == "util" and value != "N/A":
-                    percent = parse_percent(raw_value)
+                    percent = parse_leading_float(raw_value)
                     display_text = str(raw_value).replace(" ", "")
                     if percent is not None:
                         display_text = f"{int(round(percent))}%"
@@ -5901,7 +5526,7 @@ class NVClientPool:
                     continue
 
                 if col == "mem_util" and value != "N/A":
-                    percent = parse_percent(raw_value)
+                    percent = parse_leading_float(raw_value)
                     display_text = str(raw_value).replace(" ", "")
                     if percent is not None:
                         display_text = f"{int(round(percent))}%"
@@ -5923,7 +5548,7 @@ class NVClientPool:
                     continue
 
                 if col == "temp":
-                    degrees = parse_percent(raw_value)
+                    degrees = parse_leading_float(raw_value)
                     cell = align_text(value, width)
                     if degrees is not None:
                         if degrees >= 80:
@@ -6073,12 +5698,7 @@ class NVClientPool:
         else:
             mem_display = "N/A"
 
-        if avg_util >= 80:
-            util_color = "red"
-        elif avg_util >= 50:
-            util_color = "yellow"
-        else:
-            util_color = "green"
+        util_color = self._threshold_color(avg_util, 50, 80, "green")
 
         return {
             "gpu_count": gpu_count,
@@ -6216,12 +5836,7 @@ class NVClientPool:
         # CPU: utilization first, cores in brackets
         if cpu_cores > 0:
             cpu_percent_int = int(round(cpu_percent))
-            if cpu_percent_int >= 80:
-                cpu_color = "red"
-            elif cpu_percent_int >= 50:
-                cpu_color = "yellow"
-            else:
-                cpu_color = "green"
+            cpu_color = self._threshold_color(cpu_percent_int, 50, 80, "green")
             cpu_util_str = colored(f"{cpu_percent_int:>3}%", cpu_color)
             cpu_part = colored("CPU ", "dark_grey") + f"{cpu_util_str}({cpu_cores}C)"
         else:
@@ -6278,14 +5893,7 @@ class NVClientPool:
             + self._mini_bar(avg_util, util_color)
         )
         mem_percent = summary_data.get("mem_percent")
-        if mem_percent is None:
-            mem_color = None
-        elif mem_percent >= 90:
-            mem_color = "red"
-        elif mem_percent >= 75:
-            mem_color = "yellow"
-        else:
-            mem_color = "green"
+        mem_color = self._threshold_color(mem_percent, 75, 90, "green")
         mem_part = (
             f"{str(mem_display):>{mem_width}} "
             + self._mini_bar(mem_percent, mem_color)
@@ -6382,10 +5990,7 @@ class NVClientPool:
             # width the terminal had at fetch time. If the window has been
             # resized since, re-render them from the raw stats now instead
             # of painting tables that no longer fit (or waste) the width.
-            try:
-                current_width = os.get_terminal_size().columns
-            except OSError:
-                current_width = 80
+            current_width = _terminal_size().columns
             if getattr(self, "_node_workers", None) or getattr(self, "_blocks_formatted_width", None) != current_width:
                 try:
                     stats_list = self._format_client_blocks(
@@ -6435,13 +6040,9 @@ class NVClientPool:
         output_lines = []
         server_count = len(node_indices)
         server_label = "Server" if server_count == 1 else "Servers"
-        try:
-            terminal_size = os.get_terminal_size()
-            terminal_width = terminal_size.columns
-            terminal_height = terminal_size.lines
-        except OSError:
-            terminal_width = 80
-            terminal_height = 24
+        terminal_size = _terminal_size()
+        terminal_width = terminal_size.columns
+        terminal_height = terminal_size.lines
 
         display_mode = self.display_mode
         # Narrow windows get their own chrome. Every line the frame builds
@@ -6969,7 +6570,6 @@ class NVClientPool:
         return start, end
 
     def _request_ui_refresh(self):
-        self.ui_only_refresh = True
         self.refresh_needed.set()
 
     def _current_view_settings(self):
@@ -7388,20 +6988,7 @@ class NVClientPool:
         processes = self._get_sorted_unified_processes(raw_stats, row)
         if not processes:
             return None
-        index = int(self.unified_selected_process or 0)
-        selected_pid = self.unified_selected_process_pid
-        if selected_pid is not None:
-            for process_index, process in enumerate(processes):
-                if str(process.get("pid", "")) == str(selected_pid):
-                    index = process_index
-                    break
-        index = max(
-            0,
-            min(index, len(processes) - 1),
-        )
-        process = processes[index]
-        self.unified_selected_process = index
-        self.unified_selected_process_pid = str(process.get("pid", ""))
+        process = processes[self._sync_selected_process(processes)]
         client_index = self._unified_client_index_for_row(row)
         if client_index is None or not 0 <= client_index < len(self.pool):
             return None
@@ -8306,10 +7893,7 @@ class NVClientPool:
     def print_once(self):
         """Print GPU stats once and exit (no TUI loop)"""
         current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            terminal_width = os.get_terminal_size().columns
-        except OSError:
-            terminal_width = 80
+        terminal_width = _terminal_size().columns
         if self.compact:
             separator_width = min(80, terminal_width)
         else:

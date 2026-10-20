@@ -54,6 +54,8 @@ def _pool():
         ),
     ]
     pool.compact = False
+    pool.debug = False
+    pool._formatted_node_blocks = {}
     pool.display_mode = pool.DISPLAY_MODE_NODES
     pool.unified_detailed = False
     pool.unified_sort_mode = "node"
@@ -77,7 +79,6 @@ def _pool():
     pool.unified_process_sort_descending = True
     pool.unified_process_rows = 0
     pool._unified_process_visible_rows = 1
-    pool._unified_process_total_count = 0
     pool.unified_command_scroll = 0
     pool._unified_command_line_count = 0
     pool._unified_command_page_size = 0
@@ -102,7 +103,6 @@ def _pool():
     pool._persist_view_enabled = False
     pool.quit_flag = threading.Event()
     pool.refresh_needed = threading.Event()
-    pool.ui_only_refresh = False
     return pool
 
 
@@ -1871,7 +1871,6 @@ def test_process_filter_is_live_and_keeps_shortcuts_out_of_the_query(
     assert "Processes | 1/3 match | /bob_" in rendered
     assert "torchrun eval.py --suite math" in rendered
     assert pool._unified_process_count == 1
-    assert pool._unified_process_total_count == 3
 
     assert pool._handle_keypress("\n") is True
     assert pool.unified_process_filter_editing is False
