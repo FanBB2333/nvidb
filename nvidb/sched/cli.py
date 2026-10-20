@@ -958,6 +958,8 @@ def cmd_lanes(args) -> int:
         lanes = scheduler.lanes(node=node)
         if args.json:
             _print_json({"lanes": lanes})
+        elif node and not lanes:
+            print(f"no lane matches node {args.node!r}")
         else:
             print(_render_lanes(lanes))
         return 0

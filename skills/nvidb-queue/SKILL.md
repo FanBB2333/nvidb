@@ -287,7 +287,8 @@ cluster.
 
 These are the user's own workstations and they run plenty of work nobody
 submitted through the queue. `nvidb queue nodes` reports the whole card, not
-just the queue's share:
+just the queue's share (cards outside a server's `gpu_ids` are left out, as in
+`queue status`, unless one of the queue's jobs is still on them):
 
 ```bash
 nvidb queue nodes --json      # per-GPU memory, utilisation and every process

@@ -831,6 +831,10 @@ def test_an_unknown_node_filter_matches_nothing(parser, queue_db, capsys):
         assert _run(parser, ["queue", "lanes", "--node", query, "--json", "--no-tick"], queue_db) == 0
         assert [lane["node"] for lane in json.loads(capsys.readouterr().out)["lanes"]] == expected
 
+    # The table says the filter matched nothing, not that no lanes exist yet.
+    assert _run(parser, ["queue", "lanes", "--node", "typo", "--no-tick"], queue_db) == 0
+    assert capsys.readouterr().out == "no lane matches node 'typo'\n"
+
 
 def test_unseen_skips_what_a_sliding_log_window_already_showed():
     assert sched_cli._unseen("", "a\nb\n") == "a\nb\n"

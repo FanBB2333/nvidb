@@ -76,11 +76,12 @@ servers:
 - `password`: SSH password (optional, will prompt if needed)
 - `proxyjump`: OpenSSH jump host, alias, or comma-separated chain (optional; for
   example `login` or `login-a,alice@login-b:2222`)
-- `gpu_ids`: the GPU indices nvidb uses on this server (optional). The monitor
-  shows only these cards (under their own indices) and new queue placements
-  use only them; running jobs outside the list continue normally. An empty
-  list disables GPU placement on the node while still permitting CPU-only
-  queue jobs.
+- `gpu_ids`: the GPU indices nvidb uses on this server (optional). The monitor,
+  `nvidb log` and `nvidb queue status`/`nodes` show only these cards (under
+  their own indices) and new queue placements use only them; running jobs
+  outside the list continue normally, and their card stays listed in the queue
+  views until they end. An empty list disables GPU placement on the node while
+  still permitting CPU-only queue jobs.
 
 The server-level `gpu_ids` list is a placement policy. The job option `--gpus N`
 still means "request N cards"; it does not name individual indices.
@@ -166,7 +167,7 @@ nvidb log --interval 10            # Set logging interval to 10 seconds
 nvidb log --db-path /path/to/db    # Specify custom database path
 ```
 
-Press `Ctrl+C` to stop logging and save data.
+Rows are written to the database every interval. Press `Ctrl+C` to stop logging.
 
 ### 2.4 Web Dashboard
 
@@ -539,7 +540,8 @@ job twice.
 
 The queue's own bookkeeping is only half the picture: these are workstations,
 and most of what runs on them was started by hand. `nvidb queue nodes` reports
-the whole card.
+the whole card. Like `queue status`, it leaves out cards outside a server's
+`gpu_ids`.
 
 ```bash
 nvidb queue nodes               # capacity, plus the unmanaged work behind it

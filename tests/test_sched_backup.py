@@ -1,4 +1,5 @@
 """Queue database backups stay coherent while the WAL-backed queue is live."""
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -177,6 +178,30 @@ def test_generated_backups_are_rotated_without_touching_other_files(tmp_path):
 
     assert len(list(directory.glob("queue-*.db"))) == 2
     assert unrelated.read_text(encoding="utf-8") == "keep"
+
+
+def test_pruning_tolerates_a_concurrent_prune(tmp_path, monkeypatch):
+    """Another process may delete a backup at any point while this one prunes."""
+    directory = tmp_path / "backups"
+    directory.mkdir()
+    newest, middle, oldest = (directory / f"queue-{n}.db" for n in (3, 2, 1))
+    for mtime, path in enumerate((oldest, middle, newest)):
+        path.write_text("db", encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+    gone = directory / "queue-0.db"  # removed between the listing and the stat
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: iter([newest, gone, middle, oldest]))
+    real_stat = Path.stat
+
+    def stat_then_lose_oldest(self, **kwargs):
+        result = real_stat(self, **kwargs)
+        if self == oldest and os.path.exists(str(self)):
+            os.unlink(str(self))  # removed right after it was looked at
+        return result
+
+    monkeypatch.setattr(Path, "stat", stat_then_lose_oldest)
+
+    assert backup_mod._prune(directory, 1) == [str(middle), str(oldest)]
+    assert newest.exists() and not middle.exists()
 
 
 def test_periodic_backup_waits_for_its_interval(tmp_path):

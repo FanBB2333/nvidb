@@ -13,6 +13,7 @@ import sqlite3
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Dict, Optional
 
 from .. import config as nvidb_config
@@ -107,18 +108,19 @@ def _publish(
 def _prune(directory: Path, keep: int) -> list:
     if keep <= 0:
         return []
-    backups = sorted(
-        (
-            path
-            for path in directory.glob("queue-*.db")
-            if path.is_file()
-        ),
-        key=lambda path: (path.stat().st_mtime, path.name),
-        reverse=True,
-    )
+    # A concurrent prune (the daemon's periodic backup) may delete any of
+    # these between the listing and the stat or unlink below.
+    backups = []
+    for path in directory.glob("queue-*.db"):
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        if S_ISREG(info.st_mode):
+            backups.append((info.st_mtime, path.name, path))
+    backups.sort(reverse=True)
     removed = []
-    for path in backups[keep:]:
-        # A concurrent prune (the daemon's periodic backup) may have won.
+    for _, _, path in backups[keep:]:
         path.unlink(missing_ok=True)
         removed.append(str(path))
     return removed
