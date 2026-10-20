@@ -195,6 +195,33 @@ def test_lock_is_exclusive_until_its_lease_expires(tmp_path):
         conn.close()
 
 
+def test_an_interrupted_transaction_does_not_swallow_the_lease_release(tmp_path):
+    conn = dbm.open_db(tmp_path / "queue.db")
+    other = dbm.open_db(tmp_path / "queue.db")
+    try:
+        assert dbm.acquire_lock(conn, "scheduler", "client-a", 60) is True
+        with pytest.raises(KeyboardInterrupt):
+            with dbm.transaction(conn):
+                raise KeyboardInterrupt
+        assert not conn.in_transaction
+        dbm.release_lock(conn, "scheduler", "client-a")
+        assert dbm.acquire_lock(other, "scheduler", "client-b", 60) is True
+    finally:
+        conn.close()
+        other.close()
+
+
+@pytest.mark.parametrize("value", ["hello world", '"quoted"', {"a": 1}, 3, [1, 2]])
+def test_a_job_result_reads_back_as_it_was_stored(tmp_path, value):
+    conn = dbm.open_db(tmp_path / "queue.db")
+    try:
+        job_id = dbm.insert_job(conn, command="a")
+        dbm.update_job(conn, job_id, result=value)
+        assert dbm.get_job(conn, job_id).result == value
+    finally:
+        conn.close()
+
+
 def test_expired_lease_can_be_stolen(tmp_path):
     conn = dbm.open_db(tmp_path / "queue.db")
     try:

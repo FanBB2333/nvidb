@@ -364,7 +364,10 @@ def transaction(conn: sqlite3.Connection):
     depths[key] = 1
     try:
         yield conn
-    except Exception:
+    except BaseException:
+        # KeyboardInterrupt too: an interrupted block that kept its transaction
+        # open would swallow every later write on this connection, including
+        # the lease release that runs on the way out.
         depths[key] = 0
         conn.execute("ROLLBACK")
         raise
@@ -840,9 +843,7 @@ def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:
     for flag in ("paused", "runner"):
         if flag in fields:
             fields[flag] = 1 if fields[flag] else 0
-    if "runner_state" in fields and not isinstance(
-        fields["runner_state"], (str, type(None))
-    ):
+    if fields.get("runner_state") is not None:
         fields["runner_state"] = json.dumps(fields["runner_state"], ensure_ascii=False)
     fields["updated_at"] = utcnow()
     assignments = ", ".join(f"{key} = ?" for key in fields)
@@ -977,7 +978,8 @@ def update_job(conn: sqlite3.Connection, job_id: int, **fields) -> None:
     for key in ("depends_on", "depends_any"):
         if key in fields and isinstance(fields[key], (list, tuple)):
             fields[key] = ",".join(str(x) for x in fields[key]) or None
-    if "result" in fields and not isinstance(fields["result"], (str, type(None))):
+    # Callers pass decoded values; a plain string is a result, not JSON text.
+    if fields.get("result") is not None:
         fields["result"] = json.dumps(fields["result"], ensure_ascii=False)
     if "env" in fields and isinstance(fields["env"], dict):
         fields["env"] = json.dumps(fields["env"], ensure_ascii=False)
