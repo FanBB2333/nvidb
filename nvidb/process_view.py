@@ -1,5 +1,5 @@
 """Width-aware drawing for the monitor's process detail panel."""
-from .tui_theme import display_width, fit_display
+from .tui_theme import clip_display, display_width
 
 
 class ProcessPanel:
@@ -16,7 +16,7 @@ class ProcessPanel:
 
     @staticmethod
     def trim(text, limit):
-        return fit_display(str(text), limit, ellipsis="" if limit <= 2 else "..")
+        return clip_display(str(text), limit)
 
     def heading(self, title):
         label = self.trim(f"{self.horizontal} {title} ", max(0, self.width - 2))

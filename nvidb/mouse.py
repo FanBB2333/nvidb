@@ -10,6 +10,7 @@ so complete mouse reports do not wait for Escape-key disambiguation.
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 from typing import NamedTuple
@@ -49,6 +50,28 @@ def set_mouse_reporting(term, enabled: bool) -> None:
             cache[mode] = 1 if enabled else 2  # DEC SET / RESET states.
 
 
+def start_mouse_reporting(term, wanted: bool) -> bool:
+    """Enable reporting when wanted on a tty; False means run without mouse."""
+    if not wanted:
+        return False
+    try:
+        if not sys.stdout.isatty():
+            return False
+        set_mouse_reporting(term, True)
+    except Exception as error:
+        logging.debug(msg=f"Failed to enable mouse reporting: {error}")
+        return False
+    return True
+
+
+def stop_mouse_reporting(term) -> None:
+    """Restore normal terminal selection; never raise on the way out."""
+    try:
+        set_mouse_reporting(term, False)
+    except Exception:
+        pass
+
+
 class MouseEvent(NamedTuple):
     button: int
     column: int  # 1-based
@@ -78,9 +101,6 @@ class MouseSequenceParser:
     def __init__(self):
         self._pending = []
 
-    def _text(self) -> str:
-        return "".join(text for _key, text in self._pending)
-
     def feed(self, key):
         """Consume one keystroke.
 
@@ -98,7 +118,7 @@ class MouseSequenceParser:
                 return [], [key]
 
         self._pending.append((key, text))
-        buffered = self._text()
+        buffered = "".join(text for _key, text in self._pending)
 
         match = _REPORT.fullmatch(buffered)
         if match:
@@ -114,10 +134,7 @@ class MouseSequenceParser:
 
         if len(buffered) <= _MAX_BUFFER and _PARTIAL.match(buffered):
             return [], []
-
-        keys = [key for key, _text in self._pending]
-        self._pending = []
-        return [], keys
+        return [], self.flush()
 
     def flush(self):
         """Release anything held back, e.g. when the input stream goes idle."""

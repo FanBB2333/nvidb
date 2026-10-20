@@ -77,9 +77,9 @@ def fit_display(text: Optional[str], limit: int, *, ellipsis: str = "…") -> st
     return "".join(kept) + ellipsis
 
 
-def fit(text: Optional[str], width: int) -> str:
-    """Compatibility spelling for :func:`fit_display`."""
-    return fit_display(text, width)
+def clip_display(text: Optional[str], width: int, ellipsis: str = "..") -> str:
+    """Fit text to `width` columns, marking a cut only where the mark fits."""
+    return fit_display(text, width, ellipsis=ellipsis if width > display_width(ellipsis) else "")
 
 
 def pad_display(text: Optional[str], width: int) -> str:
@@ -125,7 +125,7 @@ def frame_top(width: int, *, title: str = "") -> str:
     left = f" {title} " if title else ""
     room = inner - display_width(left)
     if room < 0:
-        left = fit(left, inner).rstrip() or " "
+        left = fit_display(left, inner).rstrip() or " "
         room = inner - display_width(left)
     return CORNER_TL + left + HLINE * max(0, room) + CORNER_TR
 
@@ -142,8 +142,6 @@ def frame_separator(width: int) -> str:
 def smooth_bar(
     width: int,
     fractions: Sequence[Tuple[float, str]],
-    *,
-    empty: str = BAR_EMPTY,
 ) -> List[Tuple[str, str]]:
     """A bar as one smooth line, split into named-style segments.
 
@@ -155,19 +153,15 @@ def smooth_bar(
     or overrun the width.
     """
     width = max(0, width)
-    cells = [0] * len(fractions)
     budget = width
-    for index, (fraction, _style) in enumerate(fractions):
-        share = max(0.0, min(1.0, fraction))
-        cells[index] = min(budget, int(round(width * share)))
-        budget -= cells[index]
     segments: List[Tuple[str, str]] = []
-    for (fraction, style), count in zip(fractions, cells):
-        if count > 0:
+    for fraction, style in fractions:
+        count = min(budget, int(round(width * max(0.0, min(1.0, fraction)))))
+        budget -= count
+        if count:
             segments.append((BAR_FILL * count, style))
-    used = sum(cells)
-    if width - used > 0:
-        segments.append((empty * (width - used), MUTED))
+    if budget > 0:
+        segments.append((BAR_EMPTY * budget, MUTED))
     return segments
 
 

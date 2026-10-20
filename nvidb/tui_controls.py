@@ -15,6 +15,10 @@ _TERMINAL_TOKEN = re.compile(
 _HOVER_ON = "\x1b[7m"
 _RESET = "\x1b[0m"
 
+# Blessed names the paging keys differently across terminfo entries.
+PAGE_DOWN_KEYS = ("KEY_PGDOWN", "KEY_NPAGE", "KEY_PAGEDOWN")
+PAGE_UP_KEYS = ("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP")
+
 
 def _highlight_span(line, start, end):
     """Inverse video over an inclusive cell span, preserving existing styles."""
@@ -207,9 +211,9 @@ class ActionMenu:
             self.move(1)
         elif text == "k" or name == "KEY_UP":
             self.move(-1)
-        elif name in ("KEY_PGDOWN", "KEY_NPAGE", "KEY_PAGEDOWN"):
+        elif name in PAGE_DOWN_KEYS:
             self.move(self.page_size)
-        elif name in ("KEY_PGUP", "KEY_PPAGE", "KEY_PAGEUP"):
+        elif name in PAGE_UP_KEYS:
             self.move(-self.page_size)
         elif text == "g" or name == "KEY_HOME":
             self.selected = 0

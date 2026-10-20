@@ -34,17 +34,18 @@ from .metrics import (
 )
 from .mouse import (
     MouseSequenceParser,
-    set_mouse_reporting,
+    start_mouse_reporting,
+    stop_mouse_reporting,
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .process_view import ProcessPanel
-from .tui_controls import ActionMenu, HoverState, action_bar
+from .tui_controls import PAGE_DOWN_KEYS, PAGE_UP_KEYS, ActionMenu, HoverState, action_bar
 from .ssh_proxy import open_proxyjump_socket
 from .tui_theme import (
     ANSI_THEMES,
     DiffScreen,
+    clip_display,
     display_width,
-    fit,
     fit_display,
     frame_bottom,
     frame_separator,
@@ -99,11 +100,6 @@ def _terminal_size(columns=80, lines=24):
         return os.get_terminal_size()
     except OSError:
         return os.terminal_size((columns, lines))
-
-
-def _clip(text, width, ellipsis=".."):
-    """Fit text to `width` columns, marking a cut only where the mark fits."""
-    return fit_display(text, width, ellipsis=ellipsis if width > display_width(ellipsis) else "")
 
 
 def _xml_text(element, path, default="N/A"):
@@ -311,7 +307,7 @@ class _ConnectProgress:
             colored("  nvidb ", "green", attrs=["bold"])
             + colored(bar, "cyan")
             + colored(f"  {self.done}/{self.total}  ", "dark_grey")
-            + fit(str(label), 40)
+            + fit_display(str(label), 40)
         )
         self._write("\r\x1b[K" + line)
         self._painted = True
@@ -2046,7 +2042,7 @@ class NVClientPool:
             tail_plain = "collecting system stats…"
             plain = f"{head_plain}{sep_plain}{tail_plain}"
             if display_width(plain) > terminal_width:
-                return [fit(plain, terminal_width)]
+                return [fit_display(plain, terminal_width)]
             return [head + sep + colored(tail_plain, "dark_grey")]
 
         cores = int(sys_stats.get("cpu_cores") or 0)
@@ -2131,7 +2127,7 @@ class NVClientPool:
             plain = sep_plain.join(plain_pieces)
             if display_width(plain) <= terminal_width:
                 return [sep.join(styled_pieces)]
-        return [fit(plain, terminal_width)]
+        return [fit_display(plain, terminal_width)]
 
     def _client_table_identity(self, client_index):
         """Return compact node and hostname labels for the unified TUI table."""
@@ -2802,7 +2798,7 @@ class NVClientPool:
             else f"History  {len(history)}/{self._HISTORY_SAMPLES} samples"
         )
         if not history and not gpu_history:
-            plain = fit(f"{title} | waiting for samples", width)
+            plain = fit_display(f"{title} | waiting for samples", width)
             return [(plain, colored(plain, "cyan"))]
 
         rows = [(title, colored(title, "cyan", attrs=["bold"]))]
@@ -3770,7 +3766,7 @@ class NVClientPool:
             )
             line = f"{label:<5} {spark} {suffix}"
             if display_width(line) > terminal_width:
-                return colored(fit(line, terminal_width), color)
+                return colored(fit_display(line, terminal_width), color)
             return (
                 colored(f"{label:<5}", color, attrs=["bold"])
                 + " "
@@ -3780,7 +3776,7 @@ class NVClientPool:
 
         return "\n".join(
             [
-                colored(fit(title, terminal_width), "cyan", attrs=["bold"]),
+                colored(fit_display(title, terminal_width), "cyan", attrs=["bold"]),
                 metric_line("Util", "utilization", 0, 100, "%", "green"),
                 metric_line("VRAM", "memory", 0, 100, "%", "yellow"),
                 metric_line("Temp", "temperature", 20, 100, "C", "red"),
@@ -3918,7 +3914,7 @@ class NVClientPool:
                     excess -= reduction
 
             plain_parts = [
-                _clip(field["text"], width)
+                clip_display(field["text"], width)
                 for field, width in zip(active, widths)
             ]
             plain_length = (
@@ -4264,7 +4260,7 @@ class NVClientPool:
 
         head = lines[: separator_index + 1]
         bottom = lines[bottom_index]
-        marker_text = fit(
+        marker_text = fit_display(
             f"  … {len(lines) - keep} line(s) hidden — enlarge the terminal or press [c]",
             width,
         )
@@ -4366,7 +4362,7 @@ class NVClientPool:
 
         entries.insert(0, ("key", "Mouse / m", "Click controls; More opens all hidden actions"))
 
-        title = _clip(f"─ Help · {context} · ?/Esc/q close ", width - 2, "…")
+        title = clip_display(f"─ Help · {context} · ?/Esc/q close ", width - 2, "…")
         lines = [
             colored("╭", "dark_grey")
             + colored(title, "cyan", attrs=["bold"])
@@ -4386,13 +4382,13 @@ class NVClientPool:
         description_width = max(0, inner_width - key_width - 1)
         for kind, key, description in entries:
             if kind == "section":
-                plain = _clip(f"── {key} ", inner_width, "…")
+                plain = clip_display(f"── {key} ", inner_width, "…")
                 plain += "─" * max(0, inner_width - display_width(plain))
                 styled = colored(plain, "dark_grey")
             else:
-                key_text = pad_display(_clip(key, key_width, "…"), key_width)
+                key_text = pad_display(clip_display(key, key_width, "…"), key_width)
                 description_text = pad_display(
-                    _clip(description, description_width, "…"),
+                    clip_display(description, description_width, "…"),
                     description_width,
                 )
                 plain = f"{key_text} {description_text}"
@@ -4917,7 +4913,7 @@ class NVClientPool:
         else:
             title = "Error"
         def centered(text):
-            text = fit(f" {text} ", width)
+            text = fit_display(f" {text} ", width)
             remaining = max(0, width - display_width(text))
             left = remaining // 2
             return " " * left + text + " " * (remaining - left)
@@ -4941,7 +4937,7 @@ class NVClientPool:
         separator = " · "
 
         if display_width(label) >= width:
-            label = _clip(label, width)
+            label = clip_display(label, width)
             separator = ""
             detail = ""
         elif (
@@ -4953,7 +4949,7 @@ class NVClientPool:
                 separator = ""
                 detail = ""
             else:
-                detail = fit_display(detail, room, ellipsis="..")
+                detail = clip_display(detail, room)
 
         pieces = [colored(label, "cyan", attrs=["bold"])]
         if separator:
@@ -5216,7 +5212,7 @@ class NVClientPool:
                     kept.append(char)
                     used += char_width
                 return ".." + "".join(reversed(kept))
-            return _clip(text, width)
+            return clip_display(text, width)
 
         def align_text(text: str, width: int, alignment: str = "center") -> str:
             remaining = max(0, width - display_width(text))
@@ -5822,7 +5818,7 @@ class NVClientPool:
                 + (" · refresh failed" if last_fetch_error else "")
             )
             title_line = (
-                fit(plain_title, terminal_width)
+                fit_display(plain_title, terminal_width)
                 if display_width(plain_title) > terminal_width
                 else colored("Updated ", "dark_grey") + colored(update_display, "cyan")
                 + colored(" · ", "dark_grey")
@@ -5838,7 +5834,7 @@ class NVClientPool:
                 f"{server_label} {server_count} · View {view_label}{warn_display}"
             )
             title_line = (
-                fit(plain_title, terminal_width)
+                fit_display(plain_title, terminal_width)
                 if display_width(plain_title) > terminal_width
                 else (colored("Time ", "dark_grey") + colored(current_time, "cyan") + title_sep if debug else "")
                 + colored("Updated ", "dark_grey")
@@ -5917,7 +5913,7 @@ class NVClientPool:
             user_totals = self._format_user_memory_totals(global_user_memory)
             plain_line = f"Users (all nodes): {user_totals}"
             if self.term.length(plain_line) > terminal_width:
-                output_lines.append(fit(plain_line, terminal_width))
+                output_lines.append(fit_display(plain_line, terminal_width))
             else:
                 global_line = (
                     colored("Users (all nodes):", "magenta", attrs=["bold"])
@@ -6068,7 +6064,7 @@ class NVClientPool:
             )
             if compact_layout:
                 prefix = f"{selector} {expand_icon} {position + 1} {dot} "
-                description = fit(
+                description = fit_display(
                     self.pool[idx].description,
                     max(1, summary_room - display_width(prefix)),
                 )
@@ -6088,7 +6084,7 @@ class NVClientPool:
             else:
                 pad = max_header_width - display_width(header_plain)
                 header_padded = header_plain + " " * pad
-                header_padded = fit(header_padded, max(1, summary_room))
+                header_padded = fit_display(header_padded, max(1, summary_room))
                 if is_selected:
                     header_display = (
                         self.term.reverse + header_padded + self.term.normal
@@ -6121,7 +6117,7 @@ class NVClientPool:
             if display_width(self._ANSI_ESCAPE_RE.sub("", row)) > terminal_width:
                 # A pathologically long error message is the one input that
                 # can still overflow; dropping its colour beats wrapping.
-                row = fit(self._ANSI_ESCAPE_RE.sub("", row), terminal_width)
+                row = fit_display(self._ANSI_ESCAPE_RE.sub("", row), terminal_width)
 
             # One section per server: its header plus its whole table.
             section_lines = [row]
@@ -6162,7 +6158,7 @@ class NVClientPool:
                 # so beats painting a headless slice of the table.
                 trimmed = [
                     colored(
-                        fit(
+                        fit_display(
                             "  … table hidden — enlarge the terminal or press [c]",
                             marker_width,
                         ),
@@ -7135,11 +7131,11 @@ class NVClientPool:
                 if process_pane:
                     return self._move_unified_process_selection(-1)
                 return self._move_unified_selection(-1)
-            if key_name in {"KEY_NPAGE", "KEY_PAGEDOWN", "KEY_PGDOWN"}:
+            if key_name in PAGE_DOWN_KEYS:
                 if process_pane:
                     return self._move_unified_process_selection(5)
                 return self._move_unified_selection(max(1, self._unified_page_size))
-            if key_name in {"KEY_PPAGE", "KEY_PAGEUP", "KEY_PGUP"}:
+            if key_name in PAGE_UP_KEYS:
                 if process_pane:
                     return self._move_unified_process_selection(-5)
                 return self._move_unified_selection(-max(1, self._unified_page_size))
@@ -7170,26 +7166,13 @@ class NVClientPool:
 
     def _start_mouse_reporting(self):
         """Ask the terminal for SGR mouse reports, when the user wants them."""
-        self._mouse_reporting = False
-        if not self.mouse_enabled:
-            return
-        try:
-            if not sys.stdout.isatty():
-                return
-            set_mouse_reporting(self.term, True)
-            self._mouse_reporting = True
-        except Exception as error:
-            logging.debug(msg=f"Failed to enable mouse reporting: {error}")
+        self._mouse_reporting = start_mouse_reporting(self.term, self.mouse_enabled)
 
     def _stop_mouse_reporting(self):
         """Always restore normal terminal selection behaviour on the way out."""
-        if not self._mouse_reporting:
-            return
-        self._mouse_reporting = False
-        try:
-            set_mouse_reporting(self.term, False)
-        except Exception:
-            pass
+        if self._mouse_reporting:
+            self._mouse_reporting = False
+            stop_mouse_reporting(self.term)
 
     def _request_secret(self, prompt):
         """Workers request credentials; only the UI thread reads the terminal."""
