@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover
 
 from . import config
 from .connection import NVClientPool
-from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns
+from .metrics import ADVANCED_METRIC_GROUPS, ADVANCED_METRIC_LABELS, present_columns, visible_columns
 
 # Reuse the UI-agnostic data layer.
 from .webdata import (
@@ -375,9 +375,17 @@ class LiveCache:
     def configure(self, *, interval_seconds, enabled):
         # Sub-second intervals are allowed; the fetch loop is serial, so
         # the effective period is max(interval, fetch duration).
+        interval = max(0.25, min(3600.0, float(interval_seconds)))
+        enabled = bool(enabled)
         with self._lock:
-            self._interval = max(0.25, min(3600.0, float(interval_seconds)))
-            self._enabled = bool(enabled)
+            # Wake the fetch thread so a resume, a pause or a new period takes
+            # effect now rather than after the old wait. A paused cache whose
+            # interval changes stays asleep.
+            wake = (enabled or self._enabled) and (interval, enabled) != (self._interval, self._enabled)
+            self._interval = interval
+            self._enabled = enabled
+        if wake:
+            self._kick.set()
 
     def refresh_now(self):
         self._kick.set()
@@ -432,13 +440,14 @@ class LiveCache:
         # the wait, so sub-second intervals refresh as fast as fetches allow.
         while True:
             with self._lock:
-                enabled = self._enabled
-                interval = self._interval
-
-            if not enabled:
+                paused = not self._enabled
+            if paused:
+                # A resume or a manual refresh wakes this and fetches once.
                 self._kick.wait()
                 self._kick.clear()
-                continue
+            with self._lock:
+                enabled = self._enabled
+                interval = self._interval
 
             start = time.monotonic()
             with self._lock:
@@ -462,8 +471,11 @@ class LiveCache:
                     self.last_duration = elapsed
                     self.fetching = False
 
-            self._kick.wait(timeout=max(0.05, interval - elapsed))
-            self._kick.clear()
+            # A paused fetch goes straight back to the paused wait, so the
+            # next manual refresh is never swallowed by a period wait.
+            if enabled:
+                self._kick.wait(timeout=max(0.05, interval - elapsed))
+                self._kick.clear()
 
 
 _live_caches = {}
@@ -656,6 +668,8 @@ def _live_history_figs(history, server_desc, pal):
     util_fig = go.Figure()
     mem_fig = go.Figure()
     series = {}
+    # The y-range must fit the node's largest card, not just its first one.
+    mem_total = None
     for point in history:
         ts = point["ts"]
         for row in point["rows"]:
@@ -666,16 +680,10 @@ def _live_history_figs(history, server_desc, pal):
             s["ts"].append(ts)
             s["util"].append(row["util"])
             s["mem"].append(row["mem_used_gib"])
+            if row["mem_total_gib"] and (mem_total is None or row["mem_total_gib"] > mem_total):
+                mem_total = row["mem_total_gib"]
     if not series:
         return None, None
-    mem_total = None
-    for point in reversed(history):
-        for row in point["rows"]:
-            if row["server"] == server_desc and row["mem_total_gib"]:
-                mem_total = row["mem_total_gib"]
-                break
-        if mem_total:
-            break
     for i, (gpu, s) in enumerate(sorted(series.items())):
         color = CHART_COLORS[i % len(CHART_COLORS)]
         util_fig.add_trace(
@@ -715,7 +723,8 @@ def _live_signature(cache: LiveCache):
                 {
                     "desc": desc,
                     "kind": "gpus",
-                    "cols": [str(c) for c in table.columns],
+                    # The `_nvidb_*` columns are renderer-only, as in the TUI.
+                    "cols": [str(c) for c in visible_columns(table.columns)],
                     "adv": info.get("advanced_supported") is True,
                 }
             )
@@ -1412,6 +1421,12 @@ def create_app(*, db_path=None, include_remote=False):
         interval = float(interval_s)
         cache = _get_live_cache(include_remote_now)
         cache.configure(interval_seconds=interval, enabled=enabled)
+        # Only the cache on screen polls: the other include-remote setting's
+        # thread would otherwise keep sweeping every node forever.
+        with _live_lock:
+            others = [c for c in _live_caches.values() if c is not cache]
+        for other in others:
+            other.configure(interval_seconds=interval, enabled=False)
         if ctx.triggered_id in ("live-refresh-btn", "live-remote"):
             cache.refresh_now()
         return max(250, int(interval * 1000)), not enabled

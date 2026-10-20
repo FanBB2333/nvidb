@@ -297,6 +297,15 @@ def test_downsample_per_gpu():
     assert len(webdata._downsample_per_gpu(df, max_points_per_gpu=100)) == 10
 
 
+def test_load_sessions_missing_db_is_not_created(tmp_path):
+    missing = tmp_path / "gpu_log.db"
+    with pytest.raises(FileNotFoundError):
+        webdata.load_sessions(missing)
+    with pytest.raises(FileNotFoundError):
+        webdata.load_session_logs(missing, 1)
+    assert not missing.exists()
+
+
 def test_load_server_list_missing_config(tmp_path, monkeypatch):
     monkeypatch.setattr(webdata.config, "get_config_path", lambda: str(tmp_path / "absent.yml"))
     with pytest.raises(FileNotFoundError):

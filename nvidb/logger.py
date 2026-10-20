@@ -25,8 +25,10 @@ class NVLoggerSQLite:
         self.logging_thread = None
         self.session_id = None
         
-        # Buffer for collected data (written to DB on exit)
+        # Rows not yet written: flushed every tick, and kept for the next
+        # attempt when a write fails (disk full, DB locked).
         self.data_buffer = []
+        self._buffer_lock = threading.Lock()
         
         # Ensure directory exists
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -104,21 +106,24 @@ class NVLoggerSQLite:
         logging.info(f"Ended logging session {self.session_id} with status: {status}")
     
     def _flush_buffer(self):
-        """Write buffered data to database."""
-        if not self.data_buffer:
-            return
-        
-        self._execute('''
-            INSERT INTO gpu_logs (
-                session_id, timestamp, node, gpu_id, name, fan_speed,
-                util_gpu, util_mem, temperature, rx, tx, power,
-                memory_used, memory_total, processes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', self.data_buffer, many=True)
-        
-        buffer_count = len(self.data_buffer)
-        self.data_buffer = []
-        logging.info(f"Flushed {buffer_count} records to database")
+        """Write buffered data to database; keep it for a retry if that fails."""
+        with self._buffer_lock:
+            if not self.data_buffer:
+                return
+            try:
+                self._execute('''
+                    INSERT INTO gpu_logs (
+                        session_id, timestamp, node, gpu_id, name, fan_speed,
+                        util_gpu, util_mem, temperature, rx, tx, power,
+                        memory_used, memory_total, processes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', self.data_buffer, many=True)
+            except sqlite3.Error as e:
+                logging.error(f"Failed to write {len(self.data_buffer)} records (kept for retry): {e}")
+                return
+            buffer_count = len(self.data_buffer)
+            self.data_buffer = []
+        logging.debug(f"Flushed {buffer_count} records to database")
     
     def initialize_client_pool(self):
         """Initialize NVClientPool for data collection."""
@@ -164,6 +169,7 @@ class NVLoggerSQLite:
         """Main logging loop that runs in a separate thread."""
         while self.logging_active:
             self._collect_data()
+            self._flush_buffer()
             time.sleep(self.interval)
     
     def _collect_data(self):
@@ -173,13 +179,17 @@ class NVLoggerSQLite:
         for client in self.client_pool.pool:
             try:
                 # Advanced (DCGM) metrics live only in system_info, which is
-                # not logged, so they are not fetched.
-                stats_df, _system_info = client.get_full_gpu_info(include_advanced=False)
+                # not logged, so they are not fetched. The allowlist is the
+                # same `gpu_ids` rule the monitor and the queue apply.
+                stats_df, _system_info = NVClientPool._apply_gpu_allowlist(
+                    client, *client.get_full_gpu_info(include_advanced=False)
+                )
                 records = self._client_records(client, stats_df, timestamp)
             except Exception as e:
                 logging.error(f"Error getting data from client {client.description}: {e}")
                 continue
-            self.data_buffer.extend(records)
+            with self._buffer_lock:
+                self.data_buffer.extend(records)
     
     def _client_records(self, client, stats_df, timestamp):
         """Record tuples for one client's GPUs."""
@@ -188,7 +198,8 @@ class NVLoggerSQLite:
             # Get process information
             processes_info = "-"
             try:
-                _processes, user_summary = client.get_process_summary(stats_df.iloc[[idx]])
+                # .loc: an allowlisted frame keeps the host's row labels.
+                _processes, user_summary = client.get_process_summary(stats_df.loc[[idx]])
                 if user_summary:
                     processes_info = client.format_user_memory_compact(user_summary)
             except Exception as e:

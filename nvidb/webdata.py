@@ -18,6 +18,10 @@ from . import config
 
 
 def _open_log_db(db_path):
+    # sqlite3.connect would create a missing file, leaving an empty DB that
+    # later reads as "no such table" instead of "no log database".
+    if not Path(db_path).exists():
+        raise FileNotFoundError(f"Log database not found: {db_path}")
     return contextlib.closing(sqlite3.connect(db_path))
 
 

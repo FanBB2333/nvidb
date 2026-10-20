@@ -226,7 +226,7 @@ def _format_bytes(size_bytes: int) -> str:
 
 def _format_delta(delta_bytes: int) -> str:
     """Format memory delta with sign"""
-    sign = "+" if delta_bytes >= 0 else ""
+    sign = "+" if delta_bytes >= 0 else "-"
     return f"{sign}{_format_bytes(abs(delta_bytes))}"
 
 
