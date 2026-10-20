@@ -39,6 +39,20 @@ def test_linux_cpu_percent_covers_the_last_interval_not_the_uptime():
     assert not any(command.startswith("top") for command in client.commands)
 
 
+def test_linux_cpu_percent_counts_niced_work_but_not_iowait():
+    # Two samples 3 s apart on a 12-core node whose load runs niced.
+    client = ProcStatClient(
+        [
+            "cpu  199345 9509371 799488 45806320 345518 0 4765 0 0 0\n",
+            "cpu  199353 9510552 799538 45808651 345544 0 4765 0 0 0\n",
+        ]
+    )
+
+    client.get_system_stats()
+    busy = 8 + 1181 + 50
+    assert client.get_system_stats()["cpu_percent"] == pytest.approx(busy * 100 / (busy + 2331 + 26))
+
+
 def test_local_macos_cpu_percent_reads_mach_counters_instead_of_top(monkeypatch):
     samples = iter([(100, 1000), (150, 1100)])
     monkeypatch.setattr(connection.sys, "platform", "darwin")

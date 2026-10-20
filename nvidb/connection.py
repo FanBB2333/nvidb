@@ -748,14 +748,17 @@ class BaseClient(ABC):
 
     def _cpu_percent(self):
         """Total CPU utilization in percent, or None when it cannot be read."""
-        # Linux: "cpu  user nice system idle ..." ticks since boot.
+        # Linux: "cpu  user nice system idle iowait irq softirq steal ..." ticks
+        # since boot. Like top, everything but idle and iowait counts as busy:
+        # niced work (common for training jobs) is real load.
         fields = self.execute_command("grep 'cpu ' /proc/stat").split()
         if fields:
             try:
-                user, system, idle = int(fields[1]), int(fields[3]), int(fields[4])
+                ticks = [int(value) for value in fields[1:9]]
             except ValueError:
                 return None
-            return self._cpu_percent_since_last(user + system, user + system + idle)
+            total = sum(ticks)
+            return self._cpu_percent_since_last(total - ticks[3] - ticks[4], total)
 
         # Try macOS - use top for CPU usage (user + sys)
         parts = self.execute_command(
