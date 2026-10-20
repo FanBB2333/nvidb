@@ -395,6 +395,8 @@ def test_notify_settings_merge_over_the_defaults():
     assert load_notify_settings({"notify": {"desktop": False}})["desktop"] is False
     assert load_notify_settings({"notify": False})["enabled"] is False
     assert load_notify_settings({"notify": {"command": "cat"}})["command"] == "cat"
+    assert load_notify_settings({"notify": "false"})["enabled"] is False
+    assert load_notify_settings({"notify": {"desktop": "no"}})["desktop"] is False
 
 
 def test_a_disabled_notifier_still_marks_alerts_handled():

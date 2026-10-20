@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -103,20 +104,19 @@ def parse_link_number(value):
     nvidia-smi spells widths as "16x", NVML returns plain integers, and a
     driver that cannot answer returns nothing at all.
     """
-    if value is None:
-        return None
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        # pandas turns a missing value into NaN once another GPU on the node
+        # reports a number in the same column.
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         number = int(value)
         return number if number > 0 else None
     numbers = extract_numbers(str(value))
     if not numbers:
         return None
-    try:
-        number = int(float(numbers[0]))
-    except (TypeError, ValueError):
-        return None
+    number = int(float(numbers[0]))
     return number if number > 0 else None
 
 

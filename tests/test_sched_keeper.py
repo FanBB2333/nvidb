@@ -125,6 +125,19 @@ def test_queue_settings_merge_over_the_main_ones(nvidb_home):
     assert settings["notify"] == {"command": "push", "desktop": False}
 
 
+def test_queue_yml_notify_shorthand_overrides_the_main_mapping(nvidb_home):
+    from nvidb.sched.notify import load_notify_settings
+
+    _write(nvidb_home / "config.yml", "queue:\n  notify:\n    command: 'push'\n")
+    _write(nvidb_home / "queue.yml", "queue:\n  notify: false\n")
+    settings = nvidb_config.load_queue_config()["queue"]
+    assert load_notify_settings(settings)["enabled"] is False
+
+    _write(nvidb_home / "queue.yml", "queue:\n  notify: true\n")
+    settings = nvidb_config.load_queue_config()["queue"]
+    assert load_notify_settings(settings)["enabled"] is True
+
+
 def test_the_scheduler_reads_the_queue_config(nvidb_home, tmp_path, monkeypatch):
     from nvidb.sched import db as dbm
     from nvidb.sched.scheduler import Scheduler

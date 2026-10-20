@@ -1,6 +1,9 @@
+import stat
+
 import yaml
 
 from nvidb import config
+from nvidb.data_modules import ServerListInfo
 
 
 def _use_tmp_config(monkeypatch, tmp_path):
@@ -117,3 +120,35 @@ def test_invalid_view_settings_fall_back_to_defaults(monkeypatch, tmp_path):
     assert settings["detailed"] is True
     assert "unknown" not in settings
 
+
+def test_quoted_false_view_settings_stay_false():
+    settings = config.normalize_view_settings({"mouse": "false", "detailed": "Yes", "trends": "off"})
+
+    assert settings["mouse"] is False
+    assert settings["detailed"] is True
+    assert settings["trends"] is False
+    # An unrecognised string keeps the default rather than counting as true.
+    assert config.normalize_view_settings({"mouse": "sometimes"})["mouse"] is True
+
+
+def test_an_empty_server_list_reads_back_as_a_list(monkeypatch, tmp_path):
+    config_path = _use_tmp_config(monkeypatch, tmp_path)
+    config.save_view_settings({"mode": "unified"})
+
+    assert config.load_config()["servers"] == []
+    assert len(ServerListInfo.from_yaml(config_path)) == 0
+    # Files written by older versions hold a bare `servers:`.
+    config_path.write_text("servers:\n")
+    assert len(ServerListInfo.from_yaml(config_path)) == 0
+
+
+def test_saving_keeps_the_config_file_permissions(monkeypatch, tmp_path):
+    config_path = _use_tmp_config(monkeypatch, tmp_path)
+    config.write_config({"servers": [{"hostname": "h", "password": "secret"}]})
+    config_path.chmod(0o600)
+
+    config.save_view_settings({"mode": "unified"})
+    config.write_config(config.load_config())
+
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert [path.name for path in tmp_path.iterdir()] == ["config.yml"]

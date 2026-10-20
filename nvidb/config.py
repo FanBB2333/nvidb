@@ -4,6 +4,8 @@ Centralized configuration for working directory and other settings.
 """
 import json
 import os
+import secrets
+import stat
 from pathlib import Path
 
 # Package version
@@ -119,14 +121,34 @@ def load_queue_config(config_path=None) -> dict:
     settings = dict((main.get("queue") or {}))
     overrides = queue_cfg.get("queue") or {}
     if isinstance(overrides, dict):
-        notify = {**(settings.get("notify") or {}), **(overrides.get("notify") or {})}
+        notify = settings.get("notify")
         settings.update(overrides)
-        if notify:
+        override = overrides.get("notify")
+        if isinstance(notify, dict) and isinstance(override, dict):
             # Merged one level deeper: a queue.yml that only turns off desktop
             # notifications must not drop the command hook set in config.yml.
+            settings["notify"] = {**notify, **override}
+        elif override is None and notify is not None:
+            # An empty `notify:` in queue.yml overrides nothing.
             settings["notify"] = notify
     merged["queue"] = settings
     return merged
+
+
+_TRUE_STRINGS = {"true", "yes", "on", "1"}
+_FALSE_STRINGS = {"false", "no", "off", "0", ""}
+
+
+def _parse_bool(value) -> bool:
+    """Read a boolean setting; a quoted "false" must not count as true."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        raise ValueError(f"not a boolean: {value!r}")
+    return bool(value)
 
 
 def merge_settings(defaults, raw, *, converters=None) -> dict:
@@ -141,7 +163,7 @@ def merge_settings(defaults, raw, *, converters=None) -> dict:
             continue
         converter = converters.get(key)
         if converter is None and isinstance(default, bool):
-            converter = bool
+            converter = _parse_bool
         try:
             settings[key] = converter(raw[key]) if converter else raw[key]
         except (TypeError, ValueError):
@@ -195,6 +217,9 @@ def server_gpu_ids(server, *, context=""):
 
 def format_servers_yaml(servers) -> str:
     """Render the `servers` section with one readable block per server."""
+    if not servers:
+        # A bare `servers:` would read back as None rather than a list.
+        return "servers: []\n"
     lines = ["servers:"]
     for i, server in enumerate(servers):
         if i > 0:
@@ -259,13 +284,27 @@ def format_config_yaml(cfg: dict) -> str:
     return f"{header_text}\n\n{servers_text}\n"
 
 
-def _write_text_atomic(path: Path, text: str):
-    """Replace a file in one step so an interrupted write cannot truncate it."""
+def write_text_atomic(path: Path, text: str, *, mode=None):
+    """Replace a file in one step so an interrupted write cannot truncate it.
+
+    Each write goes through its own temporary file, so concurrent writers never
+    unlink or truncate each other's. Without an explicit `mode` an existing
+    file keeps its permissions (a config.yml holding passwords may be 0600);
+    a new one gets the umask's.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp")
+    if mode is None and path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    # O_EXCL rather than tempfile.mkstemp: mkstemp's 0600 would override the
+    # umask a new file is meant to get.
+    descriptor = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
-        temp_path.write_text(text, encoding="utf-8")
-        os.replace(temp_path, path)
+        with open(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        if mode is not None:
+            temp_path.chmod(mode)
+        os.replace(str(temp_path), str(path))
     finally:
         try:
             temp_path.unlink()
@@ -276,7 +315,7 @@ def _write_text_atomic(path: Path, text: str):
 def write_config(cfg: dict, config_path=None):
     """Write config.yml, creating the working directory when needed."""
     path = Path(config_path or get_config_path()).expanduser()
-    _write_text_atomic(path, format_config_yaml(cfg))
+    write_text_atomic(path, format_config_yaml(cfg))
 
 
 def _choice(options):
@@ -369,4 +408,4 @@ def save_view_settings(settings, config_path=None):
     text = path.read_text(encoding="utf-8")
     updated = _replace_top_level_block(text, "view", _render_view_block(settings))
     if updated != text:
-        _write_text_atomic(path, updated)
+        write_text_atomic(path, updated)

@@ -92,9 +92,9 @@ servers:
     nickname: "GPU Server via Jump Host"
     auth: "key"
     proxyjump: "login"
-    # Optional: restrict the queue to these GPU indices on this node. Other
-    # cards stay visible in monitoring but never receive queue jobs; jobs
-    # already running on an excluded card are left to finish.
+    # Optional: the only GPU indices nvidb uses on this node. The monitor
+    # hides the other cards and the queue never places new jobs on them;
+    # jobs already running on an excluded card are left to finish.
     # gpu_ids: [0, 1]
 
   # Example server with password authentication

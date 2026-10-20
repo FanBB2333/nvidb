@@ -64,7 +64,7 @@ Key options:
 - `--node <name>` — pin to one machine; prefix matches, so `--node gpu-node` works.
   Leave it off unless the job genuinely needs that machine (its data is there,
   it needs that GPU's memory); the scheduler places it better than you can.
-  A server-level `gpus: [0, 1]` allowlist is applied automatically to new
+  A server-level `gpu_ids: [0, 1]` allowlist is applied automatically to new
   placements and must not be treated as hiding the node's other cards.
 - `--pool <name>` — run on any card in a named GPU pool, across nodes; the card
   is chosen when the job starts. Use it instead of `--node` when the job needs

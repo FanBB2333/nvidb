@@ -204,21 +204,6 @@ def render_systemd_unit(*, nvidb_bin: str, interval: int) -> str:
     )
 
 
-def _write_atomic(path: Path, text: str, *, mode: Optional[int] = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        temporary.write_text(text, encoding="utf-8")
-        if mode is not None:
-            temporary.chmod(mode)
-        os.replace(str(temporary), str(path))
-    finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-
-
 def _command_error(result: subprocess.CompletedProcess) -> str:
     return (result.stderr or result.stdout or f"exit {result.returncode}").strip()
 
@@ -277,7 +262,7 @@ def install(
             )
 
     token = secrets.token_hex(16)
-    _write_atomic(
+    nvidb_config.write_text_atomic(
         target,
         render(
             nvidb_bin=resolved,
@@ -287,11 +272,11 @@ def install(
         ),
         mode=0o755,
     )
-    _write_atomic(manager_file(), f"{manager_name}\n", mode=0o600)
+    nvidb_config.write_text_atomic(manager_file(), f"{manager_name}\n", mode=0o600)
 
     unit = systemd_unit_path()
     if manager_name == "launchd":
-        _write_atomic(
+        nvidb_config.write_text_atomic(
             launchd_unit_path(),
             render_launchd_unit(nvidb_bin=resolved, interval=interval),
             mode=0o644,
@@ -299,7 +284,7 @@ def install(
     elif previous_manager == "launchd" and launchd_unit_path().exists():
         launchd_unit_path().unlink()
     if manager_name == "systemd":
-        _write_atomic(
+        nvidb_config.write_text_atomic(
             unit,
             render_systemd_unit(nvidb_bin=resolved, interval=interval),
             mode=0o644,
@@ -450,7 +435,7 @@ def run(action: str, *extra: str) -> subprocess.CompletedProcess:
     if action == "ensure" and stopped_file().exists():
         return subprocess.CompletedProcess([], 0, "explicitly stopped\n", "")
     if action == "stop":
-        _write_atomic(stopped_file(), "stopped\n", mode=0o600)
+        nvidb_config.write_text_atomic(stopped_file(), "stopped\n", mode=0o600)
     elif action in ("start", "restart"):
         stopped_file().unlink(missing_ok=True)
     _reset_status_cache()

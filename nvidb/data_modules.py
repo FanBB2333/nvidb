@@ -3,7 +3,7 @@ from typing import List, Optional
 from typing import Literal
 from dataclasses import dataclass, asdict, field
 
-from .config import normalize_gpu_indices
+from .config import _read_yaml, normalize_gpu_indices
 
 
 @dataclass
@@ -96,7 +96,5 @@ class ServerListInfo:
 
     @classmethod
     def from_yaml(cls, file):
-        import yaml
-        with open(file, 'r') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
-        return cls.from_dict((config or {}).get('servers', []))
+        # A config written with no servers may hold `servers:` (None).
+        return cls.from_dict(_read_yaml(file, strict=True).get('servers') or [])

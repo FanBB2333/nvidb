@@ -129,7 +129,8 @@ def _prune(directory: Path, keep: int) -> list:
     )
     removed = []
     for path in backups[keep:]:
-        path.unlink()
+        # A concurrent prune (the daemon's periodic backup) may have won.
+        path.unlink(missing_ok=True)
         removed.append(str(path))
     return removed
 

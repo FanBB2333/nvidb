@@ -71,6 +71,27 @@ def test_an_unknown_link_has_no_capacity_and_no_load():
     assert row[f"{HIDDEN_COLUMN_PREFIX}link_capacity"] == "N/A"
 
 
+def test_a_gpu_without_a_link_reading_next_to_one_with_it():
+    """pandas stores the missing reading as NaN once the column holds numbers."""
+    pool = _pool()
+    rows = _stats().to_dict("records")
+    rows.append({
+        **rows[0],
+        "GPU": 1,
+        "pcie_link_gen_current": None,
+        "pcie_link_width_current": None,
+        "pcie_link_gen_max": None,
+        "pcie_link_width_max": None,
+    })
+    stats = pd.DataFrame(rows)
+    assert stats["pcie_link_gen_current"].isna().iloc[1]
+
+    pool._add_pcie_link_columns(stats)
+
+    assert list(stats["link"]) == ["4.0x4", "N/A"]
+    assert stats.iloc[1][f"{HIDDEN_COLUMN_PREFIX}link_capacity"] == "N/A"
+
+
 def test_nvidia_smi_link_text_is_parsed():
     """`nvidia-smi -q -x` spells widths as "16x" where NVML returns integers."""
     pool = _pool()
