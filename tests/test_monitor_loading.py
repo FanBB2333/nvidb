@@ -4,9 +4,11 @@ from contextlib import nullcontext
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from blessed import Terminal
 
 from nvidb import connection
 from nvidb.connection import BaseClient, NVClientPool
@@ -221,6 +223,45 @@ def test_tui_draws_before_connecting_and_quits_with_ssh_still_pending(make_pool,
     assert frames[0] is False
     assert pool.quit_flag.is_set()
     assert pool._node_workers[0].is_alive()
+
+
+@pytest.mark.parametrize("worker_update", [False, True])
+def test_hover_loop_repaints_without_reformatting_or_delaying_worker_updates(
+    make_pool, monkeypatch, capsys, worker_update,
+):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    pool = make_pool(Node("synthetic"))
+    pool.term = Terminal(kind="xterm-256color", force_styling=True)
+    layouts, paints = [], []
+    pool._tui_diff_screen = SimpleNamespace(paint=lambda rows: paints.append(list(rows)))
+
+    def layout(**kwargs):
+        layouts.append(True)
+        pool._click_regions = [(0, 0, 7, ("key", "f")), (0, 9, 14, ("key", "s"))]
+        pool._click_targets = {}
+        pool._write_tui_lines(["[Filter] [Sort]", f"Sample {len(layouts)}"])
+
+    motions = iter(["\x1b[<35;2;1M", "\x1b[<35;11;1M", "\x1b[<35;1;2M", "q"])
+
+    def inkey(**kwargs):
+        key = next(motions)
+        if worker_update and key == "\x1b[<35;1;2M":
+            pool.refresh_needed.set()
+        return key
+
+    monkeypatch.setattr(connection.time, "monotonic", lambda: 0)
+    monkeypatch.setattr(pool.term, "inkey", inkey)
+    monkeypatch.setattr(pool, "print_stats", layout)
+    monkeypatch.setattr(pool, "_background_refresh", lambda: None)
+    monkeypatch.setattr(pool, "_answer_secret_request", lambda: None)
+    pool.print_refresh()
+    assert "Error occurred" not in capsys.readouterr().out
+    assert len(layouts) == (2 if worker_update else 1)
+    assert len(paints) == 4
+    assert paints[1][0] != paints[0][0] and paints[2][0] != paints[1][0]
+    assert paints[3][0] == paints[0][0]  # leaving restores the original row
+    assert paints[-1][1] == ("Sample 2" if worker_update else "Sample 1")
 
 
 def test_deferred_advanced_metrics_still_respect_gpu_allowlist(make_pool):

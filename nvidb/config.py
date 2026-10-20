@@ -26,7 +26,7 @@ DEFAULT_VIEW_SETTINGS = {
     "hide_unsupported": True,
     "mouse": True,
     # Colour theme shared by the TUIs: "classic" is the monitor's plain
-    # high-contrast ANSI palette, "muted" the queue TUI's softer tones.
+    # high-contrast ANSI palette, "muted" softens routine accents in both UIs.
     "theme": "classic",
 }
 

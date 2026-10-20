@@ -5,12 +5,16 @@ snapshot dictionary, which is exactly the contract it renders from.
 """
 import os
 import re
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
+from blessed import Terminal
 from blessed.keyboard import Keystroke
 
 from nvidb.mouse import MouseEvent
-from nvidb.sched.tui import COMMANDS, QueueTUI, _Worker
+from nvidb.tui_theme import display_width
+from nvidb.sched.tui import COMMANDS, CONFIRM_SECONDS, QueueTUI, _Worker
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 _MISSING = object()
@@ -18,6 +22,13 @@ _MISSING = object()
 
 def _plain(text):
     return ANSI.sub("", text)
+
+
+def _content_line(line):
+    """Remove the optional panel sides without changing content indentation."""
+    if line.startswith("│ ") and line.endswith(" │"):
+        return line[2:-2]
+    return line
 
 
 @pytest.fixture(autouse=True)
@@ -314,6 +325,8 @@ def _render(tui, state=None):
 
 
 def _mouse_at(output, text, *, button=0, occurrence=0):
+    from nvidb.sched.model import display_width
+
     matches = []
     for row, line in enumerate(output.splitlines()):
         start = 0
@@ -324,6 +337,7 @@ def _mouse_at(output, text, *, button=0, occurrence=0):
             matches.append((row, column))
             start = column + 1
     row, column = matches[occurrence]
+    column = display_width(output.splitlines()[row][:column])
     return MouseEvent(
         button=button,
         column=column + 1,
@@ -332,13 +346,328 @@ def _mouse_at(output, text, *, button=0, occurrence=0):
     )
 
 
+def _click_target(tui, target):
+    row, start, _end, _target = next(region for region in tui._click_regions if region[3] == target)
+    return tui.handle_mouse(MouseEvent(0, start + 1, row + 1, True))
+
+
+def _choose_menu_target(tui, state, target):
+    menu = tui._menu
+    index = next(index for index, (_label, value) in enumerate(menu.entries) if value == target)
+    menu.selected = index
+    _render(tui, state)
+    row, start, _end, _target = next(region for region in menu.regions if region[3] == ("choose", index))
+    return tui.handle_mouse(MouseEvent(0, start + 1, row + 1, True))
+
+
 # --- rendering -------------------------------------------------------------
 
-def test_task_flow_is_the_default_and_shows_each_gpu_lane():
+def test_overview_is_default_and_lists_each_job_once_in_queue_order():
     snapshot = _flow_snapshot()
+    snapshot["jobs"][3]["priority"] = 99  # Lane order still takes precedence.
     tui = _tui()
     output = _render(tui, _state(snapshot))
+
+    assert tui.resource_view == "overview"
+    assert tui.sort_key == "queue" and not tui.sort_reverse
+    assert [job["id"] for job in tui.jobs] == [10, 20, 11, 12, 13, 14]
+    assert "JOB" in output and "STATUS" in output and "WHERE" in output
+    assert "PROGRESS / WAIT" in output
+    assert "TASK FLOW" not in output and "DEPS" not in output
+    assert "python train.py" not in output
+    assert "DETAIL HIDDEN" not in output
+    for job in snapshot["jobs"]:
+        assert output.count(f"#{job['id']} {job['name']}") == 1
+
+
+@pytest.mark.parametrize("width", [24, 36, 40, 60, 80, 150])
+def test_overview_keeps_keyboard_navigation_and_more_discoverable(width):
+    tui = _tui(width=width, height=24)
+    output = _render(tui)
     lines = output.splitlines()
+    hint = _content_line(lines[-2] if lines[-1].startswith("╰") else lines[-1])
+    assert "Enter" in hint and "m" in hint and "?" in hint and "q" in hint
+    assert "j/k" in hint or "jk" in hint
+    assert display_width(hint) <= width
+    assert any(target == ("menu", "actions") for _row, _start, _end, target in tui._click_regions)
+    assert _press(tui, "m")
+    assert tui._menu is not None
+    assert any(target == ("quit", None) for _label, target in tui._menu.entries)
+
+
+def test_overview_unknown_wait_does_not_guess_a_resource_or_dependency_reason():
+    pending = _job(8, state="pending", name="unassigned", node=None,
+                   gpu_ids=[], started_at=None, elapsed_s=None)
+    snapshot = _snapshot(jobs=[pending], counts={"pending": 1})
+    tui = _tui()
+    output = _render(tui, _state(snapshot))
+    row = next(line for line in output.splitlines() if "#8 unassigned" in line)
+
+    assert "Waiting" in row and "Any GPU" in row
+    assert "Waiting for scheduling" in row
+    assert "Lane position" not in row
+    assert "After #" not in row and "memory" not in row.lower()
+
+
+def test_overview_wait_reasons_preserve_holds_pauses_dependencies_and_lane_order():
+    snapshot = _flow_snapshot()
+    snapshot["jobs"][3]["lane_seq"] = 60  # Position is 3, not the stored sequence.
+    output = _render(_tui(), _state(snapshot))
+    cases = [
+        (11, "evaluate", "Waiting", "After #10 succeeds", 1),
+        (12, "report", "Waiting", "After #11 finishes", 2),
+        (13, "archive", "Held", "job 12 failed", 3),
+        (14, "sweep-b", "Waiting", "Queue paused", 1),
+    ]
+    for job_id, name, status, reason, position in cases:
+        row = next(line for line in output.splitlines() if f"#{job_id} {name}" in line)
+        assert status in row and reason in row
+        assert f"Lane position {position}" in row
+
+
+@pytest.mark.parametrize("field,upstream_state", [("depends_on", "completed"), ("depends_any", "failed")])
+def test_overview_does_not_show_satisfied_dependencies_as_waiting(field, upstream_state):
+    job = _job(8, state="pending", name="ready", node=None, gpu_ids=[],
+               started_at=None, elapsed_s=None, **{field: [99]})
+    snapshot = _snapshot(jobs=[job], counts={"pending": 1})
+    snapshot["dependencies"] = [{"id": 99, "state": upstream_state, "name": "upstream"}]
+    output = _render(_tui(), _state(snapshot))
+    row = next(line for line in output.splitlines() if "#8 ready" in line)
+    assert "Waiting for scheduling" in row
+    assert "After #99" not in row
+
+
+@pytest.mark.parametrize("field,upstream_state,reason", [
+    ("depends_on", None, "Dependency #99 status unavailable"),
+    ("depends_any", None, "Dependency #99 status unavailable"),
+    ("depends_on", "failed", "Dependency #99 failed"),
+    ("depends_on", "cancelled", "Dependency #99 cancelled"),
+    ("depends_on", "timeout", "Dependency #99 timeout"),
+    ("depends_on", "lost", "Dependency #99 lost"),
+])
+def test_overview_reports_unknown_or_failed_dependencies_without_predicting_completion(
+    field, upstream_state, reason,
+):
+    job = _job(8, state="pending", name="blocked", node=None, gpu_ids=[],
+               held=False, held_reason=None, started_at=None, elapsed_s=None,
+               **{field: [99]})
+    snapshot = _snapshot(jobs=[job], counts={"pending": 1})
+    if upstream_state is not None:
+        snapshot["dependencies"] = [{"id": 99, "state": upstream_state, "name": "upstream"}]
+    output = _render(_tui(), _state(snapshot))
+    row = next(line for line in output.splitlines() if "#8 blocked" in line)
+
+    assert reason in row
+    assert "After #99" not in row
+    assert "Waiting for scheduling" not in row
+    assert not job["held"]  # Snapshot state is not silently changed by rendering.
+
+
+@pytest.mark.parametrize("width,height", [(36, 15), (60, 20), (80, 24), (150, 42)])
+def test_overview_keeps_jobs_and_more_visible_in_small_and_large_terminals(width, height):
+    from nvidb.sched.model import display_width
+
+    tui = _tui(width=width, height=height)
+    output = _render(tui)
+    lines = output.splitlines()
+
+    assert "#1 train" in output
+    assert "Running" in output
+    assert len(lines) <= height - 1
+    assert all(display_width(line) <= width for line in lines)
+    more = [region for region in tui._click_regions if region[3] == ("menu", "actions")]
+    assert more
+    assert all(0 <= row < len(lines) and 0 <= start <= end < width for row, start, end, _ in more)
+    if width < 72:
+        assert sum(target == ("job", 0) for target in tui._row_targets.values()) == 2
+
+
+@pytest.mark.parametrize("state,label", [
+    ("running", "Running"), ("pending", "Waiting"), ("completed", "Done"),
+    ("failed", "Failed"), ("cancelled", "Cancelled"), ("timeout", "Timed out"),
+    ("lost", "Lost"),
+])
+def test_narrow_overview_spells_out_job_states(state, label):
+    tui = _tui(width=60, height=20)
+    tui.filter = "all"
+    snapshot = _snapshot(jobs=[_job(7, state=state, name="状态测试")], counts={state: 1})
+    output = _render(tui, _state(snapshot))
+
+    assert label in output
+    assert "#7 状态测试" in output
+    assert sum(target == ("job", 0) for target in tui._row_targets.values()) == 2
+
+
+def test_narrow_overview_keeps_known_wait_reason_on_the_second_line():
+    job = _job(7, state="pending", name="等待实验", held=True,
+               held_reason="Manual review", node=None, gpu_ids=[])
+    tui = _tui(width=60, height=20)
+    output = _render(tui, _state(_snapshot(jobs=[job], counts={"pending": 1})))
+    rows = [row for row, target in tui._row_targets.items() if target == ("job", 0)]
+
+    assert len(rows) == 2
+    assert "Held" in output.splitlines()[rows[0]]
+    assert "Manual review" in output.splitlines()[rows[1]]
+
+
+def test_overview_tab_opens_visible_server_controls_before_moving_node_focus():
+    tui = _tui()
+    _render(tui)
+    _press(tui, "", name="KEY_TAB")
+    assert tui.resource_view == "servers"
+    assert tui.focus == "nodes"
+    assert "SERVERS (2)" in _render(tui)
+    _press(tui, "j")
+    assert tui.selected_node()["name"] == "small-node"
+
+
+def test_overview_chinese_node_click_scopes_running_jobs_and_keeps_job_actions_ready():
+    from nvidb.sched.model import display_width
+
+    node_name = "训练节点一"
+    snapshot = _snapshot(jobs=[
+        _job(1, name="当前训练", node=node_name),
+        _job(2, name="等待训练", state="pending", node=node_name),
+        _job(3, name="其它训练", node="small-node"),
+    ], counts={"running": 2, "pending": 1})
+    snapshot["nodes"][0]["name"] = node_name
+    state = _state(snapshot)
+    tui = _tui()
+    output = _render(tui, state)
+    row = next(row for row, target in tui._row_targets.items() if target == ("node", 0))
+    line = output.splitlines()[row]
+    offset = line.index(node_name) + len(node_name) - 1
+    column = display_width(line[:offset]) + 1
+
+    assert tui.handle_mouse(MouseEvent(0, column, row + 1, True))
+    assert tui.resource_view == "overview"
+    assert tui.focus == "jobs"
+    assert tui.job_scope_node == node_name
+    assert [job["id"] for job in tui.jobs] == [1]
+    _render(tui, state)
+    assert _click_target(tui, ("scope_all", None))
+    assert tui.job_scope_node is None
+    assert [job["id"] for job in tui.jobs] == [1, 3, 2]
+
+    _render(tui, state)
+    row = next(row for row, target in tui._row_targets.items() if target == ("node", 0))
+    tui.handle_mouse(MouseEvent(0, column, row + 1, True))
+    _render(tui, state)
+    assert _click_target(tui, ("filter", "pending"))
+    assert tui.job_scope_node is None
+    assert [job["id"] for job in tui.jobs] == [2]
+
+
+@pytest.mark.parametrize("width", [36, 80, 150])
+def test_overview_more_keeps_every_secondary_action_reachable(width):
+    tui = _tui(width=width, height=24)
+    state = _state()
+    _render(tui, state)
+    _press(tui, "j")  # Pending jobs expose both priority and ordering controls.
+    _render(tui, state)
+    visible = {target for _row, _start, _end, target in tui._click_regions}
+    assert _click_target(tui, ("menu", "actions"))
+    menu = tui._menu
+    hidden = [target for _label, target in menu.entries]
+    expected = {
+        ("detail", None), ("log", None), ("cancel", None),
+        ("priority", 1), ("priority", -1), ("move", -1), ("move", 1),
+        ("menu", "filter"), ("menu", "sort"), ("menu", "view"),
+        ("procs", None), ("tick", None), ("auto", False), ("theme", None),
+        ("switch_pane", None), ("help", None), ("quit", None),
+    }
+    assert expected <= visible | set(hidden)
+    assert len(hidden) == len(set(hidden))
+    for index in range(len(menu.entries)):
+        menu.selected = index
+        _render(tui, state)
+        assert any(region[3] == ("choose", index) for region in menu.regions)
+    assert tui.worker.actions.empty()
+
+
+@pytest.mark.parametrize("width", [36, 60, 150])
+def test_overview_cancel_confirmation_stays_visible_and_requires_a_second_click(width):
+    tui = _tui(width=width, height=15)
+    state = _state()
+    _render(tui, state)
+    if not any(region[3] == ("cancel", None) for region in tui._click_regions):
+        _click_target(tui, ("menu", "actions"))
+        _choose_menu_target(tui, state, ("cancel", None))
+    else:
+        _click_target(tui, ("cancel", None))
+    assert tui.pending_confirm is not None
+    assert tui.worker.actions.empty()
+
+    output = _render(tui, state)
+    assert "Cancel #1?" in output
+    assert "[Confirm]" in output
+    assert _click_target(tui, ("cancel", None))
+    assert tui.worker.actions.get_nowait() == ("cancel", 1)
+    assert tui.pending_confirm is None
+
+
+def test_overview_view_menu_selects_each_view_without_cycling():
+    tui = _tui()
+    state = _state()
+    for view in ("servers", "flow", "overview"):
+        _render(tui, state)
+        assert _click_target(tui, ("menu", "view"))
+        assert _choose_menu_target(tui, state, ("resource_view", view))
+        assert tui.resource_view == view
+        assert tui._menu is None
+
+
+def test_overview_resource_summary_stays_short_without_hiding_the_job_list():
+    base = _snapshot()["nodes"][1]
+    nodes = [dict(base, name=f"server-{index}") for index in range(10)]
+    jobs = [_job(index, name=f"experiment-{index}", node="server-0") for index in range(1, 13)]
+    state = _state(_snapshot(jobs=jobs, nodes=nodes, counts={"running": len(jobs)}))
+    tui = _tui()
+    output = _render(tui, state)
+    resource_rows = [row for row, target in tui._row_targets.items()
+                     if target[0] == "node" or target == ("pane", "nodes")]
+
+    assert 1 <= len(resource_rows) <= 4
+    assert "more line(s)" in output
+    for job in jobs:
+        assert f"#{job['id']} {job['name']}" in output
+    assert not any(target[0] == "gpu" for _row, _start, _end, target in tui._click_regions)
+
+    _press(tui, "v")
+    _render(tui, state)
+    assert any(target[0] == "gpu" for _row, _start, _end, target in tui._click_regions)
+    _click_target(tui, ("menu", "view"))
+    _choose_menu_target(tui, state, ("resource_view", "overview"))
+    _render(tui, state)
+    assert not any(target[0] == "gpu" for _row, _start, _end, target in tui._click_regions)
+
+
+def test_overview_details_retain_command_priority_memory_and_exit_information():
+    job = _job(7, state="failed", name="failed-run", priority=3,
+               gpu_mem_mb=8192, exit_code=2)
+    state = _state(_snapshot(jobs=[], recent=[job], nodes=[], counts={"failed": 1}))
+    tui = _tui(width=80, height=20)
+    tui.filter = "finished"
+    _render(tui, state)
+    _press(tui, "", name="KEY_ENTER")
+    pages = [_render(tui, state)]
+    for _ in range(tui.detail_pages - 1):
+        _press(tui, "]")
+        pages.append(_render(tui, state))
+    detail = "\n".join(pages)
+
+    assert "python train.py --epochs 10" in detail
+    assert "priority 3" in detail and "runtime" in detail
+    assert "GPU memory used 8.0G" in detail
+    assert "exit code 2" in detail
+    assert "vram=20.0G" in detail
+
+
+def test_task_flow_remains_available_and_shows_each_gpu_lane():
+    snapshot = _flow_snapshot()
+    tui = _tui(resource_view="flow")
+    output = _render(tui, _state(snapshot))
+    lines = [_content_line(line) for line in output.splitlines()]
 
     assert tui.resource_view == "flow"
     assert "TASK FLOW · 2N 3G · R1 Q5" in output
@@ -357,8 +686,8 @@ def test_task_flow_is_the_default_and_shows_each_gpu_lane():
 
 
 def test_task_flow_keeps_unassigned_jobs_in_the_shared_priority_pool():
-    output = _render(_tui(), _state(_flow_snapshot()))
-    lines = output.splitlines()
+    output = _render(_tui(resource_view="flow"), _state(_flow_snapshot()))
+    lines = [_content_line(line) for line in output.splitlines()]
     shared = next(line for line in lines if line.startswith("  ANY GPU"))
 
     assert "{ Q1 · priority }" in shared
@@ -378,14 +707,14 @@ def test_flow_activity_distinguishes_external_idle_and_unknown(gpu_state, node_s
     node = snapshot["nodes"][0]
     node["state"] = node_state
     node["gpus"][0].update(gpu_state)
-    output = _render(_tui(), _state(snapshot))
+    output = _render(_tui(resource_view="flow"), _state(snapshot))
     assert f"[ {expected} ]" in output
 
 
 @pytest.mark.parametrize("target", ["{ lane Q3 }", "+3"])
 def test_task_pool_and_overflow_open_complete_lane_queue(target):
     snapshot = _flow_snapshot()
-    tui = _tui(width=100, height=42)
+    tui = _tui(width=100, height=42, resource_view="flow")
     state = _state(snapshot)
     output = _render(tui, state)
     tui.handle_mouse(_mouse_at(output, target))
@@ -401,7 +730,7 @@ def test_shared_pool_excludes_running_and_cpu_jobs_and_can_open_job_detail():
     snapshot["jobs"].extend([
         _job(21, state="pending", gpus=0), _job(22, state="running", lane=None),
     ])
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     state = _state(snapshot)
     output = _render(tui, state)
     tui.handle_mouse(_mouse_at(output, "{ Q1 · priority }"))
@@ -436,7 +765,7 @@ def test_job_details_page_through_full_commands_and_dependency_states():
 
 
 def test_task_flow_draws_success_and_any_result_dependencies():
-    output = _render(_tui(), _state(_flow_snapshot()))
+    output = _render(_tui(resource_view="flow"), _state(_flow_snapshot()))
     dependency = next(line for line in output.splitlines() if "DEPS" in line)
 
     assert "#10 ─✓▶ #11" in dependency
@@ -447,7 +776,7 @@ def test_task_flow_draws_success_and_any_result_dependencies():
 def test_task_flow_job_tokens_open_the_corresponding_job_detail():
     snapshot = _flow_snapshot()
     state = _state(snapshot)
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui, state)
     click = _mouse_at(output, "[1:#14 P+2 sweep-b]")
 
@@ -464,7 +793,7 @@ def test_task_flow_job_tokens_open_the_corresponding_job_detail():
 def test_clicking_a_flow_gpu_scopes_the_job_list_to_that_card():
     snapshot = _flow_snapshot()
     state = _state(snapshot)
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui, state)
 
     assert tui.handle_mouse(_mouse_at(output, "G0 ", occurrence=1)) is True
@@ -474,25 +803,30 @@ def test_clicking_a_flow_gpu_scopes_the_job_list_to_that_card():
     assert "JOBS (1) · running on small-node/GPU0" in _render(tui, state)
 
 
-def test_v_switches_between_task_flow_and_server_capacity_views():
+def test_v_cycles_overview_task_flow_and_server_capacity_views():
     tui = _tui()
     state = _state(_flow_snapshot())
+    _render(tui, state)
+    assert tui.resource_view == "overview"
+
+    _press(tui, "v")
+    assert tui.resource_view == "flow"
     assert "TASK FLOW" in _render(tui, state)
 
     _press(tui, "v")
     assert tui.resource_view == "servers"
     assert "SERVERS (2)" in _render(tui, state)
 
-    output = _render(tui, state)
-    assert tui.handle_mouse(_mouse_at(output, "[v view:servers]")) is True
-    assert tui.resource_view == "flow"
-    assert "TASK FLOW" in _render(tui, state)
+    _render(tui, state)
+    assert _click_target(tui, ("menu", "view"))
+    assert _choose_menu_target(tui, state, ("resource_view", "overview"))
+    assert tui.resource_view == "overview"
 
 
 def test_task_flow_remains_readable_on_a_narrow_terminal():
     from nvidb.sched.model import display_width
 
-    tui = _tui(width=60)
+    tui = _tui(width=60, resource_view="flow")
     output = _render(tui, _state(_flow_snapshot()))
 
     assert "TASK FLOW" in output
@@ -559,7 +893,7 @@ def test_all_gpu_rows_and_shared_pool_are_reachable_on_one_large_node():
     node = snapshot["nodes"][1]
     node["gpus"] = [_gpu(index) for index in range(8)]
     snapshot["nodes"] = [node]
-    tui = _tui(width=100, height=30)
+    tui = _tui(width=100, height=30, resource_view="flow")
     tui.focus = "nodes"
     state = _state(snapshot)
     output = _render(tui, state)
@@ -568,7 +902,12 @@ def test_all_gpu_rows_and_shared_pool_are_reachable_on_one_large_node():
     output = _render(tui, state)
     assert "G7 " in output
     assert "ANY GPU" in output
+    _press(tui, "", name="KEY_PGDOWN")
+    output = _render(tui, state)
     assert "DEPS" in output
+    tui.handle_mouse(_mouse_at(output, "G7 ", button=64))
+    output = _render(tui, state)
+    assert "G7 " in output
     tui.handle_mouse(_mouse_at(output, "G7 "))
     assert tui.job_scope_gpu == 7
     _press(tui, "", name="KEY_LEFT")
@@ -581,7 +920,7 @@ def test_all_gpu_rows_and_shared_pool_are_reachable_on_one_large_node():
 def test_keyboard_gpu_cursor_reaches_the_last_card_and_survives_removal():
     snapshot = _snapshot(nodes=[_snapshot()["nodes"][1]])
     snapshot["nodes"][0]["gpus"] = [_gpu(index) for index in (0, 2, 7)]
-    tui = _tui(width=80, height=24)
+    tui = _tui(width=80, height=24, resource_view="flow")
     tui.focus = "nodes"
     _render(tui, _state(snapshot))
     for _ in range(3):
@@ -641,7 +980,10 @@ def test_external_processes_collapse_to_one_summary_line():
         )
     ]
     output = _plain(_tui(resource_view="servers").render(_state(snapshot)))
-    ext_lines = [line for line in output.splitlines() if line.lstrip().startswith("ext ")]
+    ext_lines = [
+        line for line in output.splitlines()
+        if _content_line(line).lstrip().startswith("ext ")
+    ]
     assert len(ext_lines) == 1
     # Biggest foreign process first, overflow counted instead of listed.
     assert "alice" in ext_lines[0] and "39.1G" in ext_lines[0]
@@ -655,7 +997,7 @@ def test_a_node_compresses_to_a_single_line_when_the_width_allows():
     line = next(line for line in output.splitlines() if "big-node" in line)
     assert "1× RTX PRO 5000" in line
     assert "G0 " in line and "67.4G/71.7G" in line
-    assert "10.0.0.1" in line and line.rstrip().endswith("up")
+    assert "10.0.0.1" in line and _content_line(line).rstrip().endswith("up")
 
 
 def test_a_thin_rule_separates_node_rows():
@@ -684,7 +1026,7 @@ def test_the_external_summary_joins_the_node_line_when_it_fits():
     assert "ext " in line and "alice" in line
     # Everything moved inline, so no stacked ext line remains.
     assert not any(
-        line.lstrip().startswith("ext ") for line in output.splitlines()
+        _content_line(line).lstrip().startswith("ext ") for line in output.splitlines()
     )
 
 
@@ -700,7 +1042,7 @@ def test_a_narrow_screen_stacks_the_node_back_into_a_grid():
     # Three cells plus the head cannot share 100 columns, so the node falls
     # back to the stacked layout: header line, grid lines below.
     assert "G0 " not in header
-    assert any(line.startswith("    G0 ") for line in lines)
+    assert any(_content_line(line).startswith("    G0 ") for line in lines)
 
 
 def test_procs_all_still_lists_every_process_line():
@@ -742,7 +1084,7 @@ def test_a_blind_node_says_so_instead_of_claiming_zero_processes():
 
 def test_progress_replaces_the_command_in_the_job_row():
     snapshot = _snapshot(jobs=[_job(1, progress="epoch 3/10 loss 0.42")])
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     tui.show_detail = True
     output = _render(tui, _state(snapshot))
     assert "PROGRESS / COMMAND" in output
@@ -752,7 +1094,7 @@ def test_progress_replaces_the_command_in_the_job_row():
 
 
 def test_a_job_without_progress_still_shows_its_command():
-    output = _render(_tui())
+    output = _render(_tui(resource_view="flow"))
     assert "PROGRESS" not in output
     assert "python train.py --epochs 10" in output
 
@@ -819,7 +1161,7 @@ def test_a_very_long_note_can_be_paged_to_its_end():
 def test_an_unreachable_node_shows_its_error():
     snapshot = _snapshot()
     snapshot["nodes"][0].update(state="down", last_error="timed out", gpus=[])
-    output = _render(_tui(), _state(snapshot))
+    output = _render(_tui(resource_view="servers"), _state(snapshot))
     assert "down" in output
     assert "timed out" in output
 
@@ -852,8 +1194,8 @@ def test_wide_characters_do_not_push_lines_past_the_edge():
 
 def test_the_screen_survives_an_empty_queue():
     output = _render(_tui(), _state(_snapshot(jobs=[], counts={})))
-    assert "queue empty" in output
-    assert "no jobs match this filter" in output
+    assert "Active 0" in output
+    assert "No active jobs" in output
 
 
 def test_before_the_first_refresh_the_screen_explains_itself():
@@ -899,7 +1241,7 @@ def test_tab_switches_which_pane_has_focus():
 def test_enter_has_visible_expand_and_collapse_states():
     snapshot = _snapshot(jobs=[_job(1, notes="visible detail")], nodes=[])
     state = _state(snapshot)
-    tui = _tui()
+    tui = _tui(resource_view="flow")
 
     collapsed = _render(tui, state)
     assert "▶ JOB 1 DETAIL HIDDEN" in collapsed
@@ -963,7 +1305,10 @@ def test_T_cycles_the_theme_and_persists_it(monkeypatch):
     _press(tui, "T")
     assert tui.theme == "muted"
     assert saved["theme"] == "muted"
-    assert "T theme:muted" in _render(tui)
+    _render(tui)
+    assert _click_target(tui, ("menu", "actions"))
+    assert any("T theme:muted" == label for label, _target in tui._menu.entries)
+    _press(tui, "", name="KEY_ESCAPE")
     _press(tui, "T")
     assert tui.theme == "classic"
 
@@ -1059,8 +1404,259 @@ def test_help_scrolls_with_keyboard_and_wheel_without_running_commands():
 
 # --- mouse interaction -----------------------------------------------------
 
-def test_clicking_job_rows_selects_then_toggles_the_current_detail():
+@pytest.fixture
+def hover_tui(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setattr("nvidb.sched.tui.age_seconds", lambda value: 125)
+    tui = _tui(resource_view="servers")
+    tui.term = Terminal(kind="xterm-256color", force_styling=True)
+    return tui
+
+
+@pytest.mark.parametrize("target", [
+    ("tick", None), ("cancel", None), ("quit", None), ("menu", "filter"),
+    ("job", 1), ("node", 1), ("gpu", (1, 0)),
+])
+def test_hover_highlights_queue_controls_and_rows_without_activating(hover_tui, target):
+    tui = hover_tui
+    before = tui.render(_state())
+    region = next((region for region in tui._click_regions if region[3] == target), None)
+    if region is not None:
+        row, column, _end, _target = region
+    else:
+        row = next(row for row, value in tui._row_targets.items() if value == target)
+        column = 0
+
+    def selection_state():
+        return (
+            tui.focus, tui.job_index, tui.node_index, tui._selected_job_id,
+            tui._cursor_gpu, tui.job_scope_node, tui.job_scope_gpu,
+            tui.filter, tui.sort_key, tui.sort_reverse, tui.show_detail,
+            tui.show_log, tui.show_help, tui.pending_confirm, tui._resource_scroll,
+        )
+
+    initial_selection = selection_state()
+    assert tui.handle_mouse(MouseEvent(35, column + 1, row + 1, True)) is True
+    hovered = tui.render(_state())
+    assert _plain(hovered) == _plain(before)
+    assert [index for index, (old, new) in enumerate(
+        zip(before.splitlines(), hovered.splitlines())
+    ) if old != new] == [row]
+    assert selection_state() == initial_selection
+    assert tui._menu is None
+    assert tui.worker.actions.empty()
+    assert tui.worker.log_request is None
+
+    # Leaving every hit target restores the row without changing selection.
+    assert tui.handle_mouse(MouseEvent(35, 1, tui.term.height, True)) is True
+    assert tui.render(_state()) == before
+
+
+def test_hover_ignores_non_actionable_queue_pane_space(hover_tui):
+    tui = hover_tui
+    before = tui.render(_state())
+    row = next(
+        row for row, target in tui._row_targets.items()
+        if target == ("pane", "jobs")
+        and not any(r == row and start <= tui.term.width - 1 <= end
+                    for r, start, end, _ in tui._click_regions)
+    )
+
+    assert tui.handle_mouse(MouseEvent(35, tui.term.width, row + 1, True)) is True
+    assert tui.render(_state()) == before
+    assert tui.focus == "jobs"
+
+
+def test_queue_hover_is_cleared_by_keyboard_input_and_opening_a_menu(hover_tui):
+    tui = hover_tui
+    before = tui.render(_state())
+    motion = _mouse_at(_plain(before), "[t tick]", button=35)
+    tui.handle_mouse(motion)
+    assert tui.render(_state()) != before
+
+    _press(tui, "z")
+    assert tui.render(_state()) == before
+
+    tui.handle_mouse(motion)
+    assert tui.render(_state()) != before
+    tui._activate("menu", "filter")
+    _press(tui, "", "KEY_ESCAPE")
+    assert tui._menu is None
+    assert tui.render(_state()) == before
+
+
+@pytest.mark.parametrize("disabled", ["mouse", "styling"])
+def test_queue_hover_respects_disabled_mouse_and_plain_terminals(hover_tui, disabled, monkeypatch):
+    tui = hover_tui
+    if disabled == "mouse":
+        tui.mouse_enabled = False
+    else:
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        tui.term = Terminal(force_styling=False)
+    before = tui.render(_state())
+
+    tui.handle_mouse(_mouse_at(_plain(before), "[t tick]", button=35))
+
+    assert tui.render(_state()) == before
+    assert tui.worker.actions.empty()
+
+
+def test_hovering_alert_rows_does_not_open_logs(hover_tui):
+    tui = hover_tui
+    snapshot = _snapshot()
+    snapshot["alerts"] = [{
+        "id": 3, "kind": "job_failed", "severity": "error", "job_id": 1,
+        "node": "small-node", "title": "job 1 failed", "acknowledged_at": None,
+    }]
+    state = _state(snapshot)
+    before = tui.render(state)
+    motion = _mouse_at(_plain(before), "job 1 failed", button=35)
+
+    tui.handle_mouse(motion)
+    hovered = tui.render(state)
+
+    assert _plain(hovered) == _plain(before)
+    assert hovered.splitlines()[motion.row - 1] != before.splitlines()[motion.row - 1]
+    assert tui.filter == "active"
+    assert tui.show_log is False
+    assert tui.worker.log_request is None
+    assert tui.worker.actions.empty()
+
+
+@pytest.fixture
+def run_queue_input(monkeypatch):
+    """Run the real input loop against deterministic terminal input and time."""
+    def run(tui, steps):
+        clock = 0.0
+        consumed = 0
+        frames = []
+        full_renders = []
+        state_reads = []
+        lifecycle = []
+        steps = iter(steps)
+
+        def inkey(timeout):
+            nonlocal clock, consumed
+            assert 0 <= timeout <= 0.4 + 1e-9
+            text, elapsed = next(steps)
+            clock += elapsed
+            consumed += 1
+            return Keystroke(text)
+
+        def frame(state):
+            full_renders.append(consumed)
+            tui._click_regions = [(0, 0, 8, ("tick", None))]
+            return tui._paint_hover(["queue"])
+
+        def read_state():
+            state_reads.append(consumed)
+            return _state()
+
+        tui.term = SimpleNamespace(
+            width=80, height=42, does_styling=False,
+            fullscreen=nullcontext, cbreak=nullcontext,
+            hidden_cursor=nullcontext, inkey=inkey,
+        )
+        monkeypatch.setattr("nvidb.sched.tui.time.monotonic", lambda: clock)
+        monkeypatch.setattr("nvidb.sched.tui.time.time", lambda: clock)
+        monkeypatch.setattr("nvidb.sched.tui.DiffScreen", lambda term: SimpleNamespace(
+            paint=lambda lines: frames.append((consumed, clock, tui.pending_confirm)),
+        ))
+        monkeypatch.setattr(tui, "_frame_lines", frame)
+        monkeypatch.setattr(tui, "_start_mouse_reporting", lambda: None)
+        monkeypatch.setattr(tui, "_stop_mouse_reporting", lambda: None)
+        monkeypatch.setattr(tui.worker, "read_state", read_state)
+        monkeypatch.setattr(tui.worker, "start", lambda: lifecycle.append("start"))
+        monkeypatch.setattr(tui.worker, "stop", lambda: lifecycle.append("stop"))
+        monkeypatch.setattr(tui.worker, "join", lambda timeout: lifecycle.append("join"))
+        assert tui.run() == 0
+        assert lifecycle == ["start", "stop", "join"]
+        return SimpleNamespace(frames=frames, full_renders=full_renders, state_reads=state_reads)
+    return run
+
+
+def test_queue_loop_batches_mouse_chunks_and_unchanged_hover(run_queue_input):
     tui = _tui()
+    enter = "\x1b[<35;1;1M"
+    inside = "\x1b[<35;3;1M"
+    leave = "\x1b[<35;1;5M"
+    report_chunks = enter + inside + leave
+    steps = [(char, 0.001) for char in report_chunks]
+    steps.extend([("z", 0.001), ("", 0.4), ("q", 0.001)])
+
+    result = run_queue_input(tui, steps)
+
+    assert [count for count, _time, _pending in result.frames] == [
+        0, len(enter), len(report_chunks), len(report_chunks) + 1, len(report_chunks) + 2,
+    ]
+    assert result.full_renders == result.state_reads == [
+        0, len(report_chunks) + 1, len(report_chunks) + 2,
+    ]
+    assert tui.worker.actions.empty()
+
+
+def test_queue_loop_refreshes_worker_data_during_continuous_mouse_input(run_queue_input):
+    tui = _tui()
+    report = "\x1b[<35;1;1M"
+    steps = [(char, 0.11) for char in report] + [("q", 0)]
+
+    result = run_queue_input(tui, steps)
+
+    # Refreshes keep happening even when no complete event has arrived yet.
+    assert [count for count, _time, _pending in result.frames] == [0, 4, 8, len(report)]
+    assert result.full_renders == result.state_reads == [0, 4, 8]
+
+
+def test_queue_loop_expires_confirmation_during_partial_mouse_input(run_queue_input):
+    tui = _tui()
+    tui.pending_confirm = ("cancel", 1, -CONFIRM_SECONDS + 0.1)
+
+    result = run_queue_input(tui, [
+        ("\x1b", 0.2), ("[<35;1;1M", 0), ("q", 0),
+    ])
+
+    assert result.frames[0][2] is not None
+    assert result.frames[1] == (1, 0.2, None)
+    assert tui.pending_confirm is None
+    assert tui.worker.actions.empty()
+
+
+def test_queue_cached_hover_keeps_the_base_frame_clean(hover_tui):
+    tui = hover_tui
+    original = tui._frame_lines(_state())
+    motion = _mouse_at("\n".join(_plain(line) for line in original), "[t tick]", button=35)
+
+    tui.handle_mouse(motion)
+    hovered = tui._paint_hover()
+
+    assert hovered != original
+    assert tui._base_frame == original
+    assert hovered == tui._frame_lines(_state())
+    tui.handle_mouse(MouseEvent(35, 1, tui.term.height, True))
+    assert tui._paint_hover() == original
+
+
+def test_queue_cached_hover_falls_back_after_resize_or_menu_change(hover_tui, monkeypatch):
+    tui = hover_tui
+    tui._frame_lines(_state())
+    monkeypatch.setenv("COLUMNS", "100")
+    assert tui._paint_hover() is None
+
+    tui._frame_lines(_state())
+    tui._activate("menu", "filter")
+    assert tui._paint_hover() is None
+    menu_lines = tui._frame_lines(_state())
+    row, start, _end, _target = tui._menu.regions[0]
+    tui.handle_mouse(MouseEvent(35, start + 1, row + 1, True))
+    assert tui._paint_hover() != menu_lines
+    assert tui._paint_hover() == tui._frame_lines(_state())
+    _press(tui, "", "KEY_ESCAPE")
+    assert tui._paint_hover() is None
+
+
+def test_clicking_job_rows_selects_then_toggles_the_current_detail():
+    tui = _tui(resource_view="flow")
     output = _render(tui)
 
     click = _mouse_at(output, "eval", occurrence=1)
@@ -1140,7 +1736,7 @@ def test_server_and_gpu_clicks_drill_down_the_running_job_list():
     assert "JOBS (2) · running on small-node/GPU1" in output
     assert tui.handle_mouse(_mouse_at(output, "[all jobs]")) is True
     assert tui.job_scope_node is None and tui.job_scope_gpu is None
-    assert [job["id"] for job in tui.jobs] == [4, 1, 2, 3, 5]
+    assert [job["id"] for job in tui.jobs] == [1, 2, 3, 4, 5]
 
 
 def test_gpu_click_regions_follow_the_stacked_narrow_layout():
@@ -1154,7 +1750,8 @@ def test_gpu_click_regions_follow_the_stacked_narrow_layout():
     output = _render(tui, _state(snapshot))
     lines = output.splitlines()
     gpu_row = next(
-        row for row, line in enumerate(lines) if line.startswith("    G10")
+        row for row, line in enumerate(lines)
+        if _content_line(line).startswith("    G10")
     )
     memory_column = lines[gpu_row].index("0M/24.0G")
 
@@ -1172,7 +1769,7 @@ def test_gpu_click_regions_follow_the_stacked_narrow_layout():
 
 
 def test_wheel_routes_to_the_pane_under_the_pointer():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
 
     assert tui.handle_mouse(_mouse_at(output, "JOBS (2)", button=65)) is True
@@ -1211,7 +1808,7 @@ def test_wheel_pages_wrapped_detail_and_scrolls_back_through_logs():
 
 
 def test_action_bar_buttons_post_actions_and_keep_cancel_confirmation():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
 
     assert tui.handle_mouse(_mouse_at(output, "[t tick]")) is True
@@ -1227,7 +1824,7 @@ def test_action_bar_buttons_post_actions_and_keep_cancel_confirmation():
 
 
 def test_status_counts_and_alert_rows_are_clickable():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
 
     assert tui.handle_mouse(_mouse_at(output, "pending 1")) is True
@@ -1256,7 +1853,7 @@ def test_status_counts_and_alert_rows_are_clickable():
 
 
 def test_help_and_quit_buttons_are_clickable():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
 
     assert tui.handle_mouse(_mouse_at(output, "[? help]")) is True
@@ -1271,6 +1868,7 @@ def test_help_and_quit_buttons_are_clickable():
 
 def test_mouse_events_are_ignored_when_mouse_support_is_disabled():
     tui = QueueTUI(mouse_enabled=False)
+    tui.resource_view = "flow"
     output = _render(tui)
 
     assert tui.handle_mouse(_mouse_at(output, "[q quit]")) is True
@@ -1294,7 +1892,7 @@ def test_cancelling_needs_a_second_keypress():
     _press(tui, "c")
     assert tui.worker.actions.empty()
     assert tui.pending_confirm is not None
-    assert "press c again" in _render(tui)
+    assert "Cancel #1?" in _render(tui)
 
     _press(tui, "c")
     assert tui.worker.actions.get_nowait() == ("cancel", 1)
@@ -1373,8 +1971,9 @@ def test_queue_sort_preserves_lane_positions_even_when_priorities_differ():
     assert tui.jobs[1]["id"] == 20  # the free pool still uses priority
 
 
-def test_the_default_sort_is_runtime_from_longest_to_shortest():
+def test_runtime_sort_is_available_from_longest_to_shortest():
     tui = _tui()
+    tui.sort_key = "time"
     snapshot = _snapshot(
         jobs=[
             _job(1, name="short", elapsed_s=15),
@@ -1395,7 +1994,7 @@ def test_the_default_sort_is_runtime_from_longest_to_shortest():
 
 
 def test_the_job_table_shows_priority_and_compact_states():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     snapshot = _snapshot(
         jobs=[_job(1), _job(2, state="pending", name="eval", priority=3)]
     )
@@ -1407,9 +2006,9 @@ def test_the_job_table_shows_priority_and_compact_states():
 def test_s_cycles_the_sort_and_S_flips_it():
     tui = _tui()
     _render(tui)
-    assert tui.sort_key == "time" and tui.sort_reverse is False
+    assert tui.sort_key == "queue" and tui.sort_reverse is False
     _press(tui, "s")
-    assert tui.sort_key == "queue"
+    assert tui.sort_key == "id"
     _press(tui, "S")
     assert tui.sort_reverse is True
     _render(tui)
@@ -1417,7 +2016,7 @@ def test_s_cycles_the_sort_and_S_flips_it():
 
 
 def test_clicking_a_column_header_sorts_then_flips():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
     assert tui.handle_mouse(_mouse_at(output, "NAME")) is True
     assert tui.sort_key == "name" and tui.sort_reverse is False
@@ -1429,10 +2028,10 @@ def test_clicking_a_column_header_sorts_then_flips():
 
 
 def test_clicking_the_sort_label_cycles_the_sort():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
-    assert tui.handle_mouse(_mouse_at(output, "sort time▼")) is True
-    assert tui.sort_key == "queue"
+    assert tui.handle_mouse(_mouse_at(output, "sort queue▼")) is True
+    assert tui.sort_key == "id"
 
 
 def test_the_selection_follows_a_job_when_the_order_changes():
@@ -1495,7 +2094,6 @@ def test_move_keys_reorder_only_pending_jobs():
 def test_moving_a_job_snaps_the_table_back_to_queue_order():
     tui = _tui()
     _render(tui)
-    _press(tui, "s")
     _press(tui, "s")  # sort by id instead
     _press(tui, "j")  # select the pending job
     _press(tui, "K")
@@ -1504,7 +2102,7 @@ def test_moving_a_job_snaps_the_table_back_to_queue_order():
 
 
 def test_priority_and_move_buttons_are_clickable():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     _render(tui)
     _press(tui, "j")  # the pending job has both button groups
     output = _render(tui)
@@ -1515,16 +2113,166 @@ def test_priority_and_move_buttons_are_clickable():
 
 
 def test_the_row_marker_tracks_the_detail_state():
-    tui = _tui()
+    tui = _tui(resource_view="flow")
     output = _render(tui)
     row = next(
         line for line in output.splitlines() if "train" in line and "python" in line
     )
-    assert row.startswith("▶")
+    assert _content_line(row).startswith("▶")
 
     _press(tui, "", name="KEY_ENTER")
     output = _render(tui)
     row = next(
         line for line in output.splitlines() if "train" in line and "python" in line
     )
-    assert row.startswith("▼")
+    assert _content_line(row).startswith("▼")
+
+
+@pytest.mark.parametrize("width", [36, 80, 150])
+def test_queue_overflow_opens_direct_filter_menu_without_keyboard(width):
+    tui = _tui(width=width)
+    state = _state(_snapshot(jobs=[_job(1), _job(2, state="pending")]))
+    _render(tui, state)
+
+    def click_target(target):
+        row, start, _, _ = next(r for r in tui._click_regions if r[3] == target)
+        assert tui.handle_mouse(MouseEvent(0, start + 1, row + 1, True))
+
+    def choose(target):
+        menu = tui._menu
+        index = next(i for i, (_, value) in enumerate(menu.entries) if value == target)
+        menu.selected = index
+        _render(tui, state)
+        row, start, _, _ = next(r for r in menu.regions if r[3] == ("choose", index))
+        assert tui.handle_mouse(MouseEvent(0, start + 1, row + 1, True))
+
+    if not any(r[3] == ("menu", "filter") for r in tui._click_regions):
+        click_target(("menu", "actions"))
+        choose(("menu", "filter"))
+    else:
+        click_target(("menu", "filter"))
+    choose(("filter", "pending"))
+    assert tui.filter == "pending"
+    assert [job["id"] for job in tui.jobs] == [2]
+    assert tui._menu is None
+    _render(tui, state)
+    if not any(r[3] == ("menu", "sort") for r in tui._click_regions):
+        click_target(("menu", "actions"))
+        choose(("menu", "sort"))
+    else:
+        click_target(("menu", "sort"))
+    choose(("sort", "pri"))
+    assert tui.sort_key == "pri"
+    assert tui.worker.actions.empty()
+
+
+@pytest.mark.parametrize("input_kind", ["wheel_up", "wheel_down", "pane_click"])
+def test_overview_server_mouse_input_keeps_keyboard_on_jobs(input_kind):
+    tui = _tui(width=80, height=24)
+    snapshot = _snapshot(jobs=[_job(1), _job(2), _job(3)])
+    node = snapshot["nodes"][0]
+    snapshot["nodes"] = [{**node, "name": f"node-{index}"} for index in range(6)]
+    state = _state(snapshot)
+    _render(tui, state)
+    target = ("pane", "nodes") if input_kind == "pane_click" else ("node", 0)
+    row = next(row for row, value in tui._row_targets.items() if value == target)
+    button = {"wheel_up": 64, "wheel_down": 65, "pane_click": 0}[input_kind]
+
+    tui.handle_mouse(MouseEvent(35, 3, row + 1, True))
+    tui.handle_mouse(MouseEvent(button, 3, row + 1, True))
+    _render(tui, state)
+    assert tui.focus == "jobs"
+    assert tui.resource_view == "overview"
+    assert tui.selected_job()["id"] == 1
+    if input_kind == "wheel_down":
+        assert tui._resource_scroll > 0
+
+    for text, name, job_id in [
+        ("\x1b[B", "KEY_DOWN", 2), ("j", None, 3),
+        ("k", None, 2), ("\x1b[A", "KEY_UP", 1),
+    ]:
+        assert tui.handle_key(Keystroke(text, name=name))
+        output = _render(tui, state)
+        assert tui.selected_job()["id"] == job_id
+        assert f"#{job_id} train" in output
+    assert tui.handle_key(Keystroke("\r", name="KEY_ENTER"))
+    _render(tui, state)
+    assert tui.show_detail
+    assert tui.handle_key(Keystroke("L"))
+    _render(tui, state)
+    assert tui.show_log and tui.worker.log_request == (1, "stdout")
+    assert tui.handle_key(Keystroke("c"))
+    _render(tui, state)
+    assert tui.pending_confirm[:2] == ("cancel", 1)
+    assert tui.worker.actions.empty()
+    assert tui.handle_key(Keystroke("q")) is False
+
+
+@pytest.mark.parametrize("switch_method", ["shortcut", "menu"])
+def test_returning_from_server_focus_to_overview_restores_job_keyboard(switch_method):
+    tui = _tui(width=80, height=24)
+    state = _state(_flow_snapshot())
+    _render(tui, state)
+    first_job = tui.selected_job()["id"]
+    assert tui.handle_key(Keystroke("\t", name="KEY_TAB"))
+    _render(tui, state)
+    assert tui.resource_view == "servers" and tui.focus == "nodes"
+    assert tui.handle_key(Keystroke("j"))
+    _render(tui, state)
+    assert tui.node_index == 1 and tui.selected_job()["id"] == first_job
+
+    if switch_method == "shortcut":
+        assert tui.handle_key(Keystroke("v"))
+    else:
+        assert _click_target(tui, ("menu", "view"))
+        _render(tui, state)
+        assert tui.handle_key(Keystroke("g"))
+        _render(tui, state)
+        menu = tui._menu
+        row, start, _end, _target = next(region for region in menu.regions if region[3] == ("choose", 1))
+        assert tui.handle_mouse(MouseEvent(35, start + 1, row + 1, True))
+        _render(tui, state)
+        assert menu.selected == 0  # Pointer feedback does not replace keyboard selection.
+        assert tui.handle_key(Keystroke("\r", name="KEY_ENTER"))
+    _render(tui, state)
+    assert tui._menu is None
+    assert tui.resource_view == "overview" and tui.focus == "jobs"
+    assert tui.selected_job()["id"] == first_job
+
+    assert tui.handle_key(Keystroke("\x1b[B", name="KEY_DOWN"))
+    _render(tui, state)
+    assert tui.selected_job()["id"] == 20
+    assert tui.handle_key(Keystroke("\r", name="KEY_ENTER"))
+    _render(tui, state)
+    assert tui.show_detail
+    assert tui.worker.actions.empty()
+    assert tui.handle_key(Keystroke("q")) is False
+
+
+def test_overview_node_alert_opens_visible_server_diagnostics_and_node_keyboard():
+    tui = _tui(width=60, height=24)
+    snapshot = _snapshot()
+    snapshot["nodes"][1].update(state="down", last_error="Connection refused")
+    snapshot["alerts"] = [{
+        "id": 7, "kind": "node_down", "severity": "error", "job_id": None,
+        "node": "small-node", "title": "small-node unreachable", "acknowledged_at": None,
+    }]
+    state = _state(snapshot)
+    tui.show_detail = True  # Compact detail normally hides the resource pane.
+    _render(tui, state)
+    row = next(row for row, target in tui._row_targets.items() if target == ("node_name", "small-node"))
+
+    assert tui.handle_mouse(MouseEvent(0, 1, row + 1, True))
+    output = _render(tui, state)
+
+    assert tui.resource_view == "servers" and tui.focus == "nodes"
+    assert tui.selected_node()["name"] == "small-node"
+    assert tui.show_detail is False
+    assert "SERVERS (2)" in output and "Connection refused" in output
+    assert tui.handle_key(Keystroke("k"))
+    _render(tui, state)
+    assert tui.selected_node()["name"] == "big-node"
+    assert tui.handle_key(Keystroke("\t", name="KEY_TAB"))
+    _render(tui, state)
+    assert tui.focus == "jobs"
+    assert tui.worker.actions.empty()

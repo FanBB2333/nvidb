@@ -19,6 +19,18 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 MUTED = "bright_black"
 
+# Both renderers share the same ANSI palette. These names stay within the
+# basic terminal colours so termcolor and Blessed agree on 16-colour terminals.
+ANSI_THEMES = {
+    "classic": {},
+    # Keep warning colours intact while softening routine accents.
+    "muted": {"cyan": "blue", "green": "cyan", "magenta": "blue"},
+}
+
+# Blessed's canonical name for termcolor's on_dark_grey selection background.
+SELECTION_BG = "bright_black"
+TABLE_HEADER_STYLE = "bold_cyan"
+
 # Rounded frame corners; the frame stays continuous through in-frame
 # separators via the T junctions.
 CORNER_TL, CORNER_TR, CORNER_BL, CORNER_BR = "╭", "╮", "╰", "╯"

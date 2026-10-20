@@ -1,7 +1,7 @@
 """Interactive terminal UI for the nvidb job queue.
 
-The screen is three stacked panes - task flow or node capacity, the job table,
-and a detail or log view for the selected job - drawn with `blessed`.
+The default overview puts jobs first, with a short server summary and detail
+or logs on demand. Task flow and node capacity remain available as extra views.
 
 All database and SSH work happens on one worker thread that owns the scheduler;
 the render thread only reads an immutable snapshot and posts actions onto a
@@ -20,15 +20,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from blessed import Terminal
 
 from .. import config as nvidb_config
+from ..tui_controls import ActionMenu, HoverState, action_bar
 from ..mouse import (
-    DISABLE_SEQUENCE as MOUSE_DISABLE_SEQUENCE,
-    ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
     MouseSequenceParser,
+    set_mouse_reporting,
 )
 from ..tui_theme import (
+    ANSI_THEMES,
     DiffScreen,
+    SELECTION_BG,
+    TABLE_HEADER_STYLE,
     display_width,
     fit_display,
+    frame_bottom,
+    frame_top,
     pad_display,
     smooth_bar,
     wrap_display,
@@ -48,32 +53,21 @@ FILTERS = ("active", "all", "running", "pending", "finished")
 # a card being full; all: those plus this queue's own jobs; off: neither.
 PROC_VIEWS = ("summary", "all", "off")
 PROC_SUMMARY_LIMIT = 2
-# The flow view answers "what is every card doing, and what runs next?".  The
-# existing server view remains available for capacity/process inspection.
-RESOURCE_VIEWS = ("flow", "servers")
+# Start with jobs; drill into per-GPU queues or capacity when needed.
+RESOURCE_VIEWS = ("overview", "flow", "servers")
 FILTER_STATES = {
     "active": ("pending", "running"),
     "running": ("running",),
     "pending": ("pending",),
     "finished": ("completed", "failed", "cancelled", "timeout", "lost"),
 }
+# Empty pane rows accept wheel/focus input but are not actionable hover targets.
+HOVER_ROW_KINDS = frozenset({
+    "job", "node", "job_log", "node_name", "detail", "close_help",
+})
 
-# Call sites use semantic ANSI names; a theme maps them to concrete tones and
-# blessed degrades each to the nearest colour the terminal actually has.
-# "classic" is the plain high-contrast palette the nvidb monitor TUI uses and
-# is the default; "muted" keeps the softer tokscale tones this TUI shipped
-# with, where saturated colour is reserved to mean "look at this".
-THEMES = {
-    "classic": {},
-    "muted": {
-        "green": "mediumseagreen",
-        "yellow": "darkkhaki",
-        "red": "indianred",
-        "cyan": "cadetblue",
-        "magenta": "rosybrown",
-        "bright_blue": "steelblue",
-    },
-}
+# Keep the monitor and queue themes identical; Blessed handles terminal depth.
+THEMES = ANSI_THEMES
 THEME_ORDER = tuple(THEMES)
 
 
@@ -294,7 +288,7 @@ COMMANDS = (
         "resource_view",
         ("v",),
         help_key="v",
-        description="Switch task flow / server capacity view",
+        description="Switch overview / task flow / server capacity",
         footer_order=42,
     ),
     Command(
@@ -347,6 +341,8 @@ COMMANDS = (
         footer_order=12,
     ),
     Command("escape", "escape", key_names=("KEY_ESCAPE",)),
+    Command("menu", "menu", ("m",), value="actions", help_key="m",
+            description="Open the actions hidden under More"),
     Command(
         "acknowledge",
         "ack",
@@ -372,10 +368,6 @@ COMMANDS = (
         footer_order=22,
     ),
 )
-
-# The selection band: a grey clearly lighter than a dark terminal background,
-# so the cursor is findable at a glance yet still reads as a tint, not a bar.
-SELECTION_BG = "gray27"
 
 STATE_STYLE = {
     "running": "green",
@@ -411,10 +403,8 @@ def display_state(job: Dict[str, Any]) -> str:
     return "held" if job.get("held") else job["state"]
 
 
-# Runtime is the opening view: the TIME column reads naturally from the
-# longest-running job at the top to the shortest at the bottom.  Queue order
-# remains one keypress away and is restored automatically before a pending job
-# is moved, because that is the order in which K/J make sense.
+# Queue order keeps running work first and respects independent lane ordering.
+# Runtime and the other fields remain available through the sort menu.
 SORT_KEYS = (
     "time",
     "queue",
@@ -680,7 +670,7 @@ class QueueTUI:
         self._resource_page_size = 1
         self._cursor_gpu: Optional[int] = None
         self.filter = "active"
-        self.sort_key = "time"
+        self.sort_key = "queue"
         self.sort_reverse = False
         # A node/GPU click scopes the lower table to work that is running on
         # that resource.  Keep this separate from node_index: the latter is a
@@ -689,7 +679,7 @@ class QueueTUI:
         self.job_scope_node: Optional[str] = None
         self.job_scope_gpu: Optional[int] = None
         self.job_scope_pool: Optional[str] = None
-        self.resource_view = "flow"
+        self.resource_view = "overview"
         # The cursor follows a job, not a row number: a refresh or a priority
         # change may reorder the table under the selection.
         self._selected_job_id: Optional[int] = None
@@ -719,6 +709,10 @@ class QueueTUI:
         # remain clickable without changing how wheel routing works.
         self._click_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
         self._row_targets: Dict[int, Tuple[str, Any]] = {}
+        self._hover = HoverState()
+        self._base_frame = None
+        self._base_frame_size = None
+        self._base_frame_menu = None
         self._header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
         self._alert_targets: Dict[int, Tuple[str, Any]] = {}
         self._node_line_targets: Dict[int, int] = {}
@@ -731,6 +725,8 @@ class QueueTUI:
         # (row offset within the job pane, start col, end col, target).
         self._job_header_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
         self._footer_regions: List[Tuple[int, int, int, Tuple[str, Any]]] = []
+        self._menu = None
+        self._overflow_controls = []
 
     # --- data -------------------------------------------------------------
 
@@ -940,7 +936,12 @@ class QueueTUI:
     def _style(self, text: str, style: Optional[str]) -> str:
         if not style:
             return text
-        formatter = getattr(self.term, self._palette.get(style, style), None)
+        # Compound attributes still use the shared theme's base colour.
+        if style.startswith("bold_"):
+            style = "bold_" + self._palette.get(style[5:], style[5:])
+        else:
+            style = self._palette.get(style, style)
+        formatter = getattr(self.term, style, None)
         return formatter(text) if callable(formatter) else text
 
     @staticmethod
@@ -994,17 +995,15 @@ class QueueTUI:
         )
 
     def _highlight_row(self, plain_parts, segments, width: int) -> str:
-        """The selection cursor: a dim band under the row.
-
-        Reverse video would paint a solid block and discard every column's
-        colour; laying a near-background grey underneath keeps the row
-        readable as data while still being findable as the cursor.
-        """
+        """Use the monitor table's grey selection band, retaining status colour."""
         out = []
         for part, (_text, style) in zip(plain_parts, segments):
             if not part:
                 continue
             fg = self._palette.get(style, style) if style else None
+            # Dim text would disappear against the same grey background.
+            if fg == SELECTION_BG:
+                fg = "white"
             attr = f"{fg}_on_{SELECTION_BG}" if fg else f"on_{SELECTION_BG}"
             formatter = getattr(self.term, attr, None)
             out.append(formatter(part) if callable(formatter) else part)
@@ -1015,7 +1014,25 @@ class QueueTUI:
             out.append(formatter(pad) if callable(formatter) else pad)
         return "".join(out)
 
+    def _title_line(self, meta: str, width: int, *, meta_style="bright_black") -> str:
+        """Keep the version at the right edge, as in the monitor header."""
+        if getattr(self, "_panel_framed", False):
+            width += 4  # This one line stays above the panel, at terminal width.
+        version = f"v{nvidb_config.VERSION}"
+        room = max(0, width - display_width(version) - 1)
+        title = fit_display(" nvidb queue ", room)
+        meta_room = max(0, room - display_width(title) - 1)
+        status = fit_display(meta, meta_room) if meta_room >= 12 else ""
+        gap = max(0, room - display_width(title) - display_width(status))
+        return self._compose([
+            (title, "bold_cyan"), (" " * gap, None), (status, meta_style),
+            (" ", None), (version, "bright_black"),
+        ], width)
+
     def _header_lines(self, state: Dict[str, Any], width: int) -> List[str]:
+        if self.resource_view == "overview":
+            return self._overview_header_lines(state, width)
+        self._overview_header_overflow = []
         snapshot = state["snapshot"] or {}
         counts = snapshot.get("counts") or {}
         self._header_regions = [(0, 0, len(" nvidb queue ") - 1, ("help", None))]
@@ -1059,21 +1076,111 @@ class QueueTUI:
         keeper_text = ""
         if keeper.get("installed") or keeper.get("running"):
             keeper_text = f"keeper {'up' if keeper.get('running') else 'DOWN'} · "
-        # A coloured wordmark, tokscale-style, instead of a reverse-video block.
-        title = " nvidb queue "
         scope = self._scope_label()
         job_view = self._scope_description() if scope else f"filter {self.filter}"
         meta = (
             f"tick {tick_text} · {keeper_text}{mode} · {status} · {job_view} "
             f"· view {self.resource_view} "
         )
-        gap = max(1, width - len(title) - len(meta))
         return [
-            self._compose(
-                [(title, "cyan"), (" " * gap, None), (meta, "bright_black")], width
-            ),
+            self._title_line(meta, width),
             self._compose(segments, width),
         ]
+
+    def _overview_header_lines(self, state: Dict[str, Any], width: int) -> List[str]:
+        snapshot = state.get("snapshot") or {}
+        counts = snapshot.get("counts") or {}
+        if not counts:
+            counts = {}
+            for job in [*(snapshot.get("jobs") or []), *(snapshot.get("recent") or [])]:
+                status = job.get("state")
+                counts[status] = counts.get(status, 0) + 1
+        running = counts.get("running", 0)
+        waiting = counts.get("pending", 0)
+        finished = sum(counts.get(status, 0) for status in FILTER_STATES["finished"])
+        title = " nvidb queue "
+        status = ["Auto" if state.get("auto_tick") else "Manual"]
+        keeper = snapshot.get("keeper") or {}
+        if keeper.get("installed") or keeper.get("running"):
+            status.append("keeper online" if keeper.get("running") else "keeper OFFLINE")
+        age = age_seconds(snapshot.get("generated_at"))
+        if state.get("busy"):
+            status.append("updating")
+        elif age is None:
+            status.append("updated --")
+        else:
+            age = max(0, int(age))
+            value, unit = (age, "s") if age < 60 else (
+                (age // 60, "m") if age < 3600 else (
+                    (age // 3600, "h") if age < 86400 else (age // 86400, "d")
+                )
+            )
+            status.append(f"updated {value}{unit} ago")
+        meta = " · ".join(status)
+        header = self._title_line(
+            meta, width,
+            meta_style="yellow" if keeper.get("installed") and not keeper.get("running") else "bright_black",
+        )
+        controls = [
+            (f"{'● ' if self.filter == value and self._scope_label() is None else ''}{label} {count}", "filter", value,
+             "cyan" if self.filter == value and self._scope_label() is None else color)
+            for label, count, value, color in (
+                ("Active", running + waiting, "active", "bright_black"),
+                ("Running", running, "running", "green"),
+                ("Waiting", waiting, "pending", "yellow"),
+                ("Finished", finished, "finished", "bright_black"),
+            )
+        ]
+        controls.append(("View: overview ▾", "menu", "view", "cyan"))
+        control_lines, regions, self._overview_header_overflow = action_bar(
+            controls, width, self._style,
+        )
+        self._header_regions = [(0, 0, min(width - 1, len(title) - 1), ("help", None))]
+        self._header_regions.extend(
+            (row + 1, start, end, target) for row, start, end, target in regions
+        )
+        return [header, *control_lines]
+
+    def _overview_node_lines(self, width: int) -> List[str]:
+        """One compact, clickable summary per server, without GPU drill-down."""
+        self._node_line_targets = {}
+        self._node_gpu_regions = []
+        self._node_header_regions = []
+        title = f"─ SERVERS ({len(self.nodes)}) "
+        lines = [self._style(
+            fit_display(title + "─" * max(0, width - display_width(title)), width),
+            "bold_cyan" if self.focus == "nodes" else "bright_black",
+        )]
+        running = {}
+        for job in (self._snapshot or {}).get("jobs") or []:
+            if job.get("state") == "running" and job.get("node"):
+                running.setdefault(job["node"], set()).add(job["id"])
+        name_width = max(8, min(22, width // 4))
+        for position, node in enumerate(self.nodes):
+            name = str(node.get("name") or "-")
+            state = node.get("state") or "unknown"
+            if not node.get("enabled", True):
+                state = "drain"
+            dot, dot_style = self._node_health_dot(node)
+            gpus = node.get("gpus") or []
+            free = [gpu["free_mb"] for gpu in gpus if gpu.get("free_mb") is not None]
+            memory = f"max free {format_mb(max(free))}" if free and state == "up" else "free --"
+            selected = name == self.job_scope_node or (
+                self.job_scope_node is None and self.focus == "nodes" and position == self.node_index
+            )
+            segments = [
+                ("❯ " if selected else "  ", "cyan"), (f"{dot} ", dot_style),
+                (pad_display(fit_display(name, name_width), name_width), "bold"),
+                (f"  {state:<5} ", dot_style),
+                (f"{len(gpus)} GPU · {len(running.get(name, set()))} run", "bright_black"),
+            ]
+            if width >= 60:
+                segments.append((f" · {memory}", "bright_black"))
+            self._node_line_targets[len(lines)] = position
+            lines.append(self._compose(segments, width, highlight=selected))
+        if not self.nodes:
+            lines.append(self._style(fit_display("  No servers configured", width), "bright_black"))
+        return lines
 
     def _alert_lines(self, snapshot: Dict[str, Any], width: int) -> List[str]:
         """A banner for failures nobody has acknowledged yet.
@@ -1404,7 +1511,7 @@ class QueueTUI:
         lines = [
             self._compose(
                 [
-                    (title, "cyan" if scope else "bright_black"),
+                    (title, "bold_cyan" if self.focus == "nodes" else "cyan" if scope else "bright_black"),
                     ("─" * max(0, width - display_width(title)), "bright_black"),
                 ],
                 width,
@@ -1600,7 +1707,7 @@ class QueueTUI:
         lines = [
             self._compose(
                 [
-                    (heading, "cyan" if scope else "bright_black"),
+                    (heading, "bold_cyan" if self.focus == "nodes" else "cyan" if scope else "bright_black"),
                     ("─" * max(0, width - display_width(heading)), "bright_black"),
                 ],
                 width,
@@ -2144,7 +2251,169 @@ class QueueTUI:
             "RC": "bright_black",
         }.get(column)
 
+    def _overview_job_info(self, job, job_map, lanes):
+        """Location and a useful explanation, without guessing scheduler state."""
+        lane = lanes.get(job.get("lane"), {})
+        pending = job.get("state") == "pending"
+        if pending:
+            node = lane.get("node") or requested_place(job)
+            gpu_ids = lane.get("gpu_ids") or []
+        else:
+            node = job.get("node")
+            gpu_ids = job.get("gpu_ids") or []
+        place = str(node or ("CPU" if not job.get("gpus") else "Any GPU"))
+        if gpu_ids:
+            place += " · GPU " + ",".join(str(index) for index in gpu_ids)
+
+        if pending:
+            position = ""
+            if job.get("lane"):
+                # A position belongs to this lane only; there is no global
+                # execution order across independent GPUs.
+                queued = [item for item in job_map.values()
+                          if item.get("lane") == job["lane"] and item.get("state") == "pending"]
+                self._sort_jobs_in_lane(queued)
+                ids = [item["id"] for item in queued]
+                if job["id"] in ids:
+                    position = f"Lane position {ids.index(job['id']) + 1}"
+            if job.get("held") or job.get("held_reason"):
+                reason = job.get("held_reason") or "Waiting for release"
+            elif lane.get("paused"):
+                reason = "Queue paused"
+            else:
+                reason = ""
+                for field, required in (("depends_on", "succeeds"), ("depends_any", "finishes")):
+                    waiting = []
+                    for dep_id in job.get(field) or []:
+                        upstream = job_map.get(int(dep_id), {})
+                        completed = upstream.get("state") == "completed"
+                        finished = upstream.get("state") in FILTER_STATES["finished"]
+                        if not upstream.get("state"):
+                            reason = f"Dependency #{dep_id} status unavailable"
+                            break
+                        if field == "depends_on" and finished and not completed:
+                            reason = f"Dependency #{dep_id} {upstream['state']}"
+                            break
+                        if not (completed if field == "depends_on" else finished):
+                            waiting.append(f"#{dep_id}")
+                    if reason:
+                        break
+                    if waiting:
+                        reason = f"After {', '.join(waiting)} {required}"
+                        break
+                if not reason and lane.get("blocked"):
+                    reason = str(lane["blocked"])
+                if not reason:
+                    reason = position or "Waiting for scheduling"
+            if position and position != reason:
+                reason = f"{reason} · {position}"
+            return place, " ".join(str(reason).split())
+
+        elapsed = job.get("elapsed_s")
+        elapsed = format_duration(elapsed) if elapsed is not None else ""
+        progress = " ".join(str(job.get("progress") or "").split())
+        if job.get("state") == "running":
+            return place, " · ".join(part for part in (elapsed, progress) if part) or "Starting"
+        if job.get("last_error"):
+            return place, " ".join(str(job["last_error"]).split())
+        result = "Completed" if job.get("state") == "completed" else job.get("state", "")
+        if job.get("exit_code") is not None and job["exit_code"] != 0:
+            result = f"Exit code {job['exit_code']}"
+        return place, " · ".join(part for part in (result, elapsed) if part)
+
+    def _overview_job_lines(self, width: int, height: int) -> List[str]:
+        self._job_line_targets = {}
+        self._job_header_regions = []
+        labels = {"active": "Active", "running": "Running", "pending": "Waiting",
+                  "finished": "Finished", "all": "All"}
+        scope = self._scope_label()
+        title = f"─ JOBS ({len(self.jobs)}) · " + (
+            self._scope_description() if scope else labels[self.filter]
+        )
+        sort_names = {"queue": "Queue", "time": "Runtime", "pri": "Priority",
+                      "id": "ID", "state": "Status", "name": "Name", "node": "Node",
+                      "vram": "VRAM", "used": "Used VRAM"}
+        button = f"[Sort: {sort_names[self.sort_key]} {'↑' if self.sort_reverse else '↓'}]"
+        button_start = max(0, width - display_width(button))
+        heading = pad_display(fit_display(title, max(0, button_start - 1)), button_start)
+        lines = [self._compose([
+            (heading, "bold_cyan" if self.focus == "jobs" else "bright_black"),
+            (button, "cyan"),
+        ], width)]
+        self._job_header_regions.append((0, button_start, width - 1, ("menu", "sort")))
+
+        narrow = width < 72
+        name_width = min(28, max(18, width // 4))
+        place_width = 24 if width >= 100 else 18
+        columns = [("JOB", name_width, "name"), ("STATUS", 10, "state"),
+                   ("WHERE", place_width, "node")]
+        if narrow:
+            columns = [("STATUS", 10, "state"), ("JOB", max(1, width - 14), "name")]
+        segments = [("  ", None)]
+        column = 2
+        for label, size, key in columns:
+            segments.append((self._cell(label, size, right=False), TABLE_HEADER_STYLE))
+            if column < width:
+                self._job_header_regions.append((1, column, min(width - 1, column + size), ("sort", key)))
+            column += size + 1
+            if not narrow:
+                segments.append(("│ ", "bright_black"))
+                column += 2
+        if not narrow:
+            segments.append(("PROGRESS / WAIT", TABLE_HEADER_STYLE))
+        lines.append(self._compose(segments, width))
+        if not self.jobs:
+            message = "No jobs in this view" if scope or self.filter != "active" else "No active jobs"
+            lines.append(self._style(fit_display(f"  {message}", width), "bright_black"))
+            return lines[:height]
+
+        row_height = 2 if narrow else 1
+        row_budget = max(1, height - len(lines))
+        capacity = max(1, row_budget // row_height)
+        if len(self.jobs) > capacity:
+            capacity = max(1, (row_budget - 1) // row_height)
+        start = max(0, min(self.job_index - capacity // 2, len(self.jobs) - capacity))
+        end = min(len(self.jobs), start + capacity)
+        job_map = self._flow_job_map(self._snapshot or {})
+        lanes = {lane["name"]: lane for lane in (self._snapshot or {}).get("lanes") or []}
+        states = {"running": "Running", "pending": "Waiting", "held": "Held",
+                  "completed": "Done", "failed": "Failed", "cancelled": "Cancelled",
+                  "timeout": "Timed out", "lost": "Lost"}
+        for position in range(start, end):
+            job = self.jobs[position]
+            state = display_state(job)
+            name = f"#{job['id']} {job.get('name') or 'Untitled'}"
+            place, info = self._overview_job_info(job, job_map, lanes)
+            current = position == self.job_index
+            selected = current and self.focus == "jobs"
+            marker = ("▼ " if self.show_detail else "❯ ") if current else "  "
+            values = {"JOB": name, "STATUS": states.get(state, state), "WHERE": place}
+            segments = [(marker, "cyan")]
+            for label, size, _key in columns:
+                style = STATE_STYLE.get(state) if label == "STATUS" else (
+                    "bright_black" if label == "WHERE" else None
+                )
+                segments.append((self._cell(values[label], size, right=False), style))
+                if not narrow:
+                    segments.append(("│ ", "bright_black"))
+            if not narrow:
+                segments.append((info, "cyan" if job.get("progress") and state == "running" else "bright_black"))
+            self._job_line_targets[len(lines)] = position
+            lines.append(self._compose(segments, width, highlight=selected))
+            if narrow and len(lines) < height:
+                # Keep the reason before the location so it survives clipping.
+                self._job_line_targets[len(lines)] = position
+                lines.append(self._compose([("  ", None), (info, "bright_black"),
+                                            (f" · {place}", "bright_black")], width, highlight=selected))
+        if (start or end < len(self.jobs)) and len(lines) < height:
+            lines.append(self._style(fit_display(
+                f"  {start + 1}–{end} / {len(self.jobs)} jobs · ↑/↓ or scroll", width,
+            ), "bright_black"))
+        return lines[:height]
+
     def _job_lines(self, width: int, height: int) -> List[str]:
+        if self.resource_view == "overview":
+            return self._overview_job_lines(width, height)
         self._job_line_targets = {}
         self._job_header_regions = []
         order = "▲" if self.sort_reverse else "▼"
@@ -2164,7 +2433,7 @@ class QueueTUI:
         lines = [
             self._compose(
                 [
-                    (title, "bright_black"),
+                    (title, "bold_cyan" if self.focus == "jobs" else "bright_black"),
                     (sort_label, "cyan"),
                     (" " + "─" * max(0, width - display_width(rule) - 1), "bright_black"),
                 ],
@@ -2191,11 +2460,11 @@ class QueueTUI:
             header_segments.append(
                 (
                     self._cell(label, size, right=name in RIGHT_ALIGNED_COLUMNS),
-                    "cyan" if sort_key == self.sort_key else "bright_black",
+                    TABLE_HEADER_STYLE,
                 )
             )
             column_start += size + 1
-        header_segments.append((last_column, "bright_black"))
+        header_segments.append((last_column, TABLE_HEADER_STYLE))
         lines.append(self._compose(header_segments, width))
 
         if not self.jobs:
@@ -2276,9 +2545,12 @@ class QueueTUI:
         job = self.selected_job()
         if job is None:
             return None
+        if self.resource_view == "overview":
+            # Detail already has a visible button. Give this row to the list.
+            return None
         title = f"─ ▶ JOB {job['id']} DETAIL HIDDEN · Enter to show "
         return self._style(
-            title + "─" * max(0, width - display_width(title)),
+            fit_display(title + "─" * max(0, width - display_width(title)), width),
             "bright_black",
         )
 
@@ -2296,7 +2568,7 @@ class QueueTUI:
                 title = f"─ LOG job {job['id']} [tail] "
                 lines = [
                     self._style(
-                        title + "─" * max(0, width - len(title)),
+                        fit_display(title + "─" * max(0, width - len(title)), width),
                         "bright_black",
                     )
                 ]
@@ -2314,7 +2586,7 @@ class QueueTUI:
             title += " "
             lines = [
                 self._style(
-                    title + "─" * max(0, width - len(title)),
+                    fit_display(title + "─" * max(0, width - len(title)), width),
                     "bright_black",
                 )
             ]
@@ -2337,6 +2609,21 @@ class QueueTUI:
         content.extend(self._field_lines("cmd", job["command"], width))
         if job.get("workdir"):
             content.extend(self._field_lines("cwd", job["workdir"], width))
+        if self.resource_view == "overview":
+            metrics = [f"priority {job.get('priority') or 0}"]
+            if job.get("elapsed_s") is not None and job.get("state") != "pending":
+                metrics.append(f"runtime {format_duration(job['elapsed_s'])}")
+            if job.get("gpu_mem_mb") is not None:
+                metrics.append(f"GPU memory used {format_mb(job['gpu_mem_mb'])}")
+            if job.get("exit_code") is not None:
+                metrics.append(f"exit code {job['exit_code']}")
+            content.extend(self._field_lines("stats", " · ".join(metrics), width))
+            if job.get("state") == "pending":
+                _place, reason = self._overview_job_info(
+                    job, self._flow_job_map(self._snapshot or {}),
+                    {lane["name"]: lane for lane in (self._snapshot or {}).get("lanes") or []},
+                )
+                content.extend(self._field_lines("wait", reason, width, style="yellow"))
         if job.get("lane"):
             queued = [item for item in self._flow_job_map(self._snapshot or {}).values()
                       if item.get("lane") == job["lane"] and item.get("state") == "pending"]
@@ -2396,7 +2683,7 @@ class QueueTUI:
         title += " "
         lines = [
             self._style(
-                title + "─" * max(0, width - display_width(title)),
+                fit_display(title + "─" * max(0, width - display_width(title)), width),
                 "bright_black",
             )
         ]
@@ -2537,7 +2824,7 @@ class QueueTUI:
             label = f"s sort:{self.sort_key}{'▲' if self.sort_reverse else '▼'}"
         elif name == "resource_view":
             label = f"v view:{self.resource_view}"
-            style = "cyan" if self.resource_view == "flow" else "bright_black"
+            return (label + " ▾", "menu", "view", "cyan")
         elif name == "process_view":
             label = f"p procs:{self.proc_view}"
         elif name == "tick":
@@ -2555,6 +2842,8 @@ class QueueTUI:
 
         if label is None:
             return None
+        if name in {"filter", "sort"}:
+            return (label + " ▾", "menu", name, "cyan")
         return (label, command.action, value, style)
 
     def _footer_lines(
@@ -2573,10 +2862,13 @@ class QueueTUI:
         self._footer_regions = []
         if self.pending_confirm:
             action, job_id, _ = self.pending_confirm
-            message = (
-                f" press {action[0]} again or click confirm to {action} job "
-                f"{job_id} (Esc cancels)"
-            )
+            if self.resource_view == "overview":
+                message = f" {action.title()} #{job_id}? Confirm or Esc back"
+            else:
+                message = (
+                    f" press {action[0]} again or click confirm to {action} job "
+                    f"{job_id} (Esc cancels)"
+                )
             lines.append(self._style(fit_display(message, width), "yellow"))
         elif state.get("error"):
             lines.append(
@@ -2589,6 +2881,12 @@ class QueueTUI:
         remaining_rows = max(0, max_rows - len(lines))
         if not remaining_rows:
             return lines[:max_rows]
+        # A simpler action bar must still explain how to operate the screen
+        # without a mouse. Reserve its second row for navigation; confirmations
+        # and worker notices use that row until they are dismissed.
+        show_key_hint = self.resource_view == "overview" and not lines and remaining_rows >= 2
+        if show_key_hint:
+            remaining_rows -= 1
         controls = [
             control
             for command in sorted(
@@ -2597,17 +2895,73 @@ class QueueTUI:
             )
             if (control := self._footer_control(command, state)) is not None
         ]
+        extra_controls = []
+        if self.resource_view == "overview":
+            header_targets = {target for _row, _start, _end, target in self._header_regions}
+            primary_targets = [
+                ("detail", None), ("log", None), ("cancel", None),
+                ("requeue", None), ("scope_all", None), ("menu", "view"),
+            ]
+            if ("menu", "view") in header_targets:
+                primary_targets.remove(("menu", "view"))
+            else:
+                # Keep the view switch reachable when the header is too narrow.
+                primary_targets.remove(("menu", "view"))
+                primary_targets.insert(0, ("menu", "view"))
+            if self.pending_confirm:
+                primary_targets.remove(("cancel", None))
+                primary_targets.insert(0, ("cancel", None))
+            primary = []
+            for target in primary_targets:
+                control = next((item for item in controls if item[1:3] == target), None)
+                if control is None:
+                    continue
+                label, kind, value, style = control
+                if kind == "detail":
+                    label = "Enter hide details" if self.show_detail else "Enter details"
+                elif kind == "log":
+                    label = "L hide logs" if self.show_log else "L logs"
+                elif kind == "cancel" and self.pending_confirm:
+                    label = "Confirm"
+                elif target == ("menu", "view"):
+                    label = "View ▾"
+                primary.append((label, kind, value, style))
+            extra_controls = [
+                item for item in controls
+                if item[1:3] not in primary_targets and item[1:3] not in header_targets
+            ]
+            extra_controls.extend(getattr(self, "_overview_header_overflow", []))
+            controls = [*primary, ("More…", "menu", "actions", "cyan")]
         control_offset = len(lines)
-        control_lines, control_regions = self._control_lines(
-            controls,
-            width,
-            max_lines=remaining_rows,
+        control_lines, control_regions, overflow = action_bar(
+            controls, width, self._style, max_rows=remaining_rows,
         )
+        self._overflow_controls = []
+        seen = set()
+        visible_targets = {target for _row, _start, _end, target in control_regions}
+        for control in [*overflow, *extra_controls]:
+            target = control[1:3]
+            if target == ("menu", "actions") or target in seen or target in visible_targets:
+                continue
+            self._overflow_controls.append(control)
+            seen.add(target)
         lines.extend(control_lines)
         self._footer_regions = [
             (line + control_offset, start, end, target)
             for line, start, end, target in control_regions
         ]
+        if show_key_hint:
+            if width >= 78:
+                hint = "↑/↓ or j/k select · Enter details · Tab servers · m more · ? help · q quit"
+            elif width >= 58:
+                hint = "↑↓/jk select · Enter details · Tab servers · m more · ? · q"
+            elif width >= 40:
+                hint = "↑↓/jk · Enter · Tab · m more · ? · q"
+            elif width >= 30:
+                hint = "↑↓/jk move · Enter · m · ? · q"
+            else:
+                hint = "↑↓/jk Enter m ? q"
+            lines.append(self._style(fit_display(hint, width), "bright_black"))
         return lines
 
     def _help_lines(self, width: int, height: Optional[int] = None) -> List[str]:
@@ -2738,10 +3092,51 @@ class QueueTUI:
         only what changed between frames."""
         return "\n".join(self._frame_lines(state))
 
+    def _wrap_queue_frame(self, lines: List[str], width: int) -> List[str]:
+        """Apply the monitor's rounded panel after laying out its content.
+
+        Translate hit boxes along with the content; the decorative edges are
+        never job targets. Menus keep their own frame and coordinate system.
+        """
+        content_width = width - 4
+        framed = [lines[0], self._style(frame_top(width), "bright_black")]
+        for line in lines[1:]:
+            plain = self.term.strip_seqs(line)
+            section = plain.startswith("─ ")
+            left, right = ("├─", "─┤") if section else ("│ ", " │")
+            padding = ("─" if section else " ") * max(0, content_width - display_width(plain))
+            framed.append(
+                self._style(left, "bright_black") + line
+                + self._style(padding + right, "bright_black")
+            )
+        framed.append(self._style(frame_bottom(width), "bright_black"))
+        self._click_regions = [
+            (row + (row > 0), start + (2 if row > 0 else 0),
+             end + (2 if row > 0 else 0), target)
+            for row, start, end, target in self._click_regions
+        ]
+        self._row_targets = {
+            row + (row > 0): target for row, target in self._row_targets.items()
+        }
+        # Specific buttons/GPU cells win over these whole-content row targets.
+        self._click_regions.extend(
+            (row, 2, width - 3, target)
+            for row, target in self._row_targets.items()
+            if target[0] in HOVER_ROW_KINDS
+        )
+        return framed
+
     def _frame_lines(self, state: Dict[str, Any]) -> List[str]:
         width = max(1, self.term.width or 100)
         height = max(2, self.term.height or 30)
         layout = LayoutProfile.for_terminal(width, height)
+        self._panel_framed = (
+            width >= 72 and height >= 14 and not self.show_help
+            and self._menu is None and state["snapshot"] is not None
+        )
+        if self._panel_framed:
+            width -= 4
+            height -= 2
         self._click_regions = []
         self._row_targets = {}
         self._alert_targets = {}
@@ -2749,7 +3144,7 @@ class QueueTUI:
         self._snapshot = snapshot
         if snapshot is None:
             message = state.get("error") or "connecting to nodes…"
-            return [fit_display(f"  {message}", width)]
+            return self._paint_hover([fit_display(f"  {message}", width)])
 
         self.nodes = snapshot["nodes"]
         self._reanchor_node_scope()
@@ -2797,11 +3192,12 @@ class QueueTUI:
             body_height = max(0, usable - len(footer))
             pane_rows = max(0, body_height - len(lines))
 
-            node_lines = (
-                self._flow_lines(width)
-                if self.resource_view == "flow"
-                else self._node_lines(width)
-            )
+            if self.resource_view == "overview":
+                node_lines = self._overview_node_lines(width)
+            elif self.resource_view == "flow":
+                node_lines = self._flow_lines(width)
+            else:
+                node_lines = self._node_lines(width)
             # A useful job table needs a title, a header, and at least one row;
             # its collapsed detail summary takes one more.  Opening detail in
             # compact mode temporarily gives those rows back to the job pane.
@@ -2813,6 +3209,8 @@ class QueueTUI:
                 layout.resource_limit,
                 max(2, int(pane_rows * layout.resource_fraction)),
             )
+            if self.resource_view == "overview":
+                desired_resource_rows = min(4, max(0, pane_rows - 6))
             if layout.name == "compact" and self.show_detail:
                 desired_resource_rows = 0
             node_budget = min(resource_room, desired_resource_rows)
@@ -2884,7 +3282,7 @@ class QueueTUI:
                         (detail_start, 0, width - 1, ("detail", None))
                     )
             else:
-                collapsed_height = 1 if self.jobs else 0
+                collapsed_height = 1 if self.jobs and self.resource_view != "overview" else 0
                 job_height = max(4, available - collapsed_height)
                 job_lines = self._job_lines(width, job_height)
                 job_lines = job_lines[: max(0, available - collapsed_height)]
@@ -2929,7 +3327,41 @@ class QueueTUI:
         self._row_targets = {
             row: target for row, target in self._row_targets.items() if row < len(lines)
         }
-        return lines
+        if self._menu is not None:
+            self._click_regions = []
+            self._row_targets = {}
+            lines = self._menu.render(
+                width, usable, self._style,
+                hover_enabled=False,
+            )
+        elif self._panel_framed:
+            lines = self._wrap_queue_frame(lines, width + 4)
+        return self._paint_hover(lines)
+
+    def _paint_hover(self, lines=None):
+        """Decorate a frame, or reuse its unmodified rows for pointer-only input."""
+        width = max(1, self.term.width or 100)
+        size = (width, max(2, self.term.height or 30))
+        if lines is not None:
+            self._base_frame = list(lines)
+            self._base_frame_size = size
+            self._base_frame_menu = self._menu
+        elif (
+            self._base_frame is None or self._base_frame_size != size
+            or self._base_frame_menu is not self._menu
+        ):
+            return None
+        enabled = self.mouse_enabled and bool(self.term.does_styling)
+        if self._menu is not None:
+            return self._menu.hover.paint(
+                self._base_frame, self._menu.regions, {}, width, enabled=enabled,
+            )
+        return self._hover.paint(
+            self._base_frame, self._click_regions,
+            {} if getattr(self, "_panel_framed", False) else self._row_targets, width,
+            enabled=enabled,
+            row_kinds=HOVER_ROW_KINDS,
+        )
 
     def _request_log(self, request: Optional[Tuple[int, str]]) -> None:
         """Forward a log request to the worker, skipping unchanged ones.
@@ -3129,6 +3561,30 @@ class QueueTUI:
         """Run one named UI action. False means the caller should quit."""
         if action == "quit":
             return False
+        if action == "menu":
+            self._hover.clear()
+            if value == "filter":
+                entries = [(name.title(), ("filter", name)) for name in FILTERS]
+                selected = FILTERS.index(self.filter)
+                title = "Filter jobs"
+            elif value == "view":
+                labels = {
+                    "overview": "Overview", "flow": "Task flow", "servers": "Server capacity",
+                }
+                entries = [(labels[name], ("resource_view", name)) for name in RESOURCE_VIEWS]
+                selected = RESOURCE_VIEWS.index(self.resource_view)
+                title = "Choose view"
+            elif value == "sort":
+                labels = {"time": "Runtime", "queue": "Queue order", "id": "Job ID", "state": "State",
+                          "pri": "Priority", "name": "Name", "node": "Node", "vram": "Requested VRAM", "used": "Used VRAM"}
+                entries = [(labels[name], ("sort", name)) for name in SORT_KEYS]
+                selected = SORT_KEYS.index(self.sort_key)
+                title = "Sort jobs · choose current field to reverse"
+            else:
+                entries = [(label, (kind, item)) for label, kind, item, _ in self._overflow_controls]
+                selected, title = 0, "More actions"
+            self._menu = ActionMenu(title, entries, selected=selected)
+            return True
         if action in {"detail", "log", "cancel", "requeue", "priority", "move"}:
             if self.focus != "jobs":
                 return True
@@ -3141,6 +3597,9 @@ class QueueTUI:
             self.show_help = False
         elif action == "switch_pane":
             self.focus = "nodes" if self.focus == "jobs" else "jobs"
+            if self.focus == "nodes" and self.resource_view == "overview":
+                self.resource_view = "servers"
+                self._resource_scroll = None
         elif action == "detail":
             self._toggle_detail()
         elif action == "log":
@@ -3214,10 +3673,15 @@ class QueueTUI:
             self.resource_view = "servers"
         elif action == "resource_view":
             self._resource_scroll = None
-            self.resource_view = RESOURCE_VIEWS[
-                (RESOURCE_VIEWS.index(self.resource_view) + 1)
-                % len(RESOURCE_VIEWS)
-            ]
+            if value in RESOURCE_VIEWS:
+                self.resource_view = value
+            else:
+                self.resource_view = RESOURCE_VIEWS[
+                    (RESOURCE_VIEWS.index(self.resource_view) + 1)
+                    % len(RESOURCE_VIEWS)
+                ]
+            if self.resource_view == "overview":
+                self.focus = "jobs"
         elif action == "theme":
             self.theme = THEME_ORDER[
                 (THEME_ORDER.index(self.theme) + 1) % len(THEME_ORDER)
@@ -3255,7 +3719,13 @@ class QueueTUI:
         elif action == "job_log" and value is not None:
             self._select_job_id(int(value), show_log=True)
         elif action == "node_name" and value is not None:
-            self._select_node_name(str(value))
+            if self._select_node_name(str(value)) and self.resource_view == "overview":
+                # A node alert opens the server's diagnostics, so node keyboard
+                # focus belongs to a visible capacity pane even on short screens.
+                self.resource_view = "servers"
+                self.show_detail = False
+                if self.show_log:
+                    self._request_log(None)
         elif action == "flow_job" and value is not None:
             job_id = int(value)
             current = self.selected_job()
@@ -3273,12 +3743,21 @@ class QueueTUI:
         elif action == "pool" and value is not None:
             self._set_pool_scope(str(value))
         elif action == "pane" and value in ("jobs", "nodes"):
-            self.focus = value
+            self.focus = "jobs" if self.resource_view == "overview" else value
         return True
 
     def handle_mouse(self, event) -> bool:
         """Handle one decoded SGR mouse event. False requests TUI exit."""
         if not self.mouse_enabled:
+            return True
+        if self._menu is not None:
+            return self._finish_menu_input(self._menu.handle_mouse(event))
+        if event.is_motion:
+            self._hover.move(
+                event, self._click_regions,
+                {} if getattr(self, "_panel_framed", False) else self._row_targets,
+                max(1, self.term.width or 100), row_kinds=HOVER_ROW_KINDS,
+            )
             return True
         row = event.row - 1
         column = event.column - 1
@@ -3287,7 +3766,11 @@ class QueueTUI:
             if region_row == row and start <= column <= end:
                 target = region_target
                 break
-        if target is None:
+        inside_content = (
+            not getattr(self, "_panel_framed", False)
+            or 2 <= column < (self.term.width or 100) - 2
+        )
+        if target is None and inside_content:
             target = self._row_targets.get(row)
 
         if self.show_help:
@@ -3303,7 +3786,9 @@ class QueueTUI:
             if kind in ("node", "gpu", "flow_job", "pool") or (
                 kind == "pane" and value == "nodes"
             ):
-                self.focus = "nodes"
+                # Overview servers are a summary, while keyboard commands
+                # continue to operate on the primary job list.
+                self.focus = "jobs" if self.resource_view == "overview" else "nodes"
                 self._scroll_resources(delta)
             elif kind in ("job", "sort") or (kind == "pane" and value == "jobs"):
                 self.focus = "jobs"
@@ -3320,6 +3805,10 @@ class QueueTUI:
             return True
         if kind == "node":
             self._select_node_position(int(value))
+            if self.resource_view == "overview":
+                # In the overview the server row is a filter for the job list.
+                # Keep Enter and the action bar attached to the filtered jobs.
+                self.focus = "jobs"
             return True
         if kind == "gpu":
             position, gpu_index = value
@@ -3331,6 +3820,12 @@ class QueueTUI:
             self.focus = "jobs"
         return self._activate(kind, value)
 
+    def _finish_menu_input(self, result):
+        closed, target = result
+        if closed:
+            self._menu = None
+        return self._activate(*target) if target else True
+
     def _dispatch_command(self, command: Command) -> bool:
         if command.action == "move_cursor":
             if self.focus == "nodes" and command.name in ("page_down", "page_up"):
@@ -3341,6 +3836,9 @@ class QueueTUI:
                 self._move(int(command.value))
             return True
         if command.action == "gpu_cursor":
+            if self.resource_view == "overview":
+                self.resource_view = "servers"
+                self._resource_scroll = None
             self._move_gpu_cursor(int(command.value))
             return True
         if command.action == "move_edge":
@@ -3375,6 +3873,11 @@ class QueueTUI:
         """Dispatch one key through the command registry."""
         name = key.name or ""
         text = str(key)
+        if text or name:
+            self._hover.clear()
+
+        if self._menu is not None:
+            return self._finish_menu_input(self._menu.handle_key(text, name))
 
         if self.show_help:
             if text in ("?", "q") or name == "KEY_ESCAPE":
@@ -3408,8 +3911,7 @@ class QueueTUI:
         if not self.mouse_enabled or not sys.stdout.isatty():
             return
         try:
-            sys.stdout.write(MOUSE_ENABLE_SEQUENCE)
-            sys.stdout.flush()
+            set_mouse_reporting(self.term, True)
             self._mouse_reporting = True
         except Exception:
             self._mouse_reporting = False
@@ -3419,8 +3921,7 @@ class QueueTUI:
             return
         self._mouse_reporting = False
         try:
-            sys.stdout.write(MOUSE_DISABLE_SEQUENCE)
-            sys.stdout.flush()
+            set_mouse_reporting(self.term, False)
         except Exception:
             pass
 
@@ -3434,21 +3935,51 @@ class QueueTUI:
                 self._start_mouse_reporting()
                 try:
                     running = True
+                    redraw = True
+                    hover_redraw = False
+                    next_refresh = 0.0
                     while running:
-                        state = self.worker.read_state()
-                        if self.show_log and self.show_detail:
-                            job = self.selected_job()
-                            if job:
-                                self._request_log((job["id"], "stdout"))
-                        screen.paint(self._frame_lines(state))
-                        key = term.inkey(timeout=0.4)
+                        if redraw or time.monotonic() >= next_refresh:
+                            state = self.worker.read_state()
+                            if self.show_log and self.show_detail:
+                                job = self.selected_job()
+                                if job:
+                                    self._request_log((job["id"], "stdout"))
+                            screen.paint(self._frame_lines(state))
+                            redraw = False
+                            hover_redraw = False
+                            next_refresh = time.monotonic() + 0.4
+                        elif hover_redraw:
+                            lines = self._paint_hover()
+                            if lines is None:
+                                # Resize or a replaced menu requires fresh layout.
+                                redraw = True
+                                continue
+                            screen.paint(lines)
+                            hover_redraw = False
+                        key = term.inkey(
+                            timeout=max(0.0, next_refresh - time.monotonic())
+                        )
                         events, keys = parser.feed(key) if key else ([], parser.flush())
+                        # Blessed may split one motion report into many keys.
+                        # Repaint for completed input, not each protocol byte;
+                        # the deadline still refreshes worker data under motion.
+                        redraw = redraw or not key
                         for event in events:
+                            hover = (
+                                self._menu.hover if self._menu is not None else self._hover
+                            )
+                            previous_region = hover.region
                             if not self.handle_mouse(event):
                                 running = False
                                 break
+                            if event.is_motion:
+                                hover_redraw = hover_redraw or hover.region != previous_region
+                            else:
+                                redraw = True
                         if running:
                             for pending in keys:
+                                redraw = True
                                 if not self.handle_key(pending):
                                     running = False
                                     break
@@ -3457,6 +3988,7 @@ class QueueTUI:
                             and time.time() - self.pending_confirm[2] > CONFIRM_SECONDS
                         ):
                             self.pending_confirm = None
+                            redraw = True
                 finally:
                     self._stop_mouse_reporting()
         except KeyboardInterrupt:

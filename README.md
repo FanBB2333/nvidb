@@ -251,6 +251,7 @@ When viewing GPU stats, use these keyboard shortcuts:
 | `i` / `T` / `K`   | Arm SIGINT / SIGTERM / SIGKILL for the selected process |
 | `Esc`             | Cancel a signal or clear the process filter |
 | `?`               | Open context-sensitive help |
+| `m` / More        | Open actions that do not fit in the toolbar |
 | Mouse             | Select rows, sort headers, click actions, or scroll either pane |
 | `Enter` (signal armed) | Confirm the pending process signal |
 | `Enter` / `Space` (per-node view) | Toggle the selected server details |
@@ -334,15 +335,31 @@ GPU/node focus, and `Tab` to switch between visible panes. Then use `j`/`k` or
 the arrow keys to move the highlighted row. The active pane uses solid borders;
 the inactive pane uses dashed borders. Only the active pane displays a
 selected-row background, so process rows are not highlighted while GPU/node
-selection has focus. Mouse reporting is on by default: click any GPU card or
-process row to select it, use the wheel over either pane to scroll that pane,
-and click the action buttons directly. Most terminals need `Shift` (or
+selection has focus. Mouse reporting is on by default. The top toolbar has
+clickable **GPUs** and **Nodes** tabs, **Filter** and **Sort** menus, and view
+controls. Hover over buttons, clickable rows or menu choices to highlight
+them; moving away restores their normal appearance. Hover does not change the
+selection or activate an action. Choose a filter or sort directly from its menu; the existing `f` and
+`s` keys still cycle them. Click the GPU table's **GPU/Node** or **Util** header
+to select node order or highest utilization first. Controls that do not fit
+move into **More**, including history, grouping, theme, paging, help and quit.
+Menus support clicking, the wheel, arrow keys, Enter and Esc; clicking outside
+closes a menu without activating the view underneath.
+
+Click a GPU row or card to select it and reveal its processes; click the
+selected GPU again to enter process focus. Clicking a closed node opens its
+details immediately. The process pane offers **Find**, **Clear** and **Hide**
+buttons (`/`, `x`, `p` in short windows), and **Apply** while editing a search.
+Process sorting is also available as a menu, including columns hidden in
+narrow windows; choosing the current field reverses it. Use the wheel over
+either pane to scroll that pane. Most terminals need `Shift` (or
 `Option`) held down for their own drag-to-select while mouse reporting is
 active; set `mouse: false` under `view` to disable TUI mouse handling.
 
 The process action bar exposes `SIGINT`, `SIGTERM`, and `SIGKILL` as `i`, `T`,
 and `K`. Every signal requires a second identical click/key press or `Enter`
-within five seconds; `Esc` cancels it. Signals run on the node that owns the
+within five seconds; explicit **Confirm** and **Cancel** buttons are also
+available, and `Esc` cancels it. Signals run on the node that owns the
 selected GPU and report permission or command failures in the pane. If
 GPU/node selection has focus, the first signal key only transfers focus to the
 process pane; press it again to arm the action.
@@ -785,12 +802,38 @@ ln -s "$PWD/skills/nvidb-queue" ~/.codex/skills/nvidb-queue
 nvidb queue                 # or: nvidb queue tui
 ```
 
-The screen opens with a task-flow pane above the job table and detail or log
-pane. It follows the active server configuration order (the same list as the
-monitor TUI unless `queue.yml` deliberately overrides `servers`); database rows
-for removed servers do not linger in the normal view. Every GPU gets a row that
-reads from left to right: live utilisation and free VRAM, the running job, the
-number of jobs in that card's lane, and as many ordered job cards as fit:
+The screen opens in **Overview**, with a short resource summary and one list
+of jobs. Each job shows its name and ID, full status, placement, and progress
+or a known waiting reason. Pending jobs show holds, paused queues, dependencies,
+or their actual lane position when those facts are available; otherwise they
+say they are waiting for scheduling. Narrow terminals use two lines per job.
+Commands, detailed memory readings and other metadata remain in job detail.
+
+The queue shares the monitor TUI's rounded grey frame, cyan table headers,
+selection band and `classic` / `muted` colour themes. The active filter has a
+`●` marker, and the version stays at the top right. Below 72 columns or 14 rows,
+the outer frame disappears to leave more room for jobs and keyboard hints.
+
+Click **Active**, **Running**, **Waiting**, or **Finished** to filter the list.
+The bottom bar keeps **Detail**, **Log**, **Cancel**, and **More** close at hand;
+**View** appears beside the filters or in the action bar. Cancellation still
+requires a second confirmation. **More** contains
+sorting, priority, reordering, scheduler controls, and other actions.
+The navigation hint stays visible: `↑`/`↓` or `j`/`k` selects a job, `Enter`
+opens its details, `m` opens More, `?` shows help, and `q` quits. Scrolling the
+server summary does not move keyboard focus away from jobs; returning to
+Overview also restores job focus.
+
+Use **View** to choose Overview, Task flow, or Server capacity; `v` cycles
+through them in that order. `Tab` from Overview opens Server capacity when it
+moves focus to the nodes, so resource selection is always visible. Resource
+views follow the active server configuration order (the same list as the
+monitor TUI unless `queue.yml` deliberately overrides `servers`); removed
+servers do not linger in the normal view.
+
+In **Task flow**, every GPU gets a row that reads from left to right: live
+utilisation and free VRAM, the running job, the number of jobs in that card's
+lane, and as many ordered job cards as fit:
 
 ```text
 G0  30% · 23.5G free  [ RUN #10 train 01:00:00 ] ──▶ { lane Q3 } ──▶ [1:#11 P+5 eval ←✓#10] ──▶ [2:#12 P0 report ←◇#11]  +1
@@ -814,8 +857,8 @@ opens the complete pending list for that pool. Job detail includes the lane
 position and each dependency's state, even when the upstream job is older than
 the recent-job list. Commands and working directories wrap across detail pages.
 
-Press `v` or click the view control to switch to the server-capacity pane with
-memory bars and process details. All SSH work happens on a worker thread, so an
+Choose **Server capacity** for memory bars and process details.
+All SSH work happens on a worker thread, so an
 unreachable node slows the numbers down but never freezes the interface.
 
 | Key                | Action                                        |
@@ -836,22 +879,25 @@ unreachable node slows the numbers down but never freezes the interface.
 | `a`                | Toggle automatic ticking                      |
 | `f`                | Cycle the job filter                          |
 | `x` / `Esc`        | Clear the current server/GPU/task-pool scope  |
-| `v`                | Switch task flow / server capacity view       |
+| `v`                | Cycle Overview / Task flow / Server capacity  |
 | `p`                | Open capacity view; cycle GPU process detail  |
 | `d`                | Drain or resume the selected node             |
 | `A`                | Acknowledge every open alert                  |
 | `?`                | Help                                          |
+| `m` / More         | Open actions hidden by the terminal width     |
 | `q`                | Quit                                          |
 | Mouse click        | Scope server/GPU jobs, select, sort or act    |
 | Mouse wheel        | Scroll resources/help, jobs, or detail/log    |
 
-The job table opens in *runtime* order, longest-running first; jobs without a
-runtime follow the measured jobs. Queue order remains available through `s`,
-and using `K`/`J` automatically restores it before moving a pending job.
+The job list opens in **queue order**: running jobs first, followed by pending
+jobs in their queue order. Runtime sorting, longest-running first, remains
+available through **More → Sort** or `s`. Using `K`/`J` restores queue order
+before moving a pending job.
 For lane jobs, queue sorting follows lane position and `K`/`J` moves the job
 within its lane without changing priorities. Lanes are grouped independently;
 there is no single dispatch order across GPUs. Free-pool reordering adjusts
-priorities, and the `PRI` column always shows the real values. Clicking a column header sorts
+priorities; the detailed tables in Task flow and Server capacity retain the
+`PRI` column. Clicking a column header sorts
 by that column (a second click flips it). In the server-capacity view, each GPU
 line draws one memory bar whose segments distinguish foreign memory (amber)
 from this queue's reservations (teal) and free space (dim). Colours are
@@ -867,7 +913,13 @@ clicking the selected row again shows or hides its detail pane. The wheel acts
 on the pane under the pointer. Status counts select their matching global job
 filter, and clicking a job alert opens that job's log. The bottom action bar
 exposes the actions that apply to the current selection, including the second
-confirmation required for cancellation. Most terminals reserve normal text
+confirmation required for cancellation. **Filter** and **Sort** in **More** open direct
+choice menus; choosing the current sort field reverses it. **More** keeps
+overflow actions accessible with the mouse even in narrow windows. Menus
+support the wheel, clickable page controls, arrow keys, Enter and Esc. Buttons,
+job/node/GPU rows and menu choices highlight on hover without changing focus
+or submitting an action.
+Most terminals reserve normal text
 selection for `Shift`-drag or `Option`-drag while mouse reporting is active. Set
 `mouse: false` under `view` in `~/.nvidb/config.yml` to disable it in both nvidb
 TUIs.

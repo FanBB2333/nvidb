@@ -1,22 +1,24 @@
 """SGR mouse reporting helpers for the nvidb TUI.
 
-blessed resolves only the escape sequences in the terminfo database, so an SGR
-mouse report (``ESC [ < button ; column ; row M|m``) arrives from ``inkey()`` in
-pieces: a ``KEY_ESCAPE`` keystroke followed by its individual characters, or -
-from blessed 1.20 on - a single ``CSI`` keystroke for the ``ESC [`` and then the
-characters. The parser here reassembles those keystrokes into mouse events and
-hands anything that is not a mouse report back to the caller untouched.
+Depending on the Blessed version, an SGR mouse report
+(``ESC [ < button ; column ; row M|m``) arrives from ``inkey()`` as a complete
+keystroke or in pieces, beginning with ``KEY_ESCAPE`` or ``CSI``. The parser
+accepts both forms and hands other keystrokes back to the caller untouched.
+Reporting setup also keeps newer Blessed decoders aware of the enabled modes,
+so complete mouse reports do not wait for Escape-key disambiguation.
 """
 
 from __future__ import annotations
 
 import re
+import sys
 from typing import NamedTuple
 
-# 1000: report button press/release. 1006: SGR coordinates, which lift the
-# 223-column limit of the original protocol.
-ENABLE_SEQUENCE = "\x1b[?1000h\x1b[?1006h"
-DISABLE_SEQUENCE = "\x1b[?1006l\x1b[?1000l"
+# 1000: report button press/release. 1003: report all pointer movement, including
+# movement with no button held. 1006: SGR coordinates, which lift the 223-column
+# limit of the original protocol. Restore every enabled mode on exit.
+ENABLE_SEQUENCE = "\x1b[?1000h\x1b[?1003h\x1b[?1006h"
+DISABLE_SEQUENCE = "\x1b[?1006l\x1b[?1003l\x1b[?1000l"
 
 _REPORT = re.compile(r"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 _PARTIAL = re.compile(r"^\x1b(\[(<\d*(;\d*){0,2})?)?$")
@@ -25,8 +27,26 @@ _PARTIAL = re.compile(r"^\x1b(\[(<\d*(;\d*){0,2})?)?$")
 _MAX_BUFFER = 24
 
 BUTTON_LEFT = 0
+MOTION_FLAG = 32
 BUTTON_WHEEL_UP = 64
 BUTTON_WHEEL_DOWN = 65
+
+
+def set_mouse_reporting(term, enabled: bool) -> None:
+    """Write mouse modes and keep Blessed's input decoder in sync."""
+    sys.stdout.write(ENABLE_SEQUENCE if enabled else DISABLE_SEQUENCE)
+    sys.stdout.flush()
+
+    # Recent Blessed versions only decode SGR mouse reports when their DEC
+    # mode cache says 1006 is enabled. Without this, even a complete report
+    # waits through the normal Escape-key delay (350 ms) before being split.
+    # We already know the modes we just wrote; querying them would add another
+    # terminal round trip and does not work in every terminal. Older Blessed
+    # versions have no cache and continue using our fragmented-report parser.
+    cache = getattr(term, "_dec_mode_cache", None)
+    if isinstance(cache, dict):
+        for mode in (1000, 1003, 1006):
+            cache[mode] = 1 if enabled else 2  # DEC SET / RESET states.
 
 
 class MouseEvent(NamedTuple):
@@ -34,6 +54,10 @@ class MouseEvent(NamedTuple):
     column: int  # 1-based
     row: int  # 1-based
     pressed: bool
+
+    @property
+    def is_motion(self) -> bool:
+        return bool(self.button & MOTION_FLAG)
 
     @property
     def is_wheel_up(self) -> bool:
@@ -68,18 +92,15 @@ class MouseSequenceParser:
         text = str(key)
         if not self._pending:
             # Whatever blessed made of the report's first bytes - a bare
-            # escape, or the whole `ESC [` - it must still be a prefix of one.
-            # A keystroke it resolved further than that, such as an alt-chord,
-            # is a key in its own right and goes straight back.
-            if not _PARTIAL.match(text):
+            # escape, the whole `ESC [`, or a complete report - it must still
+            # match the mouse protocol. Other resolved keys pass straight back.
+            if not _PARTIAL.match(text) and not _REPORT.fullmatch(text):
                 return [], [key]
-            self._pending.append((key, text))
-            return [], []
 
         self._pending.append((key, text))
         buffered = self._text()
 
-        match = _REPORT.match(buffered)
+        match = _REPORT.fullmatch(buffered)
         if match:
             button, column, row, action = match.groups()
             self._pending = []

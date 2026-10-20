@@ -32,14 +32,15 @@ from .metrics import (
     visible_columns,
 )
 from .mouse import (
-    DISABLE_SEQUENCE as MOUSE_DISABLE_SEQUENCE,
-    ENABLE_SEQUENCE as MOUSE_ENABLE_SEQUENCE,
     MouseSequenceParser,
+    set_mouse_reporting,
 )
 from .nvml import PynvmlCollector, make_nvml_agent_command
 from .process_view import ProcessPanel
+from .tui_controls import ActionMenu, HoverState, action_bar
 from .ssh_proxy import open_proxyjump_socket
 from .tui_theme import (
+    ANSI_THEMES,
     DiffScreen,
     display_width,
     fit,
@@ -64,11 +65,7 @@ from .utils import (
 )
 
 
-MONITOR_THEMES = {
-    "classic": {},
-    # Keep warnings intact while making routine accents less saturated.
-    "muted": {"cyan": "blue", "green": "cyan", "magenta": "blue"},
-}
+MONITOR_THEMES = ANSI_THEMES
 _monitor_theme = "classic"
 
 
@@ -1856,6 +1853,11 @@ class NVClientPool:
         self._click_regions = []
         self._body_click_targets = {}
         self._body_click_regions = []
+        self._tui_menu = None
+        self._tui_hover = HoverState()
+        self._tui_hover_dirty = False
+        self._tui_base_rows = None
+        self._toolbar_overflow = []
         self._unified_page_start = 0
         self._unified_gpu_count = 0
         self._unified_page_size = 1
@@ -3403,6 +3405,34 @@ class NVClientPool:
             f"sort {process_sort_label}{process_sort_arrow} | {focus_label}"
         )
         lines = [panel.heading(title)]
+        # Keep search and close available even when no process matches.
+        process_controls = [
+            ("/ Find" if inner_width >= 28 else "/", "key", "/", "cyan"),
+            ("Clear" if inner_width >= 28 else "x", "clear_search", None, "cyan"),
+            ("Hide" if inner_width >= 28 else "p", "key", "p", "cyan"),
+        ]
+        if filter_editing:
+            process_controls[0] = ("Apply" if inner_width >= 28 else "OK", "key", "\n", "cyan")
+        if compact_layout:
+            # Reuse the heading on short screens so controls cannot push the
+            # signal buttons or command pager below the terminal edge.
+            process_controls = [
+                ("OK" if filter_editing else "/", "key", "\n" if filter_editing else "/", "cyan"),
+                ("x", "clear_search", None, "cyan"),
+                ("p", "key", "p", "cyan"),
+            ]
+        button_lines, button_regions, _ = action_bar(process_controls, inner_width, self._control_style)
+        if compact_layout:
+            buttons_width = display_width(self._ANSI_ESCAPE_RE.sub("", button_lines[0]))
+            button_start = width - 2 - buttons_width
+            prefix = pad_display(fit_display(title, max(0, button_start - 3)), button_start - 2)
+            lines[0] = colored("╭ " + prefix, label_color) + button_lines[0] + colored(" ╮", label_color)
+            action_regions.extend((0, button_start + start, button_start + end, target)
+                                  for _, start, end, target in button_regions)
+        else:
+            action_regions.extend((len(lines), 2 + start, 2 + end, target)
+                                  for _, start, end, target in button_regions)
+            lines.append(panel.line(self._ANSI_ESCAPE_RE.sub("", button_lines[0]), button_lines[0]))
 
         total_process_vram = sum(
             self._extract_metric_number(process.get("used_memory")) or 0
@@ -3937,7 +3967,10 @@ class NVClientPool:
             (f"Elapsed {process.get('elapsed') or '-'}", "dark_grey"),
         ]
         if not compact_history:
-            for plain, styled in panel.fields("Usage", usage_fields):
+            usage_rows = panel.fields("Usage", usage_fields)
+            if ultra_compact:
+                usage_rows = usage_rows[:1]
+            for plain, styled in usage_rows:
                 process_line_map[len(lines)] = selected_index
                 lines.append(panel.line(plain, styled))
             if not compact_layout:
@@ -3968,6 +4001,7 @@ class NVClientPool:
                 for row in history_rows
                 if row[0].lstrip().startswith(compact_labels)
             ]
+            history_rows = history_rows[:max(0, height_budget - len(lines) - 3)]
         history_rule_lines = (
             0
             if compact_history and ultra_compact
@@ -4142,11 +4176,19 @@ class NVClientPool:
             self._pending_process_signal = None
             pending = None
         if pending:
-            message = (
-                f"Confirm SIG{pending['signal']} -> PID {pending['pid']}: "
-                "Enter / same action again | Esc cancels"
-            )
-            lines.append(panel.line(message, colored(message, "yellow", attrs=["bold"])))
+            # Confirm and cancel are separate buttons, so neither the signal
+            # label nor a changing process row has to be clicked a second time.
+            confirm_controls = [
+                ("Confirm", "key", "\n", "yellow"),
+                ("Cancel", "key", "\x1b", "cyan"),
+            ]
+            confirm_lines, confirm_regions, _ = action_bar(confirm_controls, inner_width, self._control_style)
+            action_regions.extend((len(lines), 2 + start, 2 + end, target)
+                                  for _, start, end, target in confirm_regions)
+            buttons_plain = self._ANSI_ESCAPE_RE.sub("", confirm_lines[0])
+            message = f" SIG{pending['signal']} → PID {pending['pid']}"
+            plain = buttons_plain + message
+            lines.append(panel.line(plain, confirm_lines[0] + colored(message, "yellow")))
         else:
             notice = self._process_action_notice
             if notice and notice.get("expires_at", 0) > time.monotonic():
@@ -5071,6 +5113,8 @@ class NVClientPool:
                 ("key", "? / q", "Close this help"),
             ]
 
+        entries.insert(0, ("key", "Mouse / m", "Click controls; More opens all hidden actions"))
+
         def trim(text, limit):
             text = str(text)
             if display_width(text) <= limit:
@@ -5206,6 +5250,7 @@ class NVClientPool:
             else self._unified_section_headers(table, sorted_table)
         )
         row_line_map = {}
+        header_regions = []
         if filter_mode == "errors":
             rendered_table = "Error filter: GPU rows hidden"
         elif table.empty and not source_table.empty:
@@ -5242,6 +5287,7 @@ class NVClientPool:
                 fixed_width_columns=("sel",),
                 section_headers=section_headers,
                 row_line_map=row_line_map,
+                header_regions=header_regions,
             )
         selected_gpu_row = (
             table.iloc[selected_row]
@@ -5324,6 +5370,10 @@ class NVClientPool:
             table_offset + line_index: ("gpu", page_start + row_index)
             for line_index, row_index in row_line_map.items()
         }
+        self._body_click_regions.extend(
+            (table_offset + line, start, end, ("gpu_sort", mode))
+            for line, start, end, mode in header_regions
+        )
         lines.append(rendered_table)
 
         if show_process_panel:
@@ -5422,6 +5472,140 @@ class NVClientPool:
             lines.extend(status_lines)
         return lines
 
+    @staticmethod
+    def _control_style(text, style):
+        return colored(text, "dark_grey" if style == "bright_black" else style)
+
+    def _monitor_controls(self):
+        """Visible controls and overflow share the same action definitions."""
+        if self.tui_help_visible:
+            return [("Close help", "key", "?", "cyan")]
+        unified = self.display_mode == self.DISPLAY_MODE_UNIFIED
+        controls = [
+            (("● " if unified else "") + "GPUs", "view", self.DISPLAY_MODE_UNIFIED, "cyan"),
+            (("● " if not unified else "") + "Nodes", "view", self.DISPLAY_MODE_NODES, "cyan"),
+        ]
+        pending = self._pending_process_signal
+        if pending and pending.get("expires_at", 0) > time.monotonic():
+            controls[:0] = [
+                (f"Confirm {pending['signal']}:{pending['pid']}", "key", "\n", "yellow"),
+                ("Cancel", "key", "\x1b", "cyan"),
+            ]
+        if unified:
+            process_focused = self._process_panel_visible() and self.unified_active_pane == "process"
+            if self.unified_process_filter_editing:
+                controls += [
+                    ("Apply search", "key", "\n", "cyan"),
+                    ("Clear search", "clear_search", None, "yellow"),
+                ]
+            if process_focused:
+                controls += [
+                    ("/ Find", "key", "/", "cyan"),
+                    ("Sort processes ▾", "menu", "process_sort", "cyan"),
+                    ("← GPUs", "key", "h", "cyan"),
+                ]
+            controls += [
+                (f"Filter:{self.UNIFIED_FILTER_LABELS[self._get_unified_filter_mode()]} ▾", "menu", "filter", "cyan"),
+                (f"Sort:{self._get_unified_sort_mode()} ▾", "menu", "sort", "cyan"),
+                ("Hide processes" if self._process_panel_visible() else "Processes", "key", "p", "cyan"),
+                ("Single-line" if self.unified_detailed else "Detailed", "key", "d", "cyan"),
+                ("Find process /", "key", "/", "cyan"),
+                ("History " + ("on" if self.unified_show_trends else "off"), "key", "t", "cyan"),
+                ("Flat view" if self.unified_group_by_node else "Group by node", "key", "g", "cyan"),
+                ("Show unsupported" if self.hide_unsupported else "Hide unsupported", "key", "u", "cyan"),
+                ("Previous GPUs", "gpu_page", -1, "cyan"),
+                ("Next GPUs", "gpu_page", 1, "cyan"),
+            ]
+            if self._process_panel_visible():
+                if not process_focused:
+                    controls.append(("Sort processes ▾", "menu", "process_sort", "cyan"))
+                controls += [
+                    ("More process rows", "key", "+", "cyan"),
+                    ("Fewer process rows", "key", "-", "cyan"),
+                    ("Previous command page", "key", "[", "cyan"),
+                    ("Next command page", "key", "]", "cyan"),
+                ]
+        else:
+            controls += [
+                ("Expand all", "key", "a", "cyan"),
+                ("Collapse all", "key", "c", "cyan"),
+            ]
+        controls += [
+            (f"Theme:{self.theme}", "key", "C", "cyan"),
+            ("? Help", "key", "?", "cyan"),
+            ("q Quit", "key", "q", "cyan"),
+        ]
+        return controls
+
+    def _open_tui_menu(self, name):
+        hover = getattr(self, "_tui_hover", None)
+        if hover is not None:
+            hover.clear()
+        selected = 0
+        if name == "filter":
+            title = "Filter GPUs"
+            entries = [(self.UNIFIED_FILTER_LABELS[mode], ("gpu_filter", mode))
+                       for mode in self.UNIFIED_FILTER_MODES]
+            selected = self.UNIFIED_FILTER_MODES.index(self._get_unified_filter_mode())
+        elif name == "sort":
+            title = "Sort GPUs"
+            labels = {"node": "Node order", "available": "Available GPUs first", "utilization": "Highest utilization first"}
+            entries = [(labels[mode], ("gpu_sort", mode)) for mode in self.UNIFIED_SORT_MODES]
+            selected = self.UNIFIED_SORT_MODES.index(self._get_unified_sort_mode())
+        elif name == "process_sort":
+            title = "Sort processes · choose current field to reverse"
+            entries = [(self.UNIFIED_PROCESS_SORT_LABELS[mode], ("process_sort", mode))
+                       for mode in self.UNIFIED_PROCESS_SORT_MODES]
+            selected = self.UNIFIED_PROCESS_SORT_MODES.index(self._get_unified_process_sort_mode())
+        else:
+            title = "More actions"
+            controls = getattr(self, "_toolbar_overflow", []) or self._monitor_controls()
+            entries = [(label, (action, value)) for label, action, value, _ in controls]
+        self._tui_menu = ActionMenu(title, entries, selected=selected)
+        self.unified_process_filter_editing = False
+        self._pending_process_signal = None
+        self._request_ui_refresh()
+        return True
+
+    def _finish_tui_menu_input(self, result):
+        closed, target = result
+        if closed:
+            self._tui_menu = None
+        self._request_ui_refresh()
+        if target:
+            return self._activate_tui_control(*target)
+        return True
+
+    def _activate_tui_control(self, action, value):
+        # A click leaves text entry before dispatch, so Quit is never typed
+        # into the process filter and keyboard focus matches the new view.
+        self.unified_process_filter_editing = False
+        if action == "menu":
+            return self._open_tui_menu(value)
+        if action == "view":
+            if self.display_mode != value:
+                self._toggle_display_mode()
+            self._request_ui_refresh()
+            return True
+        if action == "key":
+            self._handle_keypress(value)
+            self._request_ui_refresh()
+            return True
+        if action == "gpu_sort":
+            self._set_unified_sort_mode(value)
+        elif action == "gpu_filter":
+            self._set_unified_filter_mode(value)
+        elif action == "gpu_page":
+            self.unified_active_pane = "gpu"
+            self._move_unified_selection(value * max(1, self._unified_page_size))
+        elif action == "clear_search":
+            self._clear_unified_process_filter()
+        elif action == "process_sort":
+            self._enter_unified_process_pane()
+            self._set_unified_process_sort(value, toggle=True)
+        self._request_ui_refresh()
+        return True
+
     def _write_tui_lines(self, output_lines):
         """Paint one TUI frame, rewriting only the rows that changed.
 
@@ -5432,11 +5616,51 @@ class NVClientPool:
         rows = []
         for line in output_lines:
             rows.extend(str(line).split("\n"))
+        menu = getattr(self, "_tui_menu", None)
+        if menu is not None:
+            rows = menu.render(
+                self.term.width or 80, max(1, (self.term.height or 24) - 1),
+                self._control_style,
+                hover_enabled=False,
+            )
+            # The menu owns input; no stale targets survive underneath it.
+            self._click_regions = []
+            self._click_targets = {}
+        else:
+            height = max(0, (self.term.height or 24) - 1)
+            self._click_regions = [region for region in self._click_regions if region[0] < height]
+            self._click_targets = {row: target for row, target in self._click_targets.items() if row < height}
+        # Pointer feedback reuses this layout. Rebuilding it on every motion
+        # used to reformat every node's dataframes before changing two rows.
+        self._tui_base_rows = rows[:max(0, (self.term.height or 24) - 1)]
+        self._tui_frame_size = (self.term.width or 80, self.term.height or 24)
+        self._tui_frame_menu = menu
+        self._paint_tui_hover()
+
+    def _paint_tui_hover(self):
+        """Repaint pointer feedback without collecting or formatting data."""
+        rows = getattr(self, "_tui_base_rows", None)
+        menu = getattr(self, "_tui_menu", None)
+        size = (self.term.width or 80, self.term.height or 24)
+        if (rows is None or size != self._tui_frame_size
+                or menu is not self._tui_frame_menu):
+            return False
+        hover = menu.hover if menu is not None else getattr(self, "_tui_hover", None)
+        if hover is not None:
+            rows = hover.paint(
+                rows,
+                menu.regions if menu is not None else self._click_regions,
+                {} if menu is not None else self._click_targets,
+                size[0], enabled=self.mouse_enabled and bool(self.term.does_styling),
+                row_kinds={"gpu", "server", "process", "command", "close_help"},
+            )
         screen = getattr(self, "_tui_diff_screen", None)
         if screen is None:
             screen = DiffScreen(self.term)
             self._tui_diff_screen = screen
         screen.paint(rows)
+        self._tui_hover_dirty = False
+        return True
 
     def _wrap_panel_border(self, lines, content_width):
         """Enclose already-built content lines in a rounded panel border.
@@ -5558,6 +5782,7 @@ class NVClientPool:
         fixed_width_columns=(),
         section_headers=None,
         row_line_map=None,
+        header_regions=None,
         outer_margin: int = 0,
     ):
         """Format fixed-width table display.
@@ -5935,12 +6160,17 @@ class NVClientPool:
         cell_separator = colored(" │ ", "dark_grey")
         header_parts = []
         header_styled_parts = []
+        header_column = 2 if border else 0
         for col in selected_columns:
             width = column_widths.get(col, 12)
             col_name = truncate_text(str(column_labels.get(col, col)), width)
             cell = align_text(col_name, width)
             header_parts.append(cell)
             header_styled_parts.append(colored(cell, "cyan", attrs=["bold"]))
+            mode = {"Node": "node", "Hostname": "node", "GPU": "node", "util": "utilization"}.get(col)
+            if header_regions is not None and mode:
+                header_regions.append((1 if border else 0, header_column, header_column + width - 1, mode))
+            header_column += width + 3
         header_plain = " │ ".join(header_parts)
         header = cell_separator.join(header_styled_parts)
 
@@ -6566,75 +6796,8 @@ class NVClientPool:
         if display_mode == self.DISPLAY_MODE_UNIFIED:
             detailed = self.unified_detailed
             view_label = "Unified/Detailed" if detailed else "Unified/Single-line"
-            detail_action = "Single-line" if detailed else "Detailed"
-            process_action = (
-                "HideProc" if self._process_panel_visible() else "ShowProc"
-            )
-            sort_mode = self._get_unified_sort_mode()
-            sort_label = {
-                "node": "Node",
-                "available": "Free",
-                "utilization": "Util",
-            }[sort_mode]
-            filter_mode = self._get_unified_filter_mode()
-            filter_label = self.UNIFIED_FILTER_LABELS[filter_mode]
-            group_label = (
-                "Group" if self.unified_group_by_node else "Flat"
-            )
-            unsupported_label = (
-                "Show" if self.hide_unsupported else "Hide"
-            )
-            process_focused = (
-                self.unified_active_pane == "process"
-                and self._process_panel_visible()
-            )
-            if process_focused:
-                process_sort_mode = self._get_unified_process_sort_mode()
-                process_sort_label = self.UNIFIED_PROCESS_SORT_LABELS[
-                    process_sort_mode
-                ]
-                process_sort_arrow = (
-                    "▼" if self.unified_process_sort_descending else "▲"
-                )
-                process_filter = str(
-                    self.unified_process_filter or ""
-                )
-                find_label = (
-                    f"Find:{fit(process_filter, 12)}"
-                    if process_filter
-                    else "Find"
-                )
-                controls = (
-                    f"[?]Help [/]{find_label} "
-                    f"[o]{process_sort_label}{process_sort_arrow} "
-                    f"[+/-]Rows [←]GPU [j/k]Select [i/T/K]Signal "
-                    f"[t]History [p]{process_action} [C]{self.theme} [q]"
-                )
-                if compact_layout:
-                    controls = (
-                        f"? · /{find_label} · o sort · j/k sel · "
-                        f"t hist · p · q"
-                    )
-            else:
-                controls = (
-                    f"[?]Help [Enter/→]Proc [j/k]GPU [p]{process_action} "
-                    f"[d]{detail_action} [s]{sort_label} [f]{filter_label} "
-                    f"[C]{self.theme} [q] [g]{group_label} "
-                    f"[u]{unsupported_label} [v]Nodes"
-                )
-                if compact_layout:
-                    controls = "? · ⏎ proc · j/k GPU · d view · q quit"
-            controls = fit(controls, terminal_width)
         else:
             view_label = "Per-node"
-            controls = (
-                "[?] Help  [v] Unified view  [j/k] Select  "
-                f"[Enter] Toggle  [a/c] Expand/Collapse  [C] {self.theme}  [q] Quit"
-            )
-            if compact_layout:
-                controls = "? help · v view · j/k sel · ⏎ exp · q quit"
-        if bool(self.tui_help_visible):
-            controls = "[? / Esc / q] Close help"
         if compact_layout:
             plain_title = (
                 f"Updated {update_display} · {server_count} {server_label.lower()}"
@@ -6671,18 +6834,15 @@ class NVClientPool:
             )
         output_lines.append(title_line if strip_lines else self._with_version_header(title_line, terminal_width))
 
-        def _colorize_controls(text):
-            """Highlight [key] shortcut patterns in cyan bold."""
-            parts = re.split(r'(\[[^\]]+\])', text)
-            result = []
-            for part in parts:
-                if part.startswith('[') and part.endswith(']'):
-                    result.append(colored(part, "cyan", attrs=["bold"]))
-                else:
-                    result.append(part)
-            return "".join(result)
-
-        output_lines.append(_colorize_controls(fit(controls, terminal_width)))
+        toolbar_row = self._screen_line_count(output_lines)
+        toolbar_lines, toolbar_regions, self._toolbar_overflow = action_bar(
+            self._monitor_controls(), terminal_width, self._control_style,
+        )
+        output_lines.extend(toolbar_lines)
+        toolbar_regions = [
+            (toolbar_row + row, start, end, target)
+            for row, start, end, target in toolbar_regions
+        ]
 
         pending_nodes = []
         slow_nodes = []
@@ -6720,7 +6880,7 @@ class NVClientPool:
                 help_offset + index: ("close_help", None)
                 for index in range(len(help_lines))
             }
-            self._click_regions = []
+            self._click_regions = toolbar_regions
             self._body_click_targets = {}
             self._body_click_regions = []
             self._write_tui_lines(output_lines)
@@ -6768,7 +6928,7 @@ class NVClientPool:
                 body_offset + line: target
                 for line, target in (self._body_click_targets or {}).items()
             }
-            self._click_regions = [
+            self._click_regions = toolbar_regions + [
                 (body_offset + line, start, end, target)
                 for line, start, end, target in (
                     self._body_click_regions or []
@@ -6778,7 +6938,7 @@ class NVClientPool:
             return
 
         self._click_targets = {}
-        self._click_regions = []
+        self._click_regions = toolbar_regions
         self._body_click_targets = {}
         self._body_click_regions = []
 
@@ -7077,6 +7237,11 @@ class NVClientPool:
                 row + 1: target for row, target in self._click_targets.items()
             }
 
+            self._click_regions = [
+                (row + 1, start + 2, end + 2, target)
+                for row, start, end, target in self._click_regions
+            ]
+
         self._write_tui_lines(output_lines)
 
     def _nodes_viewport(self, heights, region_height, sep_cost, selected_pos):
@@ -7189,7 +7354,10 @@ class NVClientPool:
         next_index = (
             self.UNIFIED_SORT_MODES.index(current_mode) + 1
         ) % len(self.UNIFIED_SORT_MODES)
-        self.unified_sort_mode = self.UNIFIED_SORT_MODES[next_index]
+        self._set_unified_sort_mode(self.UNIFIED_SORT_MODES[next_index])
+
+    def _set_unified_sort_mode(self, mode):
+        self.unified_sort_mode = mode
         self.unified_selected_gpu = 0
         self.unified_selected_gpu_key = None
         self.unified_selected_process = 0
@@ -7203,7 +7371,10 @@ class NVClientPool:
         next_index = (
             self.UNIFIED_FILTER_MODES.index(current_mode) + 1
         ) % len(self.UNIFIED_FILTER_MODES)
-        self.unified_filter_mode = self.UNIFIED_FILTER_MODES[next_index]
+        self._set_unified_filter_mode(self.UNIFIED_FILTER_MODES[next_index])
+
+    def _set_unified_filter_mode(self, mode):
+        self.unified_filter_mode = mode
         self.unified_selected_gpu = 0
         self.unified_selected_gpu_key = None
         self.unified_selected_process = 0
@@ -7770,6 +7941,27 @@ class NVClientPool:
         """Apply one mouse event and report whether the frame changed."""
         if not self.mouse_enabled:
             return False
+        menu = getattr(self, "_tui_menu", None)
+        if menu is not None:
+            previous_region = menu.hover.region
+            result = menu.handle_mouse(event)
+            if event.is_motion:
+                changed = menu.hover.region != previous_region
+                if changed:
+                    self._tui_hover_dirty = True
+                return changed
+            return self._finish_tui_menu_input(result)
+        if event.is_motion:
+            hover = getattr(self, "_tui_hover", None)
+            if hover is None:
+                hover = self._tui_hover = HoverState()
+            changed = hover.move(
+                event, self._click_regions, self._click_targets, self.term.width or 80,
+                row_kinds={"gpu", "server", "process", "command", "close_help"},
+            )
+            if changed:
+                self._tui_hover_dirty = True
+            return changed
 
         row = event.row - 1
         column = event.column - 1
@@ -7787,10 +7979,19 @@ class NVClientPool:
             if (
                 event.is_left_press
                 and target is not None
-                and target[0] == "close_help"
+                and (target[0] == "close_help" or target == ("key", "?"))
             ):
                 return self._toggle_tui_help()
             return False
+
+        if event.is_left_press and target and target[0] in {
+            "menu", "view", "key", "gpu_sort", "gpu_filter", "gpu_page", "clear_search",
+        }:
+            return self._activate_tui_control(*target)
+
+        if event.is_left_press and self.unified_process_filter_editing:
+            self.unified_process_filter_editing = False
+            self._request_ui_refresh()
 
         if self.display_mode != self.DISPLAY_MODE_UNIFIED:
             if event.is_wheel_up or event.is_wheel_down:
@@ -7801,10 +8002,13 @@ class NVClientPool:
             if target is None or target[0] != "server":
                 return False
             index = target[1]
-            # First click selects the node; clicking it again expands/collapses.
+            # A closed node opens on the first click; an open node remains
+            # visible when selected, and a second click collapses it.
             if index == self.selected_server:
                 return self._toggle_server_expansion(index)
             self.selected_server = index
+            if index not in self.expanded_servers:
+                self._toggle_server_expansion(index)
             self._request_ui_refresh()
             return True
 
@@ -7901,7 +8105,7 @@ class NVClientPool:
                 or self.unified_active_pane != "gpu"
             )
             if not changed:
-                return False
+                return self._enter_unified_process_pane()
             self.unified_selected_gpu = value
             self.unified_selected_gpu_key = None
             self.unified_selected_process = 0
@@ -7909,6 +8113,9 @@ class NVClientPool:
             self.unified_command_scroll = 0
             self.unified_active_pane = "gpu"
             self._pending_process_signal = None
+            if not self._process_panel_visible():
+                self._enter_unified_process_pane()
+                self.unified_active_pane = "gpu"
             self._request_ui_refresh()
             return True
         return False
@@ -7918,6 +8125,14 @@ class NVClientPool:
         key_text = str(key)
         key_name = key.name if hasattr(key, "name") and key.name else key_text
         key_lower = key_text.lower()
+
+        hover = getattr(self, "_tui_hover", None)
+        if key_text and hover is not None and hover.clear():
+            self._request_ui_refresh()
+
+        menu = getattr(self, "_tui_menu", None)
+        if menu is not None:
+            return self._finish_tui_menu_input(menu.handle_key(key_text, key_name))
 
         if bool(self.tui_help_visible):
             if (
@@ -7938,6 +8153,8 @@ class NVClientPool:
 
         if key_text == "?":
             return self._toggle_tui_help()
+        if key_text == "m":
+            return self._open_tui_menu("actions")
 
         if key_text == "C":
             return self._toggle_theme()
@@ -8135,8 +8352,7 @@ class NVClientPool:
         try:
             if not sys.stdout.isatty():
                 return
-            sys.stdout.write(MOUSE_ENABLE_SEQUENCE)
-            sys.stdout.flush()
+            set_mouse_reporting(self.term, True)
             self._mouse_reporting = True
         except Exception as error:
             logging.debug(msg=f"Failed to enable mouse reporting: {error}")
@@ -8147,8 +8363,7 @@ class NVClientPool:
             return
         self._mouse_reporting = False
         try:
-            sys.stdout.write(MOUSE_DISABLE_SEQUENCE)
-            sys.stdout.flush()
+            set_mouse_reporting(self.term, False)
         except Exception:
             pass
 
@@ -8388,6 +8603,9 @@ class NVClientPool:
                         self.refresh_needed.clear()
                         self.print_stats(use_cache=True)
                         next_draw = time.monotonic() + 1.0
+                    elif getattr(self, "_tui_hover_dirty", False):
+                        if not self._paint_tui_hover():
+                            self.print_stats(use_cache=True)
                     self._answer_secret_request()
                 
         except KeyboardInterrupt:

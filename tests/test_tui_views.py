@@ -1301,8 +1301,8 @@ def test_narrow_windows_never_wrap_a_server_row(monkeypatch, capsys):
     assert plain[0].startswith("⌂ ")
     assert plain[1].startswith("Updated ")
     assert plain[1].endswith(" · 2 servers")
-    assert "v view" in plain[2] and "⏎ exp" in plain[2]
-    assert "[v] Unified view" not in plain[2]
+    assert "[GPUs]" in plain[2] and "[Expand all]" in plain[2]
+    assert "[More…]" in plain[2]
     # The long description yields to the summary instead of wrapping.
     header = next(line for line in plain if "training-node" in line)
     assert header.count("training-node") == 1
@@ -2169,6 +2169,8 @@ def test_hidden_detailed_process_panel_is_restored_by_enter(monkeypatch):
 
 
 def test_mouse_selects_gpus_processes_and_signal_actions(monkeypatch, capsys):
+    monkeypatch.setenv("COLUMNS", "120")
+    monkeypatch.setenv("LINES", "40")
     pool = _pool()
     pool.term = Terminal(force_styling=False)
     pool.display_mode = pool.DISPLAY_MODE_UNIFIED
@@ -2195,9 +2197,9 @@ def test_mouse_selects_gpus_processes_and_signal_actions(monkeypatch, capsys):
     assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is True
     assert pool.unified_selected_gpu == 1
 
-    # Clicking the selected GPU is inert; no separate modal view is opened.
-    assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is False
-    assert pool.unified_active_pane == "gpu"
+    # Clicking the selected GPU enters its process pane.
+    assert pool._handle_mouse_event(_click(gpu_rows[1] + 1)) is True
+    assert pool.unified_active_pane == "process"
     assert pool._handle_mouse_event(_click(gpu_rows[0] + 1)) is True
     assert pool.unified_selected_gpu == 0
 
@@ -2502,3 +2504,279 @@ def test_print_refresh_mutes_console_logging_while_it_owns_the_screen(monkeypatc
     assert logging.getLogger().isEnabledFor(logging.ERROR)
 
     assert seen_disabled_during_draw == [True]
+
+
+def _interactive_pool(monkeypatch, width=80, height=40):
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((width, height)))
+    monkeypatch.setenv("COLUMNS", str(width))
+    monkeypatch.setenv("LINES", str(height))
+    pool = _pool()
+    pool.term = Terminal(force_styling=False)
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED
+    pool.cached_stats = ["", ""]
+    pool.cached_raw_stats = _focus_raw_stats("python train.py")
+    pool._last_update_time = 1
+    pool._last_fetch_duration = 0.1
+    pool._last_fetch_error = None
+    pool._cache_lock = threading.Lock()
+    return pool
+
+
+def _click_control(pool, target):
+    row, start, _, _ = next(r for r in pool._click_regions if r[3] == target)
+    return pool._handle_mouse_event(MouseEvent(0, start + 1, row + 1, True))
+
+
+def _choose_menu(pool, target):
+    menu = pool._tui_menu
+    index = next(i for i, (_, item) in enumerate(menu.entries) if item == target)
+    menu.selected = index
+    pool.print_stats(use_cache=True)
+    row, start, _, _ = next(r for r in menu.regions if r[3] == ("choose", index))
+    return pool._handle_mouse_event(MouseEvent(0, start + 1, row + 1, True))
+
+
+@pytest.mark.parametrize("width", [36, 80, 120])
+def test_mouse_navigation_filter_and_sort_with_overflow(monkeypatch, width):
+    pool = _interactive_pool(monkeypatch, width)
+    pool.print_stats(use_cache=True)
+    # Includes the outer frame's horizontal and vertical offsets in Nodes.
+    assert _click_control(pool, ("view", pool.DISPLAY_MODE_NODES))
+    pool.print_stats(use_cache=True)
+    assert _click_control(pool, ("view", pool.DISPLAY_MODE_UNIFIED))
+    pool.print_stats(use_cache=True)
+    if not any(r[3] == ("menu", "filter") for r in pool._click_regions):
+        _click_control(pool, ("menu", "actions"))
+        _choose_menu(pool, ("menu", "filter"))
+    else:
+        _click_control(pool, ("menu", "filter"))
+    _choose_menu(pool, ("gpu_filter", "available"))
+    assert pool.unified_filter_mode == "available"
+    pool.print_stats(use_cache=True)
+    assert pool._unified_gpu_count == 1
+    if not any(r[3] == ("menu", "sort") for r in pool._click_regions):
+        _click_control(pool, ("menu", "actions"))
+        _choose_menu(pool, ("menu", "sort"))
+    else:
+        _click_control(pool, ("menu", "sort"))
+    _choose_menu(pool, ("gpu_sort", "utilization"))
+    assert pool.unified_sort_mode == "utilization"
+    assert pool._tui_menu is None
+    assert not pool.quit_flag.is_set()
+
+
+def test_gpu_click_opens_processes_and_search_recovers_from_no_matches(monkeypatch):
+    pool = _interactive_pool(monkeypatch)
+    pool.print_stats(use_cache=True)
+    row = next(r for r, target in pool._click_targets.items() if target == ("gpu", 0))
+    assert pool._handle_mouse_event(_click(row + 1))
+    assert pool._process_panel_visible()
+    pool.print_stats(use_cache=True)
+    _click_control(pool, ("key", "/"))
+    pool._handle_keypress("no-such-process")
+    pool.print_stats(use_cache=True)
+    assert pool._unified_process_count == 0
+    _click_control(pool, ("clear_search", None))
+    pool.print_stats(use_cache=True)
+    assert not pool.unified_process_filter_editing
+    assert pool._unified_process_count == 1
+    _click_control(pool, ("key", "p"))
+    assert not pool._process_panel_visible()
+
+
+def test_mouse_menu_is_modal_and_gpu_headers_sort(monkeypatch):
+    pool = _interactive_pool(monkeypatch, width=120)
+    pool.print_stats(use_cache=True)
+    _click_control(pool, ("gpu_sort", "utilization"))
+    assert pool.unified_sort_mode == "utilization"
+    pool._pending_process_signal = {"signal": "TERM"}
+    _click_control(pool, ("menu", "filter"))
+    assert pool._pending_process_signal is None
+    pool._handle_keypress("K")
+    assert pool._pending_process_signal is None
+    assert pool.unified_filter_mode == "all"
+    pool._handle_mouse_event(MouseEvent(0, 120, 40, True))
+    assert pool._tui_menu is None
+    assert not pool.quit_flag.is_set()
+
+
+def test_signal_confirmation_buttons_cancel_and_confirm_the_armed_process(monkeypatch):
+    pool = _interactive_pool(monkeypatch, width=120, height=50)
+    pool.unified_show_processes = True
+    pool.unified_active_pane = "process"
+    pool.print_stats(use_cache=True)
+    _click_control(pool, ("signal", "TERM"))
+    pool.print_stats(use_cache=True)
+    assert pool._pending_process_signal["pid"] == 4242
+    _click_control(pool, ("key", "\x1b"))
+    assert pool._pending_process_signal is None
+    _click_control(pool, ("signal", "TERM"))
+    pool.print_stats(use_cache=True)
+    sent = []
+    monkeypatch.setattr(pool, "_confirm_process_signal", lambda: sent.append(dict(pool._pending_process_signal)) or True)
+    _click_control(pool, ("key", "\n"))
+    assert [(item["pid"], item["signal"]) for item in sent] == [(4242, "TERM")]
+
+
+@pytest.mark.parametrize("width,height,history", [(40, 20, False), (40, 20, True), (80, 24, False)])
+def test_signal_actions_remain_visible_in_the_actual_short_frame(monkeypatch, width, height, history):
+    pool = _interactive_pool(monkeypatch, width=width, height=height)
+    pool.unified_show_processes = True
+    pool.unified_show_trends = history
+    pool.unified_active_pane = "process"
+    pool.print_stats(use_cache=True)
+    frame = pool._tui_diff_screen._previous
+    _click_control(pool, ("signal", "TERM"))
+    pool.print_stats(use_cache=True)
+    assert any("Confirm TERM:4242" in line for line in pool._tui_diff_screen._previous)
+    _click_control(pool, ("key", "\x1b"))
+    assert pool._pending_process_signal is None
+    assert len(frame) <= height - 1
+    assert all(display_width(_without_ansi(line)) <= width for line in frame)
+
+
+def test_node_toolbar_click_matches_the_label_inside_its_frame(monkeypatch):
+    pool = _interactive_pool(monkeypatch, width=120)
+    pool.display_mode = pool.DISPLAY_MODE_NODES
+    pool.print_stats(use_cache=True)
+    frame = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    row = next(i for i, line in enumerate(frame) if "[GPUs]" in line)
+    column = display_width(frame[row].split("[GPUs]")[0])
+    assert pool._handle_mouse_event(MouseEvent(0, column + 1, row + 1, True))
+    assert pool.display_mode == pool.DISPLAY_MODE_UNIFIED
+
+
+def test_mouse_process_sort_menu_and_leaving_search(monkeypatch):
+    pool = _interactive_pool(monkeypatch, width=80)
+    pool.unified_show_processes = True
+    pool.unified_active_pane = "process"
+    pool.print_stats(use_cache=True)
+    _click_control(pool, ("menu", "process_sort"))
+    _choose_menu(pool, ("process_sort", "cpu"))
+    assert pool.unified_process_sort_mode == "cpu"
+    pool.print_stats(use_cache=True)
+    _click_control(pool, ("key", "/"))
+    pool._handle_keypress("python")
+    pool.print_stats(use_cache=True)
+    row = next(r for r, target in pool._click_targets.items() if target[0] == "process")
+    pool._handle_mouse_event(_click(row + 1))
+    assert not pool.unified_process_filter_editing
+    assert pool.unified_process_filter == "python"
+
+
+@pytest.mark.parametrize("target", [("menu", "filter"), ("gpu_sort", "utilization")])
+def test_monitor_hover_highlights_controls_without_activating(monkeypatch, target):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    pool = _interactive_pool(monkeypatch, width=120)
+    pool.term = Terminal(kind="xterm-256color", force_styling=True)
+    pool.print_stats(use_cache=True)
+    baseline = list(pool._tui_diff_screen._previous)
+    row, start, end, _ = next(r for r in pool._click_regions if r[3] == target)
+    pool.refresh_needed.clear()
+    before = (pool.unified_filter_mode, pool.unified_sort_mode, pool.unified_selected_gpu,
+              pool.unified_active_pane, pool._pending_process_signal)
+    assert pool._handle_mouse_event(MouseEvent(35, start + 1, row + 1, True))
+    assert pool._tui_hover_dirty
+    assert not pool.refresh_needed.is_set()
+    assert pool._paint_tui_hover()
+    hovered = pool._tui_diff_screen._previous
+    assert "\x1b[7m" in hovered[row]
+    assert hovered[row] != baseline[row]
+    assert [_without_ansi(line) for line in hovered] == [_without_ansi(line) for line in baseline]
+    assert before == (pool.unified_filter_mode, pool.unified_sort_mode, pool.unified_selected_gpu,
+                      pool.unified_active_pane, pool._pending_process_signal)
+    assert getattr(pool, "_tui_menu", None) is None
+    pool.refresh_needed.clear()
+    assert not pool._handle_mouse_event(MouseEvent(35, end + 1, row + 1, True))
+    assert not pool.refresh_needed.is_set()  # motion within one control does not redraw
+    assert not pool._tui_hover_dirty
+    assert pool._handle_mouse_event(MouseEvent(35, 120, 40, True))
+    assert pool._paint_tui_hover()
+    assert pool._tui_diff_screen._previous == baseline
+
+
+def test_monitor_menu_hover_reuses_layout_and_preserves_data_refresh(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    pool = _interactive_pool(monkeypatch, width=120)
+    pool.term = Terminal(kind="xterm-256color", force_styling=True)
+    pool._open_tui_menu("filter")
+    pool.print_stats(use_cache=True)
+    baseline = list(pool._tui_diff_screen._previous)
+    menu = pool._tui_menu
+    row, start, _, _ = next(r for r in menu.regions if r[3] == ("choose", 1))
+
+    def no_relayout(*args, **kwargs):
+        pytest.fail("hover must reuse the existing layout")
+
+    monkeypatch.setattr(pool, "print_stats", no_relayout)
+    monkeypatch.setattr(menu, "render", no_relayout)
+    pool.refresh_needed.clear()
+    assert pool._handle_mouse_event(MouseEvent(35, start + 1, row + 1, True))
+    assert not pool.refresh_needed.is_set()
+    # A concurrent worker update must still cause a full data refresh later.
+    pool.refresh_needed.set()
+    assert pool._paint_tui_hover()
+    assert pool.refresh_needed.is_set()
+    assert pool._tui_diff_screen._previous[row] != baseline[row]
+    assert pool._tui_base_rows == baseline
+    assert menu.selected == 0
+
+
+def test_monitor_hover_cache_is_invalid_after_resize_or_menu_change(monkeypatch):
+    pool = _interactive_pool(monkeypatch, width=120)
+    pool.print_stats(use_cache=True)
+    pool._open_tui_menu("filter")
+    assert not pool._paint_tui_hover()
+    pool.print_stats(use_cache=True)
+    assert pool._paint_tui_hover()
+    monkeypatch.setattr(os, "get_terminal_size", lambda *args: os.terminal_size((80, 24)))
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    assert not pool._paint_tui_hover()
+    pool.print_stats(use_cache=True)
+    assert pool._paint_tui_hover()
+
+
+@pytest.mark.parametrize("mode,target", [("unified", "gpu"), ("nodes", "server")])
+def test_monitor_hover_rows_preserves_selection_and_keyboard_clears_it(monkeypatch, mode, target):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    pool = _interactive_pool(monkeypatch, width=120)
+    pool.term = Terminal(kind="xterm-256color", force_styling=True)
+    pool.display_mode = pool.DISPLAY_MODE_UNIFIED if mode == "unified" else pool.DISPLAY_MODE_NODES
+    pool.print_stats(use_cache=True)
+    row = next(r for r, value in pool._click_targets.items() if value[0] == target)
+    baseline_row = pool._tui_diff_screen._previous[row]
+    selected = (pool.selected_server, pool.unified_selected_gpu, set(pool.expanded_servers))
+    assert pool._handle_mouse_event(MouseEvent(35, 4, row + 1, True))
+    pool.print_stats(use_cache=True)
+    assert "\x1b[7m" in pool._tui_diff_screen._previous[row]
+    assert (pool.selected_server, pool.unified_selected_gpu, pool.expanded_servers) == selected
+    pool._handle_keypress("k")
+    assert pool._tui_hover.position is None
+    pool.print_stats(use_cache=True)
+    # The selected node already uses inverse video; clearing hover must restore
+    # that original selection style rather than remove all inverse sequences.
+    assert pool._tui_diff_screen._previous[row] == baseline_row
+
+
+def test_monitor_motion_does_not_arm_or_confirm_a_signal_and_respects_mouse_off(monkeypatch):
+    pool = _interactive_pool(monkeypatch, width=120, height=50)
+    pool.unified_show_processes = True
+    pool.unified_active_pane = "process"
+    pool.print_stats(use_cache=True)
+    row, start, _, _ = next(r for r in pool._click_regions if r[3] == ("signal", "TERM"))
+    pool._handle_mouse_event(MouseEvent(35, start + 1, row + 1, True))
+    assert pool._pending_process_signal is None
+    _click_control(pool, ("signal", "TERM"))
+    pending = dict(pool._pending_process_signal)
+    pool.print_stats(use_cache=True)
+    row, start, _, _ = next(r for r in pool._click_regions if r[3] == ("key", "\n"))
+    pool._handle_mouse_event(MouseEvent(32, start + 1, row + 1, True))  # dragging isn't clicking
+    assert pool._pending_process_signal == pending
+    pool.mouse_enabled = False
+    position = pool._tui_hover.position
+    assert not pool._handle_mouse_event(MouseEvent(35, 120, 50, True))
+    assert pool._tui_hover.position == position
