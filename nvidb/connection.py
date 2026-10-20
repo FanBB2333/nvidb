@@ -1663,10 +1663,10 @@ class NVClientPool:
         """Drop the GPUs a server did not hand to nvidb.
 
         Filtering here - before any column is derived - keeps every later
-        per-row list the same length as the table. Row labels are left
-        alone on purpose: they carry the host's own GPU index, which is
-        what the process lookups join on and what the UI must keep
-        showing, so a host that lends out only GPU 2 still calls it 2.
+        per-row list the same length as the table. The GPU index column
+        is left alone on purpose: it carries the host's own GPU index,
+        which is what the process lookups join on and what the UI must
+        keep showing, so a host that lends out only GPU 2 still calls it 2.
         """
         allowed = getattr(client, "gpu_ids", None)
         if allowed is None:
@@ -1767,7 +1767,14 @@ class NVClientPool:
                 gpu_summary = per_gpu_user_summary.setdefault(gpu_idx, {})
                 gpu_summary[username] = gpu_summary.get(username, 0) + memory_value
 
-            for gpu_idx, _row in stats.iterrows():
+            for label, row in stats.iterrows():
+                # Join on the same key get_process_summary gave each process:
+                # the host's GPU index, which stops matching the row label
+                # once the driver skips a GPU it cannot open.
+                try:
+                    gpu_idx = int(row.get("gpu_index", label))
+                except (TypeError, ValueError):
+                    gpu_idx = label
                 user_summary = per_gpu_user_summary.get(gpu_idx, {})
                 if user_summary:
                     process_list.append(client.format_user_memory_compact(user_summary))

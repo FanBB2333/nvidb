@@ -676,6 +676,55 @@ def test_process_details_are_only_collected_while_the_panel_is_open():
     assert calls == [False, False, True, False, True]
 
 
+def test_gpu_users_stay_on_their_gpu_when_the_driver_skips_one():
+    # NVML skips a GPU it cannot open, so the frame's row labels (0, 1, 2)
+    # stop matching the host GPU indices (0, 2, 3) the processes carry.
+    pool = _pool()
+
+    class FakeClient:
+        description = "training-node"
+        host = "100.64.0.42"
+        port = 22
+
+        def get_full_gpu_info(self):
+            row = {
+                "product_name": "NVIDIA RTX 6000 Ada",
+                "product_architecture": "Ada",
+                "tx_util": "2 KB/s",
+                "rx_util": "1 KB/s",
+                "fan_speed": "30 %",
+                "total": "49140 MiB",
+                "used": "24000 MiB",
+                "free": "25140 MiB",
+                "gpu_util": "75 %",
+                "memory_util": "25 %",
+                "gpu_temp": "48 C",
+                "power_state": "P2",
+                "power_draw": "80.00 W",
+                "current_power_limit": "200.00 W",
+                "processes": [],
+            }
+            return pd.DataFrame([{**row, "gpu_index": index} for index in (0, 2, 3)]), {}
+
+        def get_system_stats(self):
+            return {}
+
+        def get_process_summary(self, stats=None, detailed=False):
+            processes = [
+                {"gpu_index": 2, "pid": "11", "username": "alice", "used_memory": "1024 MiB"},
+                {"gpu_index": 3, "pid": "12", "username": "bob", "used_memory": "2048 MiB"},
+            ]
+            return processes, {"alice": 1024, "bob": 2048}
+
+        def format_user_memory_compact(self, summary):
+            return ",".join(sorted(summary))
+
+    stats, _info, _users, _details = pool._collect_client_gpu_info(FakeClient())
+
+    assert stats["GPU"].tolist() == [0, 2, 3]
+    assert stats["processes"].tolist() == ["-", "alice", "bob"]
+
+
 def test_process_selection_stays_on_the_same_pid_when_vram_sorting_changes(
     monkeypatch,
 ):
