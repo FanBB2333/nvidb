@@ -1203,7 +1203,7 @@ def test_server_blocks_are_built_at_their_natural_height():
     pool = _pool()
     specs = [_server_block(pool, 6), _server_block(pool, 2)]
 
-    blocks = pool._build_server_blocks(_server_rows(pool, specs), {})
+    blocks = pool._build_server_blocks(_server_rows(pool, specs), {}, 120)
 
     assert set(blocks) == {0, 1}
     assert blocks[0] == specs[0].splitlines() + [""]
@@ -1216,7 +1216,7 @@ def test_a_crowded_screen_never_drops_a_gpu_row_from_a_block():
     # whole, because the viewport scrolls rather than trimming tables.
     specs = [_server_block(pool, 8), _server_block(pool, 8), _server_block(pool, 8)]
 
-    blocks = pool._build_server_blocks(_server_rows(pool, specs), {})
+    blocks = pool._build_server_blocks(_server_rows(pool, specs), {}, 120)
 
     assert set(blocks) == {0, 1, 2}
     for index, block in blocks.items():
@@ -1247,6 +1247,23 @@ def test_what_a_server_shows_does_not_depend_on_the_cursor(monkeypatch, capsys):
         # The selection scrolls the window instead of collapsing a server.
         assert any("more server(s)" in line for line in plain), selected
         assert any(f"[{selected + 1}]" in line for line in shown), selected
+
+
+def test_a_long_users_line_stays_inside_the_panel_border(monkeypatch, capsys):
+    monkeypatch.setattr(os, "get_terminal_size", lambda: os.terminal_size((100, 60)))
+    users = {f"user{index:02d}": 2048 + index for index in range(12)}
+    raw_stats = _raw_stats_for([2, 2])
+    raw_stats["_nvidb"] = {"user_memory_by_client": {1: users}, "user_memory_global": {}}
+    pool = _nodes_pool([_server_block(_pool(), 2), _server_block(_pool(), 2)], raw_stats)
+
+    pool.print_stats(use_cache=True)
+    capsys.readouterr()
+
+    plain = [_without_ansi(line) for line in pool._tui_diff_screen._previous]
+    users_line = next(line for line in plain if "Users:" in line)
+    # The line is cut inside the frame, so its right border still closes it.
+    assert users_line.endswith("... │")
+    assert all(display_width(line) <= 100 for line in plain)
 
 
 def test_nodes_view_fits_the_terminal_with_every_server_expanded(

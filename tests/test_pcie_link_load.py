@@ -183,6 +183,34 @@ def test_a_saturated_direction_is_red_and_a_quiet_one_is_not(monkeypatch):
     assert "\x1b[" not in tx_cell
 
 
+def test_a_gpu_with_an_unknown_link_is_not_drawn_as_saturated(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("ANSI_COLORS_DISABLED", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setattr(
+        "nvidb.connection.os.get_terminal_size",
+        lambda: __import__("os").terminal_size((200, 40)),
+    )
+    pool = _pool()
+    stats = pd.DataFrame(
+        [_gpu_row(0, "RTX 4090", "10 %", "1/100"), _gpu_row(1, "RTX 4090", "10 %", "1/100")]
+    )
+    stats["rx"] = ["1 KB/s", "900 MB/s"]
+    for field in ("gen_current", "width_current", "gen_max", "width_max"):
+        stats[f"pcie_link_{field}"] = ["4" if "gen" in field else "16", "N/A"]
+    pool._add_pcie_link_columns(stats)
+    # The known GPU turns the column into float64, so the unknown one is NaN.
+    assert pd.isna(stats.loc[1, f"{HIDDEN_COLUMN_PREFIX}rx_percent"])
+    stats = stats.drop(columns=[c for c in stats.columns if c.startswith("pcie_")])
+
+    rendered = pool._format_fixed_width_table(stats)
+
+    row_line = [line for line in rendered.splitlines() if "900 MB/s" in line][0]
+    rx_cell = [cell for cell in row_line.split("│") if "900 MB/s" in cell][0]
+    # An unknown load stays plain text instead of a full red bar.
+    assert "\x1b[41m" not in rx_cell
+
+
 def test_helper_columns_never_become_table_columns(monkeypatch):
     pool = _pool()
     row = _gpu_row(0, "RTX 4090", "10 %", "1024/24576")

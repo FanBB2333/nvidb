@@ -4198,31 +4198,27 @@ class NVClientPool:
     # columns wide of its visible width.
     _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\([0-9A-Za-z]")
 
-    def _build_server_blocks(self, server_rows, user_memory_by_client):
+    def _build_server_blocks(self, server_rows, user_memory_by_client, width):
         """Render each expanded server's block at its natural height.
 
         Nothing is dropped here to make room for another server: the
         caller scrolls its viewport instead. That keeps every GPU a node
         reports on screen, and means what one server shows never depends
         on how many others are expanded or on where the cursor sits.
-        Returns {idx: [block lines]} for the expanded servers.
+        `width` is the content width the blocks are drawn into (inside the
+        panel border when there is one). Returns {idx: [block lines]} for
+        the expanded servers.
         """
         blocks = {}
         for idx, _selected, is_expanded, _header, _summary, stats_info in server_rows:
             if not is_expanded:
                 continue
             block = list(str(stats_info).splitlines())
-            if isinstance(user_memory_by_client, dict):
-                users = user_memory_by_client.get(idx, {}) or {}
-            else:
-                users = {}
+            users = user_memory_by_client.get(idx) or {}
             if users:
-                user_line = (
-                    f"Users: {self._format_user_memory_totals(users)}"
+                user_line = fit_display(
+                    f"Users: {self._format_user_memory_totals(users)}", width, ellipsis="..."
                 )
-                width = _terminal_size().columns
-                if self.term.length(user_line) > width:
-                    user_line = user_line[: max(0, width - 3)] + "..."
                 block.append(colored(user_line, "dark_grey"))
             block.append("")
             blocks[idx] = block
@@ -5263,9 +5259,13 @@ class NVClientPool:
             if name not in df.columns:
                 return None
             try:
-                return float(df.iloc[row_index][name])
+                value = float(df.iloc[row_index][name])
             except (TypeError, ValueError):
                 return None
+            # A GPU with an unknown link shares a float64 column with ones
+            # that report theirs, so its missing load arrives as NaN; NaN
+            # would clamp to a full bar and read as a saturated link.
+            return None if pd.isna(value) else value
 
         def format_bar_cell(text: str, percent: Optional[float], width: int, bar_bg=None) -> str:
             if width <= 0:
@@ -6027,7 +6027,7 @@ class NVClientPool:
             and rows_for_body - (len(server_rows) - 1) >= len(server_rows)
         )
         visible_blocks = self._build_server_blocks(
-            server_rows, user_memory_by_client
+            server_rows, user_memory_by_client, terminal_width
         )
 
         sections = []
