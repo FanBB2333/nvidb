@@ -50,7 +50,23 @@ def test_linux_cpu_percent_counts_niced_work_but_not_iowait():
 
     client.get_system_stats()
     busy = 8 + 1181 + 50
-    assert client.get_system_stats()["cpu_percent"] == pytest.approx(busy * 100 / (busy + 2331 + 26))
+    assert client.get_system_stats()["cpu_percent"] == pytest.approx(busy * 100 / (busy + 2331))
+
+
+def test_cpu_counters_going_backwards_repeat_the_previous_reading():
+    client = ProcStatClient(
+        [
+            "cpu  9000 0 1000 90000 500 0 0 0 0 0\n",
+            "cpu  9050 0 1000 90050 500 0 0 0 0 0\n",
+            # iowait shrinking and an idle counter that wrapped must not give
+            # a reading past 100% or a bogus dip.
+            "cpu  9100 0 1000 90100 100 0 0 0 0 0\n",
+            "cpu  9150 0 1000 10 100 0 0 0 0 0\n",
+        ]
+    )
+
+    readings = [client.get_system_stats()["cpu_percent"] for _ in range(4)]
+    assert readings[1:] == pytest.approx([50.0, 50.0, 50.0])
 
 
 def test_local_macos_cpu_percent_reads_mach_counters_instead_of_top(monkeypatch):

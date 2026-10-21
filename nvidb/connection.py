@@ -382,6 +382,7 @@ class BaseClient(ABC):
         self._cpu_cores = None
         # (busy, total) CPU ticks of the previous sample, for a per-interval CPU%.
         self._cpu_ticks = None
+        self._cpu_last = None
 
     def _set_connect_error(self, message: str, error_type: str = "error"):
         self.connected = False
@@ -756,16 +757,17 @@ class BaseClient(ABC):
     def _cpu_percent(self):
         """Total CPU utilization in percent, or None when it cannot be read."""
         # Linux: "cpu  user nice system idle iowait irq softirq steal ..." ticks
-        # since boot. Like top, everything but idle and iowait counts as busy:
-        # niced work (common for training jobs) is real load.
+        # since boot. Everything but idle and iowait counts as busy: niced work
+        # (common for training jobs) is real load. iowait stays out of the
+        # total too, because the kernel lets that counter go backwards.
         fields = self.execute_command("grep 'cpu ' /proc/stat").split()
         if fields:
             try:
                 ticks = [int(value) for value in fields[1:9]]
             except ValueError:
                 return None
-            total = sum(ticks)
-            return self._cpu_percent_since_last(total - ticks[3] - ticks[4], total)
+            total = sum(ticks) - ticks[4]
+            return self._cpu_percent_since_last(total - ticks[3], total)
 
         # Try macOS - use top for CPU usage (user + sys)
         parts = self.execute_command(
@@ -781,14 +783,19 @@ class BaseClient(ABC):
     def _cpu_percent_since_last(self, busy, total):
         """Busy share of the CPU ticks counted since the previous sample.
 
-        The counters run from boot, so the first sample - or one where the
-        counters did not advance or wrapped - can only give the since-boot
-        average.
+        The counters run from boot, so the first sample can only give the
+        since-boot average. A sample whose counters did not advance or went
+        backwards (macOS keeps them in 32 bits, so they wrap) repeats the
+        previous reading.
         """
         previous, self._cpu_ticks = self._cpu_ticks, (busy, total)
-        if previous is not None and total > previous[1]:
+        if previous is None:
+            self._cpu_last = busy * 100 / total
+        else:
             busy, total = busy - previous[0], total - previous[1]
-        return busy * 100 / total
+            if total > 0 and 0 <= busy <= total:
+                self._cpu_last = busy * 100 / total
+        return self._cpu_last
 
     def get_process_summary(self, gpu_stats, detailed: bool = False, *, resolve_users=True):
         """Get detailed GPU processes information with user summary.
