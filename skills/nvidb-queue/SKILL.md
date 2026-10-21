@@ -125,8 +125,8 @@ first for memory. It is named `<node>:<gpu>`, and prefix matching works.
 
 ```bash
 nvidb queue lanes --json                    # every GPU: what it runs now, what is next
-nvidb queue lane box406:0 --json            # one lane's queue, in running order
-nvidb job submit --lane box406:0 --vram 20G -n arm-a "bash run.sh"
+nvidb queue lane lab1:0 --json              # one lane's queue, in running order
+nvidb job submit --lane lab1:0 --vram 20G -n arm-a "bash run.sh"
 ```
 
 Submitting to a lane appends to it. The lane runs its jobs strictly in order,
@@ -142,13 +142,13 @@ Reordering is a local database write, so it is instant and works while the node
 is unreachable or busy:
 
 ```bash
-nvidb queue lane box406:0 move 1419 --to head     # run this one next
-nvidb queue lane box406:0 move 1419 --before 1417
-nvidb queue lane box406:0 swap 1417 1419
-nvidb queue lane box406:0 skip                    # send the next job to the back
-nvidb queue lane box406:0 assign 1421 --at head   # move a job into this lane
-nvidb queue lane box406:0 pause                   # stop starting new jobs here
-nvidb queue lane box406:0 resume
+nvidb queue lane lab1:0 move 1419 --to head       # run this one next
+nvidb queue lane lab1:0 move 1419 --before 1417
+nvidb queue lane lab1:0 swap 1417 1419
+nvidb queue lane lab1:0 skip                      # send the next job to the back
+nvidb queue lane lab1:0 assign 1421 --at head     # move a job into this lane
+nvidb queue lane lab1:0 pause                     # stop starting new jobs here
+nvidb queue lane lab1:0 resume
 ```
 
 Positions are 1-based over the *queued* jobs, so `--to 1` means "next to run".
@@ -176,8 +176,8 @@ You should not normally need to touch it. When a lane is not moving and you
 want to know whether the node's side is alive:
 
 ```bash
-nvidb queue lane box406:0 runner --json     # up? what is it running? what is staged?
-nvidb queue lane box406:0 runner restart    # never touches the job it started
+nvidb queue lane lab1:0 runner --json       # up? what is it running? what is staged?
+nvidb queue lane lab1:0 runner restart      # never touches the job it started
 ```
 
 Only the head of the lane is handed to the runner; everything behind it stays a
@@ -371,8 +371,8 @@ this guard by changing the database directly.
 
 ## More
 
-`nvidb queue --help`, `nvidb job submit --help`, and section 3 of the nvidb
-README cover the rest: the TUI (`nvidb queue`), the optional notification daemon
+`nvidb queue --help`, `nvidb job submit --help`, and `docs/queue.md` in the
+nvidb repository cover the rest: the TUI (`nvidb queue`), the optional notification daemon
 (`nvidb queue daemon`), the event log (`nvidb queue events --since <id>`, for
 catching up on what happened while you were not running), the keeper that keeps
 a queue host scheduling (`nvidb queue keeper status`), consistent database
