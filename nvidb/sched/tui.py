@@ -989,7 +989,7 @@ class QueueTUI:
         style: Optional[str] = None,
     ) -> List[str]:
         """Render a labeled detail field without truncating its value."""
-        prefix = f"  {label:<5}"
+        prefix = f"  {label:<4} "
         continuation = " " * display_width(prefix)
         available = max(1, width - display_width(prefix))
         values = wrap_display(value, available)
