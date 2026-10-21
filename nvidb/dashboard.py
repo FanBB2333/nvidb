@@ -369,6 +369,8 @@ class LiveCache:
         self.history = deque(maxlen=HISTORY_MAX_POINTS)  # [{ts, rows: [{server, gpu, util, mem_used, mem_total, power, temp}]}]
 
         self._kick = threading.Event()
+        # Set once the next fetch to start has finished.
+        self._next_fetch = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -388,7 +390,11 @@ class LiveCache:
             self._kick.set()
 
     def refresh_now(self):
+        """Fetch as soon as possible; the returned event is set once it lands."""
+        with self._lock:
+            landed = self._next_fetch
         self._kick.set()
+        return landed
 
     def snapshot(self):
         with self._lock:
@@ -452,6 +458,7 @@ class LiveCache:
             start = time.monotonic()
             with self._lock:
                 self.fetching = True
+                landed, self._next_fetch = self._next_fetch, threading.Event()
             try:
                 _fmt, raw = self.pool.get_client_gpus_info(return_raw=True)
                 now = datetime.now()
@@ -470,6 +477,7 @@ class LiveCache:
                 with self._lock:
                     self.last_duration = elapsed
                     self.fetching = False
+                landed.set()
 
             # A paused fetch goes straight back to the paused wait, so the
             # next manual refresh is never swallowed by a period wait.
@@ -1421,12 +1429,6 @@ def create_app(*, db_path=None, include_remote=False):
         interval = float(interval_s)
         cache = _get_live_cache(include_remote_now)
         cache.configure(interval_seconds=interval, enabled=enabled)
-        # Only the cache on screen polls: the other include-remote setting's
-        # thread would otherwise keep sweeping every node forever.
-        with _live_lock:
-            others = [c for c in _live_caches.values() if c is not cache]
-        for other in others:
-            other.configure(interval_seconds=interval, enabled=False)
         if ctx.triggered_id in ("live-refresh-btn", "live-remote"):
             cache.refresh_now()
         return max(250, int(interval * 1000)), not enabled
@@ -1482,6 +1484,10 @@ def create_app(*, db_path=None, include_remote=False):
         if tab != "tab-live" or not sig or not sig.get("fetched"):
             raise PreventUpdate
         cache = _get_live_cache("remote" in (remote or []))
+        if ctx.triggered_id == "live-refresh-btn":
+            # With auto refresh off nothing else would redraw once the fetch
+            # lands, so show the click's own result rather than the last one.
+            cache.refresh_now().wait(timeout=30)
         p = _live_update_payload(cache, sig, theme)
         return (
             p["alerts"],

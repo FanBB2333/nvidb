@@ -62,6 +62,24 @@ def test_live_cache_resume_and_manual_refresh_fetch_while_paused(monkeypatch):
         cache.configure(interval_seconds=5, enabled=False)
 
 
+def test_a_paused_manual_refresh_reports_when_its_own_fetch_lands(monkeypatch):
+    monkeypatch.setattr(dashboard, "NVClientPool", _FakePool)
+    cache = dashboard.LiveCache(False)
+    pool = cache.pool
+    try:
+        assert _wait_for(lambda: pool.calls >= 1)
+        cache.configure(interval_seconds=5, enabled=False)
+        time.sleep(0.1)
+        before = cache.snapshot()["last_updated"]
+
+        landed = cache.refresh_now()
+        assert landed.wait(timeout=3)
+        assert pool.calls == 2
+        assert cache.snapshot()["last_updated"] > before
+    finally:
+        cache.configure(interval_seconds=5, enabled=False)
+
+
 def test_live_signature_hides_renderer_only_columns():
     table = pd.DataFrame([{"GPU": 0, "util": "5%", "_nvidb_rx_percent": 1.0, "_nvidb_link_max": "Gen4"}])
     cache = SimpleNamespace(
