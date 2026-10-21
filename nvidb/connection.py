@@ -126,6 +126,13 @@ def _format_milliwatts(value):
     return f"{watts:.2f} W"
 
 
+def _power_cell(row):
+    """`P0 164.64/300.00`, or just the draw when the card reports no limit."""
+    draw = "/".join(extract_numbers(row["power_draw"]))
+    limit = "/".join(extract_numbers(row["current_power_limit"]))
+    return f"{row['power_state']} {draw}/{limit}" if limit else f"{row['power_state']} {draw}"
+
+
 def _dcgm_percent(value):
     """A DCGM profiling reading as 0-100, or None when it is not a number."""
     try:
@@ -1731,7 +1738,7 @@ class NVClientPool:
         stats['rx'] = [format_bandwidth(*extract_value_and_unit(value))[:11] for value in stats['rx_util']]
         stats['tx'] = [format_bandwidth(*extract_value_and_unit(value))[:11] for value in stats['tx_util']]
         self._add_pcie_link_columns(stats)
-        stats['power'] = [f"{row['power_state']} {'/'.join(extract_numbers(row['power_draw']))}/{'/'.join(extract_numbers(row['current_power_limit']))}" for _, row in stats.iterrows()]
+        stats['power'] = [_power_cell(row) for _, row in stats.iterrows()]
         stats['memory[used/total]'] = [f"{'/'.join(extract_numbers(row['used']))}/{'/'.join(extract_numbers(row['total']))}" for _, row in stats.iterrows()]
 
         # Add process information as a column (batch pid->user lookup to avoid per-process SSH calls)

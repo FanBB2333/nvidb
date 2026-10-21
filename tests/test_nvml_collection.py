@@ -295,3 +295,10 @@ def test_dcgm_derived_columns_are_not_rescaled_as_ratios():
     assert row["sol"] == "1%"
     assert row["fp64_active"] == "N/A"
     assert system_info["advanced_supported"] is True
+
+
+def test_power_cell_drops_the_slash_when_the_card_reports_no_limit():
+    from nvidb.connection import _power_cell
+
+    assert _power_cell({"power_state": "P1", "power_draw": "299.55 W", "current_power_limit": "300.00 W"}) == "P1 299.55/300.00"
+    assert _power_cell({"power_state": "P0", "power_draw": "163.20 W", "current_power_limit": "N/A"}) == "P0 163.20"
