@@ -816,7 +816,7 @@ def test_flags_given_before_a_subcommand_are_kept(parser):
 def test_an_unknown_node_filter_matches_nothing(parser, queue_db, capsys):
     conn = dbm.open_db(queue_db)
     try:
-        for name in ("box406", "box407"):
+        for name in ("lab1", "lab2"):
             dbm.upsert_node(conn, name)
             dbm.ensure_lane(conn, f"{name}:0", node=name, gpu_ids=[0])
             job_id = dbm.insert_job(conn, command="sleep 1")
@@ -824,8 +824,8 @@ def test_an_unknown_node_filter_matches_nothing(parser, queue_db, capsys):
     finally:
         conn.close()
 
-    # "box" is ambiguous and "typo" unknown: neither may widen to every node.
-    for query, expected in (("box406", ["box406"]), ("typo", []), ("box", [])):
+    # "lab" is ambiguous and "typo" unknown: neither may widen to every node.
+    for query, expected in (("lab1", ["lab1"]), ("typo", []), ("lab", [])):
         assert _run(parser, ["job", "ls", "--node", query, "--json", "--no-tick"], queue_db) == 0
         assert [job["node"] for job in json.loads(capsys.readouterr().out)["jobs"]] == expected
         assert _run(parser, ["queue", "lanes", "--node", query, "--json", "--no-tick"], queue_db) == 0

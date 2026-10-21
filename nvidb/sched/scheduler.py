@@ -200,10 +200,10 @@ def gpu_pools(cfg: Optional[dict]) -> Dict[str, Dict[str, Optional[List[int]]]]:
           pools:
             experiments:
               members:
-                - node: box406
+                - node: lab1
                   gpus: [0]
-                - node: polyu-4090      # no `gpus`: every queue GPU on it
-            big: [polyu-A100]           # a bare list of members also works
+                - node: lab2            # no `gpus`: every queue GPU on it
+            big: [lab3]                 # a bare list of members also works
 
     Indices are the node's own, and a member never widens the node's
     `gpu_ids:` allowlist. Pools may overlap; a card in two of them is still
@@ -767,7 +767,7 @@ class Scheduler:
         """Find a lane by name or unambiguous abbreviation, or explain why not.
 
         A lane that names a real GPU but has no row yet is created here, so
-        `--lane box406:1` works on a machine the queue has not probed since
+        `--lane lab1:1` works on a machine the queue has not probed since
         the card was added.
         """
         name = dbm.resolve_lane_name(self.conn, query)

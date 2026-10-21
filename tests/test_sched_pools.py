@@ -271,7 +271,7 @@ def test_cli_submits_into_a_pool_and_lists_it(parser, tmp_path, monkeypatch, cap
     monkeypatch.setenv("NVIDB_QUEUE_DB", str(tmp_path / "queue.db"))
     monkeypatch.setattr(
         "nvidb.config.load_config",
-        lambda *a, **k: {"servers": [], "queue": {"pools": {"exp": ["box406"]}}},
+        lambda *a, **k: {"servers": [], "queue": {"pools": {"exp": ["lab1"]}}},
     )
 
     def run(*argv):
@@ -290,7 +290,7 @@ def test_cli_submits_into_a_pool_and_lists_it(parser, tmp_path, monkeypatch, cap
 
     assert run("queue", "pools") == 0
     text = capsys.readouterr().out
-    assert "POOL exp" in text and "box406" in text and "unconfigured" in text
+    assert "POOL exp" in text and "lab1" in text and "unconfigured" in text
 
     assert run("job", "ls") == 0
     assert "pool:exp" in capsys.readouterr().out

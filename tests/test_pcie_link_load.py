@@ -147,8 +147,8 @@ def test_a_saturated_direction_is_red_and_a_quiet_one_is_not(monkeypatch):
     busy = _gpu_row(0, "RTX 3090 Ti", "99 %", "22817/24564")
     busy.update(
         {
-            "Node": "gem12",
-            "Hostname": "100.109.8.69",
+            "Node": "lab3",
+            "Hostname": "100.64.0.43",
             "link": "4.0x4",
             "rx": "7.0GB/s",
             "tx": "20MB/s",
@@ -249,8 +249,8 @@ def test_the_detailed_card_names_the_link_and_scores_each_direction(monkeypatch)
     row = _gpu_row(0, "RTX 3090 Ti", "99 %", "22817/24564")
     row.update(
         {
-            "Node": "gem12",
-            "Hostname": "100.109.8.69",
+            "Node": "lab3",
+            "Hostname": "100.64.0.43",
             "link": "4.0x4",
             "rx": "7.0GB/s",
             "tx": "20MB/s",
@@ -282,8 +282,8 @@ def test_a_link_with_no_traffic_says_so_without_a_percentage(monkeypatch):
     row = _gpu_row(0, "RTX 3090 Ti", "0 %", "0/24564")
     row.update(
         {
-            "Node": "gem12",
-            "Hostname": "100.109.8.69",
+            "Node": "lab3",
+            "Hostname": "100.64.0.43",
             "rx": "0",
             "tx": "0",
             f"{HIDDEN_COLUMN_PREFIX}rx_percent": 0.0,

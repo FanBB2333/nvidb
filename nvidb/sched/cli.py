@@ -2072,7 +2072,7 @@ def _register_submit_parser(job_sub) -> None:
         "--lane",
         default=None,
         metavar="NODE:GPU",
-        help="Queue on one GPU's serial lane, e.g. --lane box406:0",
+        help="Queue on one GPU's serial lane, e.g. --lane lab1:0",
     )
     submit.add_argument(
         "--at",

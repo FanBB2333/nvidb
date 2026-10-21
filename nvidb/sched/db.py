@@ -729,7 +729,7 @@ def get_node(conn: sqlite3.Connection, name: str) -> Optional[Node]:
 def resolve_node_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
     """Match a node by exact name, then case-insensitively, then by substring.
 
-    Lets a client say `--node lab2` instead of `lab2-workstation-tailscale`.
+    Lets a client say `--node lab2` instead of `lab2.example.org`.
     """
     return _resolve_name(conn, "nodes", query)
 
@@ -832,7 +832,7 @@ def update_lane(conn: sqlite3.Connection, name: str, **fields) -> None:
 def resolve_lane_name(conn: sqlite3.Connection, query: str) -> Optional[str]:
     """Match a lane by exact name, then case-insensitively, then by substring.
 
-    Lets a person say `lane 406` instead of `406-tailscale:0` when only one
+    Lets a person say `lane lab1` instead of `lab1.example.org:0` when only one
     lane could be meant.
     """
     return _resolve_name(conn, "lanes", query)

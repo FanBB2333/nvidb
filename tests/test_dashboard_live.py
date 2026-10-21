@@ -117,9 +117,9 @@ class _FakeFigure:
 def test_rolling_vram_range_fits_the_largest_gpu(monkeypatch):
     monkeypatch.setattr(dashboard, "go", SimpleNamespace(Figure=_FakeFigure, Scatter=dict), raising=False)
     rows = [
-        {"server": "406", "gpu": "GPU 0", "util": 10.0, "mem_used_gib": 4.0, "mem_total_gib": 32.0},
-        {"server": "406", "gpu": "GPU 1", "util": 90.0, "mem_used_gib": 60.0, "mem_total_gib": 72.0},
+        {"server": "lab1", "gpu": "GPU 0", "util": 10.0, "mem_used_gib": 4.0, "mem_total_gib": 32.0},
+        {"server": "lab1", "gpu": "GPU 1", "util": 90.0, "mem_used_gib": 60.0, "mem_total_gib": 72.0},
     ]
     history = [{"ts": datetime(2026, 1, 1), "rows": rows}]
-    _util_fig, mem_fig = dashboard._live_history_figs(history, "406", dashboard._pal("dark"))
+    _util_fig, mem_fig = dashboard._live_history_figs(history, "lab1", dashboard._pal("dark"))
     assert mem_fig.yaxes["range"] == [0, 72.0 * 1.05]

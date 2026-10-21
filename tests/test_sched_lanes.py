@@ -69,9 +69,9 @@ def test_tui_moves_lane_jobs_in_actual_order_without_changing_priorities(schedul
 # --- naming ----------------------------------------------------------------
 
 def test_a_lane_name_round_trips():
-    name = make_lane_name("box406", [0])
-    assert name == "box406:0"
-    assert parse_lane_name(name) == ("box406", [0])
+    name = make_lane_name("lab1", [0])
+    assert name == "lab1:0"
+    assert parse_lane_name(name) == ("lab1", [0])
 
 
 def test_a_node_named_with_a_port_still_parses():

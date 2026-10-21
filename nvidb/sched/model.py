@@ -359,7 +359,7 @@ def gpu_source_label(gpu: Dict[str, Any]) -> str:
 
 
 def make_lane_name(node: str, gpu_ids: Sequence[int]) -> str:
-    """The stable name of a lane: `<node>:<gpu indices>`, e.g. `box406:0`."""
+    """The stable name of a lane: `<node>:<gpu indices>`, e.g. `lab1:0`."""
     return f"{node}:{','.join(str(int(index)) for index in gpu_ids)}"
 
 
@@ -373,7 +373,7 @@ def parse_lane_name(name: str) -> Tuple[str, List[int]]:
     node, separator, indices = text.rpartition(":")
     if not separator:
         raise ValueError(
-            f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. box406:0"
+            f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. lab1:0"
         )
     gpu_ids = []
     for part in indices.split(","):
@@ -388,7 +388,7 @@ def parse_lane_name(name: str) -> Tuple[str, List[int]]:
             ) from None
     if not node or not gpu_ids:
         raise ValueError(
-            f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. box406:0"
+            f"Invalid lane name {name!r}; a lane is written <node>:<gpu>, e.g. lab1:0"
         )
     return node, gpu_ids
 
