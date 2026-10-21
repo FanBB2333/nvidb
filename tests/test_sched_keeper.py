@@ -550,6 +550,15 @@ def test_keeper_lifecycle_commands_do_not_auto_start_it(target):
     )
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [["queue", "--json", "keeper", "status"], ["queue", "--refresh", "2", "daemon", "--once"]],
+)
+def test_root_flags_before_a_keeper_command_do_not_auto_start_it(target, argv):
+    assert "nvidb_keeper=" not in remote_mod.build_command(target, argv)
+    assert "nvidb_keeper=" in remote_mod.build_command(target, ["queue", "--json", "status"])
+
+
 def test_the_keeper_can_be_left_alone(target):
     target["keeper"] = "off"
     assert "queue-keeper.sh" not in remote_mod.build_command(target, ["queue", "status"])

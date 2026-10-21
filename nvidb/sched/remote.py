@@ -94,6 +94,19 @@ def _strip_local_flags(head: Sequence[str]) -> List[str]:
     return out
 
 
+def _queue_subcommand(head: Sequence[str]) -> Optional[str]:
+    """The queue subcommand in `head`, past any root flags given before it."""
+    if head[:1] not in (["queue"], ["q"]):
+        return None
+    tokens = iter(head[1:])
+    for token in tokens:
+        if token == "--refresh":
+            next(tokens, None)
+        elif not token.startswith("-"):
+            return token
+    return None
+
+
 def _point_script_at_temp_file(head: List[str]) -> List[str]:
     """Rewrite `--script FILE` so it names the file we are about to write there."""
     out: List[str] = []
@@ -142,7 +155,7 @@ def build_command(
     lines: List[str] = []
     # Keeper lifecycle commands must observe state without auto-starting it.
     if (target.get("keeper") == "ensure"
-            and head[:2] not in (["queue", "keeper"], ["queue", "daemon"])
+            and _queue_subcommand(head) not in ("keeper", "daemon")
             and "--no-tick" not in head):
         # Folded into the same command, so keeping the queue alive costs no
         # extra round trip. Warnings stay on stderr so JSON stdout remains
