@@ -16,7 +16,9 @@ def _wait_for_exit(executor, job_id, run_dir, timeout=15.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         probe = executor.probe([(job_id, run_dir)]).jobs.get(job_id)
-        if probe is not None and probe.finished:
+        # The probe checks liveness before it reads the exit code, so a job
+        # caught inside its EXIT trap reports both: finished, yet still alive.
+        if probe is not None and probe.finished and not probe.alive:
             return probe
         time.sleep(0.1)
     pytest.fail(f"job {job_id} did not finish within {timeout}s")
