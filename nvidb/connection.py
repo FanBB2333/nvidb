@@ -363,6 +363,22 @@ def _prompt_secret(prompt):
     return getpass.getpass(prompt=prompt)
 
 
+SIGNAL_STATUS_MARKER = "__NVIDB_SIGNAL_STATUS__:"
+
+
+def _signal_command(signal_name, pid):
+    """Shell command that signals `pid`, then prints kill's exit status after the marker.
+
+    The status goes through `rc`, not `status`: zsh, a common login shell,
+    treats `status` as a read-only `$?` and aborts the line on assignment,
+    so the marker would never be printed although the signal was sent.
+    """
+    return (
+        f"kill -s {signal_name} -- {pid} 2>&1; "
+        f"rc=$?; printf '\\n{SIGNAL_STATUS_MARKER}%s\\n' \"$rc\""
+    )
+
+
 class BaseClient(ABC):
     """Base class for both RemoteClient and LocalClient with common functionality"""
     
@@ -6769,11 +6785,8 @@ class NVClientPool:
         signal_name = pending["signal"]
         pid = pending["pid"]
         client = self.pool[pending["client_index"]]
-        marker = "__NVIDB_SIGNAL_STATUS__:"
-        command = (
-            f"kill -s {signal_name} -- {pid} 2>&1; "
-            f"status=$?; printf '\\n{marker}%s\\n' \"$status\""
-        )
+        marker = SIGNAL_STATUS_MARKER
+        command = _signal_command(signal_name, pid)
         self._pending_process_signal = None
         if self._node_workers:
             worker = self._signal_worker

@@ -1,6 +1,9 @@
 import logging
 import os
 import re
+import shutil
+import signal
+import subprocess
 import threading
 
 import pytest
@@ -9,7 +12,7 @@ from types import SimpleNamespace
 import pandas as pd
 from blessed import Terminal
 
-from nvidb.connection import NVClientPool
+from nvidb.connection import SIGNAL_STATUS_MARKER, NVClientPool, _signal_command
 from nvidb import config
 from nvidb.mouse import MouseEvent
 from nvidb.tui_controls import HoverState
@@ -2409,6 +2412,25 @@ def test_process_signals_require_confirmation_and_target_the_selected_host():
     assert "kill -s INT -- 4242" in commands[-1]
     assert "Operation not permitted" in pool._process_action_notice["message"]
     assert pool._process_action_notice["color"] == "red"
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh"])
+def test_signal_command_reports_its_status_in_common_login_shells(shell):
+    # The command runs in the target's login shell; zsh rejects `status=$?`,
+    # which once left a delivered signal reported as a failure.
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    target = subprocess.Popen(["sleep", "30"])
+    try:
+        result = subprocess.run(
+            [shell, "-c", _signal_command("TERM", target.pid)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert f"{SIGNAL_STATUS_MARKER}0" in result.stdout
+        assert target.wait(timeout=5) == -signal.SIGTERM
+    finally:
+        if target.poll() is None:
+            target.kill()
 
 
 def test_view_changes_are_persisted_to_config(monkeypatch):
