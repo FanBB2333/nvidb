@@ -166,6 +166,9 @@ class Job:
     gpus: int = 1
     vram_mb: int = 0
     node_constraint: Optional[str] = None
+    # Physical cards on `node_constraint` this job must run on, in the order
+    # they become CUDA_VISIBLE_DEVICES. Empty lets the scheduler choose.
+    gpu_constraint: List[int] = field(default_factory=list)
     depends_on: List[int] = field(default_factory=list)
     # Dependencies that only have to *finish*, whatever they finished as.
     # `depends_on` waits for success; this waits for the outcome to be known.
@@ -224,6 +227,7 @@ class Job:
             gpus=int(data.get("gpus") or 0),
             vram_mb=int(data.get("vram_mb") or 0),
             node_constraint=data.get("node_constraint"),
+            gpu_constraint=_csv_ints(data.get("gpu_constraint")),
             depends_on=_csv_ints(data.get("depends_on")),
             depends_any=_csv_ints(data.get("depends_any")),
             max_runtime_s=data.get("max_runtime_s"),
@@ -291,6 +295,7 @@ class Job:
             "gpus": self.gpus,
             "vram_mb": self.vram_mb,
             "node_constraint": self.node_constraint,
+            "gpu_constraint": self.gpu_constraint,
             "depends_on": self.depends_on,
             "depends_any": self.depends_any,
             "max_runtime_s": self.max_runtime_s,
@@ -325,8 +330,11 @@ class Job:
 
 
 def requested_place(job: Dict[str, Any]) -> Optional[str]:
-    """Where a job not yet placed asked to run: its pinned node or its pool."""
+    """Where a job not yet placed asked to run: its pinned node (and cards)
+    or its pool."""
     if job.get("node_constraint"):
+        if job.get("gpu_constraint"):
+            return f"{job['node_constraint']}:{','.join(str(i) for i in job['gpu_constraint'])}"
         return job["node_constraint"]
     if job.get("pool"):
         return f"pool:{job['pool']}"

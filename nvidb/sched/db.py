@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     gpus            INTEGER NOT NULL DEFAULT 1,
     vram_mb         INTEGER NOT NULL DEFAULT 0,
     node_constraint TEXT,
+    -- Physical GPU indices on `node_constraint` the job must run on, in
+    -- the order they become CUDA_VISIBLE_DEVICES. NULL lets the scheduler
+    -- choose the cards.
+    gpu_constraint  TEXT,
     depends_on      TEXT,
     -- Dependencies that only have to finish, whatever they finished as.
     depends_any     TEXT,
@@ -283,6 +287,7 @@ _ADDED_COLUMNS = {
         "overdue_at": "TEXT",
         "allocation_mode": "TEXT",
         "pool": "TEXT",
+        "gpu_constraint": "TEXT",
     },
     "lanes": {
         "runner": "INTEGER NOT NULL DEFAULT 1",
@@ -903,6 +908,7 @@ def insert_job(conn: sqlite3.Connection, **fields) -> int:
         "gpus": int(fields.get("gpus", 1)),
         "vram_mb": int(fields.get("vram_mb") or 0),
         "node_constraint": fields.get("node_constraint"),
+        "gpu_constraint": ",".join(str(int(x)) for x in (fields.get("gpu_constraint") or [])) or None,
         "depends_on": ",".join(str(x) for x in (fields.get("depends_on") or [])) or None,
         "depends_any": ",".join(str(x) for x in (fields.get("depends_any") or [])) or None,
         "max_runtime_s": fields.get("max_runtime_s"),
@@ -931,6 +937,8 @@ def update_job(conn: sqlite3.Connection, job_id: int, **fields) -> None:
         return
     if "gpu_ids" in fields and isinstance(fields["gpu_ids"], (list, tuple)):
         fields["gpu_ids"] = ",".join(str(x) for x in fields["gpu_ids"])
+    if "gpu_constraint" in fields and isinstance(fields["gpu_constraint"], (list, tuple)):
+        fields["gpu_constraint"] = ",".join(str(x) for x in fields["gpu_constraint"]) or None
     for key in ("depends_on", "depends_any"):
         if key in fields and isinstance(fields[key], (list, tuple)):
             fields[key] = ",".join(str(x) for x in fields[key]) or None

@@ -1352,6 +1352,8 @@ class QueueTUI:
         node = ""
         if job.get("lane") is None and job.get("node_constraint"):
             node = f" @{fit_display(job['node_constraint'], 8)}"
+            if job.get("gpu_constraint"):
+                node += ":" + ",".join(str(index) for index in job["gpu_constraint"])
         elif job.get("pool"):
             node = f" ∈{fit_display(job['pool'], 8)}"
         return (
@@ -2245,6 +2247,8 @@ class QueueTUI:
         if pending:
             node = lane.get("node") or requested_place(job)
             gpu_ids = lane.get("gpu_ids") or []
+            if not lane and job.get("gpu_constraint"):
+                node, gpu_ids = job.get("node_constraint"), job["gpu_constraint"]
         else:
             node = job.get("node")
             gpu_ids = job.get("gpu_ids") or []

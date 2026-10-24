@@ -60,7 +60,8 @@ Key options:
   places against; it is not a limit on the job. Estimate honestly: too low and
   the GPU gets oversubscribed, too high and the job waits for room it will not
   use. Omitting it means "reserve nothing", which is only right for CPU work.
-- `--gpus N` — GPUs required, default 1. Use `--gpus 0` for CPU-only work.
+- `--gpus N` — GPUs required, default 1 (or the number of `--gpu-ids`). Use
+  `--gpus 0` for CPU-only work.
 - `--node <name>` — pin to one machine; prefix matches, so `--node gpu-node` works.
   Leave it off unless the job genuinely needs that machine (its data is there,
   it needs that GPU's memory); the scheduler places it better than you can.
@@ -72,6 +73,11 @@ Key options:
   `nvidb queue pools --json` lists the pools, their member cards and their jobs.
   It cannot be combined with `--node` or `--lane`. Pools are configured by the
   user under `queue.pools`; do not invent one.
+- `--gpu-ids 4,5,6,7` — run on exactly these cards of `--node` (required), as
+  `nvidia-smi` numbers them; the order becomes `CUDA_VISIBLE_DEVICES`. Use it
+  only when the user names the cards, or the work must sit on particular cards
+  (for example, because of how they are linked over PCIe). The job waits for those cards and
+  never takes others. It cannot be combined with `--pool` or `--lane`.
 - `--note "..."` — **write one.** Say what the job is for and what would make it
   a success. Another session, or the user in a week, reads this to understand
   why the job exists. `--name` is a label; the note is the explanation.
@@ -364,7 +370,8 @@ this guard by changing the database directly.
   GPU that looked free.
 - Pinning with `--node` out of habit. It defeats the scheduler and leaves jobs
   queued behind a busy machine while another sits idle. If the job only needs
-  one of a few machines, submit it to a `--pool` that covers them.
+  one of a few machines, submit it to a `--pool` that covers them. The same
+  goes for `--gpu-ids`: a job pinned to busy cards waits while others sit idle.
 - Polling `nvidb job ls` in a tight loop. Use `nvidb job wait`, or poll with
   `--no-tick` and a sleep.
 - Acknowledging alerts to make the output look clean.

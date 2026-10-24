@@ -128,6 +128,7 @@ a `processes` list naming every process with `managed` and `job_id`.
 # Put the command last, after `--`, or pass it as one quoted string
 nvidb job submit --name train --vram 20G -- python train.py --epochs 10
 nvidb job submit --node gpu-node --vram 8G --workdir ~/proj -- python eval.py
+nvidb job submit --node lab1 --gpu-ids 4,5,6,7 --vram 23G -- python serve.py  # exactly these cards
 nvidb job submit --pool experiments --vram 16G -- python train.py  # any card in a pool
 nvidb job submit --gpus 0 -- python prepare_data.py        # CPU-only
 nvidb job submit --after 12 --vram 4G -- python report.py  # runs after job 12
@@ -187,10 +188,30 @@ queue:
 - Membership is read on every pass: editing it moves jobs that are still
   waiting, while running and staged jobs keep their card. A pending job whose
   pool is removed is held, not failed, and continues when the pool returns.
-- `--pool` cannot be combined with `--node` or `--lane`; `lane assign` takes a
-  job out of its pool.
+- `--pool` cannot be combined with `--node`, `--lane` or `--gpu-ids`;
+  `lane assign` takes a job out of its pool.
 
 Job listings show a waiting pool job's place as `pool:NAME`; JSON carries `pool`.
+
+**Pinning GPUs.** `--gpu-ids 4,5,6,7` runs the job on exactly those cards of
+`--node`, numbered as `nvidia-smi` numbers them, and their order becomes
+`CUDA_VISIBLE_DEVICES`: `cuda:0` inside the job is card 4. Without it the
+scheduler chooses the cards, in its own order.
+
+- It needs `--node`, and cannot be combined with `--pool` or `--lane`.
+- `--gpus` defaults to the number of ids; an explicit `--gpus` that disagrees is
+  rejected.
+- The job waits in the ordinary queue until every named card fits its `--vram`
+  under the usual exclusive or shared rules. It never falls back to other cards.
+- Repeated or negative indices, an index the node does not have, and one outside
+  the node's `gpu_ids` allowlist are rejected at submit when the node's cards
+  are known. Later, a named card that disappears or is too small for `--vram`
+  fails the job as unschedulable; an allowlist edit that excludes a named card
+  holds it, and it continues when the card returns.
+- `lane assign` drops the pin, since the lane names its cards; `requeue` keeps it.
+
+Listings show a waiting pinned job's place as `lab1:4,5,6,7`; JSON carries
+`gpu_constraint`.
 
 `job edit --vram` changes the reservation of a `pending` job without replacing
 its record, so its lane/queue position, note and submitter are preserved. The

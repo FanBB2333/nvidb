@@ -572,6 +572,7 @@ class Scheduler:
         lane: Optional[str] = None,
         at: Any = "tail",
         pool: Optional[str] = None,
+        gpu_ids: Optional[Sequence[int]] = None,
     ) -> int:
         """Add a job to the queue and return its id."""
         if not command or not command.strip():
@@ -580,6 +581,24 @@ class Scheduler:
             # A pool already says where the job may run; a pin on top of it
             # would leave two answers to that question.
             raise ValueError("--pool cannot be combined with --node or --lane")
+        pinned_gpus = [int(index) for index in (gpu_ids or [])]
+        if pinned_gpus:
+            if pool or lane:
+                # A pool chooses the card and a lane already names its cards.
+                raise ValueError("--gpu-ids cannot be combined with --pool or --lane")
+            if not node:
+                raise ValueError("--gpu-ids needs --node: GPU indices only mean something on one machine")
+            negative = [index for index in pinned_gpus if index < 0]
+            if negative:
+                raise ValueError(f"--gpu-ids cannot be negative: {_csv_text(negative)}")
+            repeated = sorted({index for index in pinned_gpus if pinned_gpus.count(index) > 1})
+            if repeated:
+                raise ValueError(f"--gpu-ids repeats GPU {_csv_text(repeated)}")
+            if int(gpus) != len(pinned_gpus):
+                raise ValueError(
+                    f"--gpus {int(gpus)} disagrees with --gpu-ids "
+                    f"{_csv_text(pinned_gpus)}, which names {len(pinned_gpus)}"
+                )
         resolved_pool = self.resolve_pool(pool) if pool else None
         vram_mb = parse_size_mb(
             vram if vram is not None else self.settings.get("default_vram", 0)
@@ -603,6 +622,8 @@ class Scheduler:
                     f"Node {resolved_node!r} is ignored; run "
                     f"`nvidb queue unignore {resolved_node}` before submitting to it"
                 )
+            if pinned_gpus:
+                self._check_pinned_gpus(resolved_node, target, pinned_gpus)
 
         lane_row = None
         if lane:
@@ -633,6 +654,7 @@ class Scheduler:
                 vram_mb=vram_mb,
                 priority=int(priority),
                 node_constraint=resolved_node,
+                gpu_constraint=pinned_gpus,
                 depends_on=depends_on,
                 depends_any=depends_any,
                 max_runtime_s=max_runtime_s,
@@ -655,6 +677,7 @@ class Scheduler:
                     "gpus": int(gpus),
                     "vram_mb": vram_mb,
                     "node": resolved_node,
+                    "gpu_ids": pinned_gpus or None,
                     "lane": lane_row.name if lane_row else None,
                     "pool": resolved_pool,
                     "submitter": submitter,
@@ -666,6 +689,32 @@ class Scheduler:
             if lane_row and _explicit_position(at):
                 self._reorder_lane(lane_row.name, job_id, to=at)
         return job_id
+
+    def _check_pinned_gpus(
+        self, node_name: str, node: Optional[Node], pinned: Sequence[int]
+    ) -> None:
+        """Reject `--gpu-ids` the node cannot honour, when its cards are known.
+
+        A node the queue has not probed yet has no GPU rows; its pin is then
+        judged once the cards are in view, as an over-wide request is.
+        """
+        present = sorted(gpu.index for gpu in (node.gpus if node is not None else []))
+        if present:
+            missing = [index for index in pinned if index not in present]
+            if missing:
+                raise ValueError(
+                    f"{node_name} has no GPU {_csv_text(missing)}; "
+                    f"its GPUs are {_csv_text(present)}"
+                )
+        allowed = self._gpu_allowlists.get(node_name)
+        if allowed is not None:
+            outside = [index for index in pinned if index not in allowed]
+            if outside:
+                raise ValueError(
+                    f"GPU {_csv_text(outside)} on {node_name} is outside the "
+                    f"node's gpu_ids allowlist; the queue may use "
+                    f"{_csv_text(sorted(allowed)) or 'none'}"
+                )
 
     # --- pools ------------------------------------------------------------
 
@@ -961,8 +1010,10 @@ class Scheduler:
                 lane=target.name,
                 lane_seq=dbm.next_lane_seq(self.conn, target.name),
                 node_constraint=target.node,
-                # A lane names the card itself, so the job leaves its pool.
+                # A lane names the card itself, so the job leaves its pool and
+                # drops any cards it was pinned to.
                 pool=None,
+                gpu_constraint=None,
             )
             position = None
             if _explicit_position(at):
@@ -2513,6 +2564,17 @@ class Scheduler:
             # Removed or renamed in the configuration. Failing the job would
             # destroy it over an edit that may be undone; it waits instead.
             return f"pool {job.pool} is no longer configured; restore it under queue.pools or cancel the job"
+        if job.gpu_constraint and not job.lane and job.node_constraint:
+            allowed = self._gpu_allowlists.get(job.node_constraint)
+            outside = [] if allowed is None else [
+                index for index in job.gpu_constraint if index not in allowed
+            ]
+            if outside:
+                # Same reasoning as a removed pool: the edit may be undone.
+                return (
+                    f"GPU {_csv_text(outside)} on {job.node_constraint} is outside "
+                    "the node's gpu_ids allowlist; restore it or cancel the job"
+                )
         return None
 
     def _gate(
@@ -3128,6 +3190,27 @@ class Scheduler:
             return None
         pool_scope = f"pool {job.pool}" if job.pool else None
 
+        if job.gpu_constraint and not job.lane:
+            # Pinned to named cards, so judged against those alone, as a lane
+            # job is. An allowlist that excludes one holds the job instead
+            # (see `_request_hold_reason`), since that edit may be undone.
+            node = candidates[0]
+            present = {gpu.index: gpu for gpu in node.gpus}
+            missing = [index for index in job.gpu_constraint if index not in present]
+            if missing:
+                return (
+                    f"asks for GPU {_csv_text(missing)} on {node.name}, which has "
+                    f"no such GPU (has {_csv_text(sorted(present))})"
+                )
+            for index in job.gpu_constraint:
+                usable = max(0, present[index].mem_total_mb - headroom_mb)
+                if job.vram_mb > usable:
+                    return (
+                        f"reserves {format_mb(job.vram_mb)}; GPU {index} on "
+                        f"{node.name} holds {format_mb(usable)} at most"
+                    )
+            return None
+
         if job.lane:
             # A lane job is pinned to named cards, so it is judged against
             # those alone. Measuring it against the node's other GPUs would
@@ -3332,14 +3415,22 @@ class Scheduler:
                 if (allowed is None or budget.index in allowed)
                 and budget.fits(job.vram_mb, max_jobs)
             ]
-            if len(usable) < job.gpus:
-                continue
-            # Spread hands out the emptiest cards; pack hands out the fullest
-            # card that still fits, keeping large GPUs free for large jobs.
-            usable.sort(
-                key=lambda b: (-b.free_mb if spread else b.free_mb, b.util_percent, b.index)
-            )
-            chosen = usable[: job.gpus]
+            if job.gpu_constraint:
+                # Exactly the named cards, in the order asked for: that order
+                # becomes CUDA_VISIBLE_DEVICES. Never a substitute card.
+                by_index = {budget.index: budget for budget in usable}
+                if any(index not in by_index for index in job.gpu_constraint):
+                    continue
+                chosen = [by_index[index] for index in job.gpu_constraint]
+            else:
+                if len(usable) < job.gpus:
+                    continue
+                # Spread hands out the emptiest cards; pack hands out the fullest
+                # card that still fits, keeping large GPUs free for large jobs.
+                usable.sort(
+                    key=lambda b: (-b.free_mb if spread else b.free_mb, b.util_percent, b.index)
+                )
+                chosen = usable[: job.gpus]
             slack = sum(budget.free_mb for budget in chosen)
             rank = (
                 (-slack, min(b.util_percent for b in chosen))
@@ -3525,6 +3616,10 @@ def _with_reason(message: str, detail: Optional[str]) -> str:
     a job row has room for; the whole tail goes to the alert."""
     lines = (detail or "").strip().splitlines()
     return f"{message}: {lines[-1][:200]}" if lines else message
+
+
+def _csv_text(indices) -> str:
+    return ",".join(str(int(index)) for index in indices)
 
 
 def _lane_job_gpus(lane: Optional[Lane], job: Job) -> List[int]:

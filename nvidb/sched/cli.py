@@ -450,6 +450,7 @@ def _render_job_detail(job: Job, *, logs: Optional[str] = None) -> str:
         f"  workdir     {job.workdir or '-'}",
         f"  request     gpus={job.gpus} vram={format_mb(job.vram_mb)}"
         + (f" node={job.node_constraint}" if job.node_constraint else "")
+        + (f" gpu_ids={_csv(job.gpu_constraint)}" if job.gpu_constraint else "")
         + (f" pool={job.pool}" if job.pool else "")
         + (f" priority={job.priority}" if job.priority else ""),
         f"  placement   node={job.node or '-'} gpu={_csv(job.gpu_ids) or '-'} pid={job.remote_pid or '-'}"
@@ -1214,7 +1215,23 @@ def cmd_submit(args) -> int:
         # the opposite of what someone typing `--timeout 0` is asking for.
         if args.timeout is not None and args.timeout <= 0:
             return _error("--timeout must be a positive number of seconds", as_json=args.json)
-        if args.gpus < 0:
+        pinned_gpus = []
+        for item in (args.gpu_ids or "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                pinned_gpus.append(int(item))
+            except ValueError:
+                return _error(
+                    f"--gpu-ids expects comma-separated GPU indices such as 4,5,6,7, got {item!r}",
+                    as_json=args.json,
+                )
+        if args.gpus is not None:
+            gpus = args.gpus
+        else:
+            gpus = len(pinned_gpus) if pinned_gpus else 1
+        if gpus < 0:
             return _error("--gpus cannot be negative (use 0 for CPU-only work)", as_json=args.json)
         if args.retries < 0:
             return _error("--retries cannot be negative", as_json=args.json)
@@ -1225,7 +1242,7 @@ def cmd_submit(args) -> int:
                 name=args.name,
                 workdir=str(Path(args.workdir).expanduser()) if args.workdir else None,
                 env=env,
-                gpus=args.gpus,
+                gpus=gpus,
                 vram=args.vram,
                 priority=args.priority,
                 node=args.node,
@@ -1239,6 +1256,7 @@ def cmd_submit(args) -> int:
                 lane=args.lane,
                 at=args.at,
                 pool=args.pool,
+                gpu_ids=pinned_gpus,
             )
         except ValueError as error:
             return _error(str(error), as_json=args.json)
@@ -1262,6 +1280,8 @@ def cmd_submit(args) -> int:
                 ]
                 position = queued.index(job_id) + 1 if job_id in queued else len(queued)
                 print(f"  queued in lane {job.lane} at #{position} of {len(queued)}")
+            elif job.state == "pending" and job.gpu_constraint:
+                print(f"  waiting for GPU {_csv(job.gpu_constraint)} on {job.node_constraint}")
             elif job.state == "pending" and job.pool:
                 print(f"  waiting in pool {job.pool}; it starts on the first member GPU that fits it")
             elif job.state == "pending":
@@ -2060,8 +2080,22 @@ def _register_submit_parser(job_sub) -> None:
     )
     submit.add_argument("-n", "--name", default="", help="Human-readable job name")
     submit.add_argument("--vram", default=None, help="Estimated peak VRAM per GPU, e.g. 20G; required and positive in shared mode")
-    submit.add_argument("--gpus", type=int, default=1, help="GPUs required (0 for CPU-only)")
+    submit.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="GPUs required (default 1, or the number of --gpu-ids; 0 for CPU-only)",
+    )
     submit.add_argument("--node", default=None, help="Pin to one node (prefix match)")
+    submit.add_argument(
+        "--gpu-ids",
+        default=None,
+        metavar="IDS",
+        help=(
+            "Run on exactly these GPUs of --node, e.g. 4,5,6,7 (nvidia-smi "
+            "indices; this order becomes CUDA_VISIBLE_DEVICES)"
+        ),
+    )
     submit.add_argument(
         "--pool",
         default=None,
