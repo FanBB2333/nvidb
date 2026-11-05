@@ -5,10 +5,11 @@ group, a pid file, an atomically written exit code, captured output, and a
 `result.json` handed back to whoever asked for the job.
 """
 import time
+from unittest.mock import Mock
 
 import pytest
 
-from nvidb.sched.executor import JobExecutor
+from nvidb.sched.executor import JobExecutor, JobProbe, NodeProbe
 from nvidb.sched.transport import CommandResult, LocalTransport
 
 
@@ -27,6 +28,25 @@ def _wait_for_exit(executor, job_id, run_dir, timeout=15.0):
 @pytest.fixture
 def executor(tmp_path):
     return JobExecutor(LocalTransport("test-local"), job_root=str(tmp_path / "jobs"))
+
+
+@pytest.mark.parametrize("exit_code", [0, 42])
+def test_wait_for_exit_waits_for_cleanup_after_status_is_published(
+    executor, monkeypatch, exit_code
+):
+    """An exit code can be visible while the wrapper is still in its EXIT trap."""
+    stopped = JobProbe(job_id=1, exit_code=exit_code, alive=False)
+    probe = Mock(side_effect=[
+        NodeProbe(),
+        NodeProbe(jobs={1: JobProbe(job_id=1, alive=True)}),
+        NodeProbe(jobs={1: JobProbe(job_id=1, exit_code=exit_code, alive=True)}),
+        NodeProbe(jobs={1: stopped}),
+    ])
+    monkeypatch.setattr(executor, "probe", probe)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    assert _wait_for_exit(executor, 1, "unused") is stopped
+    assert probe.call_count == 4
 
 
 def test_a_job_runs_detached_and_reports_its_exit_code(executor):
