@@ -436,9 +436,12 @@ After function execution, it outputs:
 
 ## System Requirements
 
-- NVIDIA driver with NVML (`libnvidia-ml.so.1`)
-- Python 3.9+
-- Python 3.9+ and SSH access on remote servers
+- Linux or macOS client with Python 3.9+; macOS can monitor remote GPUs
+- Linux GPU hosts, including WSL2 with NVIDIA GPU support, with an NVIDIA
+  driver and NVML (`libnvidia-ml.so.1`)
+- Python 3.9+, SSH access, a POSIX shell and standard Unix tools on remote hosts;
+  queued job execution also requires Bash
+- Native Windows hosts are not supported; local GPU monitoring requires Linux
 - Local OpenSSH client when `proxyjump` is configured
 - `nvidia-smi` is optional and used only as an NVML failure fallback
 

@@ -7,6 +7,12 @@ until a GPU has room for them, run detached on the node, and report back.
 `nvidb q` is a short alias for `nvidb queue`; every queue subcommand accepts
 either spelling.
 
+Run the client and queue host on Linux or macOS with Python 3.9+. GPU execution
+nodes need Linux (including WSL2 with NVIDIA GPU support), Python 3.9+, SSH, a
+POSIX shell, Bash, standard Unix tools and an NVIDIA driver with NVML. Native
+Windows nodes are not supported. The node-side agents use the Python standard
+library; installing nvidb on each execution node is unnecessary.
+
 The queue's only shared state is one SQLite file (`~/.nvidb/queue.db`). Several
 independent clients — several Claude Code sessions, a script, an open TUI —
 coordinate purely by reading and writing that file, so none of them has to stay
@@ -78,12 +84,25 @@ and `user.email` (`Name <email>`). Remote submissions carry this identity to
 the queue host. `--submitter` and `NVIDB_SUBMITTER` override it; when Git identity
 is unavailable nvidb falls back to the local user, hostname and process ID.
 
-A job cancelled or timed out while its node was unreachable keeps its record
-final but its process alive. The pid is remembered separately from the job — it
-has to outlive both `job requeue` and `job purge` — and the first probe that
-reaches that node again kills it, provided the pid is still running that job's
-`run.sh`. `nvidb queue status --json` reports how many such cleanups are
-outstanding as `pending_reaps`.
+A running job whose node is unreachable stays `running` after its runtime
+limit and raises a deduplicated `job_overdue` warning. The controller settles
+its state after reconnecting and reading the node's result; elapsed time alone
+does not prove the job stopped. A lane runner can enforce its staged jobs'
+timeouts locally while the controller is offline: it sends SIGTERM to the job's
+process group, then SIGKILL to remaining group members after a five-second grace
+period. Ordinary jobs need a reachable node and a controller tick for timeout
+enforcement.
+
+If a runner restarts with a timed-out process group still alive but cannot
+verify the job wrapper's identity, it stops, preserves the claim and blocks new
+lane jobs. Check the remaining work and the node's `runner.log` before restoring
+the runner; it does not kill processes based only on an old process-group ID.
+
+An explicit cancellation while a node is unreachable can close the job record
+before its process stops. The original process identity is retained separately
+so cleanup survives `job requeue` and `job purge`; a later successful probe
+cleans up that attempt after checking its identity. `nvidb queue status --json`
+reports outstanding cleanups as `pending_reaps`.
 
 On nodes where the driver accounts for none of the memory in use — WSL, where
 the GPU is driven from Windows, and which either names no processes at all or
@@ -127,7 +146,7 @@ a `processes` list naming every process with `managed` and `job_id`.
 ```bash
 # Put the command last, after `--`, or pass it as one quoted string
 nvidb job submit --name train --vram 20G -- python train.py --epochs 10
-nvidb job submit --node gpu-node --vram 8G --workdir ~/proj -- python eval.py
+nvidb job submit --node gpu-node --vram 8G --workdir '~/proj' -- python eval.py
 nvidb job submit --node lab1 --gpu-ids 4,5,6,7 --vram 23G -- python serve.py  # exactly these cards
 nvidb job submit --pool experiments --vram 16G -- python train.py  # any card in a pool
 nvidb job submit --gpus 0 -- python prepare_data.py        # CPU-only
@@ -158,6 +177,13 @@ nvidb queue ignore offline-node   # stop probing/scheduling and hide a disconnec
 nvidb queue unignore offline-node # restore it; `nodes --include-ignored` lists hidden nodes
 nvidb queue tick                # force one scheduler pass
 ```
+
+`--workdir` is a path on the execution node. Quote `--workdir '~/proj'` (or
+`--workdir '~'`) to expand the home directory on that node; an unquoted `~` is
+expanded by your submitting shell before nvidb sees it. Absolute paths are used
+unchanged. nvidb sends commands or a `--script` file's contents, not your project,
+data or environment; install them on every eligible node and activate the
+required environment in the submitted command.
 
 Useful `submit` options: `--priority N` (higher goes first), `--timeout SECONDS`
 (kill an overrunning job), `--retries N` (restart if the process vanishes),
@@ -300,11 +326,13 @@ classified by what actually happened:
 | `job_failed`        | the command exited non-zero                          | error    |
 | `job_lost`          | the process vanished with no exit status             | error    |
 | `job_timeout`       | the job passed `--timeout` and was killed            | error    |
-| `dependency_failed` | a job can never run because a dependency failed      | error    |
+| `job_held`          | a failed prerequisite holds a dependent job pending  | warning  |
+| `job_overdue`       | runtime limit passed but the node cannot confirm exit | warning  |
 | `job_unschedulable` | no GPU in the cluster is big enough to ever hold it  | error    |
 | `job_retried`       | the process vanished but a retry remains             | warning  |
 | `launch_failed`     | the job could not be started (disk full, permissions)| warning  |
 | `node_down`         | a node stopped answering                             | error    |
+| `node_disk_low`     | free space for job output is below the configured floor | warning  |
 
 For a failed job the queue pulls the tail of its stderr (falling back to stdout)
 onto the alert, so the reason is readable locally without another round trip:
@@ -331,10 +359,13 @@ nvidb queue daemon --interval 5
 nvidb queue daemon --once --json        # a single pass, for cron
 ```
 
-The daemon is **optional** — the queue works exactly as before without it, since
-every command runs a scheduler pass. Run it when you want failures pushed to you
-rather than waiting to be asked, and for prompt timeout enforcement: without it,
-a job that overruns is only killed the next time some command happens to tick.
+The daemon is **optional**: queue commands normally run a scheduler pass. Run
+it to dispatch ordinary waiting jobs, receive alerts and enforce ordinary-job
+timeouts while no interactive client is open. Staged lane jobs have a resident
+runner that advances them and enforces their timeouts even while the controller
+is offline. An unreachable ordinary job stays `running` with `job_overdue` until
+node evidence is available; the daemon cannot enforce a timeout across a broken
+connection.
 
 Each alert is delivered once, whether or not the daemon restarts. Channels are
 configured under `queue.notify`: a desktop notification, a JSON-lines file at
@@ -641,12 +672,45 @@ database is atomically published without replacing an existing path.
 ---
 ## Upgrade notes
 
-### Upgrading an existing queue to v1.9.3
+### Upgrading to 1.10.0
 
-Existing job IDs, attempts, dependencies, lane positions, concurrency values and
-`lane_lookahead` settings are retained. The default lookahead remains 1; this
-release does not enable `all`, `auto`, ready-first dispatch or candidate lanes.
+1.10.0 includes the queue recovery and cancellation changes developed after
+1.9.2, GPU pools and exact `--gpu-ids` placement, pending-job command edits,
+large-script transport, and the updated monitor and queue interfaces.
 
+Close other controllers/TUIs using this queue, then run on the queue host:
+
+```bash
+nvidb queue backup --json
+nvidb queue keeper stop
+python -m pip install --upgrade 'nvidb==1.10.0'
+nvidb queue keeper restart
+nvidb queue status --json
+```
+
+If you manage `queue daemon` yourself, stop and restart that process instead of
+the keeper. Upgrade remote clients too; avoid mixing old and new controllers
+against one database. The database adds missing fields automatically. Existing
+job IDs, attempts, dependencies, lane positions, concurrency values and
+`lane_lookahead` settings are retained. Running jobs keep their process sessions;
+node-side runners receive the new code when the updated controller next syncs
+them. The default lookahead remains 1.
+
+GPU allocation defaults to **exclusive**. To share a card, explicitly configure
+`queue.gpu_mode: shared`; every new shared GPU submission must give a positive
+`--vram` estimate, even when `default_vram` is set. Existing pending shared jobs
+without an estimate wait until corrected. Existing allocations retain their
+recorded mode until the attempt finishes.
+
+Literal `--workdir '~/proj'` now resolves under the execution node's home. Quote
+the argument when submitting, and verify that the project and environment are
+installed there; absolute paths remain unchanged.
+
+Recovery behavior in this release:
+
+- If an ordinary launch loses its acknowledgement, its attempt and original
+  node/run directory remain recorded for recovery. Later ticks reconcile that
+  placement instead of launching a second copy on another node.
 - An unreachable job that exceeds its runtime limit stays `running` and raises
   one `job_overdue` warning per attempt. Reconnection settles the job from the
   node's result. A timeout request is recorded on that attempt before signalling;
@@ -656,20 +720,18 @@ release does not enable `all`, `auto`, ready-first dispatch or candidate lanes.
   queue positions.
 - Lane concurrency and pause settings live in `lane.json`. Lowering concurrency
   lets existing work finish and limits subsequent starts. A runner upgrade or
-  `runner restart` waits for a safe handover and adopts the same job processes.
+  `runner restart` waits for a safe handover and adopts jobs whose running
+  process identity can still be verified.
   Replayed syncs do not recreate claimed or completed attempts.
 - Parse errors requested with `--json` are JSON with exit status 2.
   `job cancel --no-tick --json` is accepted; `--no-tick` skips automatic
   scheduling, not cancellation of the named jobs.
 
-Before changing an installed service, create a queue backup. Restart the
-controller to load the new code; running jobs retain their own process sessions.
-This release adds only an optional `overdue_at` column. Automatic historical
-correction is limited to a matching timeout orphan for the same attempt and
-run directory, with a recorded earlier node completion and no node timeout
-marker. It never rewrites a requeued attempt or a user cancellation.
+Automatic historical timeout correction is limited to a matching orphan for
+the same attempt and run directory, with recorded earlier node completion and
+no node timeout marker. It never rewrites a requeued attempt or user cancellation.
 
-### Cancelling queued lane jobs in v1.9.4
+### Cancelling queued lane jobs
 
 `nvidb job cancel ID... --no-tick --json` can immediately cancel pending runner
 lane jobs that have not been staged, even while another tick is waiting on SSH.
@@ -680,5 +742,5 @@ transaction, so a stale tick cannot publish a successfully cancelled job.
 Staged jobs, running jobs, free-pool jobs and lanes without a runner retain the
 exclusive cancellation path and can still report `scheduler is busy`.
 An active older controller also retains that protection: restart or let it exit
-before relying on concurrent cancellation. The patch changes neither the runner
-script nor lane settings, and requires no schema migration.
+before relying on concurrent cancellation. Cancellation preserves lane settings
+and the positions of other queued jobs.

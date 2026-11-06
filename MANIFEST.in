@@ -1,5 +1,6 @@
 include config.example.yml queue.example.yml test.sh
 recursive-include tests *.py
 recursive-include skills *.md
+recursive-include docs *.md
 recursive-include resources *.py *.png
 prune resources/branding

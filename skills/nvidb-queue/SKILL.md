@@ -56,10 +56,12 @@ nvidb job submit --json --name train --vram 20G -- python train.py --epochs 10
 
 Key options:
 
-- `--vram 20G` — **always state this.** It is the reservation the scheduler
-  places against; it is not a limit on the job. Estimate honestly: too low and
-  the GPU gets oversubscribed, too high and the job waits for room it will not
-  use. Omitting it means "reserve nothing", which is only right for CPU work.
+- `--vram 20G` — state a realistic peak estimate **per GPU**. The default
+  `exclusive` mode gives each GPU to one queue job and permits omitting this
+  estimate; detected external GPU processes block exclusive placement. In
+  `shared` mode an explicit positive estimate is required, even if
+  `default_vram` is configured. The reservation guides placement; it does not
+  enforce a memory limit. CPU-only work (`--gpus 0`) needs no GPU reservation.
 - `--gpus N` — GPUs required, default 1 (or the number of `--gpu-ids`). Use
   `--gpus 0` for CPU-only work.
 - `--node <name>` — pin to one machine; prefix matches, so `--node gpu-node` works.
@@ -88,10 +90,17 @@ Key options:
   and its note, and waits for a person. Nothing cascades.
 - `--after-any 12` — run once job 12 *finishes*, whatever the outcome. Use this
   when the next step should look at the wreckage rather than skip it.
-- `--timeout SECONDS` — kill a job that overruns.
+- `--timeout SECONDS` — stop an overrunning job. A lane runner enforces this
+  locally with SIGTERM and, after five seconds, SIGKILL for remaining process
+  group members. Ordinary jobs need a controller tick and a reachable node;
+  an unreachable overdue job stays running until its outcome is known.
 - `--retries N` — restart if the process vanishes (node reboot, OOM killer).
   Do not use it for jobs that are not safe to run twice.
-- `--workdir DIR`, `--env KEY=VALUE`, `--priority N`, `--tag`.
+- `--workdir '~/proj'` — use a directory under the execution node's home.
+  Quote `~` so the submitting shell does not expand it; absolute paths are
+  preserved. The project, data and environment must already exist on that node.
+  nvidb transfers the command or `--script` contents, not those files.
+- `--env KEY=VALUE`, `--priority N`, `--tag`.
 - `--script FILE` — use a local file's contents as the command body. Best for
   anything multi-line; write the script, then submit it.
 - `--wait` — block until the job finishes. Only when you truly cannot proceed
@@ -226,6 +235,7 @@ not.
 
 Failures become **alerts** in the queue, classified by what happened:
 `job_failed` (non-zero exit), `job_lost` (process vanished), `job_timeout`,
+`job_overdue` (runtime limit passed but the node cannot confirm the outcome),
 `job_held` (a prerequisite ended badly, so this job is parked for a decision),
 `job_unschedulable` (no GPU in the cluster could ever hold it), `launch_failed`,
 `node_down`, `node_disk_low` (the node cannot write job output any more),
@@ -274,15 +284,22 @@ when they say so or when you have actually fixed the cause.
 
 ## Capacity, and why a job is waiting
 
-A GPU's schedulable memory is:
+Check the queue's allocation mode before interpreting free memory. In default
+`exclusive` mode each GPU runs at most one queue job, and detected external GPU
+processes prevent new exclusive placements. Increasing `max_jobs_per_gpu` or
+lane concurrency does not override exclusive mode.
+
+In explicitly configured `shared` mode, schedulable memory is:
 
 ```
 free = total − memory used by processes the queue did not start − reservations − headroom
 ```
 
-Work the user started by hand counts fully against capacity, so the queue shares
-machines rather than fighting them. A job stuck in `pending` is almost always
-waiting for VRAM — check `free_mb` per GPU before assuming anything is broken.
+Each GPU job must supply a positive `--vram` estimate; underestimating a later
+peak can still cause OOM. Existing allocations keep their recorded mode until
+that attempt finishes. A pending job may be waiting for an exclusive card,
+VRAM, a slot, a pinned GPU, dependencies or a hold. Read its waiting reason and
+node state before treating `free_mb` as available capacity.
 
 A request no GPU in the cluster could ever hold — more GPUs than any node has,
 or more VRAM than the largest card — fails immediately with `job_unschedulable`
@@ -309,7 +326,8 @@ with `managed` and, when the queue started it, `job_id`.
 
 **Read `util_percent` and `external_mem_mb` before telling the user a machine is
 free.** A GPU at 99% utilisation with no queue jobs on it is busy with the
-user's own work; scheduling onto it is legal but slow, and worth mentioning.
+user's own work. Detected external GPU processes block exclusive placement;
+shared placement still depends on the memory and slot budgets.
 
 Some GPUs report `"attribution": "blind"`: their driver (WSL) accounts for none
 of the memory in use, either naming no processes or naming them without memory
@@ -366,8 +384,9 @@ this guard by changing the database directly.
 
 - Starting GPU work over raw SSH. It is invisible to the scheduler and to every
   other session.
-- Submitting without `--vram`. The job reserves nothing and can oversubscribe a
-  GPU that looked free.
+- Assuming free memory permits sharing. Exclusive mode admits one queue job
+  per card; shared GPU jobs require a positive `--vram` estimate. Do not change
+  the user's allocation mode just to make a job start sooner.
 - Pinning with `--node` out of habit. It defeats the scheduler and leaves jobs
   queued behind a busy machine while another sits idle. If the job only needs
   one of a few machines, submit it to a `--pool` that covers them. The same
@@ -386,7 +405,24 @@ a queue host scheduling (`nvidb queue keeper status`), consistent database
 snapshots (`nvidb queue backup --json`), and the `queue:` settings in
 `~/.nvidb/config.yml` or `~/.nvidb/queue.yml`.
 
-## v1.9.3 recovery behavior
+## 1.10.0 recovery and upgrade behavior
+
+Back up the queue database before upgrading the queue host, restart its keeper
+or daemon, and update the clients that use it. Avoid mixing old and new
+controllers. Existing job IDs, attempts, dependencies and lane positions remain
+in place; node runners receive updated code during the next controller sync.
+The client and queue host support Linux/macOS with Python 3.9+. GPU execution
+nodes require Linux or WSL2 with NVIDIA support, Python 3.9+, SSH, a POSIX shell,
+Bash and standard Unix tools; native Windows nodes are not supported.
+
+An ordinary launch with a lost acknowledgement keeps its original placement
+and attempt for reconciliation. Do not submit a replacement merely because the
+launch response was lost; the original command may already be running.
+
+If a runner restarts while a timed-out group is alive but its job wrapper cannot
+be identified, it stops and preserves the claim, blocking new lane jobs. Check
+the remaining work and the node's `runner.log` before recovery; do not blindly
+kill an old process-group ID or discard its claim to restart dispatch.
 
 An unreachable job past its runtime limit remains `running` with a deduplicated
 `job_overdue` warning until node evidence arrives. Do not requeue it merely
@@ -402,10 +438,11 @@ an extra scheduling tick. JSON parse errors also return JSON (exit status 2).
 manager is separate from editing the queue.
 
 Lane concurrency changes apply to future starts without stopping current jobs.
-Runner restarts adopt existing processes after stopping dispatch safely.
-Lookahead remains 1 by default; v1.9.3 does not enable `all` or `auto`.
+Runner restarts adopt running jobs whose process identity can be verified,
+after stopping dispatch safely.
+Lookahead remains 1 by default; upgrading does not enable `all` or `auto`.
 
-In v1.9.4, `job cancel ID... --no-tick --json` can cancel unstaged runner lane
+`job cancel ID... --no-tick --json` can cancel unstaged runner lane
 jobs locally during a tick. It does not contact nodes or change other jobs.
 Staged/running jobs, free-pool jobs and lanes without a runner still need the
 scheduler lease. An older active controller also requires that lease until it

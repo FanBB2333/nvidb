@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="resources/nvidb-icon.png" alt="nvidb logo" width="160" height="160">
+  <img src="https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/nvidb-icon.png" alt="nvidb logo" width="160" height="160">
 </p>
 
 <h1 align="center">nvidb</h1>
@@ -9,7 +9,7 @@ One terminal for every NVIDIA GPU you can SSH to — monitor them, log them, and
 </p>
 
 <p align="center">
-  <img src="resources/monitor-gpus.png" alt="nvidb monitor: every GPU on every server in one view">
+  <img src="https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/monitor-gpus.png" alt="nvidb monitor: every GPU on every server in one view">
 </p>
 
 ## Highlights
@@ -27,7 +27,7 @@ One terminal for every NVIDIA GPU you can SSH to — monitor them, log them, and
 - **Logs and a web dashboard.** `nvidb log` records sessions to SQLite;
   `nvidb web` charts them and shows the live cluster in the browser.
 - **Built for scripts and agents.** Queue commands speak `--json`, and
-  [`skills/nvidb-queue`](skills/nvidb-queue/SKILL.md) teaches coding agents to use the queue.
+  [`skills/nvidb-queue`](https://github.com/FanBB2333/nvidb/blob/main/skills/nvidb-queue/SKILL.md) teaches coding agents to use the queue.
 
 ## Quick start
 
@@ -43,32 +43,43 @@ nvidb job submit --vram 20G -- python train.py   # queue a job
 nvidb queue                                      # watch the queue
 ```
 
-Servers live in `~/.nvidb/config.yml` (see [config.example.yml](config.example.yml)).
-Requires Python 3.9+ and an NVIDIA driver with NVML; remote hosts need only Python 3.9+ and SSH.
+Servers live in `~/.nvidb/config.yml` (see [config.example.yml](https://github.com/FanBB2333/nvidb/blob/main/config.example.yml)).
+The client and queue host support Linux or macOS with Python 3.9+. GPU nodes
+need Linux (including WSL2 with NVIDIA GPU support), Python 3.9+, SSH, a POSIX
+shell, Bash and an NVIDIA driver with NVML. Local GPU monitoring requires the
+same Linux/NVIDIA setup; a macOS client can monitor and schedule remote nodes.
+Native Windows nodes are not supported.
+
+Commands run in the execution node's environment. For a project in that node's
+home directory, use `--workdir '~/proj'`; quote `~` so your local shell does not
+expand it. Project files, data and Python environments must already exist on
+the chosen node; nvidb sends the command or `--script` contents.
+
+Upgrading from 1.9.x? Follow the [1.10.0 upgrade notes](https://github.com/FanBB2333/nvidb/blob/main/docs/queue.md#upgrading-to-1100).
 
 ## Screenshots
 
 **Per-node view** (`v` in the monitor)
 
-![nvidb per-node view](resources/monitor-nodes.png)
+![nvidb per-node view](https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/monitor-nodes.png)
 
 **Job queue** (`nvidb queue`) — overview, and the task-flow view with lanes and dependencies
 
-![nvidb queue overview](resources/queue-overview.png)
+![nvidb queue overview](https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/queue-overview.png)
 
-![nvidb queue task flow](resources/queue-flow.png)
+![nvidb queue task flow](https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/queue-flow.png)
 
 **Web dashboard** (`nvidb web`) — live cluster and recorded log sessions
 
-![nvidb web live](resources/web-live.png)
+![nvidb web live](https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/web-live.png)
 
-![nvidb web logs](resources/web-logs.png)
+![nvidb web logs](https://raw.githubusercontent.com/FanBB2333/nvidb/main/resources/web-logs.png)
 
 ## Documentation
 
-- [Monitor, logging and web dashboard](docs/monitor.md) — configuration, every
+- [Monitor, logging and web dashboard](https://github.com/FanBB2333/nvidb/blob/main/docs/monitor.md) — configuration, every
   command, TUI key bindings, the `@nvidb.monitor` decorator
-- [Cluster job queue](docs/queue.md) — scheduling rules, submitting and watching
+- [Cluster job queue](https://github.com/FanBB2333/nvidb/blob/main/docs/queue.md) — scheduling rules, submitting and watching
   jobs, lanes, alerts, the queue TUI, running the queue on an always-on host
 
 ## Acknowledgements
