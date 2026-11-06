@@ -226,6 +226,16 @@ A command-only edit also preserves dependency holds, and a `job_command` event
 records the previous and replacement text. Add `--no-tick` to edit without
 starting a scheduler pass.
 
+Pending runner-lane jobs that have no `run_dir` can change their command,
+reservation or dependencies while a scheduler tick is probing other nodes.
+The edit and the runner handoff use a short database transaction: whichever
+wins first determines whether the updated job may be staged. A changed head
+is checked again before anything behind it can start. Staged jobs, free-pool
+jobs and lanes without a runner still require the scheduler lease and may
+report `scheduler is busy`. An older running controller also keeps that
+protection; restart it to load the updated protocol. `--no-tick` skips the
+automatic scheduler pass after the edit.
+
 Commands can only change before the job has been staged on its node. A pending
 job with a `run_dir` may already have started in the runner even though the
 database has not observed it yet, so that edit is refused. Running and finished

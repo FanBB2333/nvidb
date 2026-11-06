@@ -4,8 +4,10 @@ import sys
 
 import pytest
 
+from fake_cluster import FakeCluster, FakeGpu, FakeNode, make_scheduler
+
 from nvidb.sched import cli, db, remote
-from nvidb.sched.scheduler import Scheduler, TICK_LOCK
+from nvidb.sched.scheduler import Scheduler, TICK_LOCK, UNSTAGED_EDIT_OWNER
 
 
 @pytest.fixture
@@ -189,3 +191,142 @@ def test_remote_edit_reads_the_local_script_before_forwarding(parser, tmp_path, 
     assert 'job edit 42 --script "$nvidb_script"' in shell
     assert str(path) not in shell
     assert "nvidb_keeper=" not in shell
+
+
+@pytest.fixture
+def runner_editors(tmp_path):
+    cluster = FakeCluster(FakeNode("box", [FakeGpu(0, "test GPU", 24564)]))
+    conn = db.open_db(tmp_path / "queue.db")
+    scheduler = make_scheduler(conn, cluster)
+    editor_conn = db.open_db(db.connection_path(conn))
+    editor = make_scheduler(editor_conn, cluster)
+    try:
+        yield scheduler, editor, cluster
+    finally:
+        editor.close()
+        editor_conn.close()
+        scheduler.close()
+        conn.close()
+
+
+def test_failed_dependency_can_be_repaired_while_a_tick_probes(
+    runner_editors, monkeypatch,
+):
+    scheduler, editor, cluster = runner_editors
+    failed = scheduler.submit("failed export", gpus=0)
+    replacement = scheduler.submit("replacement export", gpus=0)
+    db.update_job(scheduler.conn, failed, state="failed", exit_code=1)
+    db.update_job(scheduler.conn, replacement, state="completed", exit_code=0)
+    jobs = [scheduler.submit(
+        f"eval {i}", lane="box:0", vram="1G", depends_on=[failed], notes="keep",
+    ) for i in range(2)]
+    db.update_job(scheduler.conn, jobs[0], held_reason="export failed")
+    positions = [db.get_job(scheduler.conn, i).lane_seq for i in jobs]
+    backend = cluster.backend_factory(db.get_node(scheduler.conn, "box"))
+    probe = backend.probe_gpus
+
+    def repair_during_probe():
+        assert db.lock_holder(editor.conn, TICK_LOCK)["owner"] == scheduler.owner
+        for job_id in jobs:
+            edited = editor.edit_job(job_id, drop=[failed], add=[replacement])
+            assert edited.depends_on == [replacement]
+            assert not edited.is_held
+        assert db.lock_holder(editor.conn, TICK_LOCK)["owner"] == scheduler.owner
+        return probe()
+
+    monkeypatch.setattr(backend, "probe_gpus", repair_during_probe)
+    monkeypatch.setattr(editor, "backend", lambda *a: pytest.fail("edit contacted a node"))
+    assert scheduler.tick(force=True)["errors"] == []
+    assert db.get_job(scheduler.conn, jobs[0]).state == "running"
+    for job_id, position in zip(jobs, positions):
+        job = db.get_job(scheduler.conn, job_id)
+        assert (job.depends_on, job.lane_seq, job.notes) == ([replacement], position, "keep")
+    assert db.get_job(scheduler.conn, failed).state == "failed"
+
+
+@pytest.mark.parametrize("change", ["command", "vram", "add", "add_any"])
+def test_edit_winning_before_reservation_never_publishes_the_stale_head(
+    runner_editors, monkeypatch, change,
+):
+    scheduler, editor, cluster = runner_editors
+    upstream = scheduler.submit("upstream", gpus=0)
+    head = scheduler.submit("old", lane="box:0", vram="1G")
+    tail = scheduler.submit("tail", lane="box:0", vram="1G")
+    resolve = scheduler._lane_run_dir
+    changes = {"command": "new", "vram": "2G", "add": [upstream], "add_any": [upstream]}
+
+    def edit_before_reservation(lane, job, attempt):
+        if job.id == head:
+            editor.edit_job(head, **{change: changes[change]})
+        return resolve(lane, job, attempt)
+
+    monkeypatch.setattr(scheduler, "_lane_run_dir", edit_before_reservation)
+    assert scheduler.tick(force=True)["errors"] == []
+    for job_id in (head, tail):
+        assert db.get_job(scheduler.conn, job_id).run_dir is None
+        assert job_id not in cluster["box"].jobs
+
+    monkeypatch.setattr(scheduler, "_lane_run_dir", resolve)
+    if change in ("add", "add_any"):
+        scheduler.tick(force=True)
+        assert head not in cluster["box"].jobs
+        cluster["box"].finish_job(upstream)
+    assert scheduler.tick(force=True)["errors"] == []
+    assert db.get_job(scheduler.conn, head).state == "running"
+    current = db.get_job(scheduler.conn, head)
+    if change == "command":
+        assert current.command == "new"
+    if change == "vram":
+        assert current.vram_mb == 2048
+
+
+@pytest.mark.parametrize("change", [{"command": "new"}, {"vram": "2G"}, {"drop": [1]}])
+def test_a_staged_edit_cannot_bypass_the_tick_lease(runner_editors, monkeypatch, change):
+    scheduler, editor, cluster = runner_editors
+    job_id = scheduler.submit("old", lane="box:0", vram="1G")
+    backend = cluster.backend_factory(db.get_node(scheduler.conn, "box"))
+    sync = backend.lane_sync
+
+    def edit_after_reservation(**kwargs):
+        assert db.get_job(editor.conn, job_id).run_dir
+        with pytest.raises(RuntimeError, match="scheduler is busy"):
+            editor.edit_job(job_id, **change)
+        return sync(**kwargs)
+
+    monkeypatch.setattr(backend, "lane_sync", edit_after_reservation)
+    assert scheduler.tick(force=True)["errors"] == []
+    assert db.get_job(scheduler.conn, job_id).state == "running"
+    assert db.get_job(scheduler.conn, job_id).command == "old"
+
+
+@pytest.mark.parametrize("owner", ["older-tick", "controller:cancel"])
+def test_old_controllers_and_administrative_operations_keep_exclusive_edits(
+    runner_editors, owner,
+):
+    scheduler, editor, _cluster = runner_editors
+    job_id = scheduler.submit("old", lane="box:0", vram="1G")
+    db.set_meta(scheduler.conn, UNSTAGED_EDIT_OWNER, "different-tick")
+    db.acquire_lock(scheduler.conn, TICK_LOCK, owner, 60)
+    try:
+        with pytest.raises(RuntimeError, match="scheduler is busy"):
+            editor.edit_job(job_id, command="new")
+        assert db.get_job(scheduler.conn, job_id).command == "old"
+    finally:
+        db.release_lock(scheduler.conn, TICK_LOCK, owner)
+
+
+def test_no_tick_dependency_edit_succeeds_during_a_compatible_tick(
+    edit_cli, scheduler, capsys,
+):
+    old = scheduler.submit("old export", gpus=0)
+    new = scheduler.submit("new export", gpus=0)
+    job_id = scheduler.submit("eval", lane="box:0", depends_on=[old])
+    db.set_meta(scheduler.conn, UNSTAGED_EDIT_OWNER, "live-tick")
+    db.acquire_lock(scheduler.conn, TICK_LOCK, "live-tick", 60)
+    try:
+        assert edit_cli(job_id, "--drop-after", str(old), "--add-after", str(new)) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["job"]["depends_on"] == [new]
+        assert payload["tick"] == {"skipped": "disabled"}
+    finally:
+        db.release_lock(scheduler.conn, TICK_LOCK, "live-tick")

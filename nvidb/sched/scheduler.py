@@ -53,6 +53,9 @@ TICK_LOCK = "scheduler"
 # Only this exact tick owner promises to recheck pending jobs before staging.
 # An older daemon or an administrative operation must keep exclusive access.
 UNSTAGED_CANCEL_OWNER = "scheduler_unstaged_cancel_owner"
+# Kept separate from cancellation: older ticks do not recheck edited requests
+# when reserving a runner job, so they must retain exclusive access.
+UNSTAGED_EDIT_OWNER = "scheduler_unstaged_edit_owner"
 
 
 class SchedulerLeaseLost(RuntimeError):
@@ -529,6 +532,30 @@ class Scheduler:
             yield
         finally:
             dbm.release_lock(self.conn, TICK_LOCK, owner)
+
+    @contextmanager
+    def _job_edit_guard(self, job_id: int):
+        """Serialize local runner edits with staging, without waiting for SSH.
+
+        A run directory is the handoff boundary. The tick rechecks the request
+        in the same transaction that reserves that directory. Either an edit
+        commits first and invalidates its snapshot, or staging commits first
+        and the edit must take the ordinary exclusive lease. Old controllers
+        and administrative operations never advertise this protocol.
+        """
+        with dbm.transaction(self.conn):
+            job = dbm.get_job(self.conn, job_id)
+            lane = dbm.get_lane(self.conn, job.lane) if job and job.lane else None
+            holder = dbm.lock_holder(self.conn, TICK_LOCK)
+            owner = holder["owner"] if holder else None
+            if (job is not None and job.state == "pending" and lane and lane.runner
+                    and not any((job.run_dir, job.node, job.remote_pid,
+                                 job.remote_pgid, job.started_at))
+                    and (not owner or owner == dbm.get_meta(self.conn, UNSTAGED_EDIT_OWNER))):
+                yield
+                return
+        with self._operation_lease("job-edit"):
+            yield
 
     def set_node_ignored(self, name: str, ignored: bool) -> None:
         """Ignore or restore a node without racing an active scheduler tick."""
@@ -1140,14 +1167,14 @@ class Scheduler:
         Commands and VRAM reservations may only change while the job is pending.
         A command already handed to a runner cannot be replaced: the runner may
         have started it before the controller has observed that start. The
-        scheduler lease keeps a concurrent tick from launching the job between
-        that state check and the update. Dependency edits retain their existing
+        staging transaction protects unstaged runner jobs; other edits take the
+        scheduler lease. Dependency edits retain their existing
         behaviour: they may also reattach a held job to a replacement upstream.
         """
         vram_mb = parse_size_mb(vram) if vram is not None else None
         if command is not None and not command.strip():
             raise ValueError("A job needs a non-empty command")
-        with self._operation_lease("job-edit"):
+        with self._job_edit_guard(job_id):
             with dbm.transaction(self.conn):
                 job = dbm.get_job(self.conn, job_id)
                 if job is None:
@@ -1548,6 +1575,7 @@ class Scheduler:
                 summary["lock_owner"] = holder["owner"] if holder else None
                 return summary
             dbm.set_meta(self.conn, UNSTAGED_CANCEL_OWNER, self.owner)
+            dbm.set_meta(self.conn, UNSTAGED_EDIT_OWNER, self.owner)
         self._last_lease_renewal = time.monotonic()
 
         try:
@@ -2711,6 +2739,13 @@ class Scheduler:
                         or current.attempt != job.attempt or current.lane != lane.name
                         or current.run_dir != job.run_dir):
                     continue
+                if (current.command != job.command or current.vram_mb != job.vram_mb
+                        or current.depends_on != job.depends_on
+                        or current.depends_any != job.depends_any):
+                    # An edit won while run_dir was being resolved. Rebuild the
+                    # lane on the next tick; never skip its newly blocked head
+                    # or publish an obsolete command/reservation.
+                    break
                 if job.run_dir != run_dir and job.gpus > 0:
                     node = dbm.get_node(self.conn, lane.node)
                     if node is None or not self._lane_has_room(
@@ -3359,15 +3394,17 @@ class Scheduler:
     def _refresh_holds(self, summary: Dict[str, Any], jobs=None) -> None:
         """Re-evaluate holds even when the job is outside its lane's window."""
         for job in dbm.held_jobs(self.conn) if jobs is None else jobs:
-            if job.state != "pending" or not job.held_reason:
-                continue
-            if self._request_hold_reason(job):
-                continue
-            _ready, reason = self._dependencies_ready(job)
-            if reason is None:
-                self._unhold(job)
-            elif reason != job.held_reason:
-                self._hold(job, reason, summary)
+            with dbm.transaction(self.conn):
+                job = dbm.get_job(self.conn, job.id)
+                if job is None or job.state != "pending" or not job.held_reason:
+                    continue
+                if self._request_hold_reason(job):
+                    continue
+                _ready, reason = self._dependencies_ready(job)
+                if reason is None:
+                    self._unhold(job)
+                elif reason != job.held_reason:
+                    self._hold(job, reason, summary)
 
     def _find_placement(
         self,
