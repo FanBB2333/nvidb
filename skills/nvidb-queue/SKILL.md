@@ -354,6 +354,11 @@ Cancelling is destructive and discards work in progress. **Confirm with the user
 before cancelling a job you did not submit** — another session may be waiting on
 it.
 
+Cancellation returns before its five-second TERM-to-KILL grace period ends.
+Cleanup follows verified children even if their wrapper has exited. Check the
+node before reporting its GPU free; if cleanup cannot verify process identity,
+inspect the attempt directory's `cleanup.log` instead of signalling an old PID.
+
 Use `job edit --vram` when a pending reservation was estimated incorrectly.
 It preserves the job's queue/lane position, note and submitter, and immediately
 runs a scheduler pass unless `--no-tick` is given. It refuses running jobs

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional, Sequence
 
 from .transport import Transport, TransportError
+from .termination import build_termination_command
 
 PROBE_MARKER = "NVIDB_PROBE_V1"
 PS_MARKER = "PSTABLE"
@@ -432,61 +433,20 @@ class JobExecutor:
         if not run_dir:
             return False
         if not pid:
-            return self._cancel_unconfirmed(run_dir, grace=grace)
-        guard = _process_guard("$pid", "$d/run.sh")
-        term = self._signal_command(pid=pid, pgid=pgid, signal="TERM")
-        kill = self._signal_command(pid=pid, pgid=pgid, signal="KILL")
-        if timed_out:
-            condition = guard + ' && [ ! -f "$d/exit_code" ]'
-            # Persist intent on this attempt before signalling. A lost SSH
-            # reply must not turn a genuine timeout into an ordinary failure.
-            mark = '  date +%s > "$d/timeout.tmp" && mv "$d/timeout.tmp" "$d/timeout" || exit 1'
-        else:
-            condition = guard
-            mark = ":"
-        script = "\n".join(
-            [
-                f"d={shlex.quote(run_dir)}",
-                f"pid={int(pid)}",
-                f"if {condition}; then",
-                mark,
-                f"  {term}",
-                # The wrapper only runs its EXIT trap once the work it is
-                # waiting on returns, so the escalation has to reach the same
-                # set of processes rather than just the wrapper again.
-                f"  ( sleep {int(grace)}; if {guard}; then {kill}; fi ) "
-                ">/dev/null 2>&1 &",
-                '  echo "NVIDB_REAPED=1"',
-                "else",
-                '  echo "NVIDB_REAPED=0"',
-                "fi",
-            ]
+            return self._terminate_unconfirmed(run_dir, grace=grace, timed_out=timed_out)
+        script = build_termination_command(
+            run_dir, pid=pid, pgid=pgid, grace=grace, timed_out=timed_out,
         )
         result = self.transport.run(script, timeout=20)
+        if result.exit_status != 0:
+            raise TransportError(f"{self.transport.name}: could not stop job: {result.stderr.strip()}")
         return _parse_marker_int(result.stdout, "NVIDB_REAPED=") == 1
 
-    def _cancel_unconfirmed(self, run_dir: str, *, grace: int) -> bool:
-        """Seal a launch intent, then stop its process if it acquired a pid."""
-        guard = _process_guard("$pid", "$d/run.sh")
-        signal_group = (
-            'if [ -n "$pgid" ]; then kill -"$sig" -"$pgid" 2>/dev/null; '
-            'kill -"$sig" "$pid" 2>/dev/null; '
-            'else kill -"$sig" "$pid" 2>/dev/null; '
-            'pkill -"$sig" -P "$pid" 2>/dev/null; fi; true'
+    def _terminate_unconfirmed(self, run_dir: str, *, grace: int, timed_out: bool) -> bool:
+        """Resolve and stop an unconfirmed attempt under its launch lock."""
+        script = build_termination_command(
+            run_dir, pid=None, pgid=None, grace=grace, timed_out=timed_out, seal=not timed_out,
         )
-        script = "\n".join([
-            f"d={shlex.quote(run_dir)}",
-            ': > "$d/cancelled" || exit 1',
-            'pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
-            'pgid=""; if [ "$(cat "$d/session" 2>/dev/null)" = 1 ]; then '
-            'pgid=$(cat "$d/pgid" 2>/dev/null | tr -d " \\n\\r"); fi',
-            f"if {guard}; then",
-            '  sig=TERM; ' + signal_group,
-            f'  ( eval "exec ${{NVIDB_LAUNCH_LOCK_FD}}>&-"; sleep {int(grace)}; '
-            f'if {guard}; then sig=KILL; {signal_group}; fi ) >/dev/null 2>&1 &',
-            '  echo NVIDB_REAPED=1',
-            'else echo NVIDB_REAPED=0; fi',
-        ])
         result = self.transport.run(_with_launch_lock(run_dir, script), timeout=20)
         if result.exit_status != 0:
             raise TransportError(f"{self.transport.name}: could not cancel launch: {result.stderr.strip()}")
@@ -507,17 +467,6 @@ class JobExecutor:
     ) -> bool:
         """Stop a live job after verifying that the pid still belongs to it."""
         return self.reap(run_dir=run_dir, pid=pid, pgid=pgid, grace=grace)
-
-    @staticmethod
-    def _signal_command(*, pid: int, pgid: Optional[int], signal: str) -> str:
-        """Shell to signal a job: its group when it has one, its children when not."""
-        if pgid:
-            return (f"kill -{signal} -{int(pgid)} 2>/dev/null ; "
-                    f"kill -{signal} {int(pid)} 2>/dev/null ; true")
-        # No private process group, so reach the job's own children
-        # explicitly instead of leaving the real work running.
-        return (f"kill -{signal} {int(pid)} 2>/dev/null ; "
-                f"pkill -{signal} -P {int(pid)} 2>/dev/null ; true")
 
     def read_log(
         self, run_dir: str, *, stream: str = "stdout", lines: int = 200

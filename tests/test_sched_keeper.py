@@ -51,6 +51,7 @@ def nvidb_home(isolated_nvidb_config, tmp_path, monkeypatch):
     home = tmp_path / "nvidb"
     home.mkdir()
     monkeypatch.setattr(nvidb_config, "WORKING_DIR", home)
+    monkeypatch.setenv("NVIDB_HOME", str(home))
     monkeypatch.delenv("NVIDB_QUEUE_CONFIG", raising=False)
     monkeypatch.delenv(remote_mod.NO_REMOTE_ENV, raising=False)
     return home

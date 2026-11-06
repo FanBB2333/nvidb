@@ -357,15 +357,26 @@ def test_the_vram_gate_holds_a_job_back_only_when_it_can_measure(spool, tmp_path
         vram_mb=10 ** 9,  # more VRAM than any card has
         gpu_ids=[0],
     )
-    result = _run_runner(spool, tmp_path, idle_exit=0.5)
-    assert result.returncode == 0, result.stderr
-
-    state = _state(spool)
-    if _has_nvidia_smi():
-        assert state["queued"] == [1], "an impossible request should have waited"
-        assert state["finished"] == []
-    else:
-        assert [item["job_id"] for item in state["finished"]] == [1]
+    process = subprocess.Popen(
+        [sys.executable, "-u", str(_runner_file(tmp_path)), str(spool), "test:0",
+         "NVIDB_LANE=test", "testversion", ".05", ".5"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for(lambda: (spool / "state.json").exists())
+        if _has_nvidia_smi():
+            state = _state(spool)
+            assert state["queued"] == [1], "an impossible request should have waited"
+            assert state["finished"] == []
+        else:
+            _wait_for(lambda: _state(spool)["finished"])
+            assert [item["job_id"] for item in _state(spool)["finished"]] == [1]
+    finally:
+        # A pending job keeps the real runner alive on GPU hosts. End this
+        # observation explicitly instead of waiting for its idle timeout.
+        (spool / "stop").touch()
+        _, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stderr.decode()
 
 
 # --- the command the controller sends -------------------------------------

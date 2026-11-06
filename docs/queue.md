@@ -104,6 +104,13 @@ so cleanup survives `job requeue` and `job purge`; a later successful probe
 cleans up that attempt after checking its identity. `nvidb queue status --json`
 reports outstanding cleanups as `pending_reaps`.
 
+Cancellation sends TERM, then allows five seconds before KILL. Cleanup tracks
+the verified process identities independently of the wrapper, so children that
+ignore TERM are still stopped after the wrapper exits. The command can return
+before that grace period ends. If process identities can no longer be verified,
+cleanup refuses to signal them and records the error in the attempt directory's
+`cleanup.log`; check the node before assuming its resources are free.
+
 On nodes where the driver accounts for none of the memory in use — WSL, where
 the GPU is driven from Windows, and which either names no processes at all or
 names them without memory figures — the split between foreign work and the
@@ -671,6 +678,24 @@ database is atomically published without replacing an existing path.
 
 ---
 ## Upgrade notes
+
+### Upgrading to 1.10.1
+
+1.10.1 fixes cancellation leaving TERM-ignoring children running after their
+wrapper exits. Cleanup retains verified child identities through the
+five-second grace period, then sends KILL to surviving processes. This also
+applies when the launch acknowledgement was lost.
+
+Stop the queue keeper or daemon, upgrade the queue host and remote clients,
+then restart the controller. For the GitHub release, install its verified wheel:
+
+```bash
+python -m pip install --upgrade https://github.com/FanBB2333/nvidb/releases/download/v1.10.1/nvidb-1.10.1-py3-none-any.whl
+```
+
+No database migration is required. Cancellation can return before cleanup
+finishes; check the node before reporting its GPU free. The 1.10.0 upgrade
+requirements below still apply when upgrading from 1.9.x.
 
 ### Upgrading to 1.10.0
 
