@@ -10,9 +10,11 @@ Two halves, tested separately because they fail in different ways:
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -159,6 +161,7 @@ def test_the_runner_enforces_a_time_limit(spool, tmp_path):
         command="sleep 30",
         max_runtime_s=1,
     )
+    after = _stage(spool, tmp_path, job_id=2, seq=2000, command="echo second")
     started = time.time()
     result = _run_runner(spool, tmp_path, idle_exit=2.0, timeout=40)
     elapsed = time.time() - started
@@ -168,7 +171,107 @@ def test_the_runner_enforces_a_time_limit(spool, tmp_path):
     # run.sh traps TERM and reports it, so the outcome is recorded rather than
     # vanishing with the process.
     assert (run_dir / "exit_code").exists()
+    assert (run_dir / "exit_code").read_text().split()[0] == "143"
     assert (run_dir / "timeout").exists()
+    assert (after / "stdout.log").read_text().strip() == "second"
+    assert "killing it" not in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the runner targets POSIX nodes")
+@pytest.mark.parametrize(
+    "restart,wrapper_ignores_term", [(False, True), (True, True), (False, False), (True, False)],
+    ids=["resident", "adopted", "child-outlives-wrapper", "unverifiable-recovery"],
+)
+def test_timeout_preserves_the_lane_until_the_term_ignoring_group_is_gone(
+    spool, tmp_path, restart, wrapper_ignores_term,
+):
+    command = ('trap "" TERM\nsleep 30 &' if wrapper_ignores_term else
+               '(trap "" TERM; exec sleep 30) &')
+    command += '\necho $! > "$NVIDB_JOB_DIR/child.pid"\nwait'
+    run_dir = _stage(
+        spool, tmp_path, job_id=1, seq=1000, gpu_ids=[], max_runtime_s=1,
+        command=command,
+    )
+    after = _stage(spool, tmp_path, job_id=2, seq=2000, gpu_ids=[], command="echo second")
+    script = _runner_file(tmp_path)
+    first = subprocess.Popen(
+        [sys.executable, "-u", str(script), str(spool), "test:0",
+         "NVIDB_LANE=test", "v1", ".05", ".2"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for(lambda: (run_dir / "timeout").exists())
+        marker = (run_dir / "timeout").read_text()
+        assert not (after / "started").exists()
+        if not wrapper_ignores_term:
+            _wait_for(lambda: (run_dir / "exit_code").exists())
+            assert (run_dir / "exit_code").read_text().split()[0] == "143"
+            assert [job["job_id"] for job in _state(spool)["current"]] == [1]
+            assert not (after / "started").exists()
+        if restart:
+            # Restart during the grace period. Recovery must use the original
+            # marker, so repeated restarts cannot extend the job indefinitely.
+            time.sleep(1)
+            first.terminate()
+            first.communicate(timeout=5)
+            result = _run_runner(spool, tmp_path, idle_exit=.2, timeout=15)
+            if not wrapper_ignores_term:
+                assert result.returncode != 0
+                assert "wrapper identity is unavailable" in result.stderr
+                assert "refusing to release the lane" in result.stderr
+                assert (run_dir / "timeout").read_text() == marker
+                assert len(list((spool / "claimed").glob("*.json"))) == 1
+                assert not (after / "started").exists()
+                return
+            assert result.returncode == 0, result.stderr
+            assert "adopted job 1" in result.stderr
+            stderr = result.stderr
+        else:
+            _, stderr = first.communicate(timeout=15)
+            stderr = stderr.decode()
+            assert first.returncode == 0, stderr
+
+        assert (run_dir / "timeout").read_text() == marker
+        assert "killing it" in stderr
+        assert (after / "stdout.log").read_text().strip() == "second"
+        state = _state(spool)
+        assert state["current"] == []
+        assert state["queued"] == []
+        assert [item["job_id"] for item in state["finished"]] == [1, 2]
+        assert state["finished"][0]["finished_at"] - float(marker) >= 5
+        assert state["finished"][0]["exit_code"] != 0
+        # The child inherits ignored TERM too; killing only run.sh would leak it.
+        child_pid = int((run_dir / "child.pid").read_text())
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True,
+        ).stdout.strip()
+        assert not status or status.startswith("Z"), status
+    finally:
+        if first.poll() is None:
+            first.kill()
+        first.communicate(timeout=5)
+        if (run_dir / "pid").exists():
+            try:
+                os.killpg(int((run_dir / "pid").read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_timeout_does_not_release_a_group_when_process_listing_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["runner.py", str(tmp_path), "test:0", "test", "v", "1", "1"])
+    namespace = {"__name__": "runner_test"}
+    exec(runner_agent.RUNNER_SCRIPT, namespace)
+    (tmp_path / "timeout").write_text(str(time.time()))
+    job = namespace["Job"]({"job_id": 1, "run_dir": str(tmp_path)}, "unused")
+    job.pid = 12345
+    job.proc = SimpleNamespace(poll=lambda: 143)
+
+    def unavailable(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "ps", stderr=b"permission denied")
+
+    monkeypatch.setattr(subprocess, "check_output", unavailable)
+    with pytest.raises(subprocess.CalledProcessError):
+        job.alive()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the runner targets POSIX nodes")

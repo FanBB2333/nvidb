@@ -1788,6 +1788,8 @@ class Scheduler:
             self._renew_tick_lease()
             observed = probe.jobs.get(job.id)
             if observed is None:
+                if job.remote_pid is None:
+                    self._resume_launch(node, backend, job, summary)
                 continue  # nothing learned this round; leave the job alone
 
             if observed.timed_out and observed.exit_code != 0:
@@ -1812,13 +1814,26 @@ class Scheduler:
 
             if observed.alive:
                 updates: Dict[str, Any] = {"heartbeat_at": utcnow(), **progress_updates}
+                if job.remote_pid is None:
+                    updates.update(started_at=_epoch_to_iso(observed.started_epoch) or utcnow(),
+                                   last_error=None)
                 if observed.pid and observed.pid != job.remote_pid:
                     updates["remote_pid"] = observed.pid
                 if observed.pgid and observed.pgid != job.remote_pgid:
                     updates["remote_pgid"] = observed.pgid
-                dbm.update_job(self.conn, job.id, **updates)
+                with dbm.transaction(self.conn):
+                    dbm.update_job(self.conn, job.id, **updates)
+                    if job.remote_pid is None:
+                        dbm.add_event(self.conn, "job_started", job_id=job.id,
+                                      node=node.name,
+                                      message=f"pid {observed.pid} (recovered launch)",
+                                      data={"pid": observed.pid, "gpu_ids": job.gpu_ids,
+                                            "vram_mb": job.vram_mb, "recovered": True})
                 continue
 
+            if job.remote_pid is None:
+                self._resume_launch(node, backend, job, summary)
+                continue
             self._reconcile_missing_job(
                 node, backend, job, probe, progress_updates, summary
             )
@@ -1840,6 +1855,9 @@ class Scheduler:
             self.conn,
             job.id,
             state=state,
+            started_at=job.started_at or _epoch_to_iso(observed.started_epoch) or utcnow(),
+            remote_pid=job.remote_pid or observed.pid,
+            remote_pgid=job.remote_pgid or observed.pgid,
             exit_code=exit_code,
             finished_at=_epoch_to_iso(observed.finished_epoch) or utcnow(),
             result=result,
@@ -2564,6 +2582,11 @@ class Scheduler:
                     # started. Do not try a second node in that uncertain case.
                     launch_errors.append((node_name, str(error)))
                     summary["errors"].append({"job": job.id, "error": str(error)})
+                    # The durable intent still owns this placement even when
+                    # its launch acknowledgement was lost.
+                    if job.gpus <= 0 and node_name in cpu_slots:
+                        cpu_slots[node_name] = max(0, cpu_slots[node_name] - 1)
+                    _charge_budgets(budgets[node_name], gpu_ids, job.vram_mb)
                     self._renew_tick_lease()
                     break
 
@@ -3133,6 +3156,8 @@ class Scheduler:
                 gpu_ids = _lane_job_gpus(lane, job)
                 launched, errors = self._attempt_launch(job, node, gpu_ids, summary)
                 if not launched:
+                    if dbm.get_job(self.conn, job.id).state == "running":
+                        _charge_budgets(budgets[node.name], gpu_ids, job.vram_mb)
                     if errors:
                         self._report_launch_failure(job, errors, summary)
                     break
@@ -3483,32 +3508,69 @@ class Scheduler:
 
     def _launch(self, node: Node, job: Job, gpu_ids: List[int]) -> None:
         backend = self.backend(node)
+        attempt = job.attempt + 1
+        try:
+            run_dir = backend.executor.run_dir(job.id, attempt)
+        except TransportError as error:
+            raise LaunchRejected(str(error)) from error
+        # The placement is durable before sending anything that can start a
+        # process. A crash or lost reply leaves a running reservation with no
+        # pid, which is reconciled on this exact node and attempt directory.
+        dbm.update_job(self.conn, job.id, state="running", node=node.name,
+                       gpu_ids=gpu_ids, run_dir=run_dir, attempt=attempt,
+                       allocation_mode=self._gpu_mode(), remote_pid=None,
+                       remote_pgid=None, started_at=None, heartbeat_at=None,
+                       last_error="launch awaiting acknowledgement")
+        reserved = dbm.get_job(self.conn, job.id)
+        try:
+            self._start_reserved_job(node, backend, reserved)
+        except LaunchRejected:
+            # Only a positive pre-start rejection releases the reservation.
+            dbm.update_job(self.conn, job.id, **_FRESH_ATTEMPT, attempt=job.attempt)
+            raise
+
+    def _resume_launch(self, node: Node, backend: NodeBackend, job: Job,
+                       summary: Dict[str, Any]) -> None:
+        """Recover an unconfirmed start without choosing a new placement."""
+        try:
+            self._start_reserved_job(node, backend, job)
+        except TransportError as error:
+            # Even a rejection here cannot revoke an earlier uncertain send.
+            # Retain the intent until the node reports its attempt's outcome.
+            self._report_launch_failure(job, [(node.name, str(error))], summary)
+
+    def _start_reserved_job(self, node: Node, backend: NodeBackend, job: Job) -> None:
         launched = backend.executor.launch(
             job_id=job.id,
             job_name=job.name,
             command=job.command,
             workdir=job.workdir,
             env=job.env,
-            gpu_ids=gpu_ids,
+            gpu_ids=job.gpu_ids,
             node_name=node.name,
-            attempt=job.attempt + 1,
+            attempt=job.attempt,
             timeout=float(self.settings["launch_timeout"]),
+            run_dir=job.run_dir,
         )
+        if launched.pid is None:
+            dbm.update_job(self.conn, job.id,
+                           last_error="launch claimed on node; waiting for its pid or exit status")
+            return
         now = utcnow()
         with dbm.transaction(self.conn):
             dbm.update_job(
                 self.conn,
                 job.id,
                 state="running",
-                allocation_mode=self._gpu_mode(),
+                allocation_mode=job.allocation_mode,
                 node=node.name,
-                gpu_ids=gpu_ids,
+                gpu_ids=job.gpu_ids,
                 remote_pid=launched.pid,
                 remote_pgid=launched.pgid,
                 run_dir=launched.run_dir,
                 started_at=now,
                 heartbeat_at=now,
-                attempt=job.attempt + 1,
+                attempt=job.attempt,
                 last_error=None,
             )
             dbm.add_event(
@@ -3518,11 +3580,11 @@ class Scheduler:
                 node=node.name,
                 message=(
                     f"pid {launched.pid} on GPU "
-                    f"{','.join(str(i) for i in gpu_ids) or '-'}"
+                    f"{','.join(str(i) for i in job.gpu_ids) or '-'}"
                 ),
                 data={
                     "pid": launched.pid,
-                    "gpu_ids": gpu_ids,
+                    "gpu_ids": job.gpu_ids,
                     "vram_mb": job.vram_mb,
                     "vram": format_mb(job.vram_mb),
                 },

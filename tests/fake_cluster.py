@@ -242,13 +242,18 @@ class FakeExecutor:
         node_name=None,
         attempt=1,
         timeout=None,
+        run_dir=None,
     ) -> LaunchResult:
         if not self.node.online:
             raise TransportError(f"{self.node.name}: unreachable")
         if self.node.launch_error:
             raise LaunchRejected(self.node.launch_error)
+        run_dir = run_dir or self.run_dir(job_id, attempt)
+        existing = self.node.jobs.get(job_id)
+        if existing and existing["run_dir"] == run_dir:
+            return LaunchResult(pid=existing["pid"], pgid=existing["pgid"],
+                                run_dir=run_dir, adopted=True)
         pid = self.node._allocate_pid()
-        run_dir = self.run_dir(job_id, attempt)
         self.node.jobs[job_id] = {
             "pid": pid,
             "pgid": pid,
@@ -289,7 +294,7 @@ class FakeExecutor:
         if not self.node.online:
             raise TransportError(f"{self.node.name}: unreachable")
         for job_id, record in self.node.jobs.items():
-            if record["pid"] != pid or record["run_dir"] != run_dir:
+            if (pid and record["pid"] != pid) or record["run_dir"] != run_dir:
                 continue
             if not record["alive"]:
                 return False
@@ -303,7 +308,7 @@ class FakeExecutor:
         if not self.node.online:
             raise TransportError(f"{self.node.name}: unreachable")
         for job_id, record in self.node.jobs.items():
-            if record["pid"] != pid or record["run_dir"] != run_dir:
+            if (pid and record["pid"] != pid) or record["run_dir"] != run_dir:
                 continue
             if not record["alive"]:
                 return False

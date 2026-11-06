@@ -100,7 +100,7 @@ def test_run_script_embeds_the_command_without_quoting_it():
     assert "python train.py --note \"it's fine\"" in script
     assert "export CUDA_VISIBLE_DEVICES=1,2" in script
     assert "export WANDB_MODE=offline" in script
-    assert "cd /data/work" in script
+    assert "cd -- /data/work" in script
     # The exit code is published atomically, so a probe never reads a partial file.
     assert 'mv "$NVIDB_JOB_DIR/exit_code.tmp" "$NVIDB_JOB_DIR/exit_code"' in script
 

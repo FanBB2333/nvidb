@@ -59,6 +59,8 @@ CONFIG = os.path.join(SPOOL, "lane.json")
 # Jobs kept in the state file after they finish. Enough for a controller that
 # missed a few passes to see what happened without reading every run directory.
 FINISHED_MEMORY = 20
+# Match the controller's timeout grace, including when no controller is online.
+TIMEOUT_GRACE_SECONDS = 5
 
 
 def log(message):
@@ -111,6 +113,22 @@ def pid_runs(pid, run_dir):
     except (OSError, ValueError):
         return False
     return os.path.join(run_dir, "run.sh") in out.decode("utf-8", "replace")
+
+
+def process_group_alive(pgid):
+    """Whether a timed-out job still has live work in its private session.
+
+    A failed process listing is unknown, not permission to release the lane.
+    Zombies cannot do work and must not keep its capacity reserved forever.
+    """
+    output = subprocess.check_output(
+        ["ps", "-eo", "pgid=,stat="], stderr=subprocess.PIPE,
+    ).decode("utf-8", "replace")
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == str(pgid) and not fields[1].startswith("Z"):
+            return True
+    return False
 
 
 def gpu_free_mb(indices):
@@ -174,8 +192,12 @@ class Job(object):
         if self.proc is not None:
             # Our own child: poll() also reaps it, so a finished job cannot
             # linger as a zombie that still answers `kill -0`.
-            return self.proc.poll() is None
-        return pid_runs(self.pid, self.run_dir)
+            running = self.proc.poll() is None
+        else:
+            running = pid_runs(self.pid, self.run_dir)
+        if running:
+            return True
+        return os.path.exists(os.path.join(self.run_dir, "timeout")) and process_group_alive(self.pid)
 
     def exit_code(self):
         raw = ""
@@ -237,6 +259,14 @@ class Job(object):
         except (IOError, OSError, ValueError):
             return False
         if not pid_runs(pid, self.run_dir):
+            if os.path.exists(os.path.join(self.run_dir, "timeout")) and process_group_alive(pid):
+                # A saved group id alone cannot prove ownership after a restart.
+                # Keep the claim and stop dispatch instead of killing strangers
+                # or declaring a still-busy lane free.
+                raise RuntimeError(
+                    "cannot recover timed-out job %s: wrapper identity is unavailable "
+                    "but process group %s is still alive; refusing to release the lane"
+                    % (self.job_id, pid))
             return False
         self.pid = pid
         self.proc = None
@@ -251,12 +281,12 @@ class Job(object):
         if not self.pid:
             return
         try:
-            os.killpg(os.getpgid(self.pid), sig)
-        except OSError:
-            try:
-                os.kill(self.pid, sig)
-            except OSError:
-                pass
+            # start() creates a private session whose group id is this pid.
+            # Keep using that group after the wrapper exits: children may have
+            # ignored TERM and still need the timeout's KILL escalation.
+            os.killpg(self.pid, sig)
+        except ProcessLookupError:
+            pass
 
 
 class Runner(object):
@@ -360,13 +390,20 @@ class Runner(object):
             limit = job.spec.get("max_runtime_s")
             if not limit or not job.started_at:
                 continue
-            if now - job.started_at <= float(limit):
-                continue
-            log("job %s exceeded %ss; stopping it" % (job.job_id, limit))
-            # The controller may be offline; leave attempt-scoped evidence.
-            write_atomic(os.path.join(job.run_dir, "timeout"), str(now))
-            job.kill(signal.SIGTERM)
-            job.spec["max_runtime_s"] = None  # do not signal it every pass
+            timeout_path = os.path.join(job.run_dir, "timeout")
+            # The marker is also the termination clock. Adopting a job after a
+            # runner restart must continue its grace period, not start it over.
+            timeout_at = read_json(timeout_path)
+            if timeout_at is None:
+                if now - job.started_at <= float(limit):
+                    continue
+                log("job %s exceeded %ss; stopping it" % (job.job_id, limit))
+                write_atomic(timeout_path, str(now))
+                job.kill(signal.SIGTERM)
+            elif now - timeout_at >= TIMEOUT_GRACE_SECONDS:
+                log("job %s did not stop after %ss; killing it" % (
+                    job.job_id, TIMEOUT_GRACE_SECONDS))
+                job.kill(signal.SIGKILL)
 
     def maybe_start(self):
         # Sync and claim share this lock, including the gap before run.sh has

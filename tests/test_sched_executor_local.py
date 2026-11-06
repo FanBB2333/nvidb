@@ -292,20 +292,75 @@ def test_relaunching_a_live_job_adopts_it_instead_of_running_it_twice(executor):
 
 
 def test_a_finished_job_can_still_be_launched_again(executor):
-    """Adoption must not block a re-queue: that job's process is gone."""
+    """A deliberate requeue uses a fresh attempt directory."""
     launched = executor.launch(
         job_id=21, job_name="short", command="echo run-one", node_name="test-local"
     )
     _wait_for_exit(executor, 21, launched.run_dir)
 
     again = executor.launch(
-        job_id=21, job_name="short", command="echo run-two", node_name="test-local"
+        job_id=21, job_name="short", command="echo run-two", node_name="test-local", attempt=2
     )
     assert again.adopted is False
     assert again.pid != launched.pid
     _wait_for_exit(executor, 21, again.run_dir)
     log = executor.read_log(again.run_dir)
     assert "run-two" in log and "run-one" not in log  # the log was reset
+
+
+def test_replaying_a_finished_attempt_preserves_its_result_and_log(executor):
+    launched = executor.launch(job_id=81, job_name="short", command="echo original")
+    _wait_for_exit(executor, 81, launched.run_dir)
+    again = executor.launch(job_id=81, job_name="short", command="echo duplicate")
+    assert again.adopted
+    assert again.pid == launched.pid
+    assert executor.read_log(again.run_dir).strip() == "original"
+
+
+def test_concurrent_launch_replays_start_one_process(executor):
+    from concurrent.futures import ThreadPoolExecutor
+    def launch():
+        return executor.launch(job_id=82, job_name="race", command="echo started; sleep 30")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: launch(), range(2)))
+    try:
+        assert first.pid == second.pid
+        assert sorted([first.adopted, second.adopted]) == [False, True]
+        assert executor.read_log(first.run_dir).count("started") == 1
+    finally:
+        executor.terminate(run_dir=first.run_dir, pid=first.pid, pgid=first.pgid)
+
+
+def test_cancelling_without_a_pid_seals_the_attempt_before_a_late_launch(executor):
+    run_dir = executor.run_dir(83)
+    assert not executor.terminate(run_dir=run_dir, pid=None)
+    replay = executor.launch(job_id=83, job_name="cancelled", command="echo must-not-run")
+    assert replay.pid is None
+    assert executor.read_log(run_dir) == ""
+
+
+def test_cancelling_without_a_pid_finds_an_already_started_process(executor):
+    launched = executor.launch(job_id=84, job_name="lost reply", command="echo ready; sleep 30")
+    try:
+        deadline = time.monotonic() + 5
+        while "ready" not in executor.read_log(launched.run_dir):
+            assert time.monotonic() < deadline
+            time.sleep(.05)
+        assert executor.terminate(run_dir=launched.run_dir, pid=None)
+        assert _wait_for_exit(executor, 84, launched.run_dir).exit_code != 0
+    finally:
+        executor.terminate(run_dir=launched.run_dir, pid=launched.pid, pgid=launched.pgid)
+
+
+def test_an_interrupted_claim_never_reexecutes_the_same_attempt(executor):
+    from pathlib import Path
+    run_dir = Path(executor.run_dir(85))
+    run_dir.mkdir(parents=True)
+    (run_dir / "launch.claimed").touch()
+    replay = executor.launch(job_id=85, job_name="interrupted", command="echo duplicate")
+    assert replay.adopted
+    assert replay.pid is None
+    assert not (run_dir / "run.sh").exists()
 
 
 def test_requeued_attempts_use_distinct_run_directories(executor):

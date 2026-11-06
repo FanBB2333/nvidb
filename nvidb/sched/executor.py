@@ -41,7 +41,7 @@ def _process_guard(pid_expr: str, script_expr: str) -> str:
 
 
 class LaunchRejected(TransportError):
-    """A launch failed before the executor could identify a running process."""
+    """The node proved that this request never reached process creation."""
 
 
 @dataclass
@@ -49,8 +49,7 @@ class LaunchResult:
     pid: Optional[int]
     pgid: Optional[int]
     run_dir: str
-    # True when this launch found the job already running and took it over
-    # rather than starting a second copy. See `JobExecutor.launch`.
+    # True when this attempt was already claimed, including finished work.
     adopted: bool = False
 
 
@@ -145,6 +144,9 @@ def build_run_script(
         # job is cancelled, instead of the status vanishing with the process.
         "trap 'exit 143' TERM",
         "trap 'exit 130' INT",
+        # A cancel can seal an attempt before a delayed child publishes its
+        # pid. Such a child must never reach the user command.
+        '[ ! -f "$NVIDB_JOB_DIR/cancelled" ] || exit 125',
         f"export NVIDB_JOB_ID={shlex.quote(str(job_id))}",
         f"export NVIDB_JOB_NAME={shlex.quote(job_name or '')}",
         'export NVIDB_JOB_DIR="$NVIDB_JOB_DIR"',
@@ -166,7 +168,14 @@ def build_run_script(
         lines.append(f"export {key}={shlex.quote(str(value))}")
 
     if workdir:
-        lines.append(f"cd {shlex.quote(workdir)} || exit 127")
+        # Expand only the home prefix, on the node. The rest is a literal
+        # path, not shell code; the submitting machine's home is irrelevant.
+        directory = (
+            '"$HOME"' + shlex.quote(workdir[1:])
+            if workdir == "~" or workdir.startswith("~/")
+            else shlex.quote(workdir)
+        )
+        lines.append(f"cd -- {directory} || exit 127")
 
     lines.extend(
         [
@@ -179,36 +188,58 @@ def build_run_script(
     return "\n".join(lines) + "\n"
 
 
+def _with_launch_lock(run_dir: str, command: str) -> str:
+    """Serialize launch replay and cancellation on the node, including fork.
+
+    The node already requires python3 for its probe and lane runner. An OS
+    lock is released if the bootstrap dies; the durable claim below separately
+    prevents that death from authorizing another execution of the attempt.
+    """
+    program = "\n".join([
+        "import base64, fcntl, os, subprocess, sys",
+        "os.makedirs(sys.argv[1], exist_ok=True)",
+        "lock = open(os.path.join(sys.argv[1], 'launch.lock'), 'a')",
+        "with lock:",
+        "    fcntl.flock(lock, fcntl.LOCK_EX)",
+        "    body = base64.b64decode(sys.stdin.buffer.read())",
+        "    env = dict(os.environ, NVIDB_LAUNCH_LOCK_FD=str(lock.fileno()))",
+        "    raise SystemExit(subprocess.run(['/bin/sh'], input=body, env=env, pass_fds=(lock.fileno(),)).returncode)",
+    ])
+    encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    return (f"printf '%s' {shlex.quote(encoded)} | python3 -c "
+            f"{shlex.quote(program)} {shlex.quote(run_dir)}")
+
+
 def _build_launch_command(run_dir: str, script: str) -> str:
     """Build the remote bootstrap that installs, starts, or adopts ``run.sh``."""
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     quoted_dir = shlex.quote(run_dir)
-    return "\n".join(
+    command = "\n".join(
         [
             f"d={quoted_dir}",
-            'mkdir -p "$d" || exit 1',
-            # A retried transport command may find that its first attempt
-            # already started the job. Adopt only a live process that still
-            # owns this exact run.sh; a recycled pid must never qualify.
-            'nvidb_pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
-            f'if {_process_guard("$nvidb_pid", "$d/run.sh")}; then',
+            'if [ -f "$d/cancelled" ]; then echo NVIDB_CANCELLED=1; exit 0; fi',
+            # A finished attempt is just as non-repeatable as a live one.
+            # Claim before fork: even a bootstrap killed between fork and the
+            # pid write must never launch this attempt a second time.
+            'if [ -f "$d/launch.claimed" ] || [ -f "$d/pid" ] || [ -f "$d/started" ] || [ -f "$d/exit_code" ]; then',
             '  echo "NVIDB_ADOPTED=1"',
             "else",
-            f"  printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || exit 1",
-            '  chmod +x "$d/run.sh"',
-            '  rm -f "$d/exit_code" "$d/pid" "$d/pgid" "$d/result.json"',
-            '  : > "$d/stdout.log"',
-            '  : > "$d/stderr.log"',
+            '  nvidb_reject() { echo NVIDB_REJECTED=1; exit 1; }',
+            f"  printf '%s' {shlex.quote(encoded)} | base64 -d > \"$d/run.sh\" || nvidb_reject",
+            '  chmod +x "$d/run.sh" || nvidb_reject',
+            '  : > "$d/stdout.log" || nvidb_reject',
+            '  : > "$d/stderr.log" || nvidb_reject',
+            '  : > "$d/launch.claimed" || nvidb_reject',
             # setsid creates a private process group. macOS has no setsid, so
             # nohup detaches there and the missing isolation is recorded; the
             # caller will then avoid signalling the login shell's group.
             '  if command -v setsid >/dev/null 2>&1; then',
             '    echo 1 > "$d/session"',
-            '    ( setsid bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
+            '    ( eval "exec ${NVIDB_LAUNCH_LOCK_FD}>&-"; setsid bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
             " < /dev/null & )",
             "  else",
             '    echo 0 > "$d/session"',
-            '    ( nohup bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
+            '    ( eval "exec ${NVIDB_LAUNCH_LOCK_FD}>&-"; nohup bash "$d/run.sh" >> "$d/stdout.log" 2>> "$d/stderr.log"'
             " < /dev/null & )",
             "  fi",
             "  i=0",
@@ -221,8 +252,10 @@ def _build_launch_command(run_dir: str, script: str) -> str:
             'echo "NVIDB_SETSID=$(cat "$d/session" 2>/dev/null | tr -d " \\n\\r")"',
             'echo "NVIDB_PID=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")"',
             'echo "NVIDB_PGID=$(cat "$d/pgid" 2>/dev/null | tr -d " \\n\\r")"',
+            'echo "NVIDB_ACKNOWLEDGED=1"',
         ]
     )
+    return _with_launch_lock(run_dir, command)
 
 
 class JobExecutor:
@@ -283,10 +316,11 @@ class JobExecutor:
         node_name: Optional[str] = None,
         attempt: int = 1,
         timeout: float = 60.0,
+        run_dir: Optional[str] = None,
     ) -> LaunchResult:
-        """Start a job detached and return the pid/pgid it reported."""
+        """Start or recover one attempt; an unconfirmed claim has no pid yet."""
         try:
-            run_dir = self.run_dir(job_id, attempt)
+            run_dir = run_dir or self.run_dir(job_id, attempt)
         except TransportError as error:
             # Resolving the path happens before the launch command is sent, so
             # another node may be tried without risking a duplicate process.
@@ -308,8 +342,15 @@ class JobExecutor:
         pgid = _parse_marker_int(result.stdout, "NVIDB_PGID=")
         isolated = _parse_marker_int(result.stdout, "NVIDB_SETSID=") == 1
         adopted = _parse_marker_int(result.stdout, "NVIDB_ADOPTED=") == 1
-        if pid is None:
+        if _parse_marker_int(result.stdout, "NVIDB_REJECTED=") == 1:
             raise LaunchRejected(
+                f"{self.transport.name}: job {job_id} launch rejected: "
+                f"{(result.stderr or result.stdout).strip()[:400]}"
+            )
+        acknowledged = (_parse_marker_int(result.stdout, "NVIDB_ACKNOWLEDGED=") == 1
+                        or _parse_marker_int(result.stdout, "NVIDB_CANCELLED=") == 1)
+        if result.exit_status != 0 or not acknowledged:
+            raise TransportError(
                 f"{self.transport.name}: job {job_id} did not report a pid: "
                 f"{(result.stderr or result.stdout).strip()[:400]}"
             )
@@ -388,8 +429,10 @@ class JobExecutor:
         that was offline has a pid the node has long since handed to someone
         else, and killing that would be far worse than leaking a process.
         """
-        if not pid or not run_dir:
+        if not run_dir:
             return False
+        if not pid:
+            return self._cancel_unconfirmed(run_dir, grace=grace)
         guard = _process_guard("$pid", "$d/run.sh")
         term = self._signal_command(pid=pid, pgid=pgid, signal="TERM")
         kill = self._signal_command(pid=pid, pgid=pgid, signal="KILL")
@@ -420,6 +463,33 @@ class JobExecutor:
             ]
         )
         result = self.transport.run(script, timeout=20)
+        return _parse_marker_int(result.stdout, "NVIDB_REAPED=") == 1
+
+    def _cancel_unconfirmed(self, run_dir: str, *, grace: int) -> bool:
+        """Seal a launch intent, then stop its process if it acquired a pid."""
+        guard = _process_guard("$pid", "$d/run.sh")
+        signal_group = (
+            'if [ -n "$pgid" ]; then kill -"$sig" -"$pgid" 2>/dev/null; '
+            'kill -"$sig" "$pid" 2>/dev/null; '
+            'else kill -"$sig" "$pid" 2>/dev/null; '
+            'pkill -"$sig" -P "$pid" 2>/dev/null; fi; true'
+        )
+        script = "\n".join([
+            f"d={shlex.quote(run_dir)}",
+            ': > "$d/cancelled" || exit 1',
+            'pid=$(cat "$d/pid" 2>/dev/null | tr -d " \\n\\r")',
+            'pgid=""; if [ "$(cat "$d/session" 2>/dev/null)" = 1 ]; then '
+            'pgid=$(cat "$d/pgid" 2>/dev/null | tr -d " \\n\\r"); fi',
+            f"if {guard}; then",
+            '  sig=TERM; ' + signal_group,
+            f'  ( eval "exec ${{NVIDB_LAUNCH_LOCK_FD}}>&-"; sleep {int(grace)}; '
+            f'if {guard}; then sig=KILL; {signal_group}; fi ) >/dev/null 2>&1 &',
+            '  echo NVIDB_REAPED=1',
+            'else echo NVIDB_REAPED=0; fi',
+        ])
+        result = self.transport.run(_with_launch_lock(run_dir, script), timeout=20)
+        if result.exit_status != 0:
+            raise TransportError(f"{self.transport.name}: could not cancel launch: {result.stderr.strip()}")
         return _parse_marker_int(result.stdout, "NVIDB_REAPED=") == 1
 
     def request_timeout(self, *, run_dir: str, pid: Optional[int],

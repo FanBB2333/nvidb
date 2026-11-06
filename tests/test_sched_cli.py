@@ -138,6 +138,16 @@ def test_submit_without_a_command_is_refused(parser, queue_db, capsys):
     assert "nothing to run" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("workdir", ["~", "~/project with spaces", "/srv/project"])
+def test_submit_preserves_the_nodes_workdir(parser, queue_db, workdir):
+    _submit(parser, queue_db, "--workdir", workdir, "--", "pwd")
+    conn = dbm.open_db(queue_db)
+    try:
+        assert dbm.list_jobs(conn)[0].workdir == workdir
+    finally:
+        conn.close()
+
+
 def test_submit_refuses_limits_that_would_silently_mean_nothing(parser, queue_db, capsys):
     """`--timeout 0` reads as "no limit" once stored, which is not what it says."""
     assert _run(parser, ["job", "submit", "--timeout", "0", "--", "true"], queue_db) == 1

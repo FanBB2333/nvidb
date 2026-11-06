@@ -1035,13 +1035,13 @@ def add_orphan(
     reason: Optional[str] = None,
 ) -> Optional[int]:
     """Remember a process that must be killed once its node answers again."""
-    if not pid or not run_dir:
-        return None  # nothing identifiable enough to kill safely later
+    if not run_dir:
+        return None  # the attempt directory is required to identify it safely
     with transaction(conn):
         cursor = conn.execute(
             "INSERT INTO orphans(job_id, node, run_dir, pid, pgid, reason, created_at) "
             "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (job_id, node, run_dir, int(pid), pgid, reason, utcnow()),
+            (job_id, node, run_dir, int(pid) if pid else None, pgid, reason, utcnow()),
         )
         return int(cursor.lastrowid)
 

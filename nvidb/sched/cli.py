@@ -1240,7 +1240,7 @@ def cmd_submit(args) -> int:
             job_id = scheduler.submit(
                 command,
                 name=args.name,
-                workdir=str(Path(args.workdir).expanduser()) if args.workdir else None,
+                workdir=args.workdir,
                 env=env,
                 gpus=gpus,
                 vram=args.vram,
@@ -2114,7 +2114,10 @@ def _register_submit_parser(job_sub) -> None:
         metavar="head|tail|N",
         help="Where in the lane to queue it (default: tail)",
     )
-    submit.add_argument("--workdir", default=None, help="Working directory on the node")
+    submit.add_argument(
+        "--workdir", default=None,
+        help="Working directory on the node; quote '~/path' to use the node's home",
+    )
     submit.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     submit.add_argument("--priority", type=int, default=0, help="Higher runs first")
     submit.add_argument("--after", action="append", default=[], metavar="ID",
