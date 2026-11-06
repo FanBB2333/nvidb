@@ -564,7 +564,7 @@ def _write_file(path_expr: str, text: str) -> str:
 _SYNC_SCRIPT = r"""
 import fcntl, json, os, sys
 d = sys.argv[1]
-payload = json.loads(sys.argv[2])
+payload = json.load(sys.stdin)
 with open(os.path.join(d, "queue.lock"), "a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     claimed = set()
@@ -684,7 +684,16 @@ def build_sync_command(
             "fi",
         ]
     payload = json.dumps({"specs": list(specs), "config": lane_config})
-    lines.append(_python_command(_SYNC_SCRIPT, python_exe, '"$d"', shlex.quote(payload)) + " || exit 1")
+    # The job scripts inside this document can exceed execve's per-argument
+    # limit even when the outer transport streams its shell script correctly.
+    # JSON escapes newlines, so the literal heredoc delimiter cannot occur as
+    # a payload line; quoted expansion also preserves shell metacharacters.
+    lines += [
+        _python_command(_SYNC_SCRIPT, python_exe, '"$d"')
+        + " <<'NVIDB_LANE_PAYLOAD' || exit 1",
+        payload,
+        "NVIDB_LANE_PAYLOAD",
+    ]
     if want_runner:
         lines += [
             'rm -f "$d/stop"',

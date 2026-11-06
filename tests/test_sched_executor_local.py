@@ -77,6 +77,17 @@ def test_a_failing_command_propagates_its_status(executor):
     assert abs(probe.finished_epoch - time.time()) < 60
 
 
+def test_a_large_job_script_launches_and_reports_its_result(executor):
+    command = "# large multi-line script 中文 $HOME\n" * 40000 + (
+        "printf '%s' '{\"large_script\": true}' > \"$NVIDB_JOB_DIR/result.json\"\n"
+    )
+    launched = executor.launch(
+        job_id=42, job_name="large", command=command, node_name="test-local",
+    )
+    assert _wait_for_exit(executor, 42, launched.run_dir).exit_code == 0
+    assert executor.read_result(launched.run_dir) == {"large_script": True}
+
+
 def _block_the_atomic_publish(run_dir) -> None:
     """Stand where the exit code's temporary file goes.
 

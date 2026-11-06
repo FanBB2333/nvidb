@@ -236,6 +236,10 @@ report `scheduler is busy`. An older running controller also keeps that
 protection; restart it to load the updated protocol. `--no-tick` skips the
 automatic scheduler pass after the edit.
 
+Large `--script` submissions and lane payloads travel through standard input
+instead of large shell or Python arguments, avoiding the operating system's
+per-argument size limit.
+
 Commands can only change before the job has been staged on its node. A pending
 job with a `run_dir` may already have started in the runner even though the
 database has not observed it yet, so that edit is refused. Running and finished

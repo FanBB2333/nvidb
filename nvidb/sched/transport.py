@@ -18,6 +18,9 @@ from ..ssh_proxy import open_proxyjump_socket
 
 DEFAULT_CONNECT_TIMEOUT = 8.0
 DEFAULT_COMMAND_TIMEOUT = 30.0
+# Below Linux's per-argument limit and the smaller limits of some login shells.
+# Larger bootstraps travel as script text, never as a shell's -c argument.
+MAX_INLINE_COMMAND_BYTES = 32 * 1024
 
 
 @dataclass
@@ -62,10 +65,12 @@ class LocalTransport(Transport):
 
     def run(self, command: str, timeout: Optional[float] = None) -> CommandResult:
         timeout = timeout or DEFAULT_COMMAND_TIMEOUT
+        streamed = len(command.encode("utf-8")) > MAX_INLINE_COMMAND_BYTES
         try:
             completed = subprocess.run(
-                command,
-                shell=True,
+                ["/bin/sh"] if streamed else command,
+                shell=not streamed,
+                input=command if streamed else None,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -206,13 +211,20 @@ class SSHTransport(Transport):
 
     def run(self, command: str, timeout: Optional[float] = None) -> CommandResult:
         timeout = timeout or DEFAULT_COMMAND_TIMEOUT
+        script = command.encode("utf-8")
+        streamed = len(script) > MAX_INLINE_COMMAND_BYTES
         with self._lock:
             last_error: Optional[Exception] = None
             # One retry: a channel that died between ticks is routine, not fatal.
             for attempt in range(2):
                 try:
                     client = self._ensure_client()
-                    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+                    stdin, stdout, stderr = client.exec_command(
+                        "sh -s" if streamed else command, timeout=timeout
+                    )
+                    if streamed:
+                        stdin.write(script)
+                        stdin.flush()
                     stdin.close()
                     out = stdout.read().decode("utf-8", errors="replace")
                     err = stderr.read().decode("utf-8", errors="replace")
@@ -226,5 +238,4 @@ class SSHTransport(Transport):
             raise TransportError(
                 f"{self.name}: command failed: {type(last_error).__name__}: {last_error}"
             )
-
 

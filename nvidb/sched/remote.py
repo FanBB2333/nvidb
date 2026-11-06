@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .. import config as nvidb_config
 from . import keeper as keeper_mod
 from .identity import default_submitter
+from .transport import MAX_INLINE_COMMAND_BYTES
 
 # Set on the far side so a misconfigured remote pointing at itself fails as a
 # plain command instead of looping forever.
@@ -243,6 +244,10 @@ def forward(
     """
     command = build_command(target, argv, script_text=script_text)
     try:
+        if len(command.encode("utf-8")) > MAX_INLINE_COMMAND_BYTES:
+            return subprocess.run(
+                ssh_argv(target, "sh -s", tty=tty), input=command.encode("utf-8")
+            ).returncode
         return subprocess.call(ssh_argv(target, command, tty=tty))
     except FileNotFoundError:
         print("error: ssh not found on this machine", file=sys.stderr)
